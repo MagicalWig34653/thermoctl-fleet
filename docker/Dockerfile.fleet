@@ -1,0 +1,19 @@
+# Abbild des Cloud-Diensts. Getrennt von Dockerfile.agent, weil beide Seiten
+# unabhängig voneinander aktualisiert werden -- nie mit einem gemeinsamen Tag.
+FROM python:3.13-slim AS build
+WORKDIR /build
+COPY pyproject.toml LICENSE ./
+COPY protokoll ./protokoll
+COPY fleet ./fleet
+RUN pip install --no-cache-dir --prefix=/install ".[fleet]"
+
+FROM python:3.13-slim
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
+RUN useradd --system --create-home --uid 10001 fleet
+COPY --from=build /install /usr/local
+USER fleet
+WORKDIR /app
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"
+CMD ["uvicorn", "fleet.app:app", "--host", "0.0.0.0", "--port", "8000"]

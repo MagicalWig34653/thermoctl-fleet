@@ -1,0 +1,18 @@
+# Abbild des Melders (Basisstation einer Wohnung). Getrennt von Dockerfile.fleet,
+# weil eine Wohnung eine ältere Fassung fahren kann, während die Cloud längst
+# aktualisiert ist -- siehe Abschnitt 13 und 17 der Spezifikation
+# (Sollzustandsabgleich, Rollback bei ausbleibendem Herzschlag).
+FROM python:3.13-slim AS build
+WORKDIR /build
+COPY pyproject.toml LICENSE ./
+COPY protokoll ./protokoll
+COPY agent ./agent
+RUN pip install --no-cache-dir --prefix=/install ".[agent]"
+
+FROM python:3.13-slim
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
+RUN useradd --system --create-home --uid 10002 agent
+COPY --from=build /install /usr/local
+USER agent
+WORKDIR /app
+CMD ["python", "-m", "agent"]

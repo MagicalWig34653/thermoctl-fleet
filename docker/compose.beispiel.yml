@@ -1,0 +1,36 @@
+# Beispiel-Zusammenspiel beider Abbilder. Kein einziger Zugangswert steht in dieser
+# Datei -- Anmeldedaten kommen aus .env, die nicht ins Repository gehört (siehe
+# docs/spezifikation.md Abschnitt 4).
+#
+# Dieses Beispiel zeigt nur die grobe Topologie und ist kein Rollout-Rezept fuer
+# mehrere Wohnungen: Der Melder laeuft in Wirklichkeit auf der Basisstation jeder
+# Wohnung, nicht neben dem Fleet-Dienst.
+
+services:
+  fleet:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.fleet
+    # image: ghcr.io/magicalwig34653/thermoctl-fleet:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8100:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+
+  # Nur zur Veranschaulichung -- läuft in Wirklichkeit auf der Basisstation der
+  # Wohnung, nicht hier neben dem Fleet-Dienst.
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    # image: ghcr.io/magicalwig34653/thermoctl-agent:latest
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      fleet:
+        condition: service_healthy

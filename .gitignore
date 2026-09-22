@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Umgebung / Secrets
+.env
+.env.*
+!.env.example
+
+# Test / Linting
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Werkzeuge
+.idea/
+.vscode/
+.DS_Store
+.mcp.json
+
+# iCloud-Konfliktdubletten ("Datei 2.py") -- dasselbe Problem wie in thermoctl,
+# da dieses Repository im selben iCloud-synchronisierten Ordner liegt
+# (~/Documents). Siehe thermoctl/CLAUDE.md, "Praktisches zur Agentenarbeit".
+*\ [0-9]*
