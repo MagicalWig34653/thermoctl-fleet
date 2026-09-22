@@ -11,8 +11,10 @@ sofort und eindeutig zeigt, was fehlt, statt einen Erfolg vorzutäuschen.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from protokoll import Befehl, BefehlErgebnis, Herzschlag, Sollzustand
 
@@ -132,6 +134,45 @@ def sollzustand_abgleichen(soll: Sollzustand) -> None:
     )
 
 
+def waechter_zustand_melden(
+    pfad: Path, gewuenscht: str, bewaehrt: str | None = None
+) -> None:
+    """Legt den gewünschten (und, falls vorhanden, den bewährten) Digest für den
+    Wächter ab (Abschnitt 17, Schritt 2).
+
+    Anders als die übrigen Funktionen in
+    diesem Modul **real umgesetzt**, nicht als Platzhalter: Dieser Dateivertrag
+    ist der Grund, warum Agent (Python) und Wächter (Go, `waechter/`) im
+    selben Repository liegen (Abschnitt 18.3), und diese Funktion ist die
+    Agent-Seite davon -- `waechter/pruefe_vertrag.sh` ruft sie unverändert auf,
+    um den sprachübergreifenden Vertragstest zu bauen.
+
+    **Zeilenbasiert, kein JSON** -- dieselbe Begründung wie im Go-Quelltext
+    (`waechter/zustand.go`), hier absichtlich wiederholt statt nur dorthin
+    verwiesen, damit sie nicht verloren geht, wenn jemand nur diese Datei vor
+    sich hat: So ist der Vertrag in jeder Sprache mit Bordmitteln lesbar --
+    Go, Rust ohne Fremdpakete, Python, notfalls drei Zeilen Shell. Die
+    Sprachwahl des Wächters bleibt damit revidierbar, ohne den Vertrag selbst
+    zu brechen.
+
+    Vorausgesetzt wird, dass `gewuenscht` an dieser Stelle bereits gegen die
+    fest eingebauten Quellen geprüft ist (Abschnitt 13) -- diese Funktion
+    prüft nichts mehr nach, sie legt nur ab. Geschrieben wird atomar (temporäre
+    Datei plus `Path.replace`), aus demselben Grund wie in der Spezifikation
+    für den Wächter selbst gefordert: Er darf nie eine halb geschriebene
+    Zustandsdatei lesen.
+    """
+
+    zeilen = [f"gewuenscht={gewuenscht}"]
+    if bewaehrt is not None:
+        zeilen.append(f"bewaehrt={bewaehrt}")
+    zeilen.append(f"seit={int(time.time())}")
+
+    temp = pfad.with_suffix(pfad.suffix + ".tmp")
+    temp.write_text("\n".join(zeilen) + "\n", encoding="utf-8")
+    temp.replace(pfad)
+
+
 def sicherung_erstellen(betriebsdaten: bool) -> None:
     """Erstellt eine Sicherung (Abschnitt 15.1, 15.2).
 
@@ -151,4 +192,89 @@ def sicherung_erstellen(betriebsdaten: bool) -> None:
     raise NotImplementedError(
         "Sicherung (und bei Betriebsdaten: Verschlüsselung vor dem Hochladen) "
         "fehlt -- siehe docs/spezifikation.md Abschnitt 15.1 und 15.2."
+    )
+
+
+def zurueck_setzen() -> None:
+    """Setzt die Anwendung in den Auslieferungszustand zurück (Abschnitt 21.2,
+    Befehl `zuruecksetzen`, Stufe 2 -- noch nicht Teil von `BefehlTyp`, siehe
+    `protokoll/befehle.py`).
+
+    Vorgesehener Ablauf, keiner der Schritte umgesetzt:
+
+    1. **Vorher eine letzte verschlüsselte Sicherung hochladen** -- auch beim
+       Mieterwechsel: Über das **Löschen entscheidet die Aufbewahrungsfrist**
+       (Abschnitt 12), nicht der Knopfdruck. Dieser Schritt steht bewusst vor
+       dem Löschen, nicht danach.
+    2. Container stoppen, Datenbestände von thermoctl und Zigbee2MQTT löschen.
+    3. Eigene Schlüssel, Token und `melder-anmeldung.json` verwerfen;
+       WireGuard-Schlüsselpaar neu erzeugen.
+    4. Danach meldet sich das Gerät wieder mit **neuer Prüfziffer** und wartet
+       auf Zuordnung -- derselbe Weg wie die Erstinbetriebnahme (Abschnitt
+       15.3). Fleet-seitig gehört dazu: Token widerrufen, Zuordnung mit `bis`
+       schließen (Abschnitt 20.3) -- das ist Sache von `fleet/app.py`, nicht
+       dieser Funktion.
+
+    Sicherheitsrelevant (Grundsatz 7 aus thermoctls CLAUDE.md, hier
+    übernommen): Ein Zurücksetzen, das vor der Sicherung löscht statt danach,
+    verliert unwiederbringlich Mieterdaten. Die Reihenfolge der Schritte oben
+    ist deshalb keine Empfehlung, sondern Teil des Vertrags.
+    """
+
+    raise NotImplementedError(
+        "Zurücksetzen (Sicherung, Löschen, Schlüssel/Token verwerfen, "
+        "Neuanmeldung) fehlt -- siehe docs/spezifikation.md Abschnitt 21.2."
+    )
+
+
+def diagnose_paket_erstellen() -> None:
+    """Baut ein Diagnosepaket (Abschnitt 21.5, Befehl `diagnose_paket`, Stufe 1).
+
+    Protokolle der vier Dienste, Versionen und Digests, Container-Zustände,
+    Speicher- und Plattenbelegung, Zigbee-Netzzustand, die letzten
+    Regelentscheidungen -- maskiert, gepackt, hochgeladen. **Ausdrücklich
+    dafür da, den SSH-Zugang (Abschnitt 21.4) in den meisten Fällen
+    überflüssig zu machen**: Ein Diagnosepaket soll die Frage beantworten,
+    wegen der sonst jemand eine Sitzung öffnen würde, ohne dass dafür
+    überhaupt ein Rückkanal entsteht.
+
+    Wie bei `sicherung_erstellen`: Maskierung ist sicherheitsrelevant (ein
+    Protokolleintrag kann Zugangsdaten oder Mieterdaten enthalten) und gehört
+    bei der echten Umsetzung in die Hauptsession zur Gegenlese.
+    """
+
+    raise NotImplementedError(
+        "Erstellen und Hochladen des Diagnosepakets fehlt -- siehe "
+        "docs/spezifikation.md Abschnitt 21.5."
+    )
+
+
+def zugang_oeffnen(pilotbetrieb: bool) -> None:
+    """Öffnet einen befristeten SSH-Rückkanal (Abschnitt 21.4, Befehl
+    `zugang_oeffnen`, Stufe 2 -- noch nicht Teil von `BefehlTyp`).
+
+    **Die Prüfung unten ist echt umgesetzt, nicht Teil des Platzhalters**:
+    "Die Wohnung trägt dazu ein Kennzeichen (`pilotbetrieb`). Steht es nicht,
+    lehnt der Agent den Befehl ab -- die Prüfung liegt lokal, nicht in der
+    Oberfläche. Eine Cloud, die übernommen wurde, kann damit in produktiven
+    Wohnungen keine Sitzung öffnen." (Abschnitt 21.4). Diese Ablehnung darf
+    nicht warten, bis der Rest der Funktion gebaut ist -- sie ist der
+    eigentliche Sicherheitsgewinn dieses Befehls und deshalb hier bereits
+    scharf, obwohl alles danach noch Platzhalter ist.
+
+    Fehlt danach vollständig: Ausgehenden Rückkanal aufbauen, Ausstellen und
+    Verwenden eines einstündigen SSH-Zertifikats, selbsttätiges Schließen
+    nach 60 Minuten, Protokollierung von Öffnung und Schließung im lokalen
+    Protokoll und im Prüfprotokoll der Cloud.
+    """
+
+    if not pilotbetrieb:
+        raise PermissionError(
+            "zugang_oeffnen abgelehnt: Wohnung ist nicht im Erprobungsbetrieb "
+            "(pilotbetrieb=False) -- siehe docs/spezifikation.md Abschnitt 21.4."
+        )
+
+    raise NotImplementedError(
+        "Aufbau des befristeten SSH-Rückkanals fehlt -- siehe "
+        "docs/spezifikation.md Abschnitt 21.4."
     )

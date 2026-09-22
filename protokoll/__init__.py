@@ -12,7 +12,15 @@ dient.
 
 from protokoll.anmeldung import Anmeldeanfrage, Anmeldebestaetigung, MelderAnmeldedatei
 from protokoll.befehle import Befehl, BefehlErgebnis, BefehlTyp
-from protokoll.ereignisse import Ereignis
+from protokoll.bestand import (
+    Geraet,
+    GeraetLebenszyklus,
+    Liegenschaft,
+    Wohnung,
+    WohnungZustand,
+    Zuordnung,
+)
+from protokoll.ereignisse import Ereignis, stoerungsart_aus_schluessel
 from protokoll.herzschlag import (
     GeraeteZustand,
     Herzschlag,
@@ -36,8 +44,11 @@ __all__ = [
     "Dienste",
     "DienstStand",
     "Ereignis",
+    "Geraet",
+    "GeraetLebenszyklus",
     "GeraeteZustand",
     "Herzschlag",
+    "Liegenschaft",
     "MelderAnmeldedatei",
     "OffeneStoerung",
     "RegelungsZustand",
@@ -45,4 +56,8 @@ __all__ = [
     "Stoerungsart",
     "SystemZustand",
     "ThermoctlZustand",
+    "Wohnung",
+    "WohnungZustand",
+    "Zuordnung",
+    "stoerungsart_aus_schluessel",
 ]

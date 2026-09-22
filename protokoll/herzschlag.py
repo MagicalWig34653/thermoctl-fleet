@@ -73,11 +73,20 @@ class Herzschlag(BaseModel):
     Beim Nachholen (Abschnitt 5, "höchstens die letzten 240") sendet der Melder
     mehrere davon in einem Rutsch -- das Sammelformat dafür ist noch nicht
     festgelegt (siehe docs/STATUS.md, offene Punkte für das Gerüst).
+
+    `protokollversion` (Abschnitt 18.2): Der Agent schickt sie in jedem
+    Herzschlag mit. Strukturell prüft dieses Modell dabei nichts gegen
+    `PROTOKOLLVERSION` -- ob eine gemeldete Fassung "veraltet" ist und die
+    Wohnung entsprechend markiert wird, ist Anwendungslogik des Fleet-Diensts
+    (noch nicht umgesetzt), keine Validierungsregel hier: "Der Fleet-Dienst
+    nimmt eine ältere Fassung an, solange er ihre Felder versteht ... Er weist
+    sie nicht ab."
     """
 
     wohnung: str = Field(min_length=1)
     gesendet: datetime
     melder: str
+    protokollversion: int = Field(ge=1)
     thermoctl: ThermoctlZustand
     regelung: RegelungsZustand
     geraete: GeraeteZustand

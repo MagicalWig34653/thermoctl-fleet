@@ -565,22 +565,64 @@ Auf dem Gerät laufen zwei Dinge mit sehr unterschiedlichem Lebenszyklus:
 Der Wächter spricht **nicht** mit der Cloud. Er kennt nur zwei Digests — den laufenden und
 den vorherigen — und eine Frage: *Hat der Agent innerhalb der Frist „ich bin gesund" gesagt?*
 
+### Wer lädt, und wer tauscht
+
+Die Trennlinie liegt nicht bei „Agent gegen Wächter", sondern bei **darf scheitern** gegen
+**darf nicht scheitern**:
+
+| | Darf scheitern | Darf nicht scheitern |
+|---|---|---|
+| Was | Abbild holen, Digest prüfen, Vorbedingungen prüfen, Sicherung anlegen | Einen der beiden **bereits vorhandenen** Stände starten und beim Ausbleiben der Gesundmeldung zurücksetzen |
+| Wer | **Agent** | **Wächter** |
+| Braucht Netz | ja | **nein** |
+| Braucht Registry-Zugang | ja | nein |
+| Ändert sich | oft | fast nie |
+
+Deshalb lädt der **Agent** das neue Abbild selbst herunter — er hat Netz und Containerzugriff
+ohnehin, weil er auch die anderen drei Dienste pflegt. Der **Wächter** sieht nie ein
+Netzwerk, kennt keine Registry und prüft keine Signaturen. Er kennt zwei lokal vorhandene
+Digests und eine Frage.
+
+Der Gewinn: Jede Fähigkeit, die der Wächter nicht hat, ist Code, der nicht brechen kann, und
+ein Weg, den ein übernommener Fleet-Dienst nicht benutzen kann. Ein Wächter mit
+Registry-Zugang wäre ein zweiter Pfad, auf dem fremder Code aufs Gerät kommt.
+
 ### Ablauf einer Agent-Aktualisierung
 
-1. Der Agent erhält den neuen Sollzustand, prüft die Vorbedingungen (Abschnitt 13) und legt
-   den gewünschten Digest in einer Datei ab, die auch der Wächter liest.
-2. Er stoppt sich selbst. Mehr tut er nicht — er tauscht sich nicht selbst aus.
-3. Der **Wächter** merkt das Ende, holt das neue Abbild, prüft den Digest gegen die fest
-   eingebauten Quellen und startet den Agenten in der neuen Fassung.
-4. Der neue Agent muss binnen **10 Minuten** seinen Selbsttest bestehen und eine
-   Gesundmeldung an den Wächter schreiben (lokale Datei oder Unix-Socket — kein Netz nötig,
-   die Wohnung könnte gerade offline sein).
-5. Bleibt sie aus, oder startet der Container dreimal hintereinander neu, setzt der Wächter
-   **selbsttätig auf den vorherigen Digest zurück** und vermerkt den Grund. Die Wohnung läuft
-   auf der alten Fassung weiter, bis jemand hinsieht.
-6. Erst nach einer Stunde störungsfreien Betriebs wird der neue Digest als „bewährt"
-   markiert und der alte darf entfernt werden. Bis dahin liegen beide auf dem Gerät —
-   Zurückrollen braucht damit **kein Netz**.
+1. **Der Agent** erhält den neuen Sollzustand, prüft die Vorbedingungen (Abschnitt 13),
+   **holt das neue Abbild und prüft den Digest** gegen die fest eingebauten Quellen. Scheitert
+   hier etwas, bleibt einfach alles, wie es war — gemeldet, aber ohne Folgen.
+2. Er schreibt beide Digests in eine Zustandsdatei, die auch der Wächter liest —
+   **zeilenbasiert, mit Unix-Zeitstempeln**, im Stil einer systemd-Umgebungsdatei:
+
+   ```
+   gewuenscht=sha256:9f2c…
+   bewaehrt=sha256:1a7b…
+   seit=1790000123
+   ```
+
+   Kein JSON, mit Absicht: So ist der Vertrag in jeder Sprache mit Bordmitteln lesbar — in
+   Go, in Rust ohne Fremdpakete, in Python, notfalls in drei Zeilen Shell. Die Sprachwahl
+   des Wächters bleibt damit später revidierbar, ohne den Vertrag zu brechen.
+   **Beide Abbilder liegen ab jetzt lokal vor.**
+3. Er stoppt sich selbst. Mehr tut er nicht.
+4. **Der Wächter** startet den in `gewuenscht` genannten Stand. Kein Netz nötig.
+5. Der neue Agent muss binnen **10 Minuten** seinen Selbsttest bestehen und regelmäßig eine
+   Gesundmeldung in eine lokale Datei schreiben. Bleibt sie aus, oder startet der Container
+   dreimal hintereinander neu, setzt der Wächter auf `bewaehrt` zurück und vermerkt den Grund.
+6. Nach einer Stunde störungsfreien Betriebs schreibt der Agent den neuen Digest selbst als
+   `bewaehrt` fort. Erst dann darf das alte Abbild entfernt werden.
+
+### Wer bewacht wen
+
+- **Der Wächter bewacht nur den Agenten.** Das ist seine einzige Aufgabe.
+- **Der Agent bewacht die drei anderen Dienste** (thermoctl, Zigbee2MQTT, Mosquitto) nach
+  demselben Muster: vorherigen Digest merken, Gesundheit prüfen, bei Fehlschlag zurücksetzen.
+  Dafür braucht es keinen zweiten Wächter — wenn der Agent lebt, kann er das; wenn er nicht
+  lebt, ist zuerst er dran, und den holt der Wächter zurück.
+- **Fällt beides aus**, bleibt thermoctl trotzdem laufen: Es hängt nicht am Agenten, es wird
+  nur von ihm beobachtet. Die Wohnung heizt weiter, während niemand zusieht — und genau
+  dieses Schweigen meldet die Cloud (Abschnitt 8).
 
 ### Zwei Netze, zwei Sicherungen
 
@@ -597,3 +639,363 @@ Wenn seine Fassung wirklich einmal wechseln muss, ist das ein Vorgang wie ein
 Betriebssystem-Update: angekündigt, eine Wohnung zuerst, und im Zweifel mit einem Besuch
 verbunden. Bei einer Fassung im Jahresabstand ist das vertretbar; bei einem zweiten Agenten,
 der sich wöchentlich mitbewegt, wäre es das nicht.
+
+---
+
+## 18. Drei Festlegungen, die beim Bau des Gerüsts aufgefallen sind
+
+### 18.1 Was thermoctls Webhook wirklich sendet
+
+Nachgesehen in `thermoctl/integrations/notification.py` — die Nutzlast ist knapper als
+erhofft und enthält **weder Wohnung noch Art noch Zeitstempel**:
+
+```json
+{ "schluessel": "zigbee2mqtt:brücke", "schwere": "warnung",
+  "titel": "…", "text": "…" }
+```
+
+Dazu optional ein `Authorization: Bearer …`, das der Betreiber je Anlage einstellt. Daraus
+folgt für den Fleet-Dienst:
+
+- **Je Wohnung eine eigene Empfangsadresse und ein eigenes Token**:
+  `POST /v1/ereignisse/{wohnung}` mit dem Token dieser Wohnung. Die Zuordnung entsteht über
+  die Adresse und wird über das Token geprüft — nicht aus dem Text geraten.
+- **Der Zeitstempel ist der Empfangszeitpunkt.** Eine Meldung, die nach einem Netzausfall
+  verspätet eintrifft, ist als solche nicht erkennbar; die Uhrzeit des Ereignisses steht im
+  Herzschlag (`offene_stoerungen[].seit`), nicht in der Meldung.
+- **Die Art steckt im `schluessel`**, nicht in einem eigenen Feld (`zigbee2mqtt:brücke`,
+  `tenant-report:<zone>:<kategorie>`). Der Fleet-Dienst ordnet über ein Präfix zu und
+  behandelt Unbekanntes als „sonstige Meldung", statt zu scheitern.
+- Der Webhook bleibt damit, was er ist: **die Erkennung, dass etwas passiert ist**. Der
+  belastbare Zustand kommt aus dem Herzschlag.
+
+### 18.2 Verträglichkeit zwischen Fassungen
+
+`PROTOKOLLVERSION` ist eine Zahl, die bei jeder Änderung an den Modellen steigt. Regeln:
+
+- Der Agent schickt sie in jedem Herzschlag mit.
+- **Der Fleet-Dienst nimmt eine ältere Fassung an**, solange er ihre Felder versteht, und
+  zeigt die Wohnung als „veraltete Fassung" an. Er weist sie nicht ab — eine Wohnung, die
+  wegen eines Versionsunterschieds nicht mehr meldet, ist genau das Schweigen, das niemand
+  will.
+- **Der Agent lehnt Befehle einer neueren Fassung ab**, die er nicht kennt (er kennt seine
+  Befehlsliste ohnehin abschließend), meldet das als Ergebnis und läuft weiter.
+- Ein Feld darf nur hinzukommen, nie seine Bedeutung ändern. Wer etwas anders meint, nennt
+  es anders.
+
+### 18.3 Wo der Wächter wohnt, und worin er geschrieben ist
+
+**Im selben Repository, eigener Ordner `waechter/`, geschrieben in Go, kein Docker-Abbild.**
+
+*Zum Ort:*
+
+- Er läuft **außerhalb** der Containerlaufzeit — er startet und stoppt Container und muss
+  gerade dann da sein, wenn die nicht laufen.
+- Er gehört trotzdem ins selbe Repository, weil er mit dem Agenten einen Vertrag teilt: die
+  Zustandsdatei und die Gesundmeldung. Getrennte Repositories hießen, genau diesen Vertrag
+  doppelt zu pflegen.
+- Ausgeliefert als Teil des vorbereiteten Abbilds (Abschnitt 19), mit einer systemd-Einheit;
+  aktualisiert über die Paketverwaltung des Betriebssystems, nicht über den Fleet-Dienst.
+
+*Zur Sprache — Go, nicht Python:*
+
+Der Wächter ist das Einzige, was funktionieren muss, wenn alles andere kaputt ist. Ein
+Python-Programm setzt voraus, dass der Interpreter heil ist: keine halb angewandte
+`apt`-Transaktion, kein zerschossener `python3`-Symlink nach einem Versionssprung, keine
+beschädigte `.pyc`-Datei auf einer sterbenden Karte. Das sind seltene Fälle — aber genau
+die, für die es ihn gibt. Ein statisch gebundenes Binärprogramm kennt diese Fehlerklasse
+nicht.
+
+Go und nicht Rust, weil die Standardbibliothek entscheidet: Zeitrechnung und Dateiarbeit
+sind dort enthalten, die Kreuzübersetzung für `arm64` und `amd64` braucht kein zusätzliches
+Werkzeug, und ein Python-Mensch liest Go um drei Uhr nachts ohne Anlauf. Rusts Stärke —
+Sicherheit beim Verarbeiten fremder Daten — trägt hier wenig: Der Wächter liest eine Datei,
+die sein eigener Geschwisterprozess geschrieben hat, und ruft `systemctl` auf. Kein Netz,
+keine fremden Eingaben.
+
+*Bedingungen:*
+
+- **`go.mod` ohne eine einzige Abhängigkeit.** Insbesondere nicht das Docker-SDK — die
+  Container-Laufzeit wird über ihr Kommandozeilenwerkzeug oder über `systemctl` angesprochen.
+- **Statisch gebaut** (`CGO_ENABLED=0`), je ein Binärprogramm für `arm64` und `amd64`, mit
+  Prüfsumme, in der CI erzeugt und ins Abbild gelegt. Auf dem Gerät wird nichts übersetzt.
+- **Unter 300 Zeilen.** Wächst er darüber hinaus, stimmt der Zuschnitt nicht.
+- Eigene CI-Spur: `go vet`, `go test`, Bau für beide Architekturen.
+
+*Der Vertragstest wird dadurch besser:* Python schreibt die Zustandsdatei, Go liest sie.
+Zwei Sprachen, die sich kein Modell teilen können, prüfen denselben Vertrag härter als zwei
+Python-Module, die womöglich gemeinsam falsch liegen.
+
+
+### 18.4 Die Sprachregel
+
+> **Auf dem Blech: Go. Im Container: Python.**
+
+Der Wächter ist die Ausnahme, nicht der Anfang einer Wanderung. Er läuft auf dem blanken
+System und muss auch dann starten, wenn der Interpreter des Betriebssystems beschädigt ist.
+Der Agent läuft im Container, bringt seine Laufzeit im eigenen Abbild mit und ist von dieser
+Fehlerklasse gar nicht betroffen — ihn in Go zu schreiben, brächte nichts und kostete das
+gemeinsame Protokollpaket mit dem Cloud-Dienst: Das Modell müsste zweimal existieren, einmal
+als Go-Strukturen, einmal als Pydantic-Modelle, doppelt gepflegt oder aus einem Schema
+erzeugt. Genau die Doppelpflege, wegen der Agent und Cloud in einem Repository liegen.
+
+Der Wächter hat dieses Problem nicht, weil sein Vertrag aus drei Zeilen besteht.
+
+Muss später ein Teil des Agenten doch auf dem blanken System laufen — denkbar beim Tunnel,
+der eine Netzwerkschnittstelle einrichtet —, wandert **dieses Stück** zum Wächter-Binärprogramm,
+statt den Agenten umzuschreiben. Eine dritte Sprache im Repository will begründet sein; die
+zweite ist es, weil sie eine benannte Fehlerklasse ausschließt.
+
+---
+
+## 19. Die vorbereiteten Abbilder
+
+**Kein eigenes Betriebssystem.** Ein „thermoctlOS" nach dem Vorbild von Home Assistant OS
+hieße eigener Kernel, eigener Bootloader und die Verantwortung für jede Lücke im Unterbau.
+Gebaut wird stattdessen ein **Rezept**, das aus einer fertigen Linux-Ausgabe ein
+einsatzbereites Gerät macht. Der Unterschied ist nicht sprachlich: Bei einem eigenen System
+gehören die Sicherheitslücken Ihnen, bei einem vorbereiteten Abbild gehören sie Debian.
+
+### 19.1 Zwei Abbilder, ein Rezept
+
+| | **Abbild „pi"** | **Abbild „x86"** |
+|---|---|---|
+| Grundlage | Raspberry Pi OS Lite **64-Bit** (Debian 13 „Trixie", Kernel 6.12 LTS) | Debian 13 „Trixie" **amd64**, minimal |
+| Für | Raspberry Pi 4 und 5 | Mini-PC mit N100, Thin Client, alles andere |
+| Unterschiede | Kernel und Firmware von Raspberry Pi, Startpartition als FAT32 unter `/boot/firmware` | Debian-Kernel, EFI-Start |
+| Gemeinsam | **alles andere**: systemd, Paketnamen, Container-Laufzeit, Wächter, Einheiten, Aktualisierungsregeln |
+
+Das ist der Grund für genau diese zwei und nicht für Alpine: **Raspberry Pi OS ist Debian.**
+Ein Rezept, zwei Ziele, ein Wartungsweg — dieselben Paketnamen, dieselben systemd-Einheiten,
+derselbe Wächter ohne zweite Fassung.
+
+**Warum nicht Alpine:** Es benutzt OpenRC statt systemd — der Wächter bräuchte eine zweite
+Umsetzung, also genau die Doppelpflege, die wir überall sonst vermeiden. Dazu musl statt
+glibc, was bei Python-Paketen gelegentlich Reibung macht, und eine Unterstützungsdauer von
+rund zwei Jahren je Zweig statt fünf. Der Vorteil wäre ein um rund hundert Megabyte
+kleinerer Abdruck — bei 2 GB Arbeitsspeicher und SSD ist das keine Währung, in der sich
+rechnen lässt. Als Sonderfall (streng lesendes Wurzeldateisystem) bleibt es denkbar, aber
+nicht als zweiter Regelweg.
+
+### 19.2 Unterstützungsdauer
+
+- **Debian 13 „Trixie"**: volle Unterstützung bis **9. August 2028**, danach LTS bis
+  **30. Juni 2030**.
+- Raspberry Pi OS folgt seit Oktober 2025 derselben Grundlage, mit Kernel **6.12 LTS**.
+
+Das trägt die erste Gerätegeneration über ihre wirtschaftliche Lebensdauer. Der Wechsel auf
+die nächste Debian-Ausgabe wird **nicht** als Aktualisierung im laufenden Betrieb geplant,
+sondern als Welle neuer Karten beziehungsweise Datenträger über den Ersatzgeräte-Weg aus
+Abschnitt 15.3 — eine Wohnung nach der anderen, mit der Pilotwohnung zuerst.
+
+### 19.3 Was in beiden Abbildern steckt
+
+- Container-Laufzeit, Zeitsynchronisation, Hardware-Watchdog eingeschaltet
+- der **Wächter** als systemd-Einheit, das Agent-Abbild bereits vorgeladen
+- `unattended-upgrades` für Sicherheitsaktualisierungen, Neustarts nur im Zeitfenster
+- Protokolle im Arbeitsspeicher statt auf der Karte (`log2ram` oder `tmpfs`) — der größte
+  Hebel gegen Kartenverschleiß
+- udev-Regel für den Zigbee-Stick, damit er immer unter demselben Namen erscheint und nicht
+  einmal `ttyUSB0` und nach dem Neustart `ttyUSB1` heißt
+- WireGuard installiert, aber nicht eingerichtet
+- eine leere `melder-anmeldung.json` in der Startpartition
+- **kein** SSH-Passwortzugang; Schlüssel werden beim Vorbereiten hinterlegt oder gar nicht
+
+**Nur 64-Bit**, in beiden Fällen — schon weil das thermoctl-Abbild nur für `amd64` und
+`arm64` gebaut wird.
+
+### 19.4 Bau und Auslieferung
+
+- Ordner `abbild/` im selben Repository wie Agent und Wächter. Grund wie dort: Das Abbild
+  bringt eine bestimmte Wächter-Fassung mit, und die teilt einen Vertrag mit dem Agenten.
+- Gebaut in der CI (pi-gen beziehungsweise `mkosi`/`debos`), Ergebnis sind zwei Dateien
+  `.img.xz` samt Prüfsummen, veröffentlicht an der Freigabe.
+- **Neubau vierteljährlich**, damit ein frisch geflashtes Gerät nicht erst zwei Jahre
+  Aktualisierungen nachholt. Laufende Geräte holen sich das ohnehin selbst.
+- Die Abbildfassung trägt dieselbe Nummer wie die Wächter-Fassung, die darin steckt.
+
+### 19.5 Das Vorbereitungswerkzeug
+
+Es muss fast nichts können. Die Startpartition ist FAT32 und auf jedem Rechner beschreibbar;
+es genügt ein kleines Programm oder eine lokale Seite, die nach dem Schreiben des Abbilds
+Wohnungskennung, Anmeldecode, Adresse des Fleet-Dienstes und dessen Fingerabdruck in die
+`melder-anmeldung.json` schreibt — und bei WLAN-Geräten die Zugangsdaten gleich mit
+(Abschnitt 15.4). Kein eigener Imager, keine Neuerfindung: Das Abbild selbst schreibt der
+Raspberry-Pi-Imager oder `dd`.
+
+### 19.6 Was damit aufgegeben wird
+
+Die A/B-Aktualisierung des Betriebssystems, die Home Assistant OS hat. Ein misslungenes
+`apt`-Update ist damit theoretisch ein Vor-Ort-Termin. Dagegen steht: Sicherheitsaktualisierungen
+in Debian sind eng begrenzt und brechen selten, die Anwendung hat ihre eigene A/B-Sicherung
+über die Digests (Abschnitt 17), und für den Rest liegt ein vorbereitetes Ersatzgerät im
+Regal — der Fall, für den die Wiederherstellung in Minuten gebaut wurde.
+
+---
+
+## 20. Wohnungen und Geräte verwalten
+
+Der Fleet-Dienst führt das Verzeichnis: welche Wohnungen es gibt, welche Geräte im Umlauf
+sind und welches gerade wo steckt. Ohne dieses Verzeichnis gibt es keine Zuordnung, und ohne
+Zuordnung wird keine Konfiguration freigegeben (Abschnitt 15.5).
+
+### 20.1 Was geführt wird
+
+**Liegenschaft** — Name, Anschrift, Notizen. Die oberste Ebene, damit sich mehrere Häuser
+nicht vermischen.
+
+**Wohnung** — eine dauerhafte Kennung (`haus7-w03`, ändert sich nie), Bezeichnung, Lage
+(Etage, Ausrichtung), Zustand (`bewohnt`, `leer`, `im Umbau`, `stillgelegt`), Zahl der
+Heizkreise. **Kein Mietername, keine Kontaktdaten** — die Wohnung wird über ihre Kennung
+geführt, nicht über Personen. Wer den Bezug braucht, hat ihn in seiner Mieterverwaltung.
+
+**Gerät** — Seriennummer oder Hardware-Kennung, Bauart (Pi 4, Pi 5, N100 …), Anschaffungsdatum,
+Fingerabdruck des öffentlichen Schlüssels, Abbild- und Wächter-Fassung, Zustand:
+
+| Zustand | Bedeutung |
+|---|---|
+| `erfasst` | im Verzeichnis angelegt, physisch noch nicht vorbereitet |
+| `vorbereitet` | Abbild geschrieben, Anmeldecode erzeugt und gültig |
+| `gemeldet` | hat sich mit Prüfziffer gemeldet, wartet auf Bestätigung |
+| `im Einsatz` | einer Wohnung zugeordnet, meldet Herzschlag |
+| `im Regal` | vorbereitet, aber nicht zugeordnet — das Ersatzgerät |
+| `defekt` | ausgefallen, wartet auf Prüfung |
+| `ausgemustert` | dauerhaft aus dem Verkehr, Token widerrufen |
+
+**Zuordnung** — nie ein bloßes Feld am Gerät, sondern ein eigener Eintrag mit `von`, `bis`
+und Grund. Nur so lässt sich später beantworten, welches Gerät im Januar in Wohnung 3 lief.
+
+**Zigbee-Geräte je Wohnung** — als Bestandsliste aus dem Herzschlag: Raumbezeichnung,
+Batteriestand, Funkqualität, letzte Meldung. Keine Temperaturen (Abschnitt 6). Diese Liste
+ist die Grundlage für die Batterierunden.
+
+**Batterierunde** — wann zuletzt, in welcher Wohnung, welche Zellen. Zusammen mit dem
+schwächsten Wert aus dem Herzschlag ergibt das die Aufgabenliste, nach der man tatsächlich
+arbeitet.
+
+### 20.2 Die zwei Abläufe, die zählen
+
+**Erstinbetriebnahme**
+
+1. Wohnung anlegen (falls neu), Gerät erfassen.
+2. „Vorbereiten" drücken → Anmeldecode erzeugen, Abbild schreiben, Code in die
+   Startpartition (Abschnitt 15.3).
+3. Gerät anstecken. Es meldet sich und zeigt eine Prüfziffer.
+4. In der Oberfläche Wohnung wählen, **dieselbe Prüfziffer bestätigen** → Zuordnung entsteht,
+   Konfiguration wird freigegeben.
+
+**Gerätetausch**
+
+1. In der Wohnung „Gerät ersetzen" wählen und das Ersatzgerät aus dem Regal auswählen.
+2. Der Dienst verlangt eine ausdrückliche Bestätigung und **widerruft dabei das Token des
+   alten Geräts**. Das alte wechselt in `defekt` oder `im Regal`, die alte Zuordnung wird mit
+   `bis`-Zeitpunkt geschlossen.
+3. Das Ersatzgerät bekommt die Konfiguration und die letzte verschlüsselte Sicherung; den
+   Schlüssel gibt der Vermieter einmalig ein (Abschnitt 15.1).
+
+### 20.3 Regeln, die der Dienst erzwingt
+
+- **Eine Wohnung hat höchstens ein aktives Gerät.** Ein zweites zuzuordnen, schließt
+  automatisch die vorige Zuordnung — mit Rückfrage, nie stillschweigend.
+- **Ein Gerät gehört zu höchstens einer Wohnung.** Soll es in eine andere, muss es vorher
+  zurückgesetzt worden sein; der Dienst verlangt dafür eine ausdrückliche Bestätigung, bevor
+  er die Konfiguration der neuen Wohnung freigibt. Sonst wandern Räume, Zeitpläne und
+  Verlauf der einen Mietpartei in die Wohnung der nächsten.
+- **Keine Freigabe ohne bestätigte Prüfziffer.** Die Kennung allein genügt nie.
+- **Jede Änderung an Zuordnung, Zustand oder Token wird protokolliert** — wer, wann, warum.
+  Das ist dieselbe Sorgfalt, die thermoctl für Schaltentscheidungen aufwendet, angewandt auf
+  den Gerätebestand.
+- **Eine Wohnung wird nicht gelöscht, sondern stillgelegt.** Löschen würde die Historie
+  mitnehmen, die man genau dann braucht, wenn etwas strittig ist. Für die Daten gilt die
+  Aufbewahrungsfrist aus Abschnitt 12.
+
+### 20.4 Was die Oberfläche dafür zeigt
+
+Zu den drei Ansichten aus Abschnitt 9 kommt eine vierte, ruhige: **Bestand**. Liegenschaften,
+Wohnungen, Geräte, mit Filter auf „im Regal" und „defekt". Sie ist der Ort für die Fragen,
+die nicht dringend sind: Wie viele Ersatzgeräte liegen noch da? Welche Wohnung läuft auf
+welcher Bauart? Wann war die letzte Batterierunde in Wohnung 7?
+
+---
+
+## 21. Aus der Ferne zurücksetzen, neu bespielen, hineinsehen
+
+### 21.1 Zwei Dinge, die gern verwechselt werden
+
+| | **Anwendung zurücksetzen** | **System neu bespielen** |
+|---|---|---|
+| Was passiert | Datenbestände, Container, Schlüssel und Zuordnung weg, Gerät wieder im Auslieferungszustand der Anwendung | Das Betriebssystem selbst wird neu geschrieben |
+| Aus der Ferne | **ja**, in Minuten | **nur mit A/B-Partitionen**, sonst gar nicht |
+| Nötig bei | Mieterwechsel, verkorkster Zustand, Gerät geht ins Regal | Wechsel der Debian-Ausgabe, beschädigtes Dateisystem |
+| Aufwand | gering, sofort machbar | Umbau des Abbild-Rezepts |
+
+**Der erste Fall deckt fast alles ab, was im Alltag vorkommt.** Der zweite ist der seltene,
+und für ihn gibt es das Ersatzgerät.
+
+### 21.2 Zurücksetzen aus der Ferne
+
+Befehl `zuruecksetzen`, Stufe 2, mit Rückfrage in der Oberfläche und Nennung der Wohnung im
+Bestätigungstext (nicht nur „wirklich?"). Der Agent führt aus, der Wächter überwacht:
+
+1. Container stoppen, Datenbestände von thermoctl und Zigbee2MQTT löschen.
+2. **Vorher eine letzte verschlüsselte Sicherung hochladen** — auch beim Mieterwechsel, denn
+   die Aufbewahrungsfrist entscheidet über das Löschen, nicht der Knopfdruck.
+3. Eigene Schlüssel, Token und die `melder-anmeldung.json` verwerfen; WireGuard-Schlüsselpaar
+   neu erzeugen.
+4. Fleet-seitig: Token widerrufen, Zuordnung mit `bis` schließen, Gerät auf `im Regal` setzen.
+5. Das Gerät meldet sich anschließend wieder mit **neuer Prüfziffer** und wartet auf
+   Zuordnung — derselbe Weg wie bei der Erstinbetriebnahme (Abschnitt 15.3).
+
+Damit ist ein Mieterwechsel ein Vorgang von wenigen Minuten, ohne Vor-Ort-Termin, und das
+Gerät trägt garantiert nichts aus der vorigen Mietzeit weiter.
+
+### 21.3 Neu bespielen: was es wirklich kostet
+
+Ein laufendes System kann seinen eigenen Datenträger nicht überschreiben. Wer das aus der
+Ferne will, braucht **zwei Systempartitionen** (A/B) und einen Bootloader, der zwischen
+ihnen umschaltet — das leisten RAUC, Mender oder swupdate.
+
+Das ist machbar, aber kein Zusatz, sondern eine Entscheidung mit Folgen: Das Abbild-Rezept
+(Abschnitt 19) bekommt ein festes Partitionsschema, der Bootloader einen Vertrag, jede
+Systemaktualisierung wird zu einem signierten Bündel, und das Ganze braucht eine eigene
+Prüfstrecke. Dafür bekäme man: Wechsel der Debian-Ausgabe ohne Besuch, und dieselbe
+Rückfall-Sicherheit für das System, die die Anwendung über ihre Digests schon hat.
+
+**Mein Vorschlag: vorerst nicht.** Erst Abschnitt 21.2 bauen und eine Heizperiode betreiben.
+Wenn sich dann zeigt, dass Vor-Ort-Termine wegen des Systems tatsächlich anfallen — und
+nicht nur wegen defekter Hardware, wo ohnehin jemand hinmuss —, ist A/B die richtige Antwort
+und kann nachgerüstet werden. Die Entscheidung ist umkehrbar, solange das Abbild-Rezept in
+der eigenen Hand ist.
+
+**Was aus der Ferne nie geht:** ein Gerät, das nicht mehr startet. Dafür liegt das
+Ersatzgerät im Regal.
+
+### 21.4 SSH für die Erprobungsphase
+
+Berechtigtes Bedürfnis, und zugleich die Funktion, die am ehesten zur dauerhaften Hintertür
+wird. Deshalb mit Widerhaken gebaut:
+
+- **Kein ständig lauschender Dienst.** Der Zugang entsteht auf Zuruf: Befehl `zugang_oeffnen`
+  über den Befehlskanal, der Agent baut einen **ausgehenden** Rückkanal auf und schließt ihn
+  nach **60 Minuten** von selbst. Kein offener Port in der Wohnung, keine Portweiterleitung.
+- **Nur mit Schlüssel, und der Schlüssel ist flüchtig.** Die Cloud stellt ein
+  SSH-Zertifikat mit einer Stunde Gültigkeit aus; auf dem Gerät bleibt danach nichts liegen.
+  Keine Passwörter, keine dauerhaft hinterlegten `authorized_keys`.
+- **Nur in der Erprobungsphase.** Die Wohnung trägt dazu ein Kennzeichen (`pilotbetrieb`).
+  Steht es nicht, **lehnt der Agent den Befehl ab** — die Prüfung liegt lokal, nicht in der
+  Oberfläche. Eine Cloud, die übernommen wurde, kann damit in produktiven Wohnungen keine
+  Sitzung öffnen.
+- **Sichtbar, nicht heimlich.** Jede Öffnung, jede Schließung und der Zeitpunkt stehen im
+  lokalen Protokoll der Wohnung und im Prüfprotokoll der Cloud. Der Wächter schließt den
+  Kanal, wenn der Agent stirbt.
+- **In bewohnten Wohnungen gehört das in die Datenschutzinformation.** In der Pilotwohnung —
+  der eigenen oder einer leerstehenden — ist es unproblematisch. Danach ist jede Sitzung ein
+  Zugriff auf ein Gerät im Zuhause eines anderen.
+
+### 21.5 Was SSH meistens ersetzt
+
+Bevor jemand eine Sitzung öffnet, sollte ein Befehl **`diagnose_paket`** (Stufe 1) genügen:
+Protokolle der vier Dienste, Versionen und Digests, Container-Zustände, Speicher- und
+Plattenbelegung, Zigbee-Netzzustand, die letzten Regelentscheidungen — maskiert, gepackt,
+hochgeladen. In den allermeisten Fällen beantwortet das die Frage, wegen der man sich
+einloggen wollte, und hinterlässt dabei eine Datei, die man einem Zweiten zeigen kann.

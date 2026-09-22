@@ -39,7 +39,11 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["protokoll*", "fleet*", "agent*"]
+# waechter/ ist bewusst NICHT hier gelistet: Es ist seit Abschnitt 18.3 ein
+# eigenständiges Go-Modul (waechter/go.mod), kein Python-Paket -- siehe
+# waechter/README.md. tools* ist reines Bau-/CI-Werkzeug
+# (abbild/-Konfigurationsprüfung) und geht in kein Docker-Abbild ein.
+include = ["protokoll*", "fleet*", "agent*", "tools*"]
 
 [tool.ruff]
 line-length = 100
@@ -58,4 +62,4 @@ plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --cov=protokoll --cov=fleet --cov=agent --cov-report=term-missing"
+addopts = "-q --cov=protokoll --cov=fleet --cov=agent --cov=tools --cov-report=term-missing"

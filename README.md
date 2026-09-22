@@ -36,6 +36,21 @@ Beispiel-Herzschlag aus der Spezifikation von genau demselben Modell angenommen 
 das auch die Cloud-Seite entgegennimmt. Das setzt voraus, dass beide Seiten dasselbe
 Modul importieren, nicht zwei Abschriften davon.
 
+Zwei weitere Teile im selben Repository, aus demselben Grund, aber ohne eigenes
+Docker-Abbild:
+
+- **[`waechter/`](waechter/)** -- in Go geschrieben, nicht in Python: Er ist das Einzige
+  auf dem Gerät, was funktionieren muss, wenn alles andere kaputt ist, und ein
+  statisch gebundenes Binärprogramm kennt Fehlerklassen (kaputter Interpreter,
+  halb angewandtes Systemupdate) nicht, die einen Python-Prozess lahmlegen können.
+  Er teilt mit dem Agenten eine zeilenbasierte Zustandsdatei (kein JSON, damit sie
+  in jeder Sprache mit Bordmitteln lesbar bleibt) -- `waechter/pruefe_vertrag.sh`
+  prüft diesen Vertrag sprachübergreifend: Python schreibt, das gebaute
+  Go-Binärprogramm liest.
+- **[`abbild/`](abbild/)** -- das Rezept für die vorbereiteten Systemabbilder der
+  Basisstation (Raspberry Pi OS bzw. Debian, beide 64-Bit). Kein eigenes
+  Betriebssystem, nur Paketliste, Einheiten und Konfiguration auf fertigem Debian.
+
 ## Aufbau
 
 ```
@@ -43,20 +58,31 @@ fleet/       Cloud-Dienst (FastAPI): Herzschlag- und Ereignisempfang, SSE-Befehl
 agent/       Melder auf der Basisstation: Herzschlag senden, Befehle ausführen,
              Sollzustandsabgleich, Sicherung
 protokoll/   Gemeinsame Pydantic-Modelle -- der eigentliche Vertrag zwischen beiden
+waechter/    Go-Modul: tauscht den Agent-Container, kein Docker-Abbild
+abbild/      Rezept für die vorbereiteten Systemabbilder (Raspberry Pi OS, Debian)
+tools/       Bau-/CI-Werkzeuge, u. a. die Prüfung der abbild/-Konfiguration
 docs/        Spezifikation (unverändert übernommen) und STATUS.md
 ```
 
 **Stand:** Dies ist ein Gerüst, keine fertige Anwendung. Jede fehlende Stelle in
-`fleet/` und `agent/` trägt ein `NotImplementedError` mit Verweis auf den betreffenden
-Abschnitt der Spezifikation. Der aktuelle Stand und die offenen Punkte stehen in
+`fleet/`, `agent/` und `waechter/` trägt einen Verweis auf den betreffenden Abschnitt
+der Spezifikation (`NotImplementedError` in Python, ein Fehlerwert mit
+Abschnittsverweis in Go). Der aktuelle Stand und die offenen Punkte stehen in
 [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Lokal starten
 
 ```bash
 python3.13 -m venv .venv && .venv/bin/pip install -e ".[dev,fleet,agent]"
-.venv/bin/pytest
+.venv/bin/python -m pytest
 ```
+
+`python -m pytest` statt `.venv/bin/pytest`: Das Konsolenskript unter `.venv/bin`
+funktioniert bei einer editierbaren Installation unter macOS nicht zuverlässig --
+dieselbe Ursache, die thermoctls README für dessen eigenen Konsolenbefehl nennt
+(die Datei, die das Paket dort auffindbar macht, wird als versteckt markiert und
+beim Start übersprungen). `python -m pytest` nimmt stattdessen das
+Projektverzeichnis regulär in den Modulpfad.
 
 Den Cloud-Dienst gegen sich selbst laufen lassen (ohne Datenbank, ohne Anmeldung --
 siehe `docs/STATUS.md`):
@@ -67,6 +93,12 @@ siehe `docs/STATUS.md`):
 
 Ein Beispiel-Zusammenspiel beider Abbilder über Docker Compose steht in
 [`docker/compose.beispiel.yml`](docker/compose.beispiel.yml).
+
+Den Wächter prüfen (eigene Toolchain, siehe [`waechter/README.md`](waechter/README.md)):
+
+```bash
+cd waechter && go vet ./... && go test ./...
+```
 
 ## Lizenz
 

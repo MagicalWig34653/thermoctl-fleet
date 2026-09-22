@@ -24,7 +24,12 @@ jobs:
           cache: pip
       - run: pip install -e ".[dev,fleet,agent]"
       - run: ruff check .
-      - run: mypy protokoll fleet agent
+      # waechter/ ist seit Abschnitt 18.3 ein Go-Modul, nicht Teil dieser
+      # Python-Prüfung -- eigene CI-Spur in go.yml (Abschnitt 18.3,
+      # "Die bestehende Python-Spur bleibt, wie sie ist").
+      - run: mypy protokoll fleet agent tools
+      # Enthält tests/test_waechter_vertrag.py (die Python-Seite des Vertrags,
+      # Abschnitt 18.3) und tests/test_abbild_konfiguration.py (Abschnitt 19).
       - run: pytest -v
 
   docker-build:

@@ -1,0 +1,5 @@
+// Schaltet unattended-upgrades ein (Debian installiert das Paket sonst nur,
+// aktiviert es aber nicht automatisch). Gehört neben 50unattended-upgrades in
+// /etc/apt/apt.conf.d/.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";

@@ -1,9 +1,11 @@
-"""Befehl und Befehlsergebnis (docs/spezifikation.md, Abschnitt 7).
+"""Befehl und Befehlsergebnis (docs/spezifikation.md, Abschnitt 7, 21.2, 21.4, 21.5).
 
 Nur die **Stufe-1-Befehle** sind hier als Aufzählung angelegt -- Stufe 2
-(`dienst_neustart`, `update_einspielen`, `kiosk_token_widerrufen`) ist laut
-Spezifikation bewusst erst nach einer Heizperiode Betriebserfahrung dran und
-gehört deshalb nicht in dieses Gerüst.
+(`dienst_neustart`, `update_einspielen`, `kiosk_token_widerrufen`, dazu seit
+Abschnitt 21 `zuruecksetzen` und `zugang_oeffnen`) ist laut Spezifikation
+bewusst erst nach einer Heizperiode Betriebserfahrung dran und gehört deshalb
+nicht in dieses Gerüst. `diagnose_paket` (Abschnitt 21.5) ist dagegen
+ausdrücklich **Stufe 1** und steht deshalb hier in der Aufzählung.
 
 `BefehlTyp` ist die **abschließende** Liste: Ein Wert, der hier nicht steht,
 lässt sich mit diesem Modell nicht einmal bauen, geschweige denn über die
@@ -22,12 +24,30 @@ from pydantic import BaseModel, Field
 
 
 class BefehlTyp(StrEnum):
-    """Stufe-1-Befehle, von Anfang an (Abschnitt 7)."""
+    """Stufe-1-Befehle, von Anfang an (Abschnitt 7), plus `diagnose_paket` (21.5).
+
+    **Nicht** hier, weil Stufe 2: `zuruecksetzen` (Abschnitt 21.2 -- Container
+    stoppen, Datenbestände löschen, Schlüssel/Token verwerfen, WireGuard neu
+    erzeugen, vorher eine letzte verschlüsselte Sicherung hochladen) und
+    `zugang_oeffnen` (Abschnitt 21.4 -- befristeter SSH-Rückkanal, nur in
+    Wohnungen mit `pilotbetrieb`). Beide sind absichtlich noch nicht über den
+    Befehlskanal transportierbar; die Vorbereitung dafür steht als Stummel in
+    `agent/schleife.py` (`zurueck_setzen`, `zugang_oeffnen`), ausführbar erst,
+    wenn beide Werte hier ergänzt werden -- nach ausdrücklicher Freigabe wie
+    jeder andere Stufe-2-Befehl.
+    """
 
     ZUSTAND_JETZT = "zustand_jetzt"
     PROTOKOLL_HOLEN = "protokoll_holen"
     SICHERUNG_JETZT = "sicherung_jetzt"
     MELDER_NEUSTART = "melder_neustart"
+    # Stufe 1 (Abschnitt 21.5): "Protokolle der vier Dienste, Versionen und
+    # Digests, Container-Zustände, Speicher- und Plattenbelegung,
+    # Zigbee-Netzzustand, die letzten Regelentscheidungen -- maskiert,
+    # gepackt, hochgeladen." Ausdrücklich dazu da, SSH (Abschnitt 21.4) in den
+    # meisten Fällen überflüssig zu machen -- ein Diagnosepaket beantwortet
+    # die Frage, wegen der sonst jemand eine Sitzung öffnen würde.
+    DIAGNOSE_PAKET = "diagnose_paket"
 
 
 class Befehl(BaseModel):

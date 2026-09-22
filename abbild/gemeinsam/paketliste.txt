@@ -1,0 +1,53 @@
+# Pakete, die beide Abbilder installieren (Abschnitt 19.1, 19.3).
+# Eine Zeile je Paketname, Kommentare mit "#". tools/pruefe_abbild_konfiguration.py
+# prüft diese Datei (nicht leer, keine Duplikate, keine Leerzeichen in einem
+# Paketnamen) -- keine echte Installation, siehe deren Docstring.
+#
+# Versionslos: Debian-Paketnamen ohne Versionsangabe, wie in einer
+# Debian-Paketliste üblich. Welche Version installiert wird, entscheidet die
+# Debian-13-Grundlage zum Bauzeitpunkt, nicht diese Datei.
+
+# Container-Laufzeit für die vier Container aus Abschnitt 13 und den
+# Agent-Container, den der Wächter tauscht (Abschnitt 17).
+docker.io
+docker-compose-v2
+
+# Zeitsynchronisation -- Voraussetzung dafür, dass "zeitversatz_s" im
+# Herzschlag (Abschnitt 5) überhaupt etwas Sinnvolles misst und dass Zeitpläne
+# nicht falsch laufen (Alarmregel "Zeitversatz", Abschnitt 8).
+chrony
+
+# Hardware-Watchdog, eingeschaltet gemäß Abschnitt 19.3. Nicht zu verwechseln
+# mit dem Wächter (waechter/) -- dieser Watchdog überwacht den Kernel selbst,
+# nicht den Agent-Container.
+watchdog
+
+# Sicherheitsaktualisierungen unbeaufsichtigt, Neustarts nur im Zeitfenster
+# (Abschnitt 13, Betriebssystem-Abschnitt; Abschnitt 19.3).
+unattended-upgrades
+apt-listchanges
+
+# Protokolle im Arbeitsspeicher statt auf der Karte -- der größte Hebel gegen
+# Kartenverschleiß (Abschnitt 19.3). log2ram ist kein offizielles
+# Debian-Paket; welches Drittarchiv dafür eingebunden wird, ist noch nicht
+# entschieden (siehe docs/STATUS.md) -- alternativ genügt ein tmpfs-Eintrag in
+# /etc/fstab für /var/log ohne Zusatzpaket.
+# log2ram
+
+# udev selbst ist Teil der Debian-Basisinstallation und steht hier nur als
+# Beleg, dass die Regel aus udev/99-zigbee-stick.rules eine Laufzeitumgebung
+# hat, die sie auswertet.
+udev
+
+# WireGuard "installiert, aber nicht eingerichtet" (Abschnitt 14, 19.3).
+wireguard-tools
+
+# TLS-Zertifikatsprüfung des Melders (Abschnitt 4) braucht aktuelle
+# Wurzelzertifikate.
+ca-certificates
+
+# Kein Paket für den Wächter: Er ist seit Abschnitt 18.3 ein statisch
+# gebundenes Go-Binärprogramm (CGO_ENABLED=0) und braucht keine
+# Laufzeitumgebung -- deshalb kein "python3" oder Ähnliches hier. Das
+# Binärprogramm selbst wird nicht über apt installiert, sondern von der CI
+# gebaut und in dieses Abbild gelegt (Abschnitt 19.4).

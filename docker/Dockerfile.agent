@@ -7,6 +7,10 @@ WORKDIR /build
 COPY pyproject.toml LICENSE ./
 COPY protokoll ./protokoll
 COPY agent ./agent
+# waechter/ ist seit Abschnitt 18.3 ein eigenständiges Go-Modul, kein
+# Python-Paket -- nichts davon wird in dieses Abbild kopiert. Den geteilten
+# Vertrag (Zustandsdatei) schreibt agent/schleife.py selbst, ohne einen
+# Import aus waechter/.
 RUN pip install --no-cache-dir --prefix=/install ".[agent]"
 
 FROM python:3.13-slim

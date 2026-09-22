@@ -1,0 +1,14 @@
+# Fester Gerätename für den Zigbee-Funkstick (Abschnitt 19.3): "damit er immer
+# unter demselben Namen erscheint und nicht einmal ttyUSB0 und nach dem
+# Neustart ttyUSB1 heißt". Ohne diese Regel ist zigbee2mqtt.yaml/serial.port
+# nach jedem Steckplatzwechsel oder Neustart falsch, und die Anlage regelt
+# ohne Funkanbindung weiter -- ein "bridge_fault" ohne erkennbaren Grund.
+#
+# PLATZHALTER, keine echten Werte: idVendor/idProduct hängen vom tatsächlich
+# verbauten Funkstick ab (z. B. Sonoff Zigbee 3.0 USB Dongle Plus, ConBee II).
+# Vor dem echten Bau mit dem konkret beschafften Gerät ermitteln:
+#   udevadm info -a -n /dev/ttyUSB0 | grep -E 'idVendor|idProduct|serial'
+# und die Werte unten ersetzen -- keine Geräte-ID im Voraus zu erfinden ist
+# hier Absicht (thermoctl-CLAUDE.md, Grundsatz 1, sinngemäß übernommen: nichts
+# hart verdrahten, was aus der Beschaffung stammt statt aus dem Entwurf).
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="zigbee"

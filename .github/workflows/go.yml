@@ -1,0 +1,89 @@
+name: Go
+on:
+  push:
+    paths:
+      - "waechter/**"
+      - "agent/schleife.py"
+      - "protokoll/**"
+      - ".github/workflows/go.yml"
+  pull_request:
+    paths:
+      - "waechter/**"
+      - "agent/schleife.py"
+      - "protokoll/**"
+      - ".github/workflows/go.yml"
+
+# Eigene CI-Spur für den Wächter (Abschnitt 18.3, Bedingungen): "Die
+# bestehende Python-Spur bleibt, wie sie ist." Läuft deshalb unabhängig von
+# ci.yml, mit einer eigenen Go-Toolchain statt einer Python-Umgebung.
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: waechter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          # go.mod hat keine Abhängigkeiten (Abschnitt 18.3) -- der
+          # Modul-Cache existiert nur der Vollständigkeit halber.
+          cache-dependency-path: waechter/go.mod
+      - run: go vet ./...
+      - run: go test ./... -v
+
+  # Statisch gebaut (CGO_ENABLED=0), je ein Binärprogramm für arm64 und amd64,
+  # mit Prüfsumme -- genau die Bedingung aus Abschnitt 18.3. Auf dem Gerät
+  # wird nichts übersetzt; diese beiden Dateien sind das, was später ins
+  # vorbereitete Abbild (abbild/) gelegt wird (Abschnitt 19.3, 19.4).
+  bauen:
+    runs-on: ubuntu-latest
+    needs: pruefen
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    defaults:
+      run:
+        working-directory: waechter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: waechter/go.mod
+      - env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: go build -o thermoctl-waechter-${{ matrix.arch }} .
+      - run: sha256sum thermoctl-waechter-${{ matrix.arch }} > thermoctl-waechter-${{ matrix.arch }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thermoctl-waechter-${{ matrix.arch }}
+          path: |
+            waechter/thermoctl-waechter-${{ matrix.arch }}
+            waechter/thermoctl-waechter-${{ matrix.arch }}.sha256
+
+  # Der sprachübergreifende Vertragstest aus Abschnitt 18.3: Python schreibt
+  # die Zustandsdatei (mit demselben Code, der später auf dem Gerät läuft --
+  # agent.schleife.waechter_zustand_melden), der gebaute Wächter liest sie im
+  # Prüfmodus. Siehe waechter/pruefe_vertrag.sh für den Ablauf im Einzelnen
+  # und dessen Kommentar für die Begründung, warum das dieser Job ist und
+  # nicht pytest oder go test allein.
+  vertragstest:
+    runs-on: ubuntu-latest
+    needs: pruefen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: waechter/go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Nur pydantic -- protokoll/ (von agent/schleife.py importiert) braucht
+      # nichts weiter, und der Wächter selbst bleibt davon unberührt.
+      - run: pip install pydantic
+      - run: bash waechter/pruefe_vertrag.sh

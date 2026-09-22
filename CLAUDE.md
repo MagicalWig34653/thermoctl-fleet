@@ -9,7 +9,10 @@ Cloud-Dienst (`fleet/`), der von jeder Wohnung einen Herzschlag mit
 Gesundheitsdaten empfängt, Störungen sammelt, **Ausbleiben** alarmiert und eine
 kurze, abschließende Liste von Wartungsbefehlen an einen Melder (`agent/`) auf
 der Basisstation der Wohnung schicken kann. `protokoll/` ist der gemeinsame
-Vertrag zwischen beiden Seiten.
+Vertrag zwischen beiden Seiten. Dazu zwei weitere Teile, beide ohne eigenes
+Docker-Abbild: `waechter/` (in Go, tauscht den Agent-Container, läuft außerhalb
+der Containerlaufzeit, eigene CI-Spur) und `abbild/` (das Rezept für die
+vorbereiteten Systemabbilder der Basisstation).
 
 **Maßgeblich ist [`docs/spezifikation.md`](docs/spezifikation.md).** Sie ist eine
 unveränderte Kopie eines lokalen, nicht veröffentlichten Dokuments und die
@@ -57,9 +60,26 @@ nachsehen, bevor eine Lücke als Bug gemeldet wird.
 5. **Der Melder ist die Sicherheitsgrenze, nicht die Cloud.** Jede Prüfung, ob ein
    Befehl ausgeführt wird (Kennung schon gesehen? Verfallszeit überschritten?
    Vorbedingung für einen Sollzustandswechsel erfüllt?), gehört in `agent/` und wird
-   dort durchgesetzt, selbst wenn die Cloud etwas anderes sagt.
+   dort durchgesetzt, selbst wenn die Cloud etwas anderes sagt. Konkretes Beispiel
+   in `agent.schleife.zugang_oeffnen` (Abschnitt 21.4): Fehlt einer Wohnung das
+   Kennzeichen `pilotbetrieb`, lehnt **der Agent** den Befehl `zugang_oeffnen` ab
+   -- nicht die Fleet-Oberfläche. Eine übernommene Cloud kann damit in
+   produktiven Wohnungen keine SSH-Sitzung öffnen. Diese Prüfung in die
+   Oberfläche statt in den Agenten zu verlegen (etwa "der Knopf ist ja eh
+   ausgegraut") würde genau die Schutzwirkung aufheben, für die sie gebaut ist.
+6. **Der Wächter kennt kein Netz und keine Registry, und sein `go.mod` bleibt
+   ohne eine einzige Abhängigkeit.** Arbeitsteilung aus Abschnitt 17/18.3: Der
+   Agent lädt ein neues Abbild und prüft dessen Digest gegen die fest
+   eingebauten Quellen (Grundsatz 2 oben) — der Wächter tauscht danach nur
+   zwischen zwei bereits lokal vorhandenen, bereits geprüften Digests. Er ist
+   in Go geschrieben, statisch gebaut, unter 300 Zeilen — genau deshalb, weil
+   er das Einzige sein muss, was noch funktioniert, wenn alles andere kaputt
+   ist (Abschnitt 18.3). Ein `go.mod`-Eintrag für eine Fremdbibliothek (auch
+   ein Docker-SDK „nur zum Ansprechen der Laufzeit") oder Wächter-Code, der
+   eine Netzwerkverbindung öffnet oder eine Registry anspricht, verletzt
+   diesen Grundsatz unabhängig davon, wie klein die Änderung aussieht.
 
-Änderungen an einem dieser fünf Punkte sind sicherheitsrelevant im Sinn von
+Änderungen an einem dieser sechs Punkte sind sicherheitsrelevant im Sinn von
 Grundsatz 7 aus thermoctls `CLAUDE.md` (unten übernommen) und werden in der
 Hauptsession gegengelesen, nicht nur im Kreuzreview.
 
@@ -69,7 +89,7 @@ Hauptsession gegengelesen, nicht nur im Kreuzreview.
 „Arbeitsweise" — hier nur die Kernpunkte, im Zweifel gilt dort das Original:
 
 - **Aufgaben gehen an Agents, nicht an die Hauptsession.** In der Hauptsession
-  bleiben nur: Auth- und Sicherheitslogik (siehe die fünf Punkte oben), das
+  bleiben nur: Auth- und Sicherheitslogik (siehe die sechs Punkte oben), das
   Zusammenführen von Zweigen und Sammeldateien, das Gegenlesen von
   Sicherheitsrelevantem, das Zerlegen der Arbeit in Aufträge.
 - **Review kreuzweise.** Wer implementiert hat, reviewt nicht. Jedes Review führt
@@ -95,7 +115,22 @@ Hauptsession gegengelesen, nicht nur im Kreuzreview.
 | Backend | Python, FastAPI (`fleet/`), reiner Python-Client (`agent/`) |
 | Gemeinsamer Vertrag | Pydantic-Modelle in `protokoll/`, von beiden Seiten importiert |
 | Verbindung | HTTPS hinauf (`POST`), SSE hinunter (`GET /v1/befehle`) — kein MQTT im Internet, kein eigenes Rahmenprotokoll (Abschnitt 3) |
-| Betrieb | Zwei eigene Docker-Abbilder aus einem Repository (`docker/Dockerfile.fleet`, `docker/Dockerfile.agent`) |
+| Betrieb (Cloud/Gerät) | Zwei eigene Docker-Abbilder aus einem Repository (`docker/Dockerfile.fleet`, `docker/Dockerfile.agent`) |
+| Wächter | `waechter/`, Go ohne Abhängigkeiten, statisch gebaut, systemd-Einheit, kein Docker-Abbild |
+| Basisstation | `abbild/`, vorbereitetes Debian-13-Abbild (Raspberry Pi OS bzw. amd64), kein eigenes Betriebssystem, kein Docker-Abbild |
 
-Ein Repository für beide Abbilder, weil sie über den Vertrag in `protokoll/` fest
-verkoppelt sind — Begründung in `README.md`.
+Ein Repository für beide Docker-Abbilder plus Wächter plus Systemabbild-Rezept,
+weil alle vier über denselben Vertrag fest verkoppelt sind — Begründung in
+`README.md`.
+
+**Die Sprachregel (Abschnitt 18.4): Auf dem Blech Go, im Container Python.**
+Der Wächter ist die Ausnahme, nicht der Anfang einer Wanderung — er läuft auf
+dem blanken System und muss auch dann starten, wenn der Interpreter des
+Betriebssystems beschädigt ist. Der Agent bringt seine Laufzeit im eigenen
+Abbild mit und ist von dieser Fehlerklasse gar nicht betroffen; ihn in Go zu
+schreiben, kostete nur das gemeinsame Protokollpaket mit dem Cloud-Dienst
+(`protokoll/`) — doppelt gepflegt statt einmal. Muss künftig ein Teil des
+Agenten auf dem blanken System laufen (denkbar beim WireGuard-Tunnel aus
+Abschnitt 14, der eine Netzwerkschnittstelle einrichtet), **wandert dieses
+Stück zum Wächter-Binärprogramm**, statt den Agenten umzuschreiben oder eine
+dritte Sprache einzuführen.

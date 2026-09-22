@@ -1,0 +1,18 @@
+// Sicherheitsaktualisierungen unbeaufsichtigt, Neustart nur im Zeitfenster
+// (Abschnitt 13, Betriebssystem-Abschnitt: "Neustarts nur im Zeitfenster";
+// Abschnitt 19.3). Debian-Originalkommentare gekürzt -- vollständige Fassung:
+// /usr/share/doc/unattended-upgrades/examples/50unattended-upgrades nach der
+// Installation des Pakets.
+//
+// PLATZHALTER: Das Zeitfenster hier ist ein Beispielwert, keine Vorgabe.
+// Abschnitt 13 legt das eigentliche Zeitfenster für Container-Aktualisierungen
+// je Wohnung in protokoll.sollzustand.Aktualisierungsfenster fest -- ob dieses
+// Betriebssystem-Zeitfenster damit übereinstimmen muss, ist noch nicht
+// entschieden (siehe docs/STATUS.md).
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+};
+
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:30";
