@@ -2,6 +2,93 @@
 
 Last updated: 2026-09-24.
 
+## Login for the fleet UI (P3.0)
+
+The specification (section 9) describes the three UI views but is silent on
+how the landlord logs in. **Decided by the project owner, 2026-09-24:** own
+user accounts in the fleet database (`ui_users`, `ui_sessions`, migration
+`0005_ui_accounts`), password hashed with Argon2 (`argon2-cffi`), TOTP as a
+**mandatory** second factor (`pyotp`), server-side sessions via a cookie.
+The first account is created with `python -m fleet.admin create-user`,
+never via the web -- there is no `POST /ui/register` anywhere in this
+package, deliberately. No external identity provider. UI texts are German
+(matching thermoctl's own UI), code and comments English.
+
+Completely separate from agent auth (`fleet/auth.py`, `/v1/...`) --
+different table, different dependency, no shared helper beyond `Storage`
+itself; see `fleet/ui_auth.py`'s module docstring for the full reasoning,
+and `tests/test_ui_auth.py::test_agent_token_cannot_access_protected_ui_page`
+/ `::test_ui_session_cookie_cannot_access_the_agent_api` for the tests that
+would fail if this separation broke.
+
+**Where the pieces live:** `fleet/ui_auth.py` (password/TOTP verification,
+lockout, session creation/lookup, CSRF, the `require_ui_user` dependency
+every later UI package depends on), `fleet/ui_routes.py` (`GET/POST
+/ui/login`, `POST /ui/logout`, the protected `GET /ui/` placeholder, the
+`/ui`-scoped security-header middleware), `fleet/admin.py` (the CLI),
+`fleet/templates/ui/{base,login,index}.html` (shipped inside the `fleet`
+package via `[tool.setuptools.package-data]` in `pyproject.toml` -- proven
+by `tests/test_packaging.py`, which builds a real wheel and inspects it,
+not just by reading the config).
+
+**Environment variables (all optional, sensible defaults):**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FLEET_UI_LOCKOUT_THRESHOLD` | `5` | consecutive failures before an account locks |
+| `FLEET_UI_LOCKOUT_DURATION_S` | `900` (15 min) | how long a lock lasts |
+| `FLEET_UI_SESSION_ABSOLUTE_LIFETIME_S` | `43200` (12 h) | hard session ceiling regardless of activity |
+| `FLEET_UI_SESSION_IDLE_TIMEOUT_S` | `3600` (1 h) | session dies this long after the last authenticated request |
+
+**Generic failure response:** unknown user, wrong password, and
+wrong/replayed TOTP code are indistinguishable from the caller's side --
+same status code, same rendered text, similar Argon2 work (a fixed dummy
+hash, computed once at import time from data that is never stored, stands
+in for a real user's hash when the username does not exist, so the
+"unknown user" path costs the same CPU time as "known user, wrong
+password").
+
+**TOTP replay:** a ±1 time-step window (so ±30s of clock drift is
+tolerated), and a presented code resolving to a step at or before the
+user's last accepted step is rejected even if it is still numerically
+correct -- closes the replay window `pyotp.TOTP.verify()` leaves open on
+its own when called in a loop.
+
+**CSRF:** two separate tokens, matching the two phases of the flow. Before
+a session exists, `/ui/login` uses the classic double-submit-cookie pattern
+(a short-lived, `HttpOnly` pre-session cookie plus a matching hidden form
+field). After login, every state-changing `/ui` POST (including logout)
+checks a per-session token stored on the `ui_sessions` row itself, compared
+with `hmac.compare_digest`.
+
+**Open points, carried forward, not silently dropped:**
+
+- **Passkeys/WebAuthn** are a possible later extension (noted by the
+  project owner at decision time) -- not built here. Would remove the
+  stored-shared-secret risk below entirely for whoever opts in.
+- **TOTP secrets are stored in plain text** in `ui_users.totp_secret` (like
+  thermoctl's own account TOTP storage, for the same reason: a symmetric,
+  time-based one-time code needs the shared secret readable at verification
+  time, there is no salted-hash equivalent for a TOTP secret the way there
+  is for a password). A database leak exposes every account's TOTP seed,
+  not just password hashes. Mitigation options for later, not decided here:
+  encrypting `totp_secret` at rest with a key held outside the database (a
+  KMS, or an operator-supplied environment secret used only to wrap/unwrap
+  this one column), or moving to passkeys (above) where no such secret
+  exists to leak in the first place.
+- **No password-reset-by-mail**, on purpose: the fleet UI has exactly one
+  account class (the landlord), no email sending infrastructure exists
+  anywhere else in this repository, and a mail-based reset flow is its own
+  attack surface (account takeover via a compromised mailbox) for a single
+  operator who already has shell/database access to run `python -m
+  fleet.admin reset-totp`/`unlock` directly. Revisit only if a second
+  landlord account holder makes CLI access impractical.
+- Expired/idle sessions are rejected on read but not proactively deleted
+  from `ui_sessions` -- a stale row is harmless (it can never authenticate
+  again) but does accumulate; a retention/cleanup job is future work,
+  mirroring the same open point already recorded for `heartbeats`/`events`
+  retention below.
+
 ## Absence alarming (P2.2, section 8)
 
 New `fleet/alarms.py`: `check_absence_alarms(storage, now, notifiers)` builds

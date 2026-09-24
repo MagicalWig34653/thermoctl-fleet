@@ -57,7 +57,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +72,7 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    delete,
     select,
     text,
 )
@@ -202,6 +203,54 @@ class AlarmRecord(Base):
     snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
     raise_notified: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
     clear_notified: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
+
+
+class UiUserRecord(Base):
+    __tablename__ = "ui_users"
+
+    # Landlord login accounts for the fleet UI (P3.0). Deliberately its own
+    # table, unrelated to `ApartmentRecord`/agent auth (`fleet/auth.py`) --
+    # the two auth paths never share a row, a session, or a dependency
+    # (CLAUDE.md security principle 5's spirit: the UI must not become a
+    # side door into the agent API or vice versa).
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    # Argon2 encoded hash (`argon2.PasswordHasher().hash(...)`) -- carries its
+    # own salt and parameters, nothing else is stored alongside it.
+    password_hash: Mapped[str] = mapped_column(Text(), nullable=False)
+    # Base32 TOTP secret (`pyotp.random_base32()`). Stored in plain text --
+    # a known, documented open point (see docs/STATUS.md): a database leak
+    # exposes it. Passkeys/WebAuthn (avoiding a stored shared secret
+    # entirely) are a possible later extension, out of scope for P3.0.
+    totp_secret: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Replay protection (P3.0): the last TOTP time step accepted for this
+    # user. A presented code resolving to a step at or before this one is
+    # rejected even if otherwise correct -- see `fleet/ui_auth.py::verify_totp`.
+    last_totp_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class UiSessionRecord(Base):
+    __tablename__ = "ui_sessions"
+
+    # Server-side session for the fleet UI (P3.0). **Only the SHA-256 hash of
+    # the session token is stored** (`token_hash`, mirroring
+    # `ApartmentRecord.token_hash`/`hash_token` for the agent token) -- the
+    # raw token lives only in the browser's cookie and in the response that
+    # set it, never written to the database or a log line.
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # Per-session CSRF token (P3.0 requirement: "per-session token in a
+    # hidden field, required and checked on every state-changing /ui POST").
+    # Stored alongside the session, not derived from the session token
+    # itself, so leaking one does not leak the other.
+    csrf_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
 
 @dataclass(frozen=True)
@@ -691,6 +740,158 @@ class Storage:
             record = session.get(AlarmRecord, alarm_id)
             if record is not None:
                 record.snoozed_until = _naive_utc(until)
+
+    # -- ui accounts / sessions (P3.0) -------------------------------------------
+
+    def create_ui_user(
+        self,
+        username: str,
+        password_hash: str,
+        totp_secret: str,
+        created_at: datetime,
+    ) -> UiUserRecord:
+        """Creates a new UI account. Used only by `fleet.admin`'s
+        `create-user` (never by an endpoint -- "the first account is created
+        via a CLI command, never via the web", project owner decision
+        2026-09-24)."""
+
+        with self.session() as session:
+            record = UiUserRecord(
+                username=username,
+                password_hash=password_hash,
+                totp_secret=totp_secret,
+                last_totp_step=None,
+                failed_attempts=0,
+                locked_until=None,
+                created_at=_naive_utc(created_at),
+            )
+            session.add(record)
+            session.flush()
+            session.expunge(record)
+            return record
+
+    def get_ui_user_by_username(self, username: str) -> UiUserRecord | None:
+        with self.session() as session:
+            record = session.scalar(
+                select(UiUserRecord).where(UiUserRecord.username == username)
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def get_ui_user_by_id(self, user_id: int) -> UiUserRecord | None:
+        with self.session() as session:
+            record = session.get(UiUserRecord, user_id)
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def record_ui_login_failure(
+        self, user_id: int, now: datetime, lockout_threshold: int, lockout_duration_s: float
+    ) -> None:
+        """Increments the failed-attempt counter; locks the account for
+        `lockout_duration_s` once `lockout_threshold` consecutive failures
+        are reached (P3.0 lockout rule)."""
+
+        with self.session() as session:
+            record = session.get(UiUserRecord, user_id)
+            if record is None:
+                return
+            record.failed_attempts += 1
+            if record.failed_attempts >= lockout_threshold:
+                record.locked_until = _naive_utc(now) + timedelta(seconds=lockout_duration_s)
+
+    def record_ui_login_success(self, user_id: int, totp_step: int) -> None:
+        """Resets the failure counter and any lock, and records the accepted
+        TOTP step for replay protection -- called only after every check
+        (password, TOTP, lock) has already passed."""
+
+        with self.session() as session:
+            record = session.get(UiUserRecord, user_id)
+            if record is not None:
+                record.failed_attempts = 0
+                record.locked_until = None
+                record.last_totp_step = totp_step
+
+    def set_ui_user_totp_secret(self, user_id: int, totp_secret: str) -> None:
+        """`fleet.admin reset-totp` -- also clears `last_totp_step` (a step
+        recorded against the old secret is meaningless for a new one) and
+        any lock/failure count, mirroring a fresh account."""
+
+        with self.session() as session:
+            record = session.get(UiUserRecord, user_id)
+            if record is not None:
+                record.totp_secret = totp_secret
+                record.last_totp_step = None
+                record.failed_attempts = 0
+                record.locked_until = None
+
+    def unlock_ui_user(self, user_id: int) -> None:
+        """`fleet.admin unlock` -- also resets the failure counter, not only
+        `locked_until`, so the account is not one more failure away from
+        being locked again immediately."""
+
+        with self.session() as session:
+            record = session.get(UiUserRecord, user_id)
+            if record is not None:
+                record.locked_until = None
+                record.failed_attempts = 0
+
+    def delete_ui_user(self, user_id: int) -> None:
+        with self.session() as session:
+            record = session.get(UiUserRecord, user_id)
+            if record is not None:
+                session.delete(record)
+            session.execute(delete(UiSessionRecord).where(UiSessionRecord.user_id == user_id))
+
+    # -- ui sessions (P3.0) -------------------------------------------------------
+
+    def create_ui_session(
+        self,
+        user_id: int,
+        token_hash: str,
+        csrf_token: str,
+        now: datetime,
+        absolute_lifetime_s: float,
+    ) -> None:
+        normalized_now = _naive_utc(now)
+        with self.session() as session:
+            session.add(
+                UiSessionRecord(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    csrf_token=csrf_token,
+                    created_at=normalized_now,
+                    expires_at=normalized_now + timedelta(seconds=absolute_lifetime_s),
+                    last_seen_at=normalized_now,
+                )
+            )
+
+    def get_ui_session_by_token_hash(self, token_hash: str) -> UiSessionRecord | None:
+        with self.session() as session:
+            record = session.scalar(
+                select(UiSessionRecord).where(UiSessionRecord.token_hash == token_hash)
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def touch_ui_session(self, session_id: int, now: datetime) -> None:
+        """Updates `last_seen_at` for the idle timeout -- called on every
+        request that successfully authenticates via that session."""
+
+        with self.session() as session:
+            record = session.get(UiSessionRecord, session_id)
+            if record is not None:
+                record.last_seen_at = _naive_utc(now)
+
+    def delete_ui_session(self, token_hash: str) -> None:
+        """Logout (P3.0): deletes the session row server-side so the old
+        cookie value can never be used again, even before it would have
+        expired on its own."""
+
+        with self.session() as session:
+            session.execute(delete(UiSessionRecord).where(UiSessionRecord.token_hash == token_hash))
 
 
 def create_engine_from_url(url: str) -> Engine:

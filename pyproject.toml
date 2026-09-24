@@ -24,6 +24,12 @@ fleet = [
     # Absence alarming (P2.2, section 8): the generic webhook notifier. SMTP
     # notification uses stdlib `smtplib`, no extra dependency needed for it.
     "httpx>=0.27",
+    # Fleet UI login (P3.0): Argon2 password hashing, TOTP second factor,
+    # server-rendered templates, and form parsing for FastAPI.
+    "argon2-cffi>=23.1",
+    "pyotp>=2.9",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
 ]
 # Device side: HTTP client for heartbeat/events, SSE client for the
 # command channel.
@@ -42,6 +48,13 @@ dev = [
     # Local SMTP server for testing the SMTP notifier (P2.2) against a real
     # receiver -- no mocks, per CLAUDE.md's testing method.
     "aiosmtpd>=1.4",
+    # P3.0's packaging test (tests/test_packaging.py) builds a real wheel
+    # with `pip wheel --no-build-isolation` to prove the UI templates are
+    # actually included -- that needs the build backend itself present in
+    # this environment, not just declared in `[build-system]` (which only
+    # pip's own *isolated* build env would install automatically).
+    "setuptools>=77",
+    "wheel>=0.43",
 ]
 
 [build-system]
@@ -58,6 +71,14 @@ build-backend = "setuptools.build_meta"
 # and fleet/migrations/versions/__init__.py), so the Alembic scripts land in
 # the fleet Docker image without a separate package-data entry.
 include = ["protocol*", "fleet*", "agent*", "tools*"]
+
+[tool.setuptools.package-data]
+# P3.0: Jinja2 templates for the fleet UI ship inside the `fleet` package
+# itself (not read from the repository checkout at runtime), so they must be
+# listed explicitly -- `packages.find` above only picks up `.py` files.
+# `docker/Dockerfile.fleet` only `COPY`s `fleet/`, so anything the running
+# service needs must be inside this package, not alongside it.
+fleet = ["templates/ui/*.html"]
 
 [tool.ruff]
 line-length = 100
