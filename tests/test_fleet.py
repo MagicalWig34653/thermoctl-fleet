@@ -21,7 +21,7 @@ from __future__ import annotations
 import secrets
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -355,6 +355,143 @@ def test_heartbeat_is_stored_under_the_authenticated_apartment(
     assert response.status_code == 204
     assert len(storage.list_heartbeats(APARTMENT)) == 1
     assert storage.list_heartbeats(OTHER_APARTMENT) == []
+
+
+# -----------------------------------------------------------------------------
+# POST /v1/heartbeats -- catch-up batch (P2.1b, sections 5, 18.2)
+# -----------------------------------------------------------------------------
+
+
+def _heartbeat_at(sent_at: str, apartment: str = APARTMENT) -> dict[str, object]:
+    return {**HEARTBEAT_EXAMPLE, "apartment": apartment, "sent_at": sent_at}
+
+
+def _batch(count: int, apartment: str = APARTMENT) -> list[dict[str, object]]:
+    """`count` heartbeats with distinct, ascending `sent_at` values, 2
+    minutes apart (the real heartbeat interval, section 5) -- 240 of them
+    span 8 hours, matching "at most the last 240, i.e. eight hours"."""
+
+    base = datetime(2026, 9, 22, 0, 0, 0, tzinfo=UTC)
+    return [
+        _heartbeat_at(
+            (base + timedelta(minutes=2 * i)).isoformat().replace("+00:00", "Z"),
+            apartment,
+        )
+        for i in range(count)
+    ]
+
+
+def test_heartbeats_batch_without_a_token_is_401(client: TestClient) -> None:
+    response = client.post("/v1/heartbeats", json=_batch(3))
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_heartbeats_batch_without_a_token_stores_nothing(
+    client: TestClient, storage: Storage
+) -> None:
+    response = client.post("/v1/heartbeats", json=_batch(3))
+
+    assert response.status_code == 401
+    assert storage.list_heartbeats(APARTMENT) == []
+
+
+def test_heartbeats_batch_missing_token_and_malformed_body_is_401_not_422(
+    client: TestClient,
+) -> None:
+    """Same rule as the singular endpoint (P1.1): the token check runs
+    before the body is acted on, so an unauthenticated request gets 401
+    even for a structurally malformed body."""
+
+    malformed = [{k: v for k, v in HEARTBEAT_EXAMPLE.items() if k != "system"}]
+
+    response = client.post("/v1/heartbeats", json=malformed)
+
+    assert response.status_code == 401
+
+
+def test_heartbeats_batch_of_several_is_204_and_all_stored_in_sent_at_order(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    response = client.post("/v1/heartbeats", json=_batch(5), headers=_bearer(token))
+
+    assert response.status_code == 204
+    stored = storage.list_heartbeats(APARTMENT)
+    assert len(stored) == 5
+    assert [hb.sent_at for hb in stored] == sorted(hb.sent_at for hb in stored)
+
+
+def test_heartbeats_batch_exactly_240_is_accepted(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    response = client.post("/v1/heartbeats", json=_batch(240), headers=_bearer(token))
+
+    assert response.status_code == 204
+    assert len(storage.list_heartbeats(APARTMENT)) == 240
+
+
+def test_heartbeats_batch_of_241_is_422(client: TestClient, token: str) -> None:
+    response = client.post("/v1/heartbeats", json=_batch(241), headers=_bearer(token))
+
+    assert response.status_code == 422
+
+
+def test_heartbeats_batch_empty_list_is_422(client: TestClient, token: str) -> None:
+    response = client.post("/v1/heartbeats", json=[], headers=_bearer(token))
+
+    assert response.status_code == 422
+
+
+def test_heartbeats_batch_one_entry_for_another_apartment_is_403(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """One entry names a different apartment than the token -- the whole
+    batch is rejected and nothing from it is stored, not just the bad
+    entry."""
+
+    batch = _batch(3) + [_heartbeat_at("2026-09-22T09:00:00Z", OTHER_APARTMENT)]
+
+    response = client.post("/v1/heartbeats", json=batch, headers=_bearer(token))
+
+    assert response.status_code == 403
+    assert storage.list_heartbeats(APARTMENT) == []
+    assert storage.list_heartbeats(OTHER_APARTMENT) == []
+
+
+def test_heartbeats_batch_resent_is_not_duplicated(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """Re-sending the same batch (e.g. after a lost response) must not
+    produce duplicate rows -- idempotency keyed on `sent_at` per apartment."""
+
+    batch = _batch(5)
+
+    first = client.post("/v1/heartbeats", json=batch, headers=_bearer(token))
+    second = client.post("/v1/heartbeats", json=batch, headers=_bearer(token))
+
+    assert first.status_code == 204
+    assert second.status_code == 204
+    assert len(storage.list_heartbeats(APARTMENT)) == 5
+
+
+def test_heartbeats_batch_overlapping_a_live_heartbeat_is_not_duplicated(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """A heartbeat already received live via `POST /v1/heartbeat` and then
+    contained in a later catch-up batch must not be stored twice."""
+
+    live = _heartbeat_at("2026-09-22T05:00:00Z")
+    live_response = client.post("/v1/heartbeat", json=live, headers=_bearer(token))
+    assert live_response.status_code == 204
+
+    batch = [live, *_batch(3)]
+    batch_response = client.post("/v1/heartbeats", json=batch, headers=_bearer(token))
+
+    assert batch_response.status_code == 204
+    stored = storage.list_heartbeats(APARTMENT)
+    assert len(stored) == 4
+    assert len({hb.sent_at for hb in stored}) == 4
 
 
 # -----------------------------------------------------------------------------

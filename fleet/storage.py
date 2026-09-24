@@ -20,9 +20,14 @@ Three tables, deliberately minimal:
   `protocol_version` column already needed for the wire contract is compared
   against `protocol.version.PROTOCOL_VERSION` at read time
   (`Storage.get_latest_heartbeat`), so flagging an apartment "outdated" needs
-  no schema change and no `0003` migration -- a stored boolean would only
+  no schema change and no migration of its own -- a stored boolean would only
   duplicate what the column already says and could drift from it if
-  `PROTOCOL_VERSION` is ever bumped without a backfill.
+  `PROTOCOL_VERSION` is ever bumped without a backfill. **A unique index on
+  `(apartment_id, sent_at)`** (`0003_heartbeats_unique_sent_at.py`, P2.1b
+  review) makes "no duplicate `sent_at` per apartment" a database-enforced
+  constraint, not just an application-level check -- see `HeartbeatRecord`
+  and `_insert_heartbeats_ignoring_conflicts` for why a Python-level
+  check-then-insert was not safe under concurrent requests.
 - **`events`**: apartment, `schluessel` (key), `schwere` (severity), the
   *derived* fault kind (nullable -- `None` means "other report", see
   `protocol.events.fault_kind_from_key`), and receipt time. **Deliberately
@@ -54,10 +59,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import DateTime, Engine, Integer, String, Text, create_engine, select
+from sqlalchemy import DateTime, Engine, Index, Integer, String, Text, create_engine, select
+from sqlalchemy.dialects import postgresql as _postgresql_dialect
+from sqlalchemy.dialects import sqlite as _sqlite_dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from protocol import Event, Heartbeat, fault_kind_from_key
@@ -88,6 +96,28 @@ class ApartmentRecord(Base):
 
 class HeartbeatRecord(Base):
     __tablename__ = "heartbeats"
+    __table_args__ = (
+        # P2.1b review: a per-apartment unique index on `sent_at`, added by
+        # `0003_heartbeats_unique_sent_at.py`. Not present when this table was
+        # first designed (P1.3/P2.1) -- idempotency for the catch-up batch
+        # endpoint (P2.1b) was originally a Python-level "SELECT the already-
+        # stored `sent_at` values, then INSERT the rest" check. That is not
+        # atomic: reproduced with 8 threads concurrently posting the same
+        # 20-entry batch against a real, migrated SQLite database (an agent
+        # retry racing the still-in-flight first request) -- 160 rows stored,
+        # not 20. The unique index turns "duplicate `sent_at` for this
+        # apartment" into a constraint the database itself enforces, and
+        # `Storage`'s insert path (see `_insert_heartbeats_ignoring_conflicts`)
+        # turns a conflict into a silent skip instead of an error, at the SQL
+        # level, in the same statement, so two concurrent inserts can no
+        # longer both pass a check and then both write.
+        Index(
+            "ux_heartbeats_apartment_id_sent_at",
+            "apartment_id",
+            "sent_at",
+            unique=True,
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
@@ -146,6 +176,82 @@ def _naive_utc(value: datetime) -> datetime:
     if value.tzinfo is not None:
         return value.astimezone(UTC).replace(tzinfo=None)
     return value
+
+
+def _insert_heartbeats_ignoring_conflicts(
+    session: Session, rows: list[dict[str, object]]
+) -> None:
+    """Inserts `rows` (each shaped like `HeartbeatRecord`'s columns, minus
+    `id`) into `heartbeats`, silently skipping any row whose
+    `(apartment_id, sent_at)` already exists -- the unique index from
+    `0003_heartbeats_unique_sent_at.py`.
+
+    **Why a dialect-native "insert, skip on conflict" statement and not a
+    Python-level check (P2.1b review):** `save_heartbeats_batch` originally
+    queried which of a batch's `sent_at` values were already stored, then
+    inserted only the rest, all inside one transaction. That is a
+    check-then-act race: two overlapping requests (a genuine concurrent
+    catch-up, or simply an agent retrying because the first response was
+    lost while the first request was still committing) can both run the
+    SELECT before either has committed its INSERT, both see "not yet
+    stored", and both insert -- reproduced with 8 threads posting the same
+    20-entry batch concurrently against a real SQLite database: 160 rows,
+    not 20. A single `INSERT ... ON CONFLICT DO NOTHING` statement removes
+    the gap between the check and the write entirely; the database, not
+    this code, is what decides atomically whether a given `(apartment_id,
+    sent_at)` is new.
+
+    SQLite and PostgreSQL both support this directly
+    (`sqlalchemy.dialects.{sqlite,postgresql}.insert(...)
+    .on_conflict_do_nothing(index_elements=...)`) -- both are covered here,
+    since both are reachable from this module's callers today (tests run
+    against SQLite; PostgreSQL is a plausible production choice sharing
+    this same dialect family's syntax). **MariaDB is not implemented**
+    (`docs/STATUS.md`/this module's docstring both still list it only as a
+    future option, never a deployed one): MySQL/MariaDB has no `ON
+    CONFLICT` clause at all -- the equivalent there is `INSERT IGNORE`
+    (`Insert.prefix_with("IGNORE")`) or `... ON DUPLICATE KEY UPDATE
+    <pk>=<pk>` as a no-op update, neither of which is `sqlalchemy.dialects
+    .postgresql`/`.sqlite`'s `on_conflict_do_nothing` API -- whoever adds a
+    MariaDB deployment adds that branch here, not a rewrite of
+    `save_heartbeat`/`save_heartbeats_batch`, which only ever call this
+    function.
+    """
+
+    if not rows:
+        return
+    dialect = session.get_bind().dialect.name
+    # `sqlite.Insert`/`postgresql.Insert` share no common base that exposes
+    # `on_conflict_do_nothing` (it is a dialect-specific extension on each),
+    # hence the explicit `Any` -- both branches are used the same way below.
+    statement: Any
+    if dialect == "sqlite":
+        statement = _sqlite_dialect.insert(HeartbeatRecord).values(rows)
+    elif dialect == "postgresql":  # pragma: no cover -- see below
+        statement = _postgresql_dialect.insert(HeartbeatRecord).values(rows)
+    else:  # pragma: no cover -- see below
+        raise NotImplementedError(
+            f"Insert-or-ignore for heartbeats is not implemented for the "
+            f"{dialect!r} SQLAlchemy dialect -- see "
+            "_insert_heartbeats_ignoring_conflicts's docstring for what a "
+            "MariaDB deployment would need."
+        )
+    # The `postgresql`/`else` branches above are excluded from coverage
+    # (CLAUDE.md: "a line only reachable through an artificial construction"):
+    # this repository's only real database in CI and in every test is SQLite
+    # (see the module docstring, "Database URL comes exclusively from
+    # FLEET_DATABASE_URL"). Exercising the `postgresql` branch meaningfully
+    # needs an actual PostgreSQL connection to execute the resulting
+    # dialect-specific statement against, not just a faked `dialect.name` on
+    # a SQLite engine (SQLAlchemy's SQLite compiler cannot render a
+    # `postgresql.dml.Insert`'s conflict clause, so faking the name alone
+    # would only prove the branch is *selected*, not that it *works*) -- a
+    # real assertion, not a smoke test, has to wait for an actual PostgreSQL
+    # target. The `else` branch is unreachable by construction from any
+    # dialect this module's callers use today for the same reason.
+    session.execute(
+        statement.on_conflict_do_nothing(index_elements=["apartment_id", "sent_at"])
+    )
 
 
 def hash_token(token: str) -> str:
@@ -235,16 +341,79 @@ class Storage:
     def save_heartbeat(
         self, apartment_id: str, heartbeat: Heartbeat, received_at: datetime
     ) -> None:
+        """Stores one heartbeat. **Decided (P2.1b review):** a `sent_at`
+        already stored for `apartment_id` -- e.g. this exact heartbeat
+        arriving live a second time, or arriving live after it was already
+        caught up via a batch -- is silently ignored, the same as a
+        duplicate within `save_heartbeats_batch` (see there for why, and for
+        why this is enforced at the database level via the unique index from
+        `0003_heartbeats_unique_sent_at.py`, not by a Python-level check).
+        Not an error: a heartbeat is a report of current state sent every
+        120 s, not a command that must be rejected if repeated.
+        """
+
         with self.session() as session:
-            session.add(
-                HeartbeatRecord(
-                    apartment_id=apartment_id,
-                    received_at=_naive_utc(received_at),
-                    sent_at=_naive_utc(heartbeat.sent_at),
-                    protocol_version=heartbeat.protocol_version,
-                    payload_json=heartbeat.model_dump_json(),
-                )
+            _insert_heartbeats_ignoring_conflicts(
+                session,
+                [
+                    {
+                        "apartment_id": apartment_id,
+                        "received_at": _naive_utc(received_at),
+                        "sent_at": _naive_utc(heartbeat.sent_at),
+                        "protocol_version": heartbeat.protocol_version,
+                        "payload_json": heartbeat.model_dump_json(),
+                    }
+                ],
             )
+
+    def save_heartbeats_batch(
+        self, apartment_id: str, heartbeats: list[Heartbeat], received_at: datetime
+    ) -> None:
+        """Stores a catch-up batch of heartbeats in **one transaction**, all
+        with the same receipt time (P2.1b, section 5: "the agent sends the
+        buffered heartbeats ... on next contact, in one batch").
+
+        **Idempotency is enforced at the database level** (P2.1b review),
+        not by a Python-level "SELECT the already-stored `sent_at` values,
+        then INSERT the rest" check that an earlier version of this method
+        used: that check-then-insert is not atomic, and a concurrent
+        request for an overlapping or identical batch (an agent retry
+        racing the still-in-flight first attempt, for example) can read the
+        same "not yet stored" answer for the same `sent_at` twice before
+        either write commits -- reproduced with 8 threads concurrently
+        calling this method with the same 20-entry batch against a real,
+        migrated SQLite database: 160 rows stored, not 20, no exception
+        raised to say so. `_insert_heartbeats_ignoring_conflicts` instead
+        issues one dialect-native "insert, skip on conflict" statement
+        against the unique index on `(apartment_id, sent_at)`
+        (`0003_heartbeats_unique_sent_at.py`) -- the database itself
+        decides, atomically, per row, which of two concurrent writers for
+        the same `sent_at` "wins" (arbitrarily; both cases are the same
+        heartbeat data), which covers every case the work package names: a
+        batch re-sent after a lost response, a heartbeat already received
+        live via `save_heartbeat` that also appears in a later catch-up
+        batch, a duplicate `sent_at` within one batch, and now also the
+        concurrent-request case the query-based version missed. Everything
+        happens inside the same `session()` transaction as the rest of this
+        call, so a failure partway through rolls the whole batch back --
+        "nothing from the batch is stored" on the 403 path (checked by the
+        caller *before* this is ever called) extends here to "all or
+        nothing" on the storage side too.
+        """
+
+        normalized_received_at = _naive_utc(received_at)
+        rows = [
+            {
+                "apartment_id": apartment_id,
+                "received_at": normalized_received_at,
+                "sent_at": _naive_utc(heartbeat.sent_at),
+                "protocol_version": heartbeat.protocol_version,
+                "payload_json": heartbeat.model_dump_json(),
+            }
+            for heartbeat in heartbeats
+        ]
+        with self.session() as session:
+            _insert_heartbeats_ignoring_conflicts(session, rows)
 
     def list_heartbeats(self, apartment_id: str) -> list[Heartbeat]:
         """Read-back, oldest first -- reconstructed `Heartbeat` models, not
@@ -267,13 +436,28 @@ class Storage:
         `sent_at` -- a late-arriving, older heartbeat from a catch-up batch
         (section 5) must not overwrite what "latest" means here; that
         ordering choice is for P2.3/P2.2 to make, not this read.
+
+        **Tie-break (P2.1b review):** a catch-up batch (`save_heartbeats_batch`)
+        stores many rows that all share the exact same `received_at` -- one
+        receipt time for the whole batch, by design. Ordering by
+        `received_at` alone leaves "which of those rows is `LIMIT 1`"
+        undefined (the database is free to pick any of them, and that choice
+        is not guaranteed stable across runs). The tie is broken by
+        `sent_at` next (the newest-reported entry of the batch wins), and by
+        `id` last for a full order (an insertion-order fallback for the
+        pathological case of two entries sharing both timestamps) -- so the
+        result is deterministic, not merely "usually correct".
         """
 
         with self.session() as session:
             row = session.scalar(
                 select(HeartbeatRecord)
                 .where(HeartbeatRecord.apartment_id == apartment_id)
-                .order_by(HeartbeatRecord.received_at.desc())
+                .order_by(
+                    HeartbeatRecord.received_at.desc(),
+                    HeartbeatRecord.sent_at.desc(),
+                    HeartbeatRecord.id.desc(),
+                )
                 .limit(1)
             )
             if row is None:
@@ -315,7 +499,21 @@ class Storage:
 
 
 def create_engine_from_url(url: str) -> Engine:
-    return create_engine(url, future=True)
+    connect_args: dict[str, object] = {}
+    if url.startswith("sqlite"):
+        # SQLite serializes writers at the file level; its default busy
+        # timeout is 0, so a second writer that arrives while another
+        # transaction is still committing fails immediately with "database
+        # is locked" instead of waiting briefly for its turn. P2.1b review:
+        # concurrent `POST /v1/heartbeats`/`POST /v1/heartbeat` requests for
+        # the same apartment (a genuine race, or an agent retry) are exactly
+        # this case, and the insert-or-ignore write this module now uses for
+        # heartbeats (`_insert_heartbeats_ignoring_conflicts`) is meant to
+        # let concurrent writers succeed, not fail on a lock it could have
+        # simply waited out. 30s comfortably covers the short, single-batch
+        # insert transactions this module ever runs.
+        connect_args["timeout"] = 30
+    return create_engine(url, future=True, connect_args=connect_args)
 
 
 def create_storage(url: str) -> Storage:
