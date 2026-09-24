@@ -777,6 +777,19 @@ kleinerer Abdruck — bei 2 GB Arbeitsspeicher und SSD ist das keine Währung, i
 rechnen lässt. Als Sonderfall (streng lesendes Wurzeldateisystem) bleibt es denkbar, aber
 nicht als zweiter Regelweg.
 
+**Und warum kein drittes Abbild für ARM außerhalb der Raspberry-Welt:** Die
+Hardware-Recherche vom 22.09.2026 (`lokal/recherche/basisstationen-alternativen.md`) hat
+einen ernstzunehmenden Kandidaten ergeben, den **FriendlyELEC NanoPi R5S** — 4 GB, eMMC,
+NVMe-Steckplatz, Metallgehäuse, rund 4 W, für etwa 99 €. Er ist ausdrücklich *nicht*
+verworfen, aber er hängt an einer Bedingung: Ein eigenes Abbild wird er nur dann **nicht**,
+wenn das Debian dafür von **Armbian** kommt, das dessen Pflege bereits für eine große
+Nutzerbasis betreibt und ein Trixie-Abbild mit Mainline-U-Boot führt. Sobald ein Board
+stattdessen einen Herstellerkern braucht — und das gilt für alle RK3588-Boards und alle
+Router-Boards aus der OpenWrt-Ecke —, entsteht eine dritte Pflegekette, und die kostet auf
+Dauer mehr, als die zwei eingesparten Watt je wert sind. **Die Regel lautet deshalb:
+mainline oder gar nicht.** Vor einer Aufnahme in die Flotte gehört ein Gerät gekauft,
+gemessen und eine Heizperiode lang beobachtet.
+
 ### 19.2 Unterstützungsdauer
 
 - **Debian 13 „Trixie"**: volle Unterstützung bis **9. August 2028**, danach LTS bis
@@ -798,6 +811,9 @@ Abschnitt 15.3 — eine Wohnung nach der anderen, mit der Pilotwohnung zuerst.
 - udev-Regel für den Zigbee-Stick, damit er immer unter demselben Namen erscheint und nicht
   einmal `ttyUSB0` und nach dem Neustart `ttyUSB1` heißt
 - WireGuard installiert, aber nicht eingerichtet
+- **ModemManager und die Firmware-Pakete für LTE-Aufsätze**, abgeschaltet vorkonfiguriert —
+  damit ein Gerät mit Mobilfunk ohne weitere Installation startet und eines ohne nichts davon
+  merkt
 - eine leere `melder-anmeldung.json` in der Startpartition
 - **kein** SSH-Passwortzugang; Schlüssel werden beim Vorbereiten hinterlegt oder gar nicht
 
@@ -999,3 +1015,221 @@ Protokolle der vier Dienste, Versionen und Digests, Container-Zustände, Speiche
 Plattenbelegung, Zigbee-Netzzustand, die letzten Regelentscheidungen — maskiert, gepackt,
 hochgeladen. In den allermeisten Fällen beantwortet das die Frage, wegen der man sich
 einloggen wollte, und hinterlässt dabei eine Datei, die man einem Zweiten zeigen kann.
+
+---
+
+## 22. Nachträge aus dem Bau des Gerüsts
+
+Vier Stellen, an denen das Gerüst eine Lesart wählen musste. Hier festgeschrieben, damit sie
+nicht Annahme bleiben.
+
+### 22.1 Die Schlüssel der Störungsmeldungen — am Quelltext belegt
+
+Nachgesehen in `thermoctl/app.py`, `services/publishing.py`, `domain/fault_notice.py` und
+`domain/problem_report.py`:
+
+| Art | Schlüssel | Zuordnung im Fleet-Dienst |
+|---|---|---|
+| Sensorstörung | `sensor:<zonen-id>` | Präfix `sensor:` |
+| Festhängender Messwert | `sensor:<zonen-id>` | **derselbe Schlüssel wie oben** |
+| Fenster-Alarm | `fenster:<zonen-id>` | Präfix `fenster:` |
+| Gescheiterter Schaltbefehl | `schaltbefehl:<geräte-id>` | Präfix `schaltbefehl:` |
+| Brücke oder Broker weg | `zigbee2mqtt:brücke` | fester Wert |
+| Mieter-Problemmeldung | `tenant-report:<zonen-id>:<kategorie>` | Präfix `tenant-report:` |
+
+**Der Sonderfall ist wichtig:** Sensorstörung und festhängender Messwert teilen sich
+absichtlich denselben Schlüssel — sie können nie gleichzeitig auftreten, und thermoctl bildet
+beide auf dieselbe Home-Assistant-Entität ab (Begründung im Quelltext von `fault_notice.py`).
+Der Fleet-Dienst darf daraus also **nicht** auf die Art schließen. Die Art steht im
+`titel`/`text`, und der belastbare Zustand kommt ohnehin aus dem Herzschlag
+(`offene_stoerungen[].art`). Ein unbekanntes Präfix wird als „sonstige Meldung" geführt, nie
+als Fehler.
+
+### 22.2 `seit` in der Zustandsdatei
+
+Bedeutung: **der Zeitpunkt, seit dem `gewuenscht` gilt** — also wann der Agent den neuen
+Stand eingetragen hat. Der Wächter rechnet daraus zweierlei: die 10-Minuten-Frist für die
+erste Gesundmeldung und die Stunde bis zur Bewährung (Abschnitt 17). Unix-Sekunden, ganze
+Zahl, Zeitzone spielt keine Rolle.
+
+### 22.3 Die Gesundmeldung
+
+Eine Datei unter `/run/` mit einem einzigen Unix-Zeitstempel, vom Agenten regelmäßig
+überschrieben. Der Wächter prüft nur ihr Alter: älter als **120 Sekunden** gilt als stumm.
+`/run/` mit Absicht — es liegt im Arbeitsspeicher und ist nach einem Neustart leer, sodass
+eine alte Meldung nie einen frisch gestarteten, noch nicht gesunden Agenten deckt.
+
+### 22.4 Zustandsnamen
+
+Die Tabellen in Abschnitt 20.1 sind Prosa; maschinenlesbar gelten die Schreibweisen aus
+`protokoll/bestand.py` (`erfasst`, `vorbereitet`, `gemeldet`, `im_einsatz`, `im_regal`,
+`defekt`, `ausgemustert` beziehungsweise `bewohnt`, `leer`, `im_umbau`, `stillgelegt`).
+Bei Widerspruch gilt der Code, nicht die Tabelle — die Tabelle erklärt, der Code entscheidet.
+
+---
+
+## 23. Statusanzeige am Gerät (nur Raspberry Pi)
+
+Zwei LEDs am 40-poligen Anschluss, angesteuert vom **Wächter**. Bewusst dort und nicht im
+Agenten: Der Wächter läuft, wenn die Container stehen, wenn das Netz weg ist und wenn der
+Agent gerade zurückgerollt wird. Genau dann will jemand vor Ort sehen, woran er ist.
+
+### 23.1 Ohne eine einzige Abhängigkeit
+
+Die LEDs werden **nicht** über eine GPIO-Bibliothek angesteuert, sondern über den
+Kernel-Treiber: Im Abbild-Rezept (Abschnitt 19) trägt `config.txt` zwei Einträge
+
+```
+dtoverlay=gpio-led,gpio=23,label=thermoctl-geraet
+dtoverlay=gpio-led,gpio=24,label=thermoctl-anlage
+```
+
+und der Wächter schreibt anschließend nur noch in Dateien:
+
+```
+/sys/class/leds/thermoctl-geraet/brightness
+/sys/class/leds/thermoctl-anlage/brightness
+```
+
+Damit bleibt `go.mod` leer, es wird kein `ioctl` gebaut, und die Ansteuerung ist mit `echo`
+von Hand nachstellbar — was beim Suchen eines Fehlers mehr wert ist als jede Bibliothek.
+Blinkmuster über den Kernel-Trigger `timer` (`delay_on`/`delay_off`), damit der Wächter dafür
+keine eigene Schleife braucht.
+
+### 23.2 Was die beiden LEDs sagen
+
+**LED 1 — das Gerät** (grün):
+
+| Muster | Bedeutung |
+|---|---|
+| aus | kein Strom, oder der Wächter läuft nicht |
+| langsames Blinken | Start, oder Agent noch nicht gesund |
+| dauerhaft an | Agent gesund, Kontakt zur Cloud steht |
+| schnelles Blinken | wartet auf Zuordnung (Prüfziffer, Abschnitt 15.3) |
+| zweimal kurz, Pause | kein Kontakt zur Cloud — Regelung läuft trotzdem |
+
+**LED 2 — die Anlage** (gelb):
+
+| Muster | Bedeutung |
+|---|---|
+| aus | thermoctl regelt normal, keine offene Störung |
+| langsames Blinken | offene Störung (Fühler, Brücke, Schaltbefehl) |
+| dauerhaft an | **Regelung steht** — seit über drei Zyklen keine Entscheidung |
+
+Die Ausgangslage ist damit: **grün an, gelb aus.** Ein Blick genügt, auch von der Leiter aus,
+und er funktioniert ohne Netz, ohne Telefon und ohne Anmeldung.
+
+### 23.3 Grenzen und Einbauort
+
+- **Nur am Raspberry Pi.** Ein Mini-PC hat keinen solchen Anschluss. Der Wächter prüft beim
+  Start, ob die beiden Dateien existieren, und arbeitet ohne sie unverändert weiter — eine
+  fehlende Anzeige ist kein Fehler und darf nichts blockieren.
+- **In den Verteilerkasten, nicht in den Wohnraum.** Eine blinkende gelbe Leuchte in der
+  Diele erzeugt Anrufe, lange bevor jemand etwas merken würde — und Störungen gehen ohnehin
+  an Sie, nicht an den Mieter.
+- **Kein Ersatz für die Überwachung.** Die LED sieht nur, wer davorsteht. Sie ist die Anzeige
+  für den, der hinfährt, nicht die Meldung an den, der entscheidet, ob jemand hinfährt.
+- **Der Anschluss wird geteilt.** Steckt in der Wohnung ein LTE-Aufsatz (Abschnitt 23.4),
+  belegt der denselben 40-poligen Anschluss. Beides zusammen geht nur mit einer Stapelleiste,
+  und die LED-Pins müssen auf freie Leitungen gelegt werden. Vor dem Einkauf einmal prüfen,
+  welche Leitungen der gewählte Aufsatz wirklich belegt — die Datenblätter schweigen dazu
+  gern.
+
+### 23.4 Mobilfunk am Raspberry Pi: Aufsatz statt zweitem Gerät
+
+Wo die Wohnung über Mobilfunk angebunden wird, braucht ein Raspberry Pi **keinen eigenen
+LTE-Router**: Ein Aufsatz mit SIM- oder eSIM-Steckplatz sitzt auf demselben Anschluss, im
+selben Gehäuse, am selben Netzteil. Das spart nicht nur rund zehn Euro, sondern vor allem
+ein Gerät, das ausfallen, abgezogen oder vergessen werden kann. Ein Mini-PC oder ein fertiges
+Set hat diesen Anschluss nicht und braucht weiterhin den Router.
+
+Vier Punkte, die dabei zählen:
+
+- **Antenne nach außen.** Im Heizungsverteiler aus Blech ist der Empfang am schlechtesten —
+  ausgerechnet dort, wo das Gerät steht. Eine Antenne mit Kabel gehört zum Aufsatz dazu, kein
+  Zubehör für später.
+- **Spitzenstrom beim Senden.** Ein Funkmodul zieht beim Verbindungsaufbau kurzzeitig
+  deutlich mehr, als ein knapp bemessenes Netzteil liefert. Das Ergebnis sind Neustarts, die
+  aussehen wie ein Softwarefehler. Netzteil großzügig wählen.
+- **eSIM nicht im Aufsatz suchen, sondern im Kartenschacht.** Die Recherche vom
+  22.09.2026 hat keinen LTE-Aufsatz dieser Klasse mit fest verlötetem eUICC gefunden
+  (Waveshare SIM7670G und SIM7600-Reihe, Sixfab Base HAT — alle nur Kartenschacht oder
+  mPCIe). Der Weg zur eSIM führt über eine **eUICC-Karte im Nano-SIM-Format**, etwa
+  sysmoEUICC1-C2G für 23,80 €. Das ist kein Kompromiss, sondern besser: Eine Karte lässt
+  sich beim Gerätetausch umstecken, ein verlöteter Chip nicht — und Betreiber geben
+  Profile üblicherweise nur einmal aus. Ablauf und Befehle: Abschnitt 24.
+- **Ethernet bleibt frei, WLAN bleibt aus.** Das ist ein stiller Nebengewinn: Ohne WLAN
+  entfällt die Funkkollision mit Zigbee auf 2,4 GHz vollständig.
+
+---
+
+## 24. eSIM-Profile aus der Ferne verwalten
+
+Nachgetragen am 22.09.2026. Betrifft nur Wohnungen an der Mobilfunk-Variante.
+
+### 24.1 Warum das hierher gehört
+
+Eine SIM-Karte in zwölf Wohnungen zu tauschen heißt zwölf Termine. Ein Anbieterwechsel,
+eine Wohnung mit schlechtem Empfang im Netz des einen und gutem im Netz des anderen, ein
+Tarif, der ausläuft — jedes Mal Pinzette und Klingeln. Mit einer eUICC-Karte im
+Kartenschacht wird daraus ein Befehl, und Befehle sind genau das, was dieser Dienst kann.
+
+### 24.2 Die Teile
+
+| Teil | Was es tut |
+|---|---|
+| **eUICC-Karte** (z. B. sysmoEUICC1-C2G, 23,80 €) | Steckt im Nano-SIM-Schacht des Aufsatzes. Nimmt mehrere Betreiberprofile auf, eines davon aktiv. GSMA-zertifiziert nach SGP.22. |
+| **lpac** (`estkme-group/lpac`, quelloffen) | Local Profile Assistant. Spricht über den AT-Kanal des Modems mit der Karte: auflisten, laden, umschalten, löschen. |
+| **Melder** | Kennt die Befehle, ruft lpac auf, berichtet das Ergebnis. Hält kein einziges Profil selbst. |
+| **Wächter** | Hat den Rückfall. Meldet sich das Gerät nach einem Profilwechsel nicht, stellt er das vorherige Profil wieder her. |
+
+Die **EID** der Karte gehört in den Gerätebestand (Abschnitt 20), neben Seriennummer und
+Kennung. Ohne sie lässt sich bei manchen Betreibern kein Profil bestellen.
+
+### 24.3 Befehle
+
+Stufe 2, also erst nach Betriebserfahrung, und mit denselben Regeln wie alle anderen
+(Kennung, Verfallszeit, lokales Protokoll, Ergebnismeldung):
+
+| Befehl | Wirkung | Auflage |
+|---|---|---|
+| `esim_profile_auflisten` | Profile der Karte mit Kennung, Name und Zustand melden | keins, nur lesend |
+| `esim_profil_laden` | Profil über Aktivierungscode (`LPA:1$…`) herunterladen, **ohne** es zu aktivieren | Nur eine Wohnung gleichzeitig. Der Aktivierungscode wird nach der Ausführung aus dem Befehlssatz gelöscht und steht nie im Protokoll. |
+| `esim_profil_aktivieren` | Auf ein bereits geladenes Profil umschalten | **Nur mit Rückfalluhr**, siehe unten |
+| `esim_profil_loeschen` | Profil von der Karte entfernen | Niemals das aktive Profil. Ablehnung, wenn es das einzige geladene ist. |
+
+**Nie:** Profile ohne vorherigen Download aktivieren, die Karte zurücksetzen, den
+Aktivierungscode an die Cloud zurückmelden.
+
+### 24.4 Die Rückfalluhr — der eigentliche Punkt
+
+Ein Profilwechsel kappt genau die Verbindung, über die der Befehl kam. Das ist der Grund,
+warum dieser Befehl ohne Rückfall nicht existieren darf:
+
+1. Melder schreibt das aktuell aktive Profil in die Zustandsdatei des Wächters und setzt
+   eine Frist von **zehn Minuten**.
+2. Melder aktiviert das neue Profil. Das Modem meldet sich neu am Netz an.
+3. Kommt innerhalb der Frist ein bestätigter Herzschlag durch, löscht der Melder die Frist.
+   Fertig.
+4. Läuft die Frist ab, schaltet **der Wächter** — nicht der Melder — auf das vorherige
+   Profil zurück und vermerkt das lokal. Beim nächsten Herzschlag erfährt die Cloud, dass
+   der Wechsel fehlgeschlagen ist.
+
+Das ist dieselbe Aufteilung wie bei den Aktualisierungen: *Was zurückrollt, darf nicht das
+sein, was sich ändert.* Der Wächter braucht dafür nichts zu verstehen — er ruft lpac mit
+einer Profilkennung auf, die in der Zustandsdatei steht.
+
+### 24.5 Grenzen, ehrlich benannt
+
+- **Einmal muss jemand hin.** Die Karte steckt beim Aufbau jemand ein. Ferngesteuert ist
+  alles danach, nicht der erste Schritt.
+- **Für den Download braucht es Netz.** Ein neues Profil lädt über die bestehende
+  Verbindung. Ist die Wohnung schon offline, hilft die eSIM nicht — dafür ist sie nicht da.
+  Vorbereiten lässt sich das im Lager über LAN.
+- **Betreiber dürfen zicken.** Profile sind bei den Endkundentarifen häufig nur *einmal*
+  ausgebbar, und einzelne Tarife sind an Gerätelisten gebunden. Bei o2 ist beides
+  dokumentiert. Vor der Bestellung für alle Wohnungen gehört **eine** Karte an **einem**
+  Gerät durchgespielt.
+- **Nicht erprobt.** Der Weg ist aus den Spezifikationen und der Werkzeuglage abgeleitet,
+  nicht an einem laufenden Vertrag. Bis das jemand einmal gemacht hat, ist dieser Abschnitt
+  ein Plan und kein Erfahrungsbericht.
