@@ -2,6 +2,61 @@
 
 Letzte Aktualisierung: 2026-09-24.
 
+## Sechs bisher offene Punkte vom Projektinhaber entschieden
+
+Sechs Lücken, zu denen die Spezifikation bisher schwieg, sind jetzt entschieden
+und in `docs/spezifikation.md` nachgezogen (Abschnitt 17, 19, 20, 22.1-22.4,
+24.4):
+
+1. **Rückfall ohne bewährten Stand.** Beim Bau des Systemabbilds wird der
+   Digest der mitgelieferten Fassung fest in die Zustandsdatei eingetragen und
+   gilt ab dem ersten Start als `bewaehrt` (neuer Abschnitt „Rückfall ohne
+   bewährten Stand" in Abschnitt 17, Bullet in 19.3). `waechter/wache.go::
+   AufBewaehrtZuruecksetzen` meldet ein leeres `Bewaehrt` jetzt als Zeichen
+   einer **fehlerhaften Auslieferung**, nicht mehr als ungeklärten Sonderfall.
+2. **Bedeutung von `seit`:** der Zeitpunkt, seit dem `gewuenscht` gilt --
+   bereits in Abschnitt 22.2 dokumentiert, jetzt ausdrücklich als
+   nachträgliche Festlegung markiert (einzige Lesart, mit der das Feld den
+   Rückfall überhaupt steuern kann), in `waechter/zustand.go` und
+   `agent/schleife.py` nachgezogen.
+3. **Zustandsnamen englisch.** `WohnungZustand` und `GeraetLebenszyklus` in
+   `protokoll/bestand.py` tragen jetzt englische Werte (`occupied`,
+   `in_service`, ...), Tabelle dazu in Abschnitt 20.1. Nur die Werte, nicht
+   Klassen- oder Feldnamen. `fleet/app.py`-Docstrings und Tests nachgezogen.
+4. **Einheitlicher Umschlag der Störungsereignisse.** `protokoll/ereignisse.py`
+   hat jetzt `Stoerungsereignis` (Art, Schlüssel, Zeitpunkt, Klartext) und
+   `stoerungsereignis_aus_ereignis`; die Präfixtabelle deckt jetzt vier der
+   sechs Störungsarten ab (`zigbee2mqtt:`, `tenant-report:`, `fenster:`,
+   `schaltbefehl:`) -- `sensor:` bleibt absichtlich ohne Zuordnung (Abschnitt
+   22.1, Sonderfall Sensorstörung/festhängender Messwert).
+5. **Format der Gesundmeldung.** Zeilenbasiert wie die Zustandsdatei, nicht
+   ein einzelner Zeitstempel: `zeitpunkt=`, `digest=` (der **laufende**
+   Digest), `fassung=` (Abschnitt 22.3, neu geschrieben). Umgesetzt in
+   `waechter/gesundmeldung.go`, `agent/schleife.py::gesundmeldung_melden`
+   (neu), Vertragstest `waechter/pruefe_vertrag.sh` deckt jetzt auch diesen
+   Dateityp ab.
+6. **eSIM-Rückfall.** `esim_vorheriges_profil=`/`esim_frist=` sind zwei
+   weitere Zeilen in der **bestehenden** Zustandsdatei, keine eigene Datei
+   (Abschnitt 24.4). `waechter/zustand.go` überliest unbekannte Zeilen
+   ohnehin, das Format ist dadurch erweiterbar. `agent/schleife.py::
+   waechter_zustand_melden` nimmt dafür zwei neue Schlüsselwortargumente an.
+
+Das gemeinsame Zeilenformat von Zustandsdatei und Gesundmeldung wurde beim
+Umsetzen von Punkt 5 in ein neues, geteiltes Modul `waechter/zeilendatei.go`
+gezogen (`liesSchluesselWertZeilen`, `parseOptionalerZeitstempel`) -- ohne das
+wäre `waechter/` deutlich über die 300-Zeilen-Grenze gewachsen (Gesundmeldung
+brauchte durch das neue Format ebenso viel Parsing-Code wie die
+Zustandsdatei). Produktionscode liegt jetzt bei **299 Zeilen** (sechs Dateien:
+`main.go`, `wache.go`, `zustand.go`, `gesundmeldung.go`, `statusanzeige.go`,
+`zeilendatei.go`) -- **knapp unter** der Grenze von 300, weiterhin **kein**
+Eintrag in `go.mod`. `go vet` und `go test ./...` laufen grün (25 Tests,
+vorher 19). Python-Testsuite: 60 Tests (vorher 53), Abdeckung unverändert
+**94 %** (die 6 % Lücke ist ausschließlich in den bereits vor diesem Auftrag
+unbedeckten `NotImplementedError`-Stummeln, nicht in neuem Code).
+
+**Kein Widerspruch zur Spezifikation gefunden.** Alle sechs Entscheidungen
+gingen glatt in Rezept, Zustandsdatei-Vertrag und Bestandsmodelle auf.
+
 ## Spezifikation nachgezogen, Gerüst für Abschnitt 23/24, Implementierungsplan angelegt
 
 `docs/spezifikation.md` war veraltet (1001 von inzwischen 1235 Zeilen der lokalen
@@ -26,8 +81,8 @@ der Verweis wird deshalb hier vermerkt statt im Dokument korrigiert.
 unverändert weiter. `LedMusterSetzen` ist Stummel wie die übrigen Funktionen in
 `wache.go` — welches Wächter-Ereignis welches Blinkmuster auslöst, entsteht mit
 `wache.go` selbst (siehe `docs/implementierungsplan.md`, P5.7). Produktionscode
-liegt jetzt bei **273 Zeilen** (vorher 226, Grenze 300), weiterhin **kein**
-Eintrag in `go.mod`. `go vet` und `go test ./...` laufen grün (19 Tests).
+lag danach bei 273 Zeilen (vorher 226, Grenze 300) -- siehe oben für den
+aktuellen Stand (299 Zeilen, sechs Dateien) nach den sechs Nachträgen.
 
 **Gerüst für Abschnitt 24 (eSIM):** Vier neue Stummel in `agent/schleife.py`
 (`esim_profile_auflisten`, `esim_profil_laden`, `esim_profil_aktivieren`,
@@ -39,16 +94,9 @@ kappt die Verbindung, über die der Befehl kam, der Rückfall liegt deshalb beim
 **Wächter**, nicht beim Melder — dieselbe Aufteilung wie beim
 Sollzustandsabgleich, nur mit einem SIM-Profil statt einem Container-Digest.
 
-**Offener Punkt, bewusst nicht entschieden:** Ob `waechter/zustand.go`
-(`gewuenscht`/`bewaehrt`/`seit`) für die Zehn-Minuten-Rückfalluhr aus 24.4 ein
-zusätzliches Feld braucht, oder ob eine eigene Datei für den
-eSIM-Rückfall entsteht, ist offen. Das Dateiformat ist ein sprachübergreifender
-Vertrag mit eigenem Test (`waechter/pruefe_vertrag.sh`) — dieses Gerüst ändert es
-deshalb nicht auf Verdacht. Vor der Umsetzung von P5.7/eSIM-Paketen (siehe
-`docs/implementierungsplan.md`) mit dem Projektinhaber klären: entweder das
-Zustandsdateiformat um ein Feld erweitern (dann `zustand.go`, `zustand_test.go`
-und `waechter_zustand_melden` in `agent/schleife.py` gemeinsam anpassen) oder
-eine zweite, eigene Zustandsdatei nur für den SIM-Rückfall einführen.
+**Rückfalluhr entschieden** (siehe „Sechs bisher offene Punkte" oben, Punkt 6):
+`esim_vorheriges_profil=`/`esim_frist=` als zwei weitere Zeilen in der
+bestehenden Zustandsdatei, keine eigene Datei.
 
 **Neu:** `docs/implementierungsplan.md` — Arbeitspakete in der Reihenfolge aus
 Abschnitt 11, je Paket einen Auftrag mit eigenem Worktree groß, mit
@@ -100,9 +148,10 @@ unverändert**, wie in Abschnitt 18.3 gefordert.
 - Statisch gebaut (`CGO_ENABLED=0`), geprüft für `linux/arm64` und
   `linux/amd64` (lokal cross-kompiliert und mit `file` bestätigt).
 - Produktionscode (`main.go`, `zustand.go`, `gesundmeldung.go`, `wache.go`,
-  `statusanzeige.go`, ohne Tests) liegt bei **273 Zeilen** -- weiterhin unter
-  der Grenze von 300 (vorher 226, vor Abschnitt 23 gemessen).
-- `go vet` und `go test ./...` laufen grün (19 Tests, siehe Testergebnisse
+  `statusanzeige.go`, `zeilendatei.go`, ohne Tests) liegt bei **299 Zeilen**
+  -- knapp unter der Grenze von 300 (226 vor Abschnitt 23, 273 danach, siehe
+  „Sechs bisher offene Punkte" oben für den Sprung auf 299).
+- `go vet` und `go test ./...` laufen grün (25 Tests, siehe Testergebnisse
   unten).
 
 **Der sprachübergreifende Vertragstest** (`waechter/pruefe_vertrag.sh`, Abschnitt
@@ -141,13 +190,9 @@ Gerät gehört zu höchstens einer Wohnung, keine Freigabe ohne bestätigte
 Prüfziffer) sind **nirgends erzwungen** -- das ist Anwendungslogik, die bei der
 echten Umsetzung in jeden betroffenen Endpunkt muss, nicht nur in einen.
 
-**Offener Punkt:** Die Zustandsnamen (`WohnungZustand`, `GeraetLebenszyklus`)
-stehen in der Spezifikation nur als deutsche Prosa in einer Tabelle, nicht als
-maschinenlesbare Werte wie bei `Stoerungsart` (Abschnitt 5). Die
-Schreibweisen in `protokoll/bestand.py` (`im_umbau`, `im_einsatz`, `im_regal`,
-...) sind eine **Wahl dieses Gerüsts**, keine wörtliche Übernahme -- vor der
-echten Umsetzung mit dem Projektinhaber absichern, falls eine Oberfläche oder
-ein externes System bereits eigene Bezeichner erwartet.
+**Zustandsnamen entschieden** (siehe „Sechs bisher offene Punkte" oben, Punkt
+3): `WohnungZustand` und `GeraetLebenszyklus` tragen jetzt englische Werte,
+mit Tabelle in Abschnitt 20.1 -- wie bei `Stoerungsart` (Abschnitt 5).
 
 ## Aus der Ferne zurücksetzen, neu bespielen, hineinsehen (Abschnitt 21)
 
@@ -194,23 +239,6 @@ Mender oder swupdate, falls sich das später doch lohnt.
   Konsolenbefehl (siehe dessen README): die versteckte Markerdatei unter
   `.venv/bin` wird beim Start übersprungen. `python -m pytest` funktioniert
   zuverlässig und ist deshalb überall hier so dokumentiert.
-- **Wächter-Rollback ohne bewährten Stand.** `waechter/wache.go::AufBewaehrtZuruecksetzen`
-  setzt einen gesetzten `Bewaehrt`-Digest voraus. Was bei einem frisch
-  eingerichteten Gerät passiert, dessen erste Fassung fehlschlägt (noch kein
-  bewährter Stand vorhanden), behandelt die Spezifikation nicht — vor der
-  Umsetzung klären.
-- **Bedeutung von `seit` in der Zustandsdatei nicht abschließend belegt.** Die
-  Spezifikation zeigt das Feld nur an einem Beispiel. `waechter/zustand.go`
-  behandelt es als "Zeitpunkt, seit dem `gewuenscht` gilt" -- eine plausible,
-  aber nicht wörtlich bestätigte Lesart; vor der Umsetzung von `wache.go`
-  (das Feld tatsächlich auswertet) mit dem Projektinhaber absichern.
-- **Gesundmeldungs-Dateiformat nicht wörtlich festgelegt.** Abschnitt 17 sagt nur
-  "eine Gesundmeldung in eine lokale Datei schreiben", ohne Format. Hier in
-  Konsistenz mit der Zustandsdatei als einzelner Unix-Zeitstempel gewählt
-  (`waechter/gesundmeldung.go`) -- eine Annahme, keine Festlegung.
-- **`/v1/ereignisse/{wohnung}` hat kein festgelegtes Nutzlastschema für vier der
-  sechs Störungsarten.** Siehe `protokoll/ereignisse.py`: nur `zigbee2mqtt:` und
-  `tenant-report:` sind als Präfixe belegt.
 - **`abbild/`-Paketliste und udev-Regel sind Platzhalter.** Insbesondere die
   USB-IDs in `abbild/gemeinsam/udev/99-zigbee-stick.rules` müssen vor dem
   echten Bau durch die IDs des tatsächlich beschafften Funksticks ersetzt
