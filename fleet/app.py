@@ -21,8 +21,9 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -36,6 +37,7 @@ from protocol import (
     Heartbeat,
     RegistrationConfirmation,
 )
+from protocol.heartbeat import MAX_CATCH_UP_HEARTBEATS
 from protocol.inventory import Device
 from protocol.version import PROTOCOL_VERSION
 
@@ -134,12 +136,10 @@ def receive_heartbeat(
     decided here -- see `Storage.get_latest_heartbeat`.
 
     Still missing (not part of this package): gap detection for caught-up
-    heartbeats (section 5, "The cloud detects gaps by the timestamp") and the
-    batch format for catch-up delivery itself, which is not yet defined (see
-    docs/STATUS.md) -- both belong with P2.3 (the agent side that would send
-    a batch) rather than this single-heartbeat endpoint. Evaluation of the
-    alarm rules (section 8) is P2.2, layered on top of the storage done here,
-    not part of it.
+    heartbeats (section 5, "The cloud detects gaps by the timestamp") -- the
+    batch format itself is now defined, see `receive_heartbeats_batch`
+    (`POST /v1/heartbeats`, P2.1b). Evaluation of the alarm rules (section 8)
+    is P2.2, layered on top of the storage done here, not part of it.
     """
 
     if authenticated_apartment != heartbeat.apartment:
@@ -149,6 +149,55 @@ def receive_heartbeat(
         )
 
     storage.save_heartbeat(authenticated_apartment, heartbeat, datetime.now(UTC))
+
+
+@app.post("/v1/heartbeats", status_code=204)
+def receive_heartbeats_batch(
+    heartbeats: Annotated[
+        list[Heartbeat], Body(min_length=1, max_length=MAX_CATCH_UP_HEARTBEATS)
+    ],
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> None:
+    """Accepts a catch-up batch of buffered heartbeats after an outage
+    (P2.1b, section 11 step 2; section 5).
+
+    Additive per section 18.2 ("a field may only ever be added") applied to
+    the endpoint surface, not just to a model: `POST /v1/heartbeat` (P2.1)
+    stays exactly as it was, unchanged by this endpoint's existence -- this
+    is a **new**, separate path for the batch case (project owner decision,
+    2026-09-24), not a widened body accepted by the singular endpoint.
+
+    The body is a plain JSON list of `Heartbeat`, at least 1 and at most
+    `MAX_CATCH_UP_HEARTBEATS` (240, section 5: "at most the last 240, i.e.
+    eight hours") entries -- more than that is a 422, enforced structurally
+    by `Body(max_length=...)`, not by application code.
+
+    The same token check as `POST /v1/heartbeat` (`require_apartment_token_by_hash`,
+    P1.1), but applied to **every** entry in the batch: if any heartbeat in
+    the list names an apartment other than `authenticated_apartment`, the
+    whole request is a 403 and nothing from the batch is stored -- this
+    check runs before `Storage.save_heartbeats_batch` is ever called, so
+    there is no partial write to roll back for this case; the storage layer
+    itself is transactional for the remaining "batch resent"/"batch
+    overlaps a live-received entry" idempotency cases (see
+    `Storage.save_heartbeats_batch`'s own docstring for how duplicates
+    -- keyed on `sent_at` per apartment -- are skipped, not re-inserted).
+
+    All entries in one batch are stored with the **same** receipt time
+    (server time in UTC, one `datetime.now(UTC)` call for the whole
+    request), mirroring P2.1/P1.2's "receipt time is server time" -- not a
+    per-entry receipt time, since the whole point of a catch-up batch is
+    that it arrives together, late, after an outage.
+    """
+
+    if any(heartbeat.apartment != authenticated_apartment for heartbeat in heartbeats):
+        raise HTTPException(
+            status_code=403,
+            detail="Token is not authorized for the reported apartment.",
+        )
+
+    storage.save_heartbeats_batch(authenticated_apartment, heartbeats, datetime.now(UTC))
 
 
 @app.post("/v1/events/{apartment}", status_code=204)

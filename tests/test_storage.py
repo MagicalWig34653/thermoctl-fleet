@@ -13,8 +13,9 @@ as a real-looking example value").
 from __future__ import annotations
 
 import secrets
+import threading
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from alembic.autogenerate import compare_metadata
@@ -160,8 +161,14 @@ def test_heartbeats_are_read_back_oldest_first(storage: Storage) -> None:
     older = datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC)
     newer = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
 
-    storage.save_heartbeat("house7-a03", _make_heartbeat(), newer)
-    storage.save_heartbeat("house7-a03", _make_heartbeat(), older)
+    # Distinct `sent_at` per call -- see the comment in
+    # test_get_latest_heartbeat_returns_the_most_recently_received_one.
+    storage.save_heartbeat(
+        "house7-a03", _make_heartbeat().model_copy(update={"sent_at": newer}), newer
+    )
+    storage.save_heartbeat(
+        "house7-a03", _make_heartbeat().model_copy(update={"sent_at": older}), older
+    )
 
     read_back_times = [record.received_at for record in _raw_heartbeat_rows(storage)]
     assert read_back_times == sorted(read_back_times)
@@ -194,11 +201,21 @@ def test_get_latest_heartbeat_returns_the_most_recently_received_one(
     older = datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC)
     newer = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
 
-    storage.save_heartbeat("house7-a03", _make_heartbeat(), older)
-    storage.save_heartbeat("house7-a03", _make_heartbeat(), newer)
-    # Saved last, but with an earlier receipt time than either of the above.
+    # Distinct `sent_at` per call (P2.1b review: `save_heartbeat` now ignores
+    # a repeated `sent_at` for the same apartment instead of inserting a
+    # second row -- see the unique index in `0003_heartbeats_unique_sent_at.py`).
     storage.save_heartbeat(
-        "house7-a03", _make_heartbeat(), datetime(2026, 9, 22, 9, 0, 0, tzinfo=UTC)
+        "house7-a03", _make_heartbeat().model_copy(update={"sent_at": older}), older
+    )
+    storage.save_heartbeat(
+        "house7-a03", _make_heartbeat().model_copy(update={"sent_at": newer}), newer
+    )
+    # Saved last, but with an earlier receipt time than either of the above.
+    third_sent_at = datetime(2026, 9, 22, 8, 0, 0, tzinfo=UTC)
+    storage.save_heartbeat(
+        "house7-a03",
+        _make_heartbeat().model_copy(update={"sent_at": third_sent_at}),
+        datetime(2026, 9, 22, 9, 0, 0, tzinfo=UTC),
     )
 
     latest = storage.get_latest_heartbeat("house7-a03")
@@ -214,23 +231,249 @@ def test_get_latest_heartbeat_outdated_flag_lower_equal_higher(
 
     monkeypatch.setattr(storage_module, "PROTOCOL_VERSION", 5)
 
-    lower = _make_heartbeat().model_copy(update={"protocol_version": 4})
+    # Distinct `sent_at` per call -- see the comment in
+    # test_get_latest_heartbeat_returns_the_most_recently_received_one.
+    lower = _make_heartbeat().model_copy(
+        update={"protocol_version": 4, "sent_at": datetime(2026, 9, 21, tzinfo=UTC)}
+    )
     storage.save_heartbeat("house7-a03", lower, datetime(2026, 9, 22, tzinfo=UTC))
     latest = storage.get_latest_heartbeat("house7-a03")
     assert latest is not None
     assert latest.outdated is True
 
-    equal = lower.model_copy(update={"protocol_version": 5})
+    equal = lower.model_copy(
+        update={"protocol_version": 5, "sent_at": datetime(2026, 9, 22, tzinfo=UTC)}
+    )
     storage.save_heartbeat("house7-a03", equal, datetime(2026, 9, 23, tzinfo=UTC))
     latest = storage.get_latest_heartbeat("house7-a03")
     assert latest is not None
     assert latest.outdated is False
 
-    higher = lower.model_copy(update={"protocol_version": 6})
+    higher = lower.model_copy(
+        update={"protocol_version": 6, "sent_at": datetime(2026, 9, 23, tzinfo=UTC)}
+    )
     storage.save_heartbeat("house7-a03", higher, datetime(2026, 9, 24, tzinfo=UTC))
     latest = storage.get_latest_heartbeat("house7-a03")
     assert latest is not None
     assert latest.outdated is False
+
+
+# -----------------------------------------------------------------------------
+# Storage.save_heartbeats_batch (P2.1b, section 5) -- catch-up batches, plus
+# the get_latest_heartbeat tie-break fix from the P2.1 review.
+# -----------------------------------------------------------------------------
+
+
+def _batch_heartbeats(count: int, apartment: str = "house7-a03") -> list[Heartbeat]:
+    base = datetime(2026, 9, 22, 0, 0, 0, tzinfo=UTC)
+    return [
+        _make_heartbeat(apartment).model_copy(update={"sent_at": base + timedelta(minutes=2 * i)})
+        for i in range(count)
+    ]
+
+
+def test_get_latest_heartbeat_tie_break_shared_received_at_newest_sent_at_wins(
+    storage: Storage,
+) -> None:
+    """A batch (`save_heartbeats_batch`) stores many rows with an identical
+    `received_at` -- the receipt time of the whole batch. Ordering by
+    `received_at` alone leaves the pick undefined; the newest `sent_at`
+    within that tie must win deterministically (P2.1 review)."""
+
+    shared_received_at = datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC)
+    batch = _batch_heartbeats(3)
+
+    storage.save_heartbeats_batch("house7-a03", batch, shared_received_at)
+
+    latest = storage.get_latest_heartbeat("house7-a03")
+    assert latest is not None
+    assert latest.heartbeat.sent_at == max(hb.sent_at for hb in batch)
+
+
+def test_save_heartbeats_batch_stores_all_entries_with_the_same_received_at(
+    storage: Storage,
+) -> None:
+    received_at = datetime(2026, 9, 22, 11, 0, 0, tzinfo=UTC)
+    batch = _batch_heartbeats(5)
+
+    storage.save_heartbeats_batch("house7-a03", batch, received_at)
+
+    rows = _raw_heartbeat_rows(storage)
+    assert len(rows) == 5
+    assert {row.received_at for row in rows} == {received_at.replace(tzinfo=None)}
+
+
+def test_save_heartbeats_batch_resent_does_not_duplicate(storage: Storage) -> None:
+    batch = _batch_heartbeats(4)
+
+    storage.save_heartbeats_batch(
+        "house7-a03", batch, datetime(2026, 9, 22, tzinfo=UTC)
+    )
+    storage.save_heartbeats_batch(
+        "house7-a03", batch, datetime(2026, 9, 23, tzinfo=UTC)
+    )
+
+    assert len(storage.list_heartbeats("house7-a03")) == 4
+
+
+def test_save_heartbeats_batch_skips_entry_already_stored_live(storage: Storage) -> None:
+    live = _make_heartbeat().model_copy(
+        update={"sent_at": datetime(2026, 9, 22, 6, 0, 0, tzinfo=UTC)}
+    )
+    storage.save_heartbeat("house7-a03", live, datetime(2026, 9, 22, 6, 0, 5, tzinfo=UTC))
+
+    batch = [live, *_batch_heartbeats(3)]
+    storage.save_heartbeats_batch(
+        "house7-a03", batch, datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+    )
+
+    stored = storage.list_heartbeats("house7-a03")
+    assert len(stored) == 4
+    assert len({hb.sent_at for hb in stored}) == 4
+
+
+def test_save_heartbeats_batch_empty_list_is_a_no_op(storage: Storage) -> None:
+    """The endpoint (`fleet/app.py`) already rejects an empty batch with a
+    422 before this is ever called, but `Storage.save_heartbeats_batch`
+    itself must not error on an empty list either -- it is a plain no-op."""
+
+    storage.save_heartbeats_batch("house7-a03", [], datetime(2026, 9, 22, tzinfo=UTC))
+
+    assert storage.list_heartbeats("house7-a03") == []
+
+
+def test_save_heartbeats_batch_does_not_mix_apartments(storage: Storage) -> None:
+    storage.save_heartbeats_batch(
+        "house7-a03", _batch_heartbeats(2, "house7-a03"), datetime(2026, 9, 22, tzinfo=UTC)
+    )
+    storage.save_heartbeats_batch(
+        "house7-a04", _batch_heartbeats(2, "house7-a04"), datetime(2026, 9, 22, tzinfo=UTC)
+    )
+
+    assert len(storage.list_heartbeats("house7-a03")) == 2
+    assert len(storage.list_heartbeats("house7-a04")) == 2
+
+
+def test_get_latest_heartbeat_outdated_flag_correct_for_batch_stored_latest(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The outdated flag (section 18.2) is derived correctly for the entry a
+    batch insert makes "latest", not just for a single-heartbeat insert."""
+
+    monkeypatch.setattr(storage_module, "PROTOCOL_VERSION", 5)
+
+    batch = _batch_heartbeats(3)
+    newest_sent_at = max(hb.sent_at for hb in batch)
+    batch = [
+        hb.model_copy(update={"protocol_version": 4 if hb.sent_at == newest_sent_at else 5})
+        for hb in batch
+    ]
+
+    storage.save_heartbeats_batch(
+        "house7-a03", batch, datetime(2026, 9, 22, tzinfo=UTC)
+    )
+
+    latest = storage.get_latest_heartbeat("house7-a03")
+    assert latest is not None
+    assert latest.heartbeat.sent_at == newest_sent_at
+    assert latest.outdated is True
+
+
+def test_save_heartbeat_duplicate_sent_at_is_ignored_not_an_error(storage: Storage) -> None:
+    """P2.1b review: `save_heartbeat` must not raise (e.g. an unhandled
+    `IntegrityError`) when the same apartment reports the same `sent_at`
+    twice live -- the second call is a silent no-op, consistent with how
+    `save_heartbeats_batch` treats the same case."""
+
+    heartbeat = _make_heartbeat()
+
+    storage.save_heartbeat("house7-a03", heartbeat, datetime(2026, 9, 22, tzinfo=UTC))
+    storage.save_heartbeat("house7-a03", heartbeat, datetime(2026, 9, 23, tzinfo=UTC))
+
+    stored = storage.list_heartbeats("house7-a03")
+    assert len(stored) == 1
+
+
+# -----------------------------------------------------------------------------
+# Migration 0003: unique index on heartbeats(apartment_id, sent_at)
+# (P2.1b review)
+# -----------------------------------------------------------------------------
+
+
+def test_migration_0003_creates_a_unique_index_on_apartment_and_sent_at(
+    tmp_path: object,
+) -> None:
+    url = _database_url(tmp_path)
+
+    upgrade(url)
+
+    engine = create_storage(url).engine
+    indexes = inspect(engine).get_indexes("heartbeats")
+    matching = [
+        index
+        for index in indexes
+        if index["unique"] and list(index["column_names"]) == ["apartment_id", "sent_at"]
+    ]
+    assert len(matching) == 1
+
+
+def test_migration_0003_downgrade_removes_the_index_upgrade_restores_it(
+    tmp_path: object,
+) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_storage(url).engine
+
+    downgrade(url, "0002")
+    indexes_after_downgrade = inspect(engine).get_indexes("heartbeats")
+    assert all(
+        list(index["column_names"]) != ["apartment_id", "sent_at"]
+        for index in indexes_after_downgrade
+    )
+
+    upgrade(url)
+    indexes_after_upgrade = inspect(engine).get_indexes("heartbeats")
+    assert any(
+        index["unique"] and list(index["column_names"]) == ["apartment_id", "sent_at"]
+        for index in indexes_after_upgrade
+    )
+
+
+def test_save_heartbeats_batch_is_safe_under_concurrent_overlapping_batches(
+    tmp_path: object,
+) -> None:
+    """P2.1b review: cross-review reproduced a duplicate-row race by running
+    8 threads that each call `Storage.save_heartbeats_batch` concurrently
+    with the *same* 20-entry batch against a real, migrated SQLite database
+    -- the original SELECT-then-INSERT idempotency check stored 160 rows,
+    not 20, with no exception raised. The fix (a DB-level `INSERT ... ON
+    CONFLICT DO NOTHING` against the unique index from this migration) must
+    leave exactly one row per `sent_at`, from separate threads/sessions, no
+    exception."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    batch = _batch_heartbeats(20)
+    received_at = datetime(2026, 9, 22, tzinfo=UTC)
+    errors: list[BaseException] = []
+
+    def _post_batch() -> None:
+        try:
+            storage.save_heartbeats_batch("house7-a03", batch, received_at)
+        except BaseException as exc:  # noqa: BLE001 -- captured to fail the test explicitly
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_post_batch) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    stored = storage.list_heartbeats("house7-a03")
+    assert len(stored) == 20
+    assert len({hb.sent_at for hb in stored}) == 20
 
 
 def test_event_can_be_written_and_read_back_with_derived_fault_kind(storage: Storage) -> None:

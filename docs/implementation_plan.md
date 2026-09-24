@@ -73,6 +73,35 @@ parallel with all other packages of the same stage.
 - **Depends on:** P1.1, P1.3.
 - [x] done
 
+### P2.1b -- Catch-up batch endpoint `POST /v1/heartbeats`
+- **Goal:** accept a JSON list of buffered heartbeats an agent sends in one
+  batch after an outage (section 5, "the agent sends the buffered
+  heartbeats (at most the last 240, i.e. eight hours) on next contact, in
+  one batch") -- additive per section 18.2, `POST /v1/heartbeat` (P2.1)
+  stays exactly as it is. Decided by the project owner (2026-09-24): a new
+  endpoint, not a widened body on the singular one; P2.3 (the agent side
+  that would produce such a batch) is deferred (see below).
+- **Files:** `fleet/app.py::receive_heartbeats_batch` (new), `fleet/storage.py::
+  Storage.save_heartbeats_batch` (new), `protocol/heartbeat.py`
+  (`MAX_CATCH_UP_HEARTBEATS = 240`, a module constant, not a model field),
+  `fleet/migrations/versions/0003_heartbeats_unique_sent_at.py` (new,
+  added during cross-review, see below).
+- **Section:** 5, 18.2.
+- **Acceptance:** at least 1, at most 240 entries accepted, 241 rejected
+  with 422, an empty list rejected with 422; every entry must carry the
+  authenticated apartment or the whole batch is a 403 and nothing is
+  stored; a resent batch and a batch overlapping a heartbeat already
+  received live via `POST /v1/heartbeat` both do not produce duplicate
+  rows, **including under concurrent/overlapping requests for the same
+  apartment** (cross-review reproduced a duplicate-row race in a first,
+  Python-level-only idempotency check; fixed with a unique database index,
+  migration `0003`, and a dialect-native insert-or-ignore write -- see
+  `docs/STATUS.md`); `Storage.get_latest_heartbeat`'s ordering is
+  deterministic even when many rows from one batch share the same
+  `received_at` (tie broken by `sent_at` then `id`).
+- **Depends on:** P2.1.
+- [x] done
+
 ### P2.2 -- Absence alarming
 - **Goal:** if an apartment's heartbeat fails to arrive, alarm (section 8).
 - **Files:** new module for the check (background task/scheduler),
@@ -99,6 +128,9 @@ parallel with all other packages of the same stage.
   endpoint (fixture, no real service); the 240-entry buffer limit is
   demonstrated by a test.
 - **Parallel to:** P2.1, P2.2 (the other end of the line).
+- **Deferred (project owner, 2026-09-24):** until thermoctl provides
+  `/api/v1/health` and `health.read` (section 10); no response format is
+  invented in this repository.
 
 ---
 

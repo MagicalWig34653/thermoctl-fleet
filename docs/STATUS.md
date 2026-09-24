@@ -400,6 +400,150 @@ which only ever sees one heartbeat per request as things stand. Alarm
 evaluation (section 8) is P2.2, layered on top of the storage and the
 `get_latest_heartbeat`/outdated-flag machinery built here, not part of it.
 
+## Catch-up batch endpoint `POST /v1/heartbeats` (P2.1b, section 5)
+
+New, additive endpoint (project owner decision, 2026-09-24): `POST
+/v1/heartbeats` accepts a plain JSON list of `Heartbeat` for the catch-up
+case section 5 describes ("the agent sends the buffered heartbeats (at
+most the last 240, i.e. eight hours) on next contact, in one batch").
+`POST /v1/heartbeat` (P2.1) is **unchanged** -- section 18.2's "a field may
+only ever be added" is read here as extending to the endpoint surface too:
+the batch case gets its own path rather than a widened body on the
+singular one, so nothing that already depends on posting exactly one
+heartbeat has to change.
+
+**The limit is a module constant, not a model field.**
+`protocol.heartbeat.MAX_CATCH_UP_HEARTBEATS = 240`, in `protocol/heartbeat.py`
+next to `Heartbeat` itself, with a comment citing section 5 -- deliberately
+not a field on any Pydantic model (the work package's own instruction): the
+240 figure is a property of the *buffer* that produces a batch (the
+endpoint here, and the agent-side buffer P2.3 will eventually fill), not of
+a single heartbeat's wire shape. `fleet/app.py::receive_heartbeats_batch`
+enforces "at least 1, at most 240" structurally via
+`Body(min_length=1, max_length=MAX_CATCH_UP_HEARTBEATS)` -- 0 or 241+
+entries are a 422 from FastAPI/Pydantic itself, not application code, the
+same way a single malformed `Heartbeat` already was.
+
+**Auth and all-or-nothing:** the existing `require_apartment_token_by_hash`
+dependency (P1.1) identifies the apartment from the token, exactly as
+`POST /v1/heartbeat` does. Every entry in the list must then carry that
+same apartment; the check runs over the whole list, in the endpoint,
+*before* `Storage.save_heartbeats_batch` is ever called -- so a single
+mismatched entry anywhere in the batch is a 403 and **nothing** from the
+batch reaches storage, not just the offending entry. This mirrors P2.1's
+existing apartment/body cross-check for the singular endpoint, applied to
+every element of the list instead of one body.
+
+**Idempotency is enforced at the database level (revised after cross-review
+of this package's first version).** The first version of
+`Storage.save_heartbeats_batch` queried which of the batch's `sent_at`
+values were already stored for that apartment, then inserted only the
+rest, all inside one transaction -- and cross-review reproduced a race in
+exactly that check-then-insert: 8 threads calling
+`save_heartbeats_batch` concurrently with the *same* 20-entry batch against
+a real, migrated SQLite database stored **160 rows, not 20**, no exception
+raised (two overlapping requests -- a genuine concurrent catch-up, or an
+agent retry racing its own still-in-flight first attempt -- can both read
+"not yet stored" for the same `sent_at` before either write commits). The
+fix: a new migration, `0003_heartbeats_unique_sent_at.py`, adds a unique
+index on `heartbeats(apartment_id, sent_at)` (never editing `0001`/`0002`;
+`HeartbeatRecord.__table_args__` gained a matching `Index(..., unique=True)`
+so `alembic.autogenerate.compare_metadata` against `0001`-`0003` stays
+empty, still covered by `test_migrations_match_the_orm_model_exactly`). No
+data migration/dedupe step -- the migration's own docstring notes this
+repository has no production deployment yet, so there is no existing data
+that could already violate the new constraint. `Storage`'s write path
+(`_insert_heartbeats_ignoring_conflicts`) now issues one dialect-native
+`INSERT ... ON CONFLICT DO NOTHING` statement against that index (SQLite
+and PostgreSQL both support `sqlalchemy.dialects.{sqlite,postgresql}
+.insert(...).on_conflict_do_nothing(index_elements=...)` -- MariaDB is
+**not implemented**, since no MariaDB deployment exists yet: its equivalent
+would be `INSERT IGNORE` or `... ON DUPLICATE KEY UPDATE <pk>=<pk>`, a
+different SQLAlchemy API that the function's docstring documents as the
+follow-up work for whoever adds that deployment) instead of a Python-level
+check -- the database itself now decides atomically, per row, whether a
+given `(apartment_id, sent_at)` is new, so two concurrent writers can no
+longer both pass a check and then both write. `Storage.save_heartbeat` (the
+single-heartbeat path, P2.1) goes through the same function now, for
+consistency: a live heartbeat whose `sent_at` is already stored is silently
+ignored, not a 500 -- decided and tested
+(`test_save_heartbeat_duplicate_sent_at_is_ignored_not_an_error`), since a
+heartbeat is a periodic report of current state, not a command that must
+reject a repeat. `create_engine_from_url` also gained a 30s SQLite
+`timeout` (`connect_args`), so a second writer arriving while another
+transaction is still committing waits briefly instead of failing
+immediately with "database is locked" -- SQLite's default busy timeout is
+0.
+
+**Concurrency regression test:**
+`tests/test_storage.py::test_save_heartbeats_batch_is_safe_under_concurrent_overlapping_batches`
+runs 8 real threads (separate calls into the same `Storage`, each opening
+its own session) posting the same 20-entry batch concurrently against a
+real, migrated SQLite database and asserts exactly 20 rows, 20 distinct
+`sent_at` values, and no exception from any thread -- run five times in a
+row during this task with no flake. Migration-level:
+`test_migration_0003_creates_a_unique_index_on_apartment_and_sent_at` and
+`test_migration_0003_downgrade_removes_the_index_upgrade_restores_it`
+(`inspect(engine).get_indexes("heartbeats")` before/after `downgrade(url,
+"0002")` and a re-`upgrade`).
+
+**Tie-break fix for `Storage.get_latest_heartbeat` (from the P2.1 review):**
+a batch stores many rows that all share the exact same `received_at` (the
+one receipt time for the whole call) -- ordering by `received_at` alone
+left "which of those rows is `LIMIT 1`" undefined. Now ordered by
+`received_at desc, sent_at desc, id desc`: the newest-reported entry of a
+tied batch wins, with `id` as a last, fully deterministic tiebreaker.
+Covered by `tests/test_storage.py::
+test_get_latest_heartbeat_tie_break_shared_received_at_newest_sent_at_wins`
+(a batch with a shared `received_at`, asserting the row with the newest
+`sent_at` is returned) and by
+`test_get_latest_heartbeat_outdated_flag_correct_for_batch_stored_latest`
+(the outdated flag, section 18.2, derived correctly for the entry a batch
+insert makes "latest", not only for a single-heartbeat insert).
+
+**Tests:** `tests/test_fleet.py` (endpoint level, same fixtures as P1.1/P2.1):
+a batch of several stored and read back in `sent_at` order; exactly 240
+accepted; 241 → 422; an empty list → 422; one entry naming another
+apartment → 403 with nothing stored for either apartment; no token → 401
+with nothing stored; missing-token-plus-malformed-body → 401 not 422 (same
+pattern as P1.1); a resent batch → no duplicates; a batch overlapping a
+heartbeat already received live → not duplicated. `tests/test_storage.py`
+gained direct tests for `Storage.save_heartbeats_batch` (same-`received_at`
+storage, resend idempotency, overlap-with-live idempotency, apartment
+isolation, empty-list no-op) plus the two tie-break tests, the duplicate-
+live-heartbeat test, the two migration-0003 tests, and the concurrency
+regression test, all described above. Two pre-existing storage tests that
+happened to save two heartbeats for the same apartment with an identical
+`sent_at` (relying on the old, now-removed "duplicates allowed, ordered by
+`received_at`" behaviour to build their fixture data) were updated to use
+distinct `sent_at` values instead -- their actual assertions (latest-by-
+`received_at`, the outdated flag) are unchanged.
+
+Full suite: **149 tests** (up from 128), coverage **96%** (`python -m
+pytest`, addopts-scoped to `protocol`, `fleet`, `agent`, `tools`) --
+`fleet/app.py`, `fleet/auth.py`, `fleet/storage.py`, and
+`protocol/heartbeat.py` all at 100% (the two lines in `_insert_heartbeats_
+ignoring_conflicts` reachable only with an actual PostgreSQL connection, or
+an actual MariaDB one, are `# pragma: no cover` with a reason, per
+CLAUDE.md: "a line only reachable through an artificial construction");
+the remaining gap is unchanged pre-existing scaffold (`agent/loop.py`,
+`tools/check_image_config.py`) -- `ruff check .` and `mypy .` / `mypy
+protocol fleet agent tools` all clean. `watchdog/`: `go vet ./...` clean,
+`go test ./...` green (unchanged, `protocol/`'s field *names* were not
+touched, only a new module constant and a docstring sentence added),
+`watchdog/check_contract.sh` passes.
+
+**Batch format open point (P2.1's `STATUS.md` entry) is now closed** by
+this package -- `POST /v1/heartbeats`, a plain JSON list of `Heartbeat`,
+`MAX_CATCH_UP_HEARTBEATS = 240`. **Still open, explicitly out of scope
+here, not invented:** gap detection for caught-up heartbeats (section 5,
+"The cloud detects gaps by the timestamp and displays them as such") --
+this package stores the batch; *displaying* a detected gap is a UI concern
+that belongs with P3.2 (the apartment detail view), not this endpoint.
+P2.3 (the agent side that would produce a batch to send here) stays
+deferred, see the note in `docs/implementation_plan.md` under P2.3 and the
+"Decisions by the project owner" note carried by this task.
+
 ## Accept and store fault events (P1.2, sections 6, 8, 18.1, 22.1)
 
 `fleet/app.py::receive_event` is implemented: after the existing P1.1 token
