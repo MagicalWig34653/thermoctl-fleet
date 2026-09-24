@@ -14,6 +14,8 @@ on:
       - "protocol/registration.py"
       - "tools/check_image_config.py"
       - ".github/workflows/image.yml"
+  # Manual run for a specific commit, e.g. to confirm a merge commit on main.
+  workflow_dispatch:
 
 # For now ONLY a buildability check: read the configuration, validate the
 # package list (image/README.md, "State of this scaffold"). No real pi-gen
