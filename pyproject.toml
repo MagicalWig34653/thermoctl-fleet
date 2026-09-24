@@ -16,6 +16,11 @@ fleet = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "sse-starlette>=2.1",
+    # Storage layer (P1.3): SQLAlchemy + Alembic migrations, cloud side only --
+    # the agent image must not pull these in, hence the `fleet` extra and not
+    # a base dependency.
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
 ]
 # Device side: HTTP client for heartbeat/events, SSE client for the
 # command channel.
@@ -42,6 +47,10 @@ build-backend = "setuptools.build_meta"
 # standalone Go module (watchdog/go.mod), not a Python package -- see
 # watchdog/README.md. tools* is pure build/CI tooling (image/ configuration
 # check) and does not go into any Docker image.
+# fleet.migrations* (P1.3) matches "fleet*" and is picked up automatically --
+# it is a proper package (has __init__.py, see fleet/migrations/__init__.py
+# and fleet/migrations/versions/__init__.py), so the Alembic scripts land in
+# the fleet Docker image without a separate package-data entry.
 include = ["protocol*", "fleet*", "agent*", "tools*"]
 
 [tool.ruff]

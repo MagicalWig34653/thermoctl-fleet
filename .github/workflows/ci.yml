@@ -7,9 +7,12 @@ permissions:
   contents: read
 
 jobs:
-  # No database service: the scaffold stores nothing (see docs/STATUS.md). Once
-  # storage exists, add it here -- following the same pattern as thermoctl's
-  # ci.yml (sqlite/mariadb matrix, THERMOCTL_TEST_DATABASE_URL equivalent).
+  # No database service: the storage layer (P1.3, docs/STATUS.md) runs its
+  # tests against a real SQLite file in `tmp_path`, created via the Alembic
+  # migrations themselves -- SQLite needs no separate service container, only
+  # a writable filesystem, which the runner already provides. A mariadb/
+  # postgres matrix, following thermoctl's ci.yml pattern
+  # (THERMOCTL_TEST_DATABASE_URL and friends), is not part of this package.
   check:
     runs-on: ubuntu-latest
     strategy:
