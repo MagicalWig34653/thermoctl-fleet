@@ -23,7 +23,9 @@ from alembic.migration import MigrationContext
 from sqlalchemy import inspect
 
 import fleet.storage as storage_module
+from fleet.alarms import AlarmKind, Urgency
 from fleet.storage import (
+    AlarmRecord,
     ApartmentRecord,
     Base,
     HeartbeatRecord,
@@ -705,3 +707,245 @@ def test_get_storage_reads_the_environment_variable_and_caches_the_instance(
 
     assert isinstance(first, Storage)
     assert first is second
+
+
+# -- alarms (P2.2) -------------------------------------------------------------
+
+
+def test_list_apartment_ids_returns_all_registered_apartments(storage: Storage) -> None:
+    storage.set_apartment_token("house7-a03", secrets.token_urlsafe(32))
+    storage.set_apartment_token("house7-a04", secrets.token_urlsafe(32))
+
+    assert set(storage.list_apartment_ids()) == {"house7-a03", "house7-a04"}
+
+
+def test_list_apartment_ids_is_empty_with_no_apartments_registered(storage: Storage) -> None:
+    assert storage.list_apartment_ids() == []
+
+
+def test_get_latest_alarm_returns_none_when_none_was_ever_raised(storage: Storage) -> None:
+    assert storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value) is None
+
+
+def test_raise_alarm_creates_an_open_unnotified_alarm(storage: Storage) -> None:
+    raised_at = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+
+    alarm = storage.raise_alarm(
+        "house7-a03", AlarmKind.NOT_REPORTING.value, Urgency.HIGH.value, raised_at
+    )
+
+    assert alarm is not None
+    assert alarm.apartment_id == "house7-a03"
+    assert alarm.kind == AlarmKind.NOT_REPORTING.value
+    assert alarm.urgency == Urgency.HIGH.value
+    assert alarm.cleared_at is None
+    assert alarm.raise_notified is False
+    assert alarm.clear_notified is False
+    assert alarm.snoozed_until is None
+
+    latest = storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value)
+    assert latest is not None
+    assert latest.id == alarm.id
+
+
+def test_clear_alarm_sets_cleared_at_and_resets_clear_notified(storage: Storage) -> None:
+    raised_at = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+    cleared_at = datetime(2026, 9, 22, 12, 10, 0, tzinfo=UTC)
+    alarm = storage.raise_alarm(
+        "house7-a03", AlarmKind.NOT_REPORTING.value, Urgency.HIGH.value, raised_at
+    )
+    assert alarm is not None
+    storage.mark_alarm_clear_notified(alarm.id)  # pretend a stale True was set
+
+    storage.clear_alarm(alarm.id, cleared_at)
+
+    latest = storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value)
+    assert latest is not None
+    assert latest.cleared_at == cleared_at.replace(tzinfo=None)
+    assert latest.clear_notified is False
+
+
+def test_clear_alarm_on_an_unknown_id_does_nothing(storage: Storage) -> None:
+    storage.clear_alarm(999999, datetime(2026, 9, 22, tzinfo=UTC))  # must not raise
+
+
+def test_mark_alarm_raise_notified(storage: Storage) -> None:
+    alarm = storage.raise_alarm(
+        "house7-a03",
+        AlarmKind.NOT_REPORTING.value,
+        Urgency.HIGH.value,
+        datetime(2026, 9, 22, tzinfo=UTC),
+    )
+    assert alarm is not None
+
+    storage.mark_alarm_raise_notified(alarm.id)
+
+    latest = storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value)
+    assert latest is not None
+    assert latest.raise_notified is True
+
+
+def test_mark_alarm_raise_notified_on_an_unknown_id_does_nothing(storage: Storage) -> None:
+    storage.mark_alarm_raise_notified(999999)  # must not raise
+
+
+def test_mark_alarm_clear_notified_on_an_unknown_id_does_nothing(storage: Storage) -> None:
+    storage.mark_alarm_clear_notified(999999)  # must not raise
+
+
+def test_set_alarm_snoozed_until(storage: Storage) -> None:
+    alarm = storage.raise_alarm(
+        "house7-a03",
+        AlarmKind.NOT_REPORTING.value,
+        Urgency.HIGH.value,
+        datetime(2026, 9, 22, tzinfo=UTC),
+    )
+    assert alarm is not None
+    until = datetime(2026, 9, 23, 8, 0, 0, tzinfo=UTC)
+
+    storage.set_alarm_snoozed_until(alarm.id, until)
+
+    latest = storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value)
+    assert latest is not None
+    assert latest.snoozed_until == until.replace(tzinfo=None)
+
+
+def test_set_alarm_snoozed_until_on_an_unknown_id_does_nothing(storage: Storage) -> None:
+    storage.set_alarm_snoozed_until(999999, datetime(2026, 9, 23, tzinfo=UTC))  # must not raise
+
+
+def test_get_latest_alarm_returns_the_most_recently_raised_of_several(storage: Storage) -> None:
+    older = storage.raise_alarm(
+        "house7-a03",
+        AlarmKind.NOT_REPORTING.value,
+        Urgency.HIGH.value,
+        datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC),
+    )
+    assert older is not None
+    storage.clear_alarm(older.id, datetime(2026, 9, 22, 10, 5, 0, tzinfo=UTC))
+    newer = storage.raise_alarm(
+        "house7-a03",
+        AlarmKind.NOT_REPORTING.value,
+        Urgency.HIGH.value,
+        datetime(2026, 9, 22, 11, 0, 0, tzinfo=UTC),
+    )
+    assert newer is not None
+
+    latest = storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value)
+    assert latest is not None
+    assert latest.id == newer.id
+
+
+def test_raise_alarm_returns_none_when_one_is_already_open(storage: Storage) -> None:
+    """The partial unique index `ux_alarms_apartment_id_kind_open`
+    (`0004_alarms.py`) makes a second raise for an already-open
+    `(apartment_id, kind)` a no-op rather than a second row -- exercised
+    here single-threaded first; `test_raise_alarm_is_safe_under_concurrent_
+    calls` below exercises the actual race with real threads."""
+
+    first = storage.raise_alarm(
+        "house7-a03",
+        AlarmKind.NOT_REPORTING.value,
+        Urgency.HIGH.value,
+        datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC),
+    )
+    assert first is not None
+
+    second = storage.raise_alarm(
+        "house7-a03",
+        AlarmKind.NOT_REPORTING.value,
+        Urgency.HIGH.value,
+        datetime(2026, 9, 22, 10, 1, 0, tzinfo=UTC),
+    )
+
+    assert second is None
+    latest = storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value)
+    assert latest is not None
+    assert latest.id == first.id  # still the first row, not overwritten
+
+
+def test_raise_alarm_is_safe_under_concurrent_calls(tmp_path: object) -> None:
+    """Cross-review reproduced the bug this guards against: 5 concurrent
+    `check_absence_alarms` runs for one absent apartment produced 4
+    duplicate open alarms and 5 raise notifications, because the original
+    `raise_alarm` was a plain INSERT with no database-level guard. Against
+    a real, migrated SQLite database, with real threads (not a mock), the
+    partial unique index plus the insert-or-ignore write path must leave
+    exactly one open row and let exactly one thread's call return a
+    non-`None` record."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    apartment = "house7-a03"
+    raised_at = datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def _raise() -> None:
+        try:
+            results.append(
+                storage.raise_alarm(
+                    apartment, AlarmKind.NOT_REPORTING.value, Urgency.HIGH.value, raised_at
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 -- captured to fail the test explicitly
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_raise) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1  # exactly one thread created the row
+
+    with storage.session() as session:
+        open_rows = list(
+            session.query(AlarmRecord)
+            .filter(
+                AlarmRecord.apartment_id == apartment,
+                AlarmRecord.kind == AlarmKind.NOT_REPORTING.value,
+                AlarmRecord.cleared_at.is_(None),
+            )
+            .all()
+        )
+        session.expunge_all()
+    assert len(open_rows) == 1
+
+
+def test_migration_0004_alarms_upgrade_creates_the_table(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+
+    upgrade(url)
+
+    engine = create_storage(url).engine
+    assert "alarms" in set(inspect(engine).get_table_names())
+    columns = {col["name"] for col in inspect(engine).get_columns("alarms")}
+    assert columns == {
+        "id",
+        "apartment_id",
+        "kind",
+        "urgency",
+        "raised_at",
+        "cleared_at",
+        "snoozed_until",
+        "raise_notified",
+        "clear_notified",
+    }
+
+
+def test_migration_0004_alarms_downgrade_removes_the_table(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+
+    downgrade(url, "0002")
+
+    engine = create_storage(url).engine
+    assert "alarms" not in set(inspect(engine).get_table_names())
+
+    # And back up again -- the round trip other migration tests exercise too.
+    upgrade(url)
+    assert "alarms" in set(inspect(create_storage(url).engine).get_table_names())

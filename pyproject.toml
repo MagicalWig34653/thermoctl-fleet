@@ -21,6 +21,9 @@ fleet = [
     # a base dependency.
     "sqlalchemy>=2.0",
     "alembic>=1.13",
+    # Absence alarming (P2.2, section 8): the generic webhook notifier. SMTP
+    # notification uses stdlib `smtplib`, no extra dependency needed for it.
+    "httpx>=0.27",
 ]
 # Device side: HTTP client for heartbeat/events, SSE client for the
 # command channel.
@@ -36,6 +39,9 @@ dev = [
     "httpx2>=2.12",
     "ruff>=0.16",
     "mypy>=1.18",
+    # Local SMTP server for testing the SMTP notifier (P2.2) against a real
+    # receiver -- no mocks, per CLAUDE.md's testing method.
+    "aiosmtpd>=1.4",
 ]
 
 [build-system]

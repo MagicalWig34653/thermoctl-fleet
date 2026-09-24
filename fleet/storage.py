@@ -63,7 +63,18 @@ from typing import Any
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import DateTime, Engine, Index, Integer, String, Text, create_engine, select
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Engine,
+    Index,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    select,
+    text,
+)
 from sqlalchemy.dialects import postgresql as _postgresql_dialect
 from sqlalchemy.dialects import sqlite as _sqlite_dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -142,6 +153,55 @@ class EventRecord(Base):
     # `protocol.events.fault_kind_from_key`.
     fault_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class AlarmRecord(Base):
+    __tablename__ = "alarms"
+    __table_args__ = (
+        # Cross-review, P2.2: 5 concurrent `check_absence_alarms` runs for
+        # one absent apartment produced 4 duplicate open alarms and 5 raise
+        # notifications -- the same class of bug `0003_heartbeats_unique_
+        # sent_at.py` fixed for heartbeats, reproduced here for alarms. A
+        # *partial* unique index (only `WHERE cleared_at IS NULL`, not
+        # every row) is what "at most one row per `(apartment_id, kind)`
+        # may be open at a time" actually means: a cleared alarm must not
+        # block a later, genuinely new outage from opening a fresh row.
+        # `Storage.raise_alarm` below performs the insert as a
+        # dialect-native `INSERT ... ON CONFLICT ... WHERE cleared_at IS
+        # NULL DO NOTHING`, turning the race into a database-level
+        # guarantee rather than a Python check-then-insert.
+        Index(
+            "ux_alarms_apartment_id_kind_open",
+            "apartment_id",
+            "kind",
+            unique=True,
+            sqlite_where=text("cleared_at IS NULL"),
+            postgresql_where=text("cleared_at IS NULL"),
+        ),
+    )
+
+    # One row per raised alarm instance (P2.2, section 8). `kind`/`urgency`
+    # are plain strings, not FK'd to an enum type -- `fleet/alarms.py` owns
+    # the closed `AlarmKind`/`Urgency` enumerations and converts to/from
+    # their `.value` at the boundary, mirroring how `EventRecord.fault_kind`
+    # above stores the derived `FaultKind` as a string, not an ORM enum
+    # column. An alarm is "open" while `cleared_at IS NULL`; clearing it
+    # resets `clear_notified` to `False` so the all-clear notification
+    # (section 8: "every alarm has an all-clear") gets retried independently
+    # of whether the raise notification ever succeeded.
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    urgency: Mapped[str] = mapped_column(String(16), nullable=False)
+    raised_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    # Section 8: "every alarm has ... a snooze" -- suppresses a *retried*
+    # raise-notification (after a notifier failure) until this time. No
+    # HTTP/UI endpoint sets this yet (the fleet-UI auth path does not exist,
+    # P3.x) -- see docs/STATUS.md.
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    raise_notified: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
+    clear_notified: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
 
 
 @dataclass(frozen=True)
@@ -496,6 +556,141 @@ class Storage:
             result = list(rows)
             session.expunge_all()
             return result
+
+    # -- apartments (id listing, for the alarm check) ----------------------------
+
+    def list_apartment_ids(self) -> list[str]:
+        """All registered apartment ids -- P2.2's alarm check iterates these,
+        then skips any with no stored heartbeat at all (see `fleet/alarms.py`:
+        section 8 is silent on apartments that have never reported, so they
+        are deliberately not alarmed)."""
+
+        with self.session() as session:
+            return list(session.scalars(select(ApartmentRecord.id)).all())
+
+    # -- alarms (P2.2, section 8) -------------------------------------------------
+
+    def get_latest_alarm(self, apartment_id: str, kind: str) -> AlarmRecord | None:
+        """The most recent alarm row of `kind` for `apartment_id`, open or
+        already cleared, or `None` if none was ever raised. "Most recent"
+        (not "the open one") on purpose: the caller also needs the last
+        *cleared* alarm to retry an all-clear notification that previously
+        failed (`clear_notified` still `False`)."""
+
+        with self.session() as session:
+            row = session.scalar(
+                select(AlarmRecord)
+                .where(AlarmRecord.apartment_id == apartment_id, AlarmRecord.kind == kind)
+                .order_by(AlarmRecord.raised_at.desc(), AlarmRecord.id.desc())
+                .limit(1)
+            )
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def raise_alarm(
+        self, apartment_id: str, kind: str, urgency: str, raised_at: datetime
+    ) -> AlarmRecord | None:
+        """Atomically creates a new, open alarm row (`raise_notified=False`)
+        for `(apartment_id, kind)`, or returns `None` if one is already
+        open -- enforced by the partial unique index
+        `ux_alarms_apartment_id_kind_open`
+        (`fleet/migrations/versions/0004_alarms.py`), via a dialect-native
+        `INSERT ... ON CONFLICT ... WHERE cleared_at IS NULL DO NOTHING ...
+        RETURNING id`, not a Python-level check-then-insert. Cross-review
+        reproduced the gap this closes: 5 concurrent `check_absence_alarms`
+        runs for one absent apartment produced 4 duplicate open alarms and
+        5 raise notifications -- the same class of race
+        `_insert_heartbeats_ignoring_conflicts` fixes for heartbeats
+        (P2.1b), here for alarms.
+
+        **Only a caller that gets back a non-`None` record may notify**
+        (see `fleet/alarms.py::_handle_absent`) -- every other concurrent
+        caller lost the race and must not duplicate the notification; the
+        alarm it "lost" to is either already notified, or will be picked
+        up (and its notification retried, if that one failed) by a later
+        check run through the normal `raise_notified` path.
+
+        A later, separate outage after an all-clear still creates a new
+        row (section 8: "a new outage after an all-clear raises a new
+        alarm") -- the partial index only ever restricts `cleared_at IS
+        NULL` rows, so an already-cleared alarm never blocks this insert.
+        """
+
+        values: dict[str, object] = {
+            "apartment_id": apartment_id,
+            "kind": kind,
+            "urgency": urgency,
+            "raised_at": _naive_utc(raised_at),
+            "cleared_at": None,
+            "snoozed_until": None,
+            "raise_notified": False,
+            "clear_notified": False,
+        }
+        with self.session() as session:
+            dialect = session.get_bind().dialect.name
+            # See `_insert_heartbeats_ignoring_conflicts` above for why this
+            # branches on dialect name and why `postgresql`/`else` are
+            # excluded from coverage -- the same reasoning applies here
+            # unchanged (SQLite is this repository's only real database
+            # today; a real PostgreSQL target is needed to exercise that
+            # branch meaningfully, not just select it).
+            statement: Any
+            if dialect == "sqlite":
+                statement = _sqlite_dialect.insert(AlarmRecord).values(**values)
+            elif dialect == "postgresql":  # pragma: no cover -- see above
+                statement = _postgresql_dialect.insert(AlarmRecord).values(**values)
+            else:  # pragma: no cover -- see above
+                raise NotImplementedError(
+                    f"Insert-or-ignore for alarms is not implemented for the "
+                    f"{dialect!r} SQLAlchemy dialect -- see "
+                    "_insert_heartbeats_ignoring_conflicts's docstring for "
+                    "the same gap on the heartbeats table."
+                )
+            statement = statement.on_conflict_do_nothing(
+                index_elements=["apartment_id", "kind"],
+                index_where=text("cleared_at IS NULL"),
+            ).returning(AlarmRecord.id)
+            inserted_id = session.execute(statement).scalar()
+            if inserted_id is None:
+                return None
+            record = session.get(AlarmRecord, inserted_id)
+            assert record is not None  # just inserted in this same transaction
+            session.expunge(record)
+            return record
+
+    def clear_alarm(self, alarm_id: int, cleared_at: datetime) -> None:
+        """Sets `cleared_at` and resets `clear_notified` to `False` -- the
+        all-clear notification (section 8) still needs to go out; that is
+        `fleet/alarms.py`'s job, not this write."""
+
+        with self.session() as session:
+            record = session.get(AlarmRecord, alarm_id)
+            if record is not None:
+                record.cleared_at = _naive_utc(cleared_at)
+                record.clear_notified = False
+
+    def mark_alarm_raise_notified(self, alarm_id: int) -> None:
+        with self.session() as session:
+            record = session.get(AlarmRecord, alarm_id)
+            if record is not None:
+                record.raise_notified = True
+
+    def mark_alarm_clear_notified(self, alarm_id: int) -> None:
+        with self.session() as session:
+            record = session.get(AlarmRecord, alarm_id)
+            if record is not None:
+                record.clear_notified = True
+
+    def set_alarm_snoozed_until(self, alarm_id: int, until: datetime) -> None:
+        """Section 8: "every alarm has ... a snooze". No HTTP/UI endpoint
+        calls this yet (the fleet-UI auth path does not exist, P3.x) -- see
+        docs/STATUS.md; this is the storage-level primitive for it."""
+
+        with self.session() as session:
+            record = session.get(AlarmRecord, alarm_id)
+            if record is not None:
+                record.snoozed_until = _naive_utc(until)
 
 
 def create_engine_from_url(url: str) -> Engine:

@@ -26,6 +26,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 
+import fleet.storage as storage_module
+from fleet.alarms import NotifierConfigError
 from fleet.app import app
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from protocol import Heartbeat
@@ -121,6 +123,59 @@ def test_healthz_responds(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_lifespan_starts_and_cancels_the_alarm_background_task(
+    monkeypatch: pytest.MonkeyPatch, db_path: str
+) -> None:
+    """P2.2 (section 8): `fleet.app.lifespan` starts the periodic
+    absence-alarm background task on startup and cancels it cleanly on
+    shutdown. The check logic itself (`check_absence_alarms`) is fully
+    covered with an injected clock in `tests/test_alarms.py`; this only
+    confirms the scheduling wrapper wires up and tears down without error
+    -- see `fleet.app._alarm_check_loop`'s own `# pragma: no cover` for why
+    its infinite loop body is deliberately not exercised here (it would
+    otherwise need either a real wait or an artificial construction that
+    tests the wrapper rather than anything real)."""
+
+    monkeypatch.setenv("FLEET_DATABASE_URL", f"sqlite:///{db_path}")
+    # Large on purpose -- the loop's single `asyncio.sleep` call must not
+    # actually fire while this test's `with` block is open.
+    monkeypatch.setenv("FLEET_ALARM_CHECK_INTERVAL_S", "3600")
+    storage_module._storage_singleton = None
+    try:
+        with TestClient(app) as lifespan_client:
+            response = lifespan_client.get("/healthz")
+            assert response.status_code == 200
+    finally:
+        storage_module._storage_singleton = None
+
+
+def test_lifespan_fails_loudly_on_a_misconfigured_alert_channel(
+    monkeypatch: pytest.MonkeyPatch, db_path: str
+) -> None:
+    """Cross-review: `load_notifiers_from_env` used to be called from
+    *inside* `_alarm_check_loop`, so a misconfigured alert channel (here:
+    `FLEET_ALERT_SMTP_HOST` set without the required `FLEET_ALERT_SMTP_FROM`/
+    `FLEET_ALERT_SMTP_TO`) raised on the background task's first iteration,
+    got caught by the task's own `except Exception`, logged once, and the
+    service then ran forever with silently no notifier configured at all --
+    contrary to what the surrounding comment claimed. `fleet.app.lifespan`
+    now parses the configuration itself, before the task ever starts, so
+    entering the app's lifespan (as `TestClient(app)`'s `with` block does)
+    must raise `NotifierConfigError` here -- application *startup* fails
+    loudly, not a background task nobody is watching."""
+
+    monkeypatch.setenv("FLEET_DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("FLEET_ALERT_SMTP_HOST", "smtp.example.invalid")
+    monkeypatch.delenv("FLEET_ALERT_SMTP_FROM", raising=False)
+    monkeypatch.delenv("FLEET_ALERT_SMTP_TO", raising=False)
+    storage_module._storage_singleton = None
+    try:
+        with pytest.raises(NotifierConfigError), TestClient(app):
+            pass
+    finally:
+        storage_module._storage_singleton = None
 
 
 # -----------------------------------------------------------------------------
