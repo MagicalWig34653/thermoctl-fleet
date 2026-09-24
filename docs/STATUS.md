@@ -242,7 +242,7 @@ itself), coverage **98%** (852 statements, 20 missed -- `fleet/alarms.py`,
 `fleet/app.py`, `fleet/storage.py`, `fleet/auth.py`, and all four
 migrations at 100%) -- `ruff check .` and `mypy .` /
 `mypy protocol fleet agent tools` all clean. Merge commit `0821e07`,
-follow-up fix commit noted in this package's own commit trailer.
+follow-up fix commit `505b102`.
 
 ## Token check per apartment (P1.1, sections 4, 18.1)
 
