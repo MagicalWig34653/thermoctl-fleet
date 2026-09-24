@@ -36,10 +36,18 @@ packages fill the bodies in.
   apartment ids ... in the source code" extends here to "do not reveal
   which apartments exist" over the wire; a caller who gets a different
   response for "wrong token" than for "no such apartment" could enumerate
-  apartment ids by trial. The comparison against a *known* stored hash uses
+  apartment ids by trial. **Correction (P1.2 review):** this is true only
+  for `require_apartment_token` (apartment from the address), which compares
+  the presented token's hash against a *known* stored hash with
   `hmac.compare_digest`, not `==`, precisely because that comparison is the
   one place where the number of matching leading bytes could otherwise leak
-  through timing.
+  through timing. `require_apartment_token_by_hash` (apartment not in the
+  address) instead does an indexed equality lookup of the SHA-256 digest
+  against `apartments.token_hash` -- there is no known hash to compare
+  against up front, so there is no timing side channel to guard with
+  `compare_digest` either: the token's >=32 bytes of server-generated
+  entropy (section 4) mean an indexed lookup yields an attacker nothing more
+  than "hash present or not".
 
 **Lookup by hash, not by parsing the token.** `POST /v1/heartbeat`,
 `GET /v1/commands`, and `POST /v1/commands/{id}/result` carry no apartment
@@ -108,6 +116,102 @@ everywhere, never a literal secret. Full suite: **107 tests** (up from 80),
 coverage **96%** (unchanged from P1.3 -- `fleet/auth.py`, `fleet/app.py`,
 `fleet/storage.py`, and both migrations now at 100%) -- `ruff check .` and
 `mypy .` / `mypy protocol fleet agent tools` all clean.
+
+## Accept and store fault events (P1.2, sections 6, 8, 18.1, 22.1)
+
+`fleet/app.py::receive_event` is implemented: after the existing P1.1 token
+dependency (`require_apartment_token`, apartment from the address), it
+calls `Storage.save_event(apartment, event, datetime.now(UTC))` -- receipt
+time as server time in UTC (section 18.1: "the timestamp is the receipt
+time"), and returns 204. No `NotImplementedError` remains on this path.
+`Storage.save_event` (already written for P1.3) derives the fault kind via
+`protocol.events.fault_kind_from_key` internally; an unknown `schluessel`
+prefix is stored with `fault_kind` = `None` ("other report"), never
+rejected -- including the deliberate `sensor:` special case (section 22.1):
+sensor fault and stuck reading share one key and are therefore never told
+apart here, confirmed by a test that posts the same `sensor:<zone>` key
+twice and asserts both rows get `fault_kind` = `None`.
+
+**What is stored:** apartment (from the address, not the body), `schluessel`,
+`schwere`, the derived `fault_kind`, and `received_at`. **What is
+deliberately not stored, and not otherwise used to derive anything stored:
+`titel` and `text`** -- the project owner's decision for this task, not
+reopened here. Verified in thermoctl's source: a tenant report's `text`
+contains "Reported by: `<tenant name>`", the last room temperature, the
+setpoint, the mode, and the tenant's free-text note; a sensor-fault `text`
+contains the frost-protection setpoint. Section 6 forbids all of these
+categories in the cloud outright ("the text of tenant problem reports" is
+explicitly listed among what is not transmitted). `protocol.events.Event`
+keeps accepting and validating all four German fields unchanged (thermoctl's
+payload is not ours to change, section 11: "no change to thermoctl") --
+`receive_event` simply never reads `event.titel`/`event.text` after
+validation, and `Storage.save_event`'s `EventRecord` has no column for
+either (already true since P1.3, re-verified here).
+
+The same decision reaches into `protocol/events.py`:
+`fault_event_from_event` used to build `FaultEvent.message` as
+`f"{event.titel}: {event.text}"` -- that is gone. `message` is now built
+from a fixed, non-sensitive English label per `FaultKind` (or "other report"
+where `kind` is `None`) plus `key` (e.g. `"window alarm: fenster:3"`,
+`"other report: sensor:3"`) -- `key` alone is safe to include per section 6
+("that one exists, with time and room"), since it carries only a technical
+zone/device id and the category, never free text. No field of `Event` or
+`FaultEvent` was renamed, removed, or added (section 18.2: "a field may only
+ever be added"); `FaultEvent.message` stays, its description now documents
+what it contains and why. `docs/specification.md` section 22.1 gained a
+"**Decided afterward (project owner, 2026-09-24):**" paragraph recording
+this; the rest of the document is unchanged, still a byte-identical copy
+otherwise.
+
+**Tests** (`tests/test_fleet.py`, endpoint level, through `TestClient` with a
+real migrated SQLite database, extending the P1.1 fixtures): all four
+non-`sensor:` prefixes from section 22.1's key table with realistic keys
+(parametrized), asserting the stored row's apartment/key/severity/kind and
+that `received_at` falls inside the request's time window; the `sensor:`
+special case explicitly, posting the same key twice and asserting both rows
+get `fault_kind` = `None`; an unknown prefix → 204, `fault_kind` = `None`;
+events are stored under the address apartment only, not visible for another
+apartment (`storage.list_events(OTHER_APARTMENT) == []`); a rejected (401)
+request stores nothing. **Privacy test:** posts an event whose `titel`/
+`text` carry unique marker strings shaped like what thermoctl actually
+sends (a fake "Reported by: ..." tenant name, a fake room temperature), then
+asserts the markers appear nowhere -- checked three independent ways: via
+`Storage.list_events`, via a raw `SELECT * FROM events` against the engine,
+and via the raw bytes of the SQLite file (plus any `-wal`/`-journal`
+sidecar) read directly off disk, so a bug at any one layer could not hide a
+leak past the other two. The two tests that previously asserted
+`NotImplementedError` for a valid, authenticated request now assert 204
+instead; the P1.1 401/403 tests for this endpoint are otherwise unchanged
+and still pass. `tests/test_protocol.py` gained a test asserting
+`fault_event_from_event`'s `message` never contains `titel`/`text`
+(same marker-string technique) and updated the existing envelope test's
+`message` assertion to the new format.
+
+**`fleet/auth.py` docstring correction (from the P1.1 review):** it had
+claimed both dependencies compare with `hmac.compare_digest`; true only for
+`require_apartment_token` (a *known* stored hash to compare against).
+`require_apartment_token_by_hash` does an indexed equality lookup of the
+presented token's SHA-256 digest against `apartments.token_hash` instead --
+there is no known hash to time an approach toward, so there is no timing
+side channel `compare_digest` would need to close: the token's >=32 bytes of
+server-generated entropy (section 4) mean the lookup yields nothing more
+than "hash present or not" either way. Reworded in both `fleet/auth.py` and
+the matching P1.1 passage above; docstring/prose only, no logic changed.
+
+**Remaining gap, not built here:** alarm evaluation (section 8, "fault open
+for longer than 2 hours" among the nine rules) needs the absence-alarming
+machinery from P2.2 (which does not exist yet) to evaluate "how long has
+this been open" against ongoing heartbeats -- storing the event is the
+precondition for that, not the alarm itself. Also still open, carried over
+from P1.1/P1.3 and unaffected by this task: retention (section 12), the
+registration endpoint, token rotation/revocation over HTTP.
+
+Full suite: **117 tests** (up from 107), coverage **96%** (unchanged --
+`fleet/app.py`, `fleet/auth.py`, `fleet/storage.py`, `protocol/events.py`,
+and both migrations at 100%) -- `ruff check .` and `mypy .` /
+`mypy protocol fleet agent tools` all clean. `watchdog/`: `go vet ./...`
+clean, `go test ./...` green (unchanged, `protocol/` field names were not
+touched), `watchdog/check_contract.sh` passes.
 
 ## Storage layer (P1.3, section 12)
 

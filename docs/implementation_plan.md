@@ -41,6 +41,7 @@ parallel with all other packages of the same stage.
   prefix are covered by a test; the test in particular confirms the special
   case "sensor fault and stuck reading share the same key".
 - **Depends on:** P1.1, P1.3.
+- [x] done
 
 ### P1.3 -- Storage layer (database)
 - **Goal:** set up persistence for heartbeats, events, inventory -- the
