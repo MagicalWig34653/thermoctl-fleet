@@ -71,6 +71,7 @@ parallel with all other packages of the same stage.
 - **Acceptance:** test with equal, lower, and higher `protocol_version`;
   the higher one must not be rejected (forward compatibility).
 - **Depends on:** P1.1, P1.3.
+- [x] done
 
 ### P2.2 -- Absence alarming
 - **Goal:** if an apartment's heartbeat fails to arrive, alarm (section 8).

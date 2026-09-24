@@ -117,6 +117,97 @@ coverage **96%** (unchanged from P1.3 -- `fleet/auth.py`, `fleet/app.py`,
 `fleet/storage.py`, and both migrations now at 100%) -- `ruff check .` and
 `mypy .` / `mypy protocol fleet agent tools` all clean.
 
+## Accept and store heartbeats (P2.1, sections 5, 18.2)
+
+`fleet/app.py::receive_heartbeat` is implemented: after the existing P1.1
+token dependency (`require_apartment_token_by_hash`, apartment identified by
+the token's hash, no apartment in the address) and the existing
+apartment/body cross-check (unchanged, still 403 on a mismatch between
+`authenticated_apartment` and `heartbeat.apartment`), it calls
+`Storage.save_heartbeat(authenticated_apartment, heartbeat,
+datetime.now(UTC))` -- receipt time as server time in UTC, the same pattern
+P1.2 established for `receive_event` -- and returns 204. No
+`NotImplementedError` remains on this path.
+
+**Version compatibility (section 18.2), the point of this package:** a
+heartbeat is accepted and stored regardless of its `protocol_version` --
+lower, equal, or higher than this service's own `PROTOCOL_VERSION`. The
+specification is explicit that a version difference must never cause an
+apartment to go silent, so nothing in `receive_heartbeat` compares
+`protocol_version` at all; the endpoint's only job is to store what arrived.
+
+**"Outdated version" is derived at read time, not stored as a column.**
+`HeartbeatRecord.protocol_version` has existed since P1.3, before this
+package, precisely because the heartbeat's own wire contract needs it --
+reusing it means the outdated flag costs no schema change and needs no
+`0003` migration. New: `Storage.get_latest_heartbeat(apartment_id) ->
+LatestHeartbeat | None` (`fleet/storage.py`), returning the most recently
+*received* heartbeat (ordered by `received_at`, the receipt time, not
+`sent_at` -- a late-arriving catch-up entry from an outage, section 5, must
+not become "latest" just because it was saved after) together with
+`outdated = protocol_version < PROTOCOL_VERSION`, computed against
+`protocol.version.PROTOCOL_VERSION` at call time. This is the function P3.x
+(the apartment views) and P2.2 (absence alarming, "version gap" in section
+8) both consume -- one place computes "is this apartment on an old
+protocol", not duplicated per caller. A stored boolean was the rejected
+alternative: it would only repeat what the existing column already says,
+and could silently drift out of sync with it the day `PROTOCOL_VERSION` is
+next bumped, unless every historical row were backfilled at that point too
+-- deriving it removes that failure mode entirely. No `0003` migration
+exists; `alembic.autogenerate.compare_metadata` still stays empty against
+`0001`/`0002` (the existing `test_migrations_match_the_orm_model_exactly`
+in `tests/test_storage.py` continues to cover this unchanged, since nothing
+in the ORM model changed).
+
+**Unknown fields from a newer agent are accepted, not a 422.** Checked as
+part of this task: `protocol.heartbeat.Heartbeat` carries no `model_config`
+at all, so Pydantic's default `extra="ignore"` already applies -- an extra
+field a higher-protocol-version agent might one day send is silently
+dropped during validation rather than rejected. No change to `protocol/`
+was needed or made; `tests/test_fleet.py::
+test_heartbeat_higher_version_with_an_unknown_extra_field_is_204` locks
+this in against a regression (e.g. someone later adding a stricter
+`model_config` to `Heartbeat` for an unrelated reason).
+
+**Tests** (`tests/test_fleet.py`, endpoint level, through `TestClient` with
+a real migrated SQLite database, extending the P1.1/P1.2 fixtures): the
+previous `test_heartbeat_with_a_valid_token_passes_through_to_not_implemented`
+is replaced by `..._is_204` (P1.1's own 401/403 tests for this endpoint are
+otherwise untouched and still pass); a 401 and the existing apartment/body-
+mismatch 403 both now additionally assert nothing was stored for either
+apartment; `protocol_version` equal, lower (via `monkeypatch` on
+`fleet.storage.PROTOCOL_VERSION`, since the currently released
+`PROTOCOL_VERSION` is 1 and the model's `ge=1` constraint makes a literal
+lower value inexpressible) and higher than `PROTOCOL_VERSION` are each
+posted and asserted 204 plus stored; the lower case additionally asserts
+`get_latest_heartbeat(...).outdated is True`, equal and higher both assert
+`False`; a higher version with an extra unknown field asserts 204; the
+spec-section-5 example (`HEARTBEAT_EXAMPLE`, already used by P1.1's tests)
+is posted and read back via `storage.list_heartbeats` and compared equal to
+`Heartbeat.model_validate(HEARTBEAT_EXAMPLE)`; storage is confirmed scoped
+to the authenticated apartment only (`list_heartbeats(OTHER_APARTMENT) ==
+[]`). `tests/test_storage.py` gained direct tests for
+`Storage.get_latest_heartbeat`: `None` for an apartment with nothing
+stored, "most recently *received*, not most recently *saved*" (three
+heartbeats saved out of `received_at` order), and the outdated flag for
+lower/equal/higher via the same `monkeypatch` technique.
+
+Full suite: **128 tests** (up from 117), coverage **96%** (unchanged --
+`fleet/app.py`, `fleet/auth.py`, and `fleet/storage.py` all at 100%) --
+`ruff check .` and `mypy .` / `mypy protocol fleet agent tools` all clean.
+
+**Still missing, explicitly out of scope for this package, tracked here
+instead of invented:** gap detection for caught-up heartbeats (section 5,
+"The cloud detects gaps by the timestamp") and the batch format for
+catch-up delivery -- the specification requires the agent to send up to
+240 buffered heartbeats in one batch after an outage, but the wire shape
+of that batch is not yet defined anywhere (`protocol/heartbeat.py`'s own
+docstring already flagged this as open); both belong with P2.3 (the agent
+side that would produce such a batch), not this single-heartbeat endpoint,
+which only ever sees one heartbeat per request as things stand. Alarm
+evaluation (section 8) is P2.2, layered on top of the storage and the
+`get_latest_heartbeat`/outdated-flag machinery built here, not part of it.
+
 ## Accept and store fault events (P1.2, sections 6, 8, 18.1, 22.1)
 
 `fleet/app.py::receive_event` is implemented: after the existing P1.1 token

@@ -16,6 +16,13 @@ Three tables, deliberately minimal:
   setpoints, schedules, absence periods, tenant data) -- verified by reading
   that module: none of its fields carry such data, so storing the validated
   model verbatim does not smuggle in anything the specification excludes.
+  **"Outdated version" (P2.1, section 18.2) is derived, not stored:** the
+  `protocol_version` column already needed for the wire contract is compared
+  against `protocol.version.PROTOCOL_VERSION` at read time
+  (`Storage.get_latest_heartbeat`), so flagging an apartment "outdated" needs
+  no schema change and no `0003` migration -- a stored boolean would only
+  duplicate what the column already says and could drift from it if
+  `PROTOCOL_VERSION` is ever bumped without a backfill.
 - **`events`**: apartment, `schluessel` (key), `schwere` (severity), the
   *derived* fault kind (nullable -- `None` means "other report", see
   `protocol.events.fault_kind_from_key`), and receipt time. **Deliberately
@@ -44,6 +51,7 @@ import hashlib
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -53,6 +61,7 @@ from sqlalchemy import DateTime, Engine, Integer, String, Text, create_engine, s
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from protocol import Event, Heartbeat, fault_kind_from_key
+from protocol.version import PROTOCOL_VERSION
 
 
 class Base(DeclarativeBase):
@@ -103,6 +112,25 @@ class EventRecord(Base):
     # `protocol.events.fault_kind_from_key`.
     fault_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+@dataclass(frozen=True)
+class LatestHeartbeat:
+    """The most recent stored heartbeat of one apartment, plus whether it is
+    "outdated version" (P2.1, section 18.2).
+
+    `outdated` is **derived**, not stored: `HeartbeatRecord.protocol_version`
+    (a column since P1.3, before this task) already carries everything
+    needed to compute it at read time, so no migration and no extra column
+    were needed for this flag -- see `docs/STATUS.md` for the reasoning.
+    Consumed by the UI (P3.x) and by absence alarming (P2.2, "version gap",
+    section 8) alike, so this lives on `Storage`, not duplicated in either
+    caller.
+    """
+
+    heartbeat: Heartbeat
+    received_at: datetime
+    outdated: bool
 
 
 def _naive_utc(value: datetime) -> datetime:
@@ -229,6 +257,32 @@ class Storage:
                 .order_by(HeartbeatRecord.received_at)
             ).all()
             return [Heartbeat.model_validate_json(row.payload_json) for row in rows]
+
+    def get_latest_heartbeat(self, apartment_id: str) -> LatestHeartbeat | None:
+        """The most recently *received* heartbeat of `apartment_id`, plus
+        the derived "outdated version" flag (section 18.2), or `None` if
+        none was ever stored.
+
+        Ordered by `received_at` (the receipt time, section 18.1), not
+        `sent_at` -- a late-arriving, older heartbeat from a catch-up batch
+        (section 5) must not overwrite what "latest" means here; that
+        ordering choice is for P2.3/P2.2 to make, not this read.
+        """
+
+        with self.session() as session:
+            row = session.scalar(
+                select(HeartbeatRecord)
+                .where(HeartbeatRecord.apartment_id == apartment_id)
+                .order_by(HeartbeatRecord.received_at.desc())
+                .limit(1)
+            )
+            if row is None:
+                return None
+            return LatestHeartbeat(
+                heartbeat=Heartbeat.model_validate_json(row.payload_json),
+                received_at=row.received_at,
+                outdated=row.protocol_version < PROTOCOL_VERSION,
+            )
 
     # -- events ---------------------------------------------------------------
 

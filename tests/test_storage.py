@@ -177,6 +177,61 @@ def test_unknown_apartment_has_no_heartbeats(storage: Storage) -> None:
     assert storage.list_heartbeats("does-not-exist") == []
 
 
+def test_get_latest_heartbeat_returns_none_for_an_apartment_with_none_stored(
+    storage: Storage,
+) -> None:
+    assert storage.get_latest_heartbeat("house7-a03") is None
+
+
+def test_get_latest_heartbeat_returns_the_most_recently_received_one(
+    storage: Storage,
+) -> None:
+    """Ordered by `received_at` (receipt time), not `sent_at` or insertion
+    order -- a heartbeat saved *later* but with an *earlier* `received_at`
+    must not become "latest"."""
+
+    older = datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC)
+    newer = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+
+    storage.save_heartbeat("house7-a03", _make_heartbeat(), older)
+    storage.save_heartbeat("house7-a03", _make_heartbeat(), newer)
+    # Saved last, but with an earlier receipt time than either of the above.
+    storage.save_heartbeat(
+        "house7-a03", _make_heartbeat(), datetime(2026, 9, 22, 9, 0, 0, tzinfo=UTC)
+    )
+
+    latest = storage.get_latest_heartbeat("house7-a03")
+    assert latest is not None
+    assert latest.received_at.replace(tzinfo=UTC) == newer
+
+
+def test_get_latest_heartbeat_outdated_flag_lower_equal_higher(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 18.2: a lower `protocol_version` than `PROTOCOL_VERSION` is
+    flagged outdated; equal and higher are not."""
+
+    monkeypatch.setattr(storage_module, "PROTOCOL_VERSION", 5)
+
+    lower = _make_heartbeat().model_copy(update={"protocol_version": 4})
+    storage.save_heartbeat("house7-a03", lower, datetime(2026, 9, 22, tzinfo=UTC))
+    latest = storage.get_latest_heartbeat("house7-a03")
+    assert latest is not None
+    assert latest.outdated is True
+
+    equal = lower.model_copy(update={"protocol_version": 5})
+    storage.save_heartbeat("house7-a03", equal, datetime(2026, 9, 23, tzinfo=UTC))
+    latest = storage.get_latest_heartbeat("house7-a03")
+    assert latest is not None
+    assert latest.outdated is False
+
+    higher = lower.model_copy(update={"protocol_version": 6})
+    storage.save_heartbeat("house7-a03", higher, datetime(2026, 9, 24, tzinfo=UTC))
+    latest = storage.get_latest_heartbeat("house7-a03")
+    assert latest is not None
+    assert latest.outdated is False
+
+
 def test_event_can_be_written_and_read_back_with_derived_fault_kind(storage: Storage) -> None:
     event = Event(
         schluessel="fenster:bathroom",

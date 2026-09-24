@@ -52,8 +52,9 @@ def healthz() -> dict[str, str]:
 def receive_heartbeat(
     heartbeat: Heartbeat,
     authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> None:
-    """Accepts a heartbeat (section 5).
+    """Accepts and stores a heartbeat (P2.1, section 11 step 2; sections 5, 18.2).
 
     The token check (P1.1, sections 4, 18.1) is done: `authenticated_apartment`
     is the apartment the presented token's hash resolved to (see
@@ -61,9 +62,31 @@ def receive_heartbeat(
     not report for another apartment, so a mismatch is a 403, not a silent
     overwrite of whichever apartment the token happened to name.
 
-    Still missing: storing the heartbeat, including gap detection for caught-up
-    heartbeats (section 5, "The cloud detects gaps by the timestamp"),
-    evaluation of the alarm rules (section 8).
+    `Storage.save_heartbeat` (section 12/18.1) stores the heartbeat under
+    the authenticated apartment together with the receipt time (server time
+    in UTC, mirroring P1.2's `receive_event`) -- not `heartbeat.sent_at`,
+    which cannot be trusted to be monotonic (a late-arriving report after an
+    outage, section 5) and is kept in the stored payload for that reason,
+    not discarded.
+
+    **Version compatibility (section 18.2):** every `protocol_version` --
+    lower, equal, or higher than this service's own `PROTOCOL_VERSION` -- is
+    accepted and stored unchanged; a heartbeat is never rejected for its
+    version alone ("an apartment that stops reporting because of a version
+    difference is exactly the silence nobody wants"). Unknown extra fields a
+    newer agent might send are silently ignored by `Heartbeat` (Pydantic's
+    default `extra="ignore"`), not a 422, for the same reason: forward
+    compatibility is section 18.2's whole point, not an afterthought. Whether
+    the *stored* heartbeat counts as "outdated version" is derived, not
+    decided here -- see `Storage.get_latest_heartbeat`.
+
+    Still missing (not part of this package): gap detection for caught-up
+    heartbeats (section 5, "The cloud detects gaps by the timestamp") and the
+    batch format for catch-up delivery itself, which is not yet defined (see
+    docs/STATUS.md) -- both belong with P2.3 (the agent side that would send
+    a batch) rather than this single-heartbeat endpoint. Evaluation of the
+    alarm rules (section 8) is P2.2, layered on top of the storage done here,
+    not part of it.
     """
 
     if authenticated_apartment != heartbeat.apartment:
@@ -72,10 +95,7 @@ def receive_heartbeat(
             detail="Token is not authorized for the reported apartment.",
         )
 
-    raise NotImplementedError(
-        "Storage and alarm evaluation are missing -- see docs/specification.md "
-        "sections 5 and 8."
-    )
+    storage.save_heartbeat(authenticated_apartment, heartbeat, datetime.now(UTC))
 
 
 @app.post("/v1/events/{apartment}", status_code=204)
