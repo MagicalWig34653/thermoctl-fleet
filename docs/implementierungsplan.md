@@ -227,8 +227,9 @@ sechs Endpunkte auf einmal anfasst.
 ### P5.6 — Wächter-Hauptschleife (`waechter/wache.go`)
 - **Ziel:** `AgentGestoppt`, `DigestStarten`, `GesundmeldungAbwarten`,
   `AufBewaehrtZuruecksetzen` echt umsetzen. Bleibt **ohne** Abhängigkeit in
-  `go.mod`, Produktionscode unter 300 Zeilen (aktuell 273, siehe
-  `docs/STATUS.md` — beim Einbau von P5.6 nachmessen).
+  `go.mod`, Produktionscode unter 300 Zeilen (aktuell 299, knapp, siehe
+  `docs/STATUS.md` — beim Einbau von P5.6 nachmessen, ggf. `zeilendatei.go`
+  als Vorbild für weitere Kürzungen nehmen).
 - **Dateien:** `waechter/wache.go`, `waechter/main.go`.
 - **Abschnitt:** 17, 18.3.
 - **Abnahme:** `go test ./...` grün, `go vet ./...` sauber, Vertragstest
@@ -263,9 +264,11 @@ begründet werden muss.
   bleibt es — dieses Paket baut nur das, was danach noch fehlt. **SR.**
 - **`esim_profile_auflisten`, `esim_profil_laden`** (Abschnitt 24.3): `lpac`-Anbindung,
   Aktivierungscode-Handling ohne Protokollspur.
-- **`esim_profil_aktivieren`** (Abschnitt 24.3, 24.4): die Rückfalluhr — klärt
-  zugleich die in `docs/STATUS.md` offene Frage, ob `waechter/zustand.go` dafür ein
-  zusätzliches Feld braucht oder eine eigene Datei entsteht. **SR.**
+- **`esim_profil_aktivieren`** (Abschnitt 24.3, 24.4): die Rückfalluhr — das
+  Dateiformat dafür ist entschieden (`esim_vorheriges_profil=`/`esim_frist=`
+  als zwei weitere Zeilen in der bestehenden Zustandsdatei, siehe
+  `docs/STATUS.md`); dieses Paket ruft `agent.schleife.waechter_zustand_melden`
+  damit auf und baut den Rest der Funktion. **SR.**
 - **`esim_profil_loeschen`** (Abschnitt 24.3).
 - **A/B-Systempartitionen** (Abschnitt 21.3): laut Projektinhaber ausdrücklich
   zurückgestellt, kein Paket, bis eine Heizperiode zeigt, dass Vor-Ort-Termine

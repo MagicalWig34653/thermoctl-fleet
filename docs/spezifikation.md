@@ -640,6 +640,28 @@ Betriebssystem-Update: angekündigt, eine Wohnung zuerst, und im Zweifel mit ein
 verbunden. Bei einer Fassung im Jahresabstand ist das vertretbar; bei einem zweiten Agenten,
 der sich wöchentlich mitbewegt, wäre es das nicht.
 
+### Rückfall ohne bewährten Stand
+
+Nachgetragen, weil das Gerüst die Lücke beim Bau von `waechter/wache.go` aufgeworfen hat:
+`AufBewaehrtZuruecksetzen` setzt einen gesetzten `bewaehrt`-Digest voraus — was passiert bei
+einem frisch eingerichteten Gerät, dessen erste Fassung fehlschlägt, bevor überhaupt ein
+Stand eine Stunde störungsfrei lief?
+
+**Entschieden: Es gibt diesen Fall nicht, weil er beim Bau des Abbilds bereits geschlossen
+wird.** Der Digest der mitgelieferten Agent-Fassung (Abschnitt 19.3) wird beim Bau des
+Systemabbilds fest in die Zustandsdatei eingetragen — `gewuenscht` und `bewaehrt` zeigen bei
+Auslieferung auf **denselben** Digest, gültig ab dem ersten Start. Ein Gerät hat damit von
+der ersten Sekunde an ein Rückfallziel, notfalls die Auslieferungsfassung selbst. Ohne das
+wäre ein Gerät, dessen erste Aktualisierung fehlschlägt, nur durch einen Vor-Ort-Termin zu
+retten — genau die Art von Fahrt, die der Wächter überhaupt vermeiden soll.
+
+Betroffen: das Abbild-Rezept (Abschnitt 19.4, Bau schreibt die Zustandsdatei mit), sowie
+`waechter/zustand.go` und `waechter/wache.go` auf der Lesarten-Seite — beide setzen von nun
+an voraus, dass ein ordnungsgemäß ausgeliefertes Gerät niemals mit leerem `bewaehrt` startet;
+ein leeres `bewaehrt` ist damit kein normaler Anfangszustand mehr, sondern ein Zeichen für
+eine fehlerhafte Auslieferung, und wird als Fehler gemeldet, nicht stillschweigend
+hingenommen.
+
 ---
 
 ## 18. Drei Festlegungen, die beim Bau des Gerüsts aufgefallen sind
@@ -815,6 +837,9 @@ Abschnitt 15.3 — eine Wohnung nach der anderen, mit der Pilotwohnung zuerst.
   damit ein Gerät mit Mobilfunk ohne weitere Installation startet und eines ohne nichts davon
   merkt
 - eine leere `melder-anmeldung.json` in der Startpartition
+- eine bereits geschriebene Zustandsdatei (Abschnitt 17) für den Wächter, mit `gewuenscht`
+  und `bewaehrt` auf den Digest der mitgelieferten Agent-Fassung gesetzt — siehe „Rückfall
+  ohne bewährten Stand" in Abschnitt 17
 - **kein** SSH-Passwortzugang; Schlüssel werden beim Vorbereiten hinterlegt oder gar nicht
 
 **Nur 64-Bit**, in beiden Fällen — schon weil das thermoctl-Abbild nur für `amd64` und
@@ -861,22 +886,33 @@ Zuordnung wird keine Konfiguration freigegeben (Abschnitt 15.5).
 nicht vermischen.
 
 **Wohnung** — eine dauerhafte Kennung (`haus7-w03`, ändert sich nie), Bezeichnung, Lage
-(Etage, Ausrichtung), Zustand (`bewohnt`, `leer`, `im Umbau`, `stillgelegt`), Zahl der
-Heizkreise. **Kein Mietername, keine Kontaktdaten** — die Wohnung wird über ihre Kennung
-geführt, nicht über Personen. Wer den Bezug braucht, hat ihn in seiner Mieterverwaltung.
+(Etage, Ausrichtung), Zustand, Zahl der Heizkreise. **Kein Mietername, keine Kontaktdaten** —
+die Wohnung wird über ihre Kennung geführt, nicht über Personen. Wer den Bezug braucht, hat
+ihn in seiner Mieterverwaltung.
+
+Die maschinenlesbaren Werte des Wohnungszustands sind **englisch** (nachträglich
+entschieden, siehe Abschnitt 22.4 — nur die Werte, nicht die Modell- und Feldnamen):
+
+| Wert | Bedeutung |
+|---|---|
+| `occupied` | bewohnt |
+| `vacant` | leer, aktuell ohne Mieter |
+| `renovating` | im Umbau |
+| `retired` | stillgelegt (Abschnitt 20.3: „eine Wohnung wird nicht gelöscht, sondern stillgelegt") |
 
 **Gerät** — Seriennummer oder Hardware-Kennung, Bauart (Pi 4, Pi 5, N100 …), Anschaffungsdatum,
-Fingerabdruck des öffentlichen Schlüssels, Abbild- und Wächter-Fassung, Zustand:
+Fingerabdruck des öffentlichen Schlüssels, Abbild- und Wächter-Fassung, Zustand. Ebenfalls
+englische Werte, dieselbe Begründung:
 
-| Zustand | Bedeutung |
+| Wert | Bedeutung |
 |---|---|
-| `erfasst` | im Verzeichnis angelegt, physisch noch nicht vorbereitet |
-| `vorbereitet` | Abbild geschrieben, Anmeldecode erzeugt und gültig |
-| `gemeldet` | hat sich mit Prüfziffer gemeldet, wartet auf Bestätigung |
-| `im Einsatz` | einer Wohnung zugeordnet, meldet Herzschlag |
-| `im Regal` | vorbereitet, aber nicht zugeordnet — das Ersatzgerät |
-| `defekt` | ausgefallen, wartet auf Prüfung |
-| `ausgemustert` | dauerhaft aus dem Verkehr, Token widerrufen |
+| `registered` | im Verzeichnis angelegt, physisch noch nicht vorbereitet |
+| `prepared` | Abbild geschrieben, Anmeldecode erzeugt und gültig |
+| `reported` | hat sich mit Prüfziffer gemeldet, wartet auf Bestätigung |
+| `in_service` | einer Wohnung zugeordnet, meldet Herzschlag |
+| `in_storage` | vorbereitet, aber nicht zugeordnet — das Ersatzgerät |
+| `faulty` | ausgefallen, wartet auf Prüfung |
+| `decommissioned` | dauerhaft aus dem Verkehr, Token widerrufen |
 
 **Zuordnung** — nie ein bloßes Feld am Gerät, sondern ein eigener Eintrag mit `von`, `bis`
 und Grund. Nur so lässt sich später beantworten, welches Gerät im Januar in Wohnung 3 lief.
@@ -1045,6 +1081,15 @@ Der Fleet-Dienst darf daraus also **nicht** auf die Art schließen. Die Art steh
 (`offene_stoerungen[].art`). Ein unbekanntes Präfix wird als „sonstige Meldung" geführt, nie
 als Fehler.
 
+**Nachgetragen (einheitlicher Umschlag, Abschnitt 5 und 21):** Alle sechs Störungsarten
+benutzen im Fleet-Dienst denselben Umschlag — Art, Schlüssel, Zeitpunkt, Klartext. Die
+Präfixe `zigbee2mqtt:` und `tenant-report:` (sowie die weiteren aus der Tabelle oben) bleiben
+dabei eine **Konvention im Schlüssel**, keine eigenen Typen — die Art ist ein eigenes,
+optionales Feld im Umschlag (`None`, wo der Schlüssel wie beim Sonderfall oben keine
+eindeutige Zuordnung erlaubt), nicht etwas, das aus dem Schlüssel-Text herausgeraten wird.
+Der Vorteil: Eine neue Störungsart kostet keine Protokolländerung auf beiden Seiten, nur
+einen neuen Eintrag in der Präfixtabelle.
+
 ### 22.2 `seit` in der Zustandsdatei
 
 Bedeutung: **der Zeitpunkt, seit dem `gewuenscht` gilt** — also wann der Agent den neuen
@@ -1052,19 +1097,53 @@ Stand eingetragen hat. Der Wächter rechnet daraus zweierlei: die 10-Minuten-Fri
 erste Gesundmeldung und die Stunde bis zur Bewährung (Abschnitt 17). Unix-Sekunden, ganze
 Zahl, Zeitzone spielt keine Rolle.
 
+**Nachträglich festgelegt:** Die Spezifikation zeigte dieses Feld ursprünglich nur an einem
+Beispiel (Abschnitt 17, Schritt 2), ohne seine Bedeutung im Text zu nennen. Diese Lesart ist
+keine von mehreren gleichwertigen Möglichkeiten, sondern die **einzige**, mit der das Feld
+den Rückfall überhaupt steuern kann: Nur wenn `seit` an den *aktuellen* Sollstand gebunden
+ist, lässt sich daraus eine Frist ab dessen Eintreffen berechnen. Jede andere Lesart (etwa
+„Zeitpunkt der letzten Änderung irgendeines Feldes") würde die 10-Minuten- und die
+Stunden-Frist aus Abschnitt 17 unbrauchbar machen, sobald `bewaehrt` fortgeschrieben wird,
+ohne dass sich `gewuenscht` ändert.
+
 ### 22.3 Die Gesundmeldung
 
-Eine Datei unter `/run/` mit einem einzigen Unix-Zeitstempel, vom Agenten regelmäßig
-überschrieben. Der Wächter prüft nur ihr Alter: älter als **120 Sekunden** gilt als stumm.
-`/run/` mit Absicht — es liegt im Arbeitsspeicher und ist nach einem Neustart leer, sodass
-eine alte Meldung nie einen frisch gestarteten, noch nicht gesunden Agenten deckt.
+**Zeilenbasiert wie die Zustandsdatei, nicht ein einzelner Zeitstempel** (nachträglich
+festgelegt; ersetzt die vorherige Annahme „ein einzelner Unix-Zeitstempel"). Eine Datei unter
+`/run/`, vom Agenten regelmäßig überschrieben, mit drei Zeilen:
+
+```
+zeitpunkt=1790000123
+digest=sha256:9f2c…
+fassung=0.4.0
+```
+
+- **`zeitpunkt`**: Unix-Sekunden, wie zuvor — der Wächter prüft ihr Alter, älter als
+  **120 Sekunden** gilt als stumm.
+- **`digest`**: der **laufende** Digest, also der des Container-Standes, der diese
+  Gesundmeldung gerade schreibt. Das ist der eigentliche Gewinn gegenüber einem bloßen
+  Zeitstempel: Der Wächter sieht damit nicht nur, dass etwas lebt, sondern dass **das
+  Richtige** lebt — eine Gesundmeldung vom alten Stand, die nach einem Tausch liegen bleibt
+  (etwa weil der neue Container noch nicht geschrieben hat), täuscht damit keine gesunde
+  neue Fassung vor.
+- **`fassung`**: die Agent-Fassung im Klartext, für Diagnose vor Ort ohne Rückgriff auf den
+  Digest.
+
+`/run/` bleibt mit Absicht: es liegt im Arbeitsspeicher und ist nach einem Neustart leer,
+sodass eine alte Meldung nie einen frisch gestarteten, noch nicht gesunden Agenten deckt.
+Unbekannte künftige Zeilen werden überlesen, wie bei der Zustandsdatei (Abschnitt 18.2,
+sinngemäß).
 
 ### 22.4 Zustandsnamen
 
-Die Tabellen in Abschnitt 20.1 sind Prosa; maschinenlesbar gelten die Schreibweisen aus
-`protokoll/bestand.py` (`erfasst`, `vorbereitet`, `gemeldet`, `im_einsatz`, `im_regal`,
-`defekt`, `ausgemustert` beziehungsweise `bewohnt`, `leer`, `im_umbau`, `stillgelegt`).
-Bei Widerspruch gilt der Code, nicht die Tabelle — die Tabelle erklärt, der Code entscheidet.
+Die Tabellen in Abschnitt 20.1 sind Prosa; maschinenlesbar gelten die **englischen**
+Schreibweisen aus `protokoll/bestand.py`, jetzt als eigene Tabelle in Abschnitt 20.1
+festgehalten (nachträglich entschieden — vorher standen dort deutsche Schreibweisen wie
+`im_einsatz`, `im_regal`; ausschlaggebend war, dass eine spätere Oberfläche oder ein externes
+System eher englische Bezeichner erwartet, wie es bei `Stoerungsart` in Abschnitt 5 bereits
+der Fall ist). Bei Widerspruch gilt der Code, nicht die Tabelle — die Tabelle erklärt, der
+Code entscheidet. **Nur die Werte sind englisch**, die Modell- und Feldnamen
+(`WohnungZustand`, `GeraetLebenszyklus`, `zustand`, …) bleiben deutsch.
 
 ---
 
@@ -1218,6 +1297,27 @@ warum dieser Befehl ohne Rückfall nicht existieren darf:
 Das ist dieselbe Aufteilung wie bei den Aktualisierungen: *Was zurückrollt, darf nicht das
 sein, was sich ändert.* Der Wächter braucht dafür nichts zu verstehen — er ruft lpac mit
 einer Profilkennung auf, die in der Zustandsdatei steht.
+
+**Nachträglich festgelegt, wo das steht:** In der **bestehenden** Zustandsdatei des Wächters
+(Abschnitt 17, `gewuenscht=`/`bewaehrt=`/`seit=`), als zwei weitere Zeilen — **keine zweite
+Datei**:
+
+```
+esim_vorheriges_profil=<Profilkennung>
+esim_frist=1790000723
+```
+
+Das Format ist dadurch erweiterbar, ohne dass es sich als solches „ankündigen" musste:
+`waechter/zustand.go` überliest jede unbekannte Zeile bereits, statt sie abzulehnen (siehe
+dort, „Unbekannte Schlüssel werden ignoriert"), also auch diese beiden, solange ein Wächter
+sie noch nicht kennt. Ein älterer Wächter auf einem noch nicht aktualisierten Gerät liest
+damit weiterhin `gewuenscht`/`bewaehrt`/`seit` unverändert und ignoriert die beiden
+eSIM-Zeilen folgenlos; er kann die Rückfalluhr dann schlicht noch nicht bedienen, bis seine
+eigene Fassung das nachzieht (Abschnitt 17, „Der Wächter selbst" — Fassungswechsel sind
+seltene, angekündigte Vorgänge). Eine zweite, eigene Datei hätte denselben Nutzen gehabt,
+aber einen zweiten Ort für den Wächter geschaffen, an dem er nach Fristen suchen muss — genau
+die Art von Verdopplung, die das zeilenbasierte, überlesbare Format aus Abschnitt 17 von
+Anfang an vermeiden sollte.
 
 ### 24.5 Grenzen, ehrlich benannt
 
