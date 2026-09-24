@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from fleet.app import app
 from fleet.storage import Storage, create_storage, get_storage, upgrade
+from protocol import Heartbeat
 from protocol.version import PROTOCOL_VERSION
 
 APARTMENT = "house7-a03"
@@ -176,11 +177,15 @@ def test_heartbeat_with_an_unregistered_apartment_token_is_403(client: TestClien
     assert response.status_code == 403
 
 
-def test_heartbeat_with_a_valid_token_passes_through_to_not_implemented(
-    client: TestClient, token: str
-) -> None:
-    with pytest.raises(NotImplementedError):
-        client.post("/v1/heartbeat", json=HEARTBEAT_EXAMPLE, headers=_bearer(token))
+def test_heartbeat_with_a_valid_token_is_204(client: TestClient, token: str) -> None:
+    """P2.1: the endpoint is implemented, so a valid, well-formed request
+    now returns 204, not `NotImplementedError`."""
+
+    response = client.post(
+        "/v1/heartbeat", json=HEARTBEAT_EXAMPLE, headers=_bearer(token)
+    )
+
+    assert response.status_code == 204
 
 
 def test_heartbeat_for_another_apartment_than_the_token_is_403(
@@ -219,6 +224,137 @@ def test_heartbeat_endpoint_rejects_a_malformed_body_structurally(
     response = client.post("/v1/heartbeat", json=malformed, headers=_bearer(token))
 
     assert response.status_code == 422
+
+
+def test_heartbeat_rejected_request_stores_nothing(
+    client: TestClient, storage: Storage
+) -> None:
+    """A 401 must not have any side effect on storage."""
+
+    response = client.post("/v1/heartbeat", json=HEARTBEAT_EXAMPLE)
+
+    assert response.status_code == 401
+    assert storage.list_heartbeats(APARTMENT) == []
+
+
+def test_heartbeat_for_another_apartment_than_the_token_stores_nothing(
+    client: TestClient, storage: Storage, other_token: str
+) -> None:
+    """The 403 for a body/token apartment mismatch (see above) must not have
+    stored anything for either apartment."""
+
+    response = client.post(
+        "/v1/heartbeat", json=HEARTBEAT_EXAMPLE, headers=_bearer(other_token)
+    )
+
+    assert response.status_code == 403
+    assert storage.list_heartbeats(APARTMENT) == []
+    assert storage.list_heartbeats(OTHER_APARTMENT) == []
+
+
+# -----------------------------------------------------------------------------
+# POST /v1/heartbeat -- storage and version compatibility (P2.1, sections 5, 18.2)
+# -----------------------------------------------------------------------------
+
+
+def _heartbeat_payload(protocol_version: int, **extra: object) -> dict[str, object]:
+    return {**HEARTBEAT_EXAMPLE, "protocol_version": protocol_version, **extra}
+
+
+def test_heartbeat_lower_protocol_version_is_flagged_outdated(
+    client: TestClient, storage: Storage, token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 18.2: a lower `protocol_version` than our own is accepted and
+    stored, and the apartment is derived as "outdated version" on read."""
+
+    monkeypatch.setattr("fleet.storage.PROTOCOL_VERSION", 5)
+
+    response = client.post(
+        "/v1/heartbeat", json=_heartbeat_payload(1), headers=_bearer(token)
+    )
+
+    assert response.status_code == 204
+    latest = storage.get_latest_heartbeat(APARTMENT)
+    assert latest is not None
+    assert latest.outdated is True
+
+
+def test_heartbeat_equal_protocol_version_is_not_outdated(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    response = client.post(
+        "/v1/heartbeat",
+        json=_heartbeat_payload(PROTOCOL_VERSION),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 204
+    latest = storage.get_latest_heartbeat(APARTMENT)
+    assert latest is not None
+    assert latest.outdated is False
+
+
+def test_heartbeat_higher_protocol_version_is_accepted_and_not_outdated(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """Forward compatibility (section 18.2): a higher version is never
+    rejected, and is not flagged "outdated" either -- only *lower* is."""
+
+    response = client.post(
+        "/v1/heartbeat",
+        json=_heartbeat_payload(PROTOCOL_VERSION + 1),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 204
+    latest = storage.get_latest_heartbeat(APARTMENT)
+    assert latest is not None
+    assert latest.outdated is False
+
+
+def test_heartbeat_higher_version_with_an_unknown_extra_field_is_204(
+    client: TestClient, token: str
+) -> None:
+    """A future agent on a higher protocol version may send a field this
+    service does not know yet -- `Heartbeat` must ignore it (Pydantic's
+    default `extra="ignore"`), not reject the request with a 422."""
+
+    payload = _heartbeat_payload(
+        PROTOCOL_VERSION + 1, a_field_this_version_does_not_know_yet="unexpected"
+    )
+
+    response = client.post("/v1/heartbeat", json=payload, headers=_bearer(token))
+
+    assert response.status_code == 204
+
+
+def test_heartbeat_stored_and_read_back_equals_what_was_sent(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """The spec-section-5 example (`HEARTBEAT_EXAMPLE`), reused here as
+    P1.2's tests reuse it for events -- round-trips through storage
+    unchanged."""
+
+    response = client.post(
+        "/v1/heartbeat", json=HEARTBEAT_EXAMPLE, headers=_bearer(token)
+    )
+
+    assert response.status_code == 204
+    stored = storage.list_heartbeats(APARTMENT)
+    assert len(stored) == 1
+    assert stored[0] == Heartbeat.model_validate(HEARTBEAT_EXAMPLE)
+
+
+def test_heartbeat_is_stored_under_the_authenticated_apartment(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    response = client.post(
+        "/v1/heartbeat", json=HEARTBEAT_EXAMPLE, headers=_bearer(token)
+    )
+
+    assert response.status_code == 204
+    assert len(storage.list_heartbeats(APARTMENT)) == 1
+    assert storage.list_heartbeats(OTHER_APARTMENT) == []
 
 
 # -----------------------------------------------------------------------------
