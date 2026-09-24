@@ -29,11 +29,21 @@ left to be inferred from what happens next):
   apartment does not exist at all. Both cases return the **same** response
   (same status, same generic detail message) on purpose: telling the two
   apart would let a caller enumerate which apartment ids exist, which
-  CLAUDE.md's "do not reveal which apartments exist" rules out. The
-  comparison against a *known* stored hash (both dependencies below, once
-  an apartment has been identified) uses `hmac.compare_digest`, not `==`,
-  so a wrong guess does not leak how many leading bytes it got right via
-  timing.
+  CLAUDE.md's "do not reveal which apartments exist" rules out.
+  `require_apartment_token` (apartment from the address) compares against a
+  *known* stored hash with `hmac.compare_digest`, not `==`, so a wrong guess
+  does not leak how many leading bytes it got right via timing.
+  `require_apartment_token_by_hash` (apartment not in the address) instead
+  does an indexed equality lookup of the presented token's SHA-256 digest
+  against `apartments.token_hash` (`Storage
+  .get_apartment_id_by_token_hash`) -- there is no *known* hash to compare
+  against up front, the digest itself is the lookup key. This is not a
+  timing weakness: the token carries >=32 bytes of server-generated entropy
+  (section 4), so an indexed equality comparison over its SHA-256 digest
+  gives an attacker no more than "hash present or not" -- no partial-match
+  signal a `compare_digest` guards against exists here to begin with,
+  because nothing is compared byte by byte against a value the attacker is
+  approaching.
 
 The raw token is never put into a log line, a stored value, or an error
 message anywhere in this module -- only its SHA-256 hash

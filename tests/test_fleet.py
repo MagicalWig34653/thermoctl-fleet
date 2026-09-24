@@ -19,7 +19,9 @@ real-looking example value").
 from __future__ import annotations
 
 import secrets
+import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -71,8 +73,13 @@ def _bearer(token: str) -> dict[str, str]:
 
 
 @pytest.fixture
-def storage(tmp_path: object) -> Storage:
-    url = f"sqlite:///{tmp_path}/fleet-test.db"
+def db_path(tmp_path: object) -> str:
+    return f"{tmp_path}/fleet-test.db"
+
+
+@pytest.fixture
+def storage(db_path: str) -> Storage:
+    url = f"sqlite:///{db_path}"
     upgrade(url)
     return create_storage(url)
 
@@ -260,10 +267,14 @@ def test_event_endpoint_accepts_the_real_webhook_payload_with_a_valid_token(
     client: TestClient, token: str
 ) -> None:
     """Section 18.1: the apartment is embedded in the address, not in the
-    body."""
+    body. P1.2: the endpoint is implemented, so a valid, well-formed request
+    now returns 204, not `NotImplementedError`."""
 
-    with pytest.raises(NotImplementedError):
-        client.post(f"/v1/events/{APARTMENT}", json=EVENT_EXAMPLE, headers=_bearer(token))
+    response = client.post(
+        f"/v1/events/{APARTMENT}", json=EVENT_EXAMPLE, headers=_bearer(token)
+    )
+
+    assert response.status_code == 204
 
 
 def test_event_with_another_apartments_token_on_this_address_is_403(
@@ -315,8 +326,193 @@ def test_rotated_token_old_one_is_403_new_one_passes(
     )
     assert old_response.status_code == 403
 
-    with pytest.raises(NotImplementedError):
-        client.post(f"/v1/events/{APARTMENT}", json=EVENT_EXAMPLE, headers=_bearer(new_token))
+    new_response = client.post(
+        f"/v1/events/{APARTMENT}", json=EVENT_EXAMPLE, headers=_bearer(new_token)
+    )
+    assert new_response.status_code == 204
+
+
+# -----------------------------------------------------------------------------
+# POST /v1/events/{apartment} -- storage (P1.2, sections 6, 8, 18.1, 22.1)
+# -----------------------------------------------------------------------------
+
+
+def _event_payload(schluessel: str, schwere: str = "stoerung") -> dict[str, str]:
+    return {
+        "schluessel": schluessel,
+        "schwere": schwere,
+        "titel": "irrelevant title",
+        "text": "irrelevant text",
+    }
+
+
+@pytest.mark.parametrize(
+    ("schluessel", "expected_kind"),
+    [
+        ("fenster:bathroom", "window_alarm"),
+        ("schaltbefehl:radiator-3", "command_failure"),
+        ("zigbee2mqtt:brücke", "bridge_fault"),
+        ("tenant-report:bathroom:heating_cold", "tenant_report"),
+    ],
+)
+def test_event_stores_the_derived_fault_kind_for_known_prefixes(
+    client: TestClient,
+    storage: Storage,
+    token: str,
+    schluessel: str,
+    expected_kind: str,
+) -> None:
+    """Section 22.1's key table, four of the six kinds (the fifth and sixth,
+    sensor fault and stuck reading, are the `sensor:` special case below,
+    since both map to the very same key)."""
+
+    before = datetime.now(UTC)
+
+    response = client.post(
+        f"/v1/events/{APARTMENT}",
+        json=_event_payload(schluessel),
+        headers=_bearer(token),
+    )
+
+    after = datetime.now(UTC)
+    assert response.status_code == 204
+
+    rows = storage.list_events(APARTMENT)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.apartment_id == APARTMENT
+    assert row.schluessel == schluessel
+    assert row.schwere == "stoerung"
+    assert row.fault_kind == expected_kind
+    received_at = row.received_at.replace(tzinfo=UTC)
+    assert before <= received_at <= after
+
+
+def test_event_sensor_prefix_special_case_stores_no_kind_for_either_fault(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """Section 22.1: sensor fault and stuck reading deliberately share the
+    exact same key `sensor:<zone-id>` -- thermoctl maps both onto the same
+    Home Assistant entity, so the fleet service must not (and structurally
+    cannot) infer which of the two occurred from the key alone. Both reports
+    are stored with `fault_kind` = None ("other report"), not guessed."""
+
+    key = "sensor:bathroom"
+
+    for _ in range(2):  # once "as" a sensor fault, once "as" a stuck reading
+        response = client.post(
+            f"/v1/events/{APARTMENT}",
+            json=_event_payload(key),
+            headers=_bearer(token),
+        )
+        assert response.status_code == 204
+
+    rows = storage.list_events(APARTMENT)
+    assert len(rows) == 2
+    assert all(row.schluessel == key for row in rows)
+    assert all(row.fault_kind is None for row in rows)
+
+
+def test_event_with_unknown_prefix_is_204_and_stored_as_other_report(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """Section 18.1/22.1: an unknown prefix is "other report", never an
+    error -- 204, `fault_kind` None."""
+
+    response = client.post(
+        f"/v1/events/{APARTMENT}",
+        json=_event_payload("some-future-prefix:42"),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 204
+    rows = storage.list_events(APARTMENT)
+    assert len(rows) == 1
+    assert rows[0].fault_kind is None
+
+
+def test_event_titel_and_text_never_reach_the_database(
+    client: TestClient, storage: Storage, db_path: str, token: str
+) -> None:
+    """Privacy test (section 6, decided afterward in section 22.1): unique
+    marker strings placed in `titel`/`text` -- the kind of content thermoctl
+    actually sends there (a fake tenant name, a room temperature) -- must
+    appear nowhere in the stored event, checked two independent ways: via
+    `Storage.list_events` and via the raw bytes of the SQLite file itself, so
+    a bug in the ORM mapping could not hide a leak."""
+
+    tenant_name_marker = "Reported-by-Erika-Musterfrau-Unique98765"
+    room_temperature_marker = "room-temperature-21.3-C-Unique98765"
+    payload = {
+        "schluessel": "tenant-report:bathroom:heating_cold",
+        "schwere": "stoerung",
+        "titel": tenant_name_marker,
+        "text": room_temperature_marker,
+    }
+
+    response = client.post(
+        f"/v1/events/{APARTMENT}", json=payload, headers=_bearer(token)
+    )
+    assert response.status_code == 204
+
+    # 1. Through the storage API and its underlying engine via raw SQL.
+    rows = storage.list_events(APARTMENT)
+    assert len(rows) == 1
+    for row in rows:
+        for value in vars(row).values():
+            assert tenant_name_marker not in str(value)
+            assert room_temperature_marker not in str(value)
+
+    with storage.engine.connect() as connection:
+        raw_rows = connection.exec_driver_sql("SELECT * FROM events").fetchall()
+    assert len(raw_rows) == 1
+    for raw_row in raw_rows:
+        for value in raw_row:
+            assert tenant_name_marker not in str(value)
+            assert room_temperature_marker not in str(value)
+
+    # 2. Through the raw bytes of the database file, independent of any ORM
+    # or SQL layer -- a leaked marker anywhere in the file (a stray column,
+    # a WAL/journal artifact) would still show up here.
+    sqlite_connection = sqlite3.connect(db_path)
+    try:
+        sqlite_connection.commit()  # flush any pending SQLite journal/WAL content
+    finally:
+        sqlite_connection.close()
+    raw_bytes = b""
+    for suffix in ("", "-wal", "-journal"):
+        try:
+            raw_bytes += open(f"{db_path}{suffix}", "rb").read()
+        except FileNotFoundError:
+            pass
+    assert tenant_name_marker.encode() not in raw_bytes
+    assert room_temperature_marker.encode() not in raw_bytes
+
+
+def test_event_is_stored_under_the_address_apartment_only(
+    client: TestClient, storage: Storage, token: str, other_token: str
+) -> None:
+    """Events are stored under the apartment from the address and are not
+    visible for another apartment."""
+
+    response = client.post(
+        f"/v1/events/{APARTMENT}", json=EVENT_EXAMPLE, headers=_bearer(token)
+    )
+    assert response.status_code == 204
+
+    assert len(storage.list_events(APARTMENT)) == 1
+    assert storage.list_events(OTHER_APARTMENT) == []
+
+
+def test_event_rejected_request_stores_nothing(
+    client: TestClient, storage: Storage
+) -> None:
+    """A 401/403 must not have any side effect on storage."""
+
+    response = client.post(f"/v1/events/{APARTMENT}", json=EVENT_EXAMPLE)
+
+    assert response.status_code == 401
+    assert storage.list_events(APARTMENT) == []
 
 
 # -----------------------------------------------------------------------------

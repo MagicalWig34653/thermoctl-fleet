@@ -1099,6 +1099,16 @@ in the envelope (`None` where the key does not allow an unambiguous mapping, as 
 special case above), not something guessed out of the key's text. The benefit: a new fault
 kind costs no protocol change on either side, only a new entry in the prefix table.
 
+**Decided afterward (project owner, 2026-09-24):** the envelope's "plain text" is generated
+by the fleet service itself, from `kind` and `key` only -- it is never taken from
+thermoctl's `titel`/`text`. Reason, verified in thermoctl's source: a tenant report's `text`
+names the tenant ("Reported by: ..."), the last room temperature, the setpoint, the mode,
+and the tenant's free-text note; a sensor-fault `text` carries the frost-protection setpoint.
+Section 6 forbids all of these in the cloud outright ("the text of tenant problem reports" is
+explicitly listed among what is not transmitted). `Event` keeps accepting and validating
+`titel`/`text` unchanged (thermoctl's webhook payload is not ours to change), the fleet
+service simply never reads either field again once validation has passed.
+
 ### 22.2 `since` in the state file
 
 Meaning: **the point in time since which `desired` has applied** -- i.e. when the agent

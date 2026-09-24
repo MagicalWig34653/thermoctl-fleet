@@ -237,9 +237,36 @@ def test_fault_event_from_event_builds_the_unified_envelope() -> None:
     assert fault_event.kind == FaultKind.WINDOW_ALARM
     assert fault_event.key == "fenster:3"
     assert fault_event.timestamp == received
-    assert fault_event.message == (
-        "Window open: Zone 3 reports an open window for 20 minutes."
+    assert fault_event.message == "window alarm: fenster:3"
+
+
+def test_fault_event_from_event_message_never_contains_titel_or_text() -> None:
+    """Decided afterward (section 22.1, 2026-09-24): `message` is built only
+
+    from `kind`/`key`, never from `Event.titel`/`Event.text` -- those carry
+    the tenant's name, room temperature, setpoint, mode, and free-text note
+    (tenant report) or the frost-protection setpoint (sensor fault), all
+    forbidden in the cloud by section 6.
+    """
+
+    tenant_name_marker = "Reported by: Erika Musterfrau-Unique12345"
+    room_temperature_marker = "21.3 degrees C, setpoint 22.0"
+    event = Event.model_validate(
+        {
+            "schluessel": "tenant-report:3:heating_cold",
+            "schwere": "stoerung",
+            "titel": tenant_name_marker,
+            "text": room_temperature_marker,
+        }
     )
+
+    fault_event = fault_event_from_event(
+        event, datetime(2026, 9, 22, 14, 3, 11, tzinfo=UTC)
+    )
+
+    assert tenant_name_marker not in fault_event.message
+    assert room_temperature_marker not in fault_event.message
+    assert fault_event.message == "tenant report: tenant-report:3:heating_cold"
 
 
 def test_fault_event_from_event_leaves_kind_open_for_ambiguous_key() -> None:
@@ -257,3 +284,4 @@ def test_fault_event_from_event_leaves_kind_open_for_ambiguous_key() -> None:
     )
 
     assert fault_event.kind is None
+    assert fault_event.message == "other report: sensor:3"

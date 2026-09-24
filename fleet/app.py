@@ -15,11 +15,14 @@ have been implemented.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
+from fleet.storage import Storage, get_storage
 from protocol import (
     CommandResult,
     DeviceLifecycle,
@@ -80,8 +83,10 @@ def receive_event(
     apartment: str,
     event: Event,
     authenticated_apartment: str = Depends(require_apartment_token),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> None:
-    """Accepts an event report (section 11, step 1; section 18.1).
+    """Accepts and stores an event report (P1.2, section 11 step 1; sections
+    6, 8, 18.1, 22.1).
 
     The apartment is embedded in the address, not in the payload -- thermoctl's
     fault webhook sends only `schluessel`/`schwere`/`titel`/`text` unchanged (see
@@ -89,16 +94,27 @@ def receive_event(
     `require_apartment_token`, which already validated the address apartment
     against the presented token -- `authenticated_apartment` is that same value.
 
-    Still missing: storage, mapping the `schluessel` prefix via
-    `protocol.fault_kind_from_key` for alarm evaluation (section 8).
+    `Storage.save_event` (section 12/22.1) stores apartment, `schluessel`,
+    `schwere`, the fault kind derived via `protocol.fault_kind_from_key`
+    (`None` = "other report" -- including the deliberate `sensor:` special
+    case, section 22.1: sensor fault and stuck reading share one key and are
+    therefore never distinguished here), and the receipt time (section 18.1:
+    "the timestamp is the receipt time", server time in UTC) -- never the
+    unknown prefix as an error. **`event.titel`/`event.text` are deliberately
+    discarded here, never stored or otherwise used** (decided afterward,
+    section 22.1): thermoctl's tenant-report text names the tenant, the last
+    room temperature, the setpoint, the mode, and a free-text note;
+    sensor-fault text carries the frost-protection setpoint -- all forbidden
+    in the cloud by section 6.
+
+    Still missing: alarm evaluation (section 8) -- an open fault older than
+    two hours should alarm, which needs the absence-alarming machinery from
+    P2.2, not this endpoint alone.
     """
 
     del authenticated_apartment  # equal to `apartment` by construction, see above
 
-    raise NotImplementedError(
-        f"Storage and alarm evaluation for apartment {apartment!r} are missing "
-        "-- see docs/specification.md sections 8, 11 and 18.1."
-    )
+    storage.save_event(apartment, event, datetime.now(UTC))
 
 
 @app.get("/v1/commands")
