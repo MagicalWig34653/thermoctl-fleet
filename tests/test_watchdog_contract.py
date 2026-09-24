@@ -1,18 +1,16 @@
-"""Prüft die Python-Seite des Vertrags mit dem Wächter (Abschnitt 17, 18.3).
+"""Tests the Python side of the contract with the watchdog (section 17, 18.3).
 
-Der eigentliche **sprachübergreifende** Vertragstest -- "Python schreibt die
-Zustandsdatei, Go liest sie" -- läuft nicht hier, sondern in
-`waechter/pruefe_vertrag.sh` (gebaut vom Go-Binärprogramm, ausgeführt in
-`.github/workflows/go.yml`): Ein Python-Testprozess kann kein Go-Binärprogramm
-bauen, ohne dass diese Testsuite plötzlich eine Go-Toolchain voraussetzt, und
-CLAUDE.md hält die Python-CI-Spur ausdrücklich unverändert (Abschnitt 18.3,
-"Die bestehende Python-Spur bleibt, wie sie ist").
+The actual **cross-language** contract test -- "Python writes the state file,
+Go reads it" -- does not run here but in `watchdog/check_contract.sh` (built
+from the Go binary, run in `.github/workflows/go.yml`): a Python test process
+cannot build a Go binary without this test suite suddenly requiring a Go
+toolchain, and CLAUDE.md explicitly keeps the existing Python CI track
+unchanged (section 18.3, "the existing Python track stays as it is").
 
-Was hier geprüft wird: dass `agent.schleife.waechter_zustand_melden`
-tatsächlich das dokumentierte, zeilenbasierte Format schreibt (`gewuenscht=`,
-optional `bewaehrt=`, `seit=`) -- kein JSON, keine falsch benannten
-Schlüssel, kein fehlender abschließender Zeilenumbruch, an dem ein
-zeilenweiser Leser (wie `waechter/zustand.go`) sich verschlucken würde.
+What is checked here: that `agent.loop.report_watchdog_state` actually writes
+the documented, line-based format (`desired=`, optional `proven=`, `since=`)
+-- no JSON, no misnamed keys, no missing trailing newline that a line-by-line
+reader (like `watchdog/state.go`) would choke on.
 """
 
 from __future__ import annotations
@@ -20,102 +18,102 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from agent.schleife import gesundmeldung_melden, waechter_zustand_melden
+from agent.loop import report_health, report_watchdog_state
 
 
-def test_schreibt_gewuenscht_und_seit_ohne_bewaehrt(tmp_path: Path) -> None:
-    pfad = tmp_path / "zustand.env"
+def test_writes_desired_and_since_without_proven(tmp_path: Path) -> None:
+    path = tmp_path / "state.env"
     digest = "sha256:" + "a" * 64
 
-    waechter_zustand_melden(pfad, gewuenscht=digest)
+    report_watchdog_state(path, desired=digest)
 
-    zeilen = pfad.read_text(encoding="utf-8").splitlines()
-    assert zeilen[0] == f"gewuenscht={digest}"
-    assert not any(zeile.startswith("bewaehrt=") for zeile in zeilen)
-    assert re.fullmatch(r"seit=\d+", zeilen[-1])
-
-
-def test_schreibt_bewaehrten_digest_wenn_angegeben(tmp_path: Path) -> None:
-    pfad = tmp_path / "zustand.env"
-    neu = "sha256:" + "b" * 64
-    alt = "sha256:" + "a" * 64
-
-    waechter_zustand_melden(pfad, gewuenscht=neu, bewaehrt=alt)
-
-    zeilen = pfad.read_text(encoding="utf-8").splitlines()
-    assert f"gewuenscht={neu}" in zeilen
-    assert f"bewaehrt={alt}" in zeilen
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == f"desired={digest}"
+    assert not any(line.startswith("proven=") for line in lines)
+    assert re.fullmatch(r"since=\d+", lines[-1])
 
 
-def test_datei_ist_kein_json() -> None:
-    """Abschnitt 17/18.3: bewusst kein JSON, damit jede Sprache mit Bordmitteln
+def test_writes_proven_digest_when_given(tmp_path: Path) -> None:
+    path = tmp_path / "state.env"
+    new = "sha256:" + "b" * 64
+    old = "sha256:" + "a" * 64
 
-    lesen kann -- stellvertretend dafür geprüft am Quelltext: `agent.schleife`
-    importiert `json` an keiner Stelle.
+    report_watchdog_state(path, desired=new, proven=old)
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert f"desired={new}" in lines
+    assert f"proven={old}" in lines
+
+
+def test_file_is_not_json() -> None:
+    """Section 17/18.3: deliberately not JSON, so that every language can
+
+    read it with built-in tools -- checked representatively against the
+    source: `agent.loop` does not import `json` anywhere.
     """
 
-    import agent.schleife as modul
+    import agent.loop as module
 
-    quelltext = Path(modul.__file__).read_text(encoding="utf-8")
-    assert "import json" not in quelltext
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    assert "import json" not in source
 
 
-def test_datei_endet_mit_zeilenumbruch(tmp_path: Path) -> None:
-    """Ein zeilenweiser Leser (bufio.Scanner in waechter/zustand.go) braucht keinen
+def test_file_ends_with_a_newline(tmp_path: Path) -> None:
+    """A line-by-line reader (bufio.Scanner in watchdog/state.go) does not need
 
-    abschließenden Zeilenumbruch, aber ein fehlender wäre ein Zeichen dafür,
-    dass hier nicht mit den vorgesehenen, einzeln zusammengesetzten Zeilen
-    gearbeitet wurde -- deshalb ausdrücklich geprüft.
+    a trailing newline, but a missing one would be a sign that this was not
+    built from the intended, individually assembled lines -- hence checked
+    explicitly.
     """
 
-    pfad = tmp_path / "zustand.env"
-    waechter_zustand_melden(pfad, gewuenscht="sha256:" + "a" * 64)
+    path = tmp_path / "state.env"
+    report_watchdog_state(path, desired="sha256:" + "a" * 64)
 
-    assert pfad.read_text(encoding="utf-8").endswith("\n")
+    assert path.read_text(encoding="utf-8").endswith("\n")
 
 
-def test_schreibt_esim_rueckfallzeilen_wenn_angegeben(tmp_path: Path) -> None:
-    """Abschnitt 24.4, nachträglich festgelegt: die Rückfalluhr steht als zwei
+def test_writes_esim_fallback_lines_when_given(tmp_path: Path) -> None:
+    """Section 24.4, decided afterward: the fallback clock is two further
 
-    weitere Zeilen in derselben Zustandsdatei.
+    lines in the same state file.
     """
 
-    pfad = tmp_path / "zustand.env"
+    path = tmp_path / "state.env"
 
-    waechter_zustand_melden(
-        pfad,
-        gewuenscht="sha256:" + "a" * 64,
-        esim_vorheriges_profil="profil-1",
-        esim_frist=1790000723,
+    report_watchdog_state(
+        path,
+        desired="sha256:" + "a" * 64,
+        esim_previous_profile="profile-1",
+        esim_deadline=1790000723,
     )
 
-    zeilen = pfad.read_text(encoding="utf-8").splitlines()
-    assert "esim_vorheriges_profil=profil-1" in zeilen
-    assert "esim_frist=1790000723" in zeilen
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert "esim_previous_profile=profile-1" in lines
+    assert "esim_deadline=1790000723" in lines
 
 
-def test_ohne_esim_angaben_bleiben_die_zeilen_weg(tmp_path: Path) -> None:
-    pfad = tmp_path / "zustand.env"
+def test_without_esim_data_the_lines_stay_out(tmp_path: Path) -> None:
+    path = tmp_path / "state.env"
 
-    waechter_zustand_melden(pfad, gewuenscht="sha256:" + "a" * 64)
+    report_watchdog_state(path, desired="sha256:" + "a" * 64)
 
-    zeilen = pfad.read_text(encoding="utf-8").splitlines()
-    assert not any(zeile.startswith("esim_") for zeile in zeilen)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert not any(line.startswith("esim_") for line in lines)
 
 
-def test_gesundmeldung_melden_schreibt_zeitpunkt_digest_fassung(tmp_path: Path) -> None:
-    """Abschnitt 22.3, nachträglich festgelegt: zeilenbasiert wie die
+def test_report_health_writes_timestamp_digest_version(tmp_path: Path) -> None:
+    """Section 22.3, decided afterward: line-based like the state file, not
 
-    Zustandsdatei, nicht ein einzelner Zeitstempel.
+    a single timestamp.
     """
 
-    pfad = tmp_path / "gesundmeldung.env"
+    path = tmp_path / "health.env"
     digest = "sha256:" + "c" * 64
 
-    gesundmeldung_melden(pfad, digest=digest, fassung="0.4.0")
+    report_health(path, digest=digest, version="0.4.0")
 
-    zeilen = pfad.read_text(encoding="utf-8").splitlines()
-    assert re.fullmatch(r"zeitpunkt=\d+", zeilen[0])
-    assert zeilen[1] == f"digest={digest}"
-    assert zeilen[2] == "fassung=0.4.0"
-    assert pfad.read_text(encoding="utf-8").endswith("\n")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert re.fullmatch(r"timestamp=\d+", lines[0])
+    assert lines[1] == f"digest={digest}"
+    assert lines[2] == "version=0.4.0"
+    assert path.read_text(encoding="utf-8").endswith("\n")

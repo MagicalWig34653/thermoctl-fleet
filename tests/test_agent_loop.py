@@ -1,70 +1,70 @@
-"""Prüft die Abschnitt-21-Stummel in `agent/schleife.py`.
+"""Tests the section-21 stubs in `agent/loop.py`.
 
-`zugang_oeffnen` ist der einzige davon mit einer echten Prüfung (die
-`pilotbetrieb`-Ablehnung) -- entsprechend zwei Fälle dafür, nicht nur einer.
+`open_access` is the only one with a real check (the `pilot_mode` rejection) --
+accordingly two cases for it, not just one.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from agent.schleife import (
-    diagnose_paket_erstellen,
-    esim_profil_aktivieren,
-    esim_profil_laden,
-    esim_profil_loeschen,
-    esim_profile_auflisten,
-    zugang_oeffnen,
-    zurueck_setzen,
+from agent.loop import (
+    create_diagnostic_bundle,
+    esim_profile_activate,
+    esim_profile_delete,
+    esim_profile_load,
+    esim_profiles_list,
+    factory_reset,
+    open_access,
 )
 
 
-def test_zurueck_setzen_meldet_fehlende_umsetzung() -> None:
+def test_factory_reset_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        zurueck_setzen()
+        factory_reset()
 
 
-def test_diagnose_paket_erstellen_meldet_fehlende_umsetzung() -> None:
+def test_create_diagnostic_bundle_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        diagnose_paket_erstellen()
+        create_diagnostic_bundle()
 
 
-def test_zugang_oeffnen_lehnt_ohne_pilotbetrieb_lokal_ab() -> None:
-    """Abschnitt 21.4: 'lehnt der Agent den Befehl ab -- die Prüfung liegt
+def test_open_access_rejects_without_pilot_mode_locally() -> None:
+    """Section 21.4: 'the agent rejects the command -- the check is local,
 
-    lokal, nicht in der Oberfläche.' Diese Ablehnung ist echt umgesetzt,
-    deshalb `PermissionError` und nicht `NotImplementedError`.
+    not in the UI.' This rejection is really implemented, hence
+    `PermissionError` rather than `NotImplementedError`.
     """
 
     with pytest.raises(PermissionError):
-        zugang_oeffnen(pilotbetrieb=False)
+        open_access(pilot_mode=False)
 
 
-def test_zugang_oeffnen_meldet_fehlende_umsetzung_wenn_pilotbetrieb_gesetzt() -> None:
-    """Mit `pilotbetrieb=True` besteht der Befehl die einzige echte Prüfung --
+def test_open_access_reports_missing_implementation_when_pilot_mode_set() -> None:
+    """With `pilot_mode=True` the command passes the one real check --
 
-    der Rest (SSH-Zertifikat, Rückkanal) ist weiterhin Platzhalter.
+    the rest (SSH certificate, back-channel) is still a placeholder.
     """
 
     with pytest.raises(NotImplementedError):
-        zugang_oeffnen(pilotbetrieb=True)
+        open_access(pilot_mode=True)
 
 
-def test_esim_profile_auflisten_meldet_fehlende_umsetzung() -> None:
+def test_esim_profiles_list_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        esim_profile_auflisten()
+        esim_profiles_list()
 
 
-def test_esim_profil_laden_meldet_fehlende_umsetzung() -> None:
+def test_esim_profile_load_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        esim_profil_laden("LPA:1$rsp.example.com$ABCDEF")
+        esim_profile_load("LPA:1$rsp.example.com$ABCDEF")
 
 
-def test_esim_profil_aktivieren_meldet_fehlende_umsetzung() -> None:
+def test_esim_profile_activate_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        esim_profil_aktivieren("profil-1")
+        esim_profile_activate("profile-1")
 
 
-def test_esim_profil_loeschen_meldet_fehlende_umsetzung() -> None:
+def test_esim_profile_delete_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        esim_profil_loeschen("profil-1")
+        esim_profile_delete("profile-1")

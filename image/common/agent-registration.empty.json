@@ -1,5 +1,5 @@
 {
-  "fleet_adresse": "",
-  "zertifikat_fingerabdruck": "",
-  "anmeldecode": ""
+  "fleet_address": "",
+  "certificate_fingerprint": "",
+  "registration_code": ""
 }

@@ -1,8 +1,8 @@
-"""Prüft `tools/pruefe_abbild_konfiguration.py`.
+"""Tests `tools/check_image_config.py`.
 
-Sowohl gegen die echte Konfiguration unter `abbild/` (kein Alibi-Test: fällt
-eine der Dateien dort aus, schlägt dieser Test fehl, nicht erst der CI-Lauf in
-`abbild.yml`) als auch gegen absichtlich fehlerhafte Fälle.
+Both against the real configuration under `image/` (not an alibi test: if one of
+the files there breaks, this test fails, not only the CI run in `image.yml`) and
+against deliberately broken cases.
 """
 
 from __future__ import annotations
@@ -12,55 +12,57 @@ from pathlib import Path
 
 import pytest
 
-from tools.pruefe_abbild_konfiguration import (
-    ABBILD_VERZEICHNIS,
-    Abbildfehler,
-    alles_pruefen,
-    melder_anmeldung_vorlage_pruefen,
-    paketliste_pruefen,
-    udev_regel_pruefen,
+from tools.check_image_config import (
+    IMAGE_DIR,
+    ImageError,
+    check_agent_registration_template,
+    check_all,
+    check_package_list,
+    check_udev_rule,
 )
 
 
-def test_echte_abbild_konfiguration_ist_plausibel() -> None:
-    alles_pruefen(ABBILD_VERZEICHNIS)
+def test_real_image_configuration_is_plausible() -> None:
+    check_all(IMAGE_DIR)
 
 
-def test_paketliste_lehnt_leere_datei_ab(tmp_path: Path) -> None:
-    datei = tmp_path / "paketliste.txt"
-    datei.write_text("# nur ein Kommentar\n", encoding="utf-8")
+def test_package_list_rejects_empty_file(tmp_path: Path) -> None:
+    path = tmp_path / "packages.txt"
+    path.write_text("# just a comment\n", encoding="utf-8")
 
-    with pytest.raises(Abbildfehler):
-        paketliste_pruefen(datei)
-
-
-def test_paketliste_lehnt_duplikat_ab(tmp_path: Path) -> None:
-    datei = tmp_path / "paketliste.txt"
-    datei.write_text("docker.io\ndocker.io\n", encoding="utf-8")
-
-    with pytest.raises(Abbildfehler):
-        paketliste_pruefen(datei)
+    with pytest.raises(ImageError):
+        check_package_list(path)
 
 
-def test_paketliste_lehnt_ungueltigen_namen_ab(tmp_path: Path) -> None:
-    datei = tmp_path / "paketliste.txt"
-    datei.write_text("Nicht Gueltig!\n", encoding="utf-8")
+def test_package_list_rejects_duplicate(tmp_path: Path) -> None:
+    path = tmp_path / "packages.txt"
+    path.write_text("docker.io\ndocker.io\n", encoding="utf-8")
 
-    with pytest.raises(Abbildfehler):
-        paketliste_pruefen(datei)
-
-
-def test_udev_regel_ohne_subsystem_wird_abgelehnt(tmp_path: Path) -> None:
-    datei = tmp_path / "99-zigbee-stick.rules"
-    datei.write_text("# nur ein Kommentar\n", encoding="utf-8")
-
-    with pytest.raises(Abbildfehler):
-        udev_regel_pruefen(datei)
+    with pytest.raises(ImageError):
+        check_package_list(path)
 
 
-def test_melder_anmeldung_vorlage_mit_fehlendem_feld_wird_abgelehnt(tmp_path: Path) -> None:
-    datei = tmp_path / "melder-anmeldung.leer.json"
-    datei.write_text(json.dumps({"fleet_adresse": ""}), encoding="utf-8")
+def test_package_list_rejects_invalid_name(tmp_path: Path) -> None:
+    path = tmp_path / "packages.txt"
+    path.write_text("Not Valid!\n", encoding="utf-8")
 
-    with pytest.raises(Abbildfehler):
-        melder_anmeldung_vorlage_pruefen(datei)
+    with pytest.raises(ImageError):
+        check_package_list(path)
+
+
+def test_udev_rule_without_subsystem_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "99-zigbee-stick.rules"
+    path.write_text("# just a comment\n", encoding="utf-8")
+
+    with pytest.raises(ImageError):
+        check_udev_rule(path)
+
+
+def test_agent_registration_template_with_missing_field_is_rejected(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent-registration.empty.json"
+    path.write_text(json.dumps({"fleet_address": ""}), encoding="utf-8")
+
+    with pytest.raises(ImageError):
+        check_agent_registration_template(path)

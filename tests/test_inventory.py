@@ -1,10 +1,9 @@
-"""Prüft die vier Bestand-Modelle (Abschnitt 20.1).
+"""Tests the four inventory models (section 20.1).
 
-Kein Alibi-Test: geprüft wird genau, was Abschnitt 20 verlangt -- die
-Zuordnung ist ein eigener Eintrag statt eines Felds am Gerät, die Wohnung
-nimmt keinen Mieternamen an, und `pilotbetrieb` ist ohne Angabe `False`
-(Abschnitt 21.4: eine neu angelegte Wohnung ist nie versehentlich im
-Erprobungsbetrieb).
+Not an alibi test: this checks exactly what section 20 requires -- the assignment
+is its own entry instead of a field on the device, the apartment does not accept a
+tenant name, and `pilot_mode` defaults to `False` without being given (section
+21.4: a newly created apartment is never accidentally in pilot mode).
 """
 
 from __future__ import annotations
@@ -12,117 +11,117 @@ from __future__ import annotations
 import pydantic
 import pytest
 
-from protokoll.bestand import (
-    Geraet,
-    GeraetLebenszyklus,
-    Liegenschaft,
-    Wohnung,
-    WohnungZustand,
-    Zuordnung,
+from protocol.inventory import (
+    Apartment,
+    ApartmentState,
+    Assignment,
+    Device,
+    DeviceLifecycle,
+    Property,
 )
 
 
-def test_zustandsnamen_sind_englisch_abschnitt_20_1_22_4() -> None:
-    """Abschnitt 20.1/22.4: nachträglich als englische Werte festgelegt --
+def test_state_names_are_english_section_20_1_22_4() -> None:
+    """Section 20.1/22.4: decided afterward as English values --
 
-    stellvertretend geprüft, dass die frühere deutsche Schreibweise ('im_einsatz',
-    'bewohnt') keine gültigen Werte mehr sind und die neuen es sind.
+    checked representatively that the former German spelling ('im_einsatz',
+    'bewohnt') are no longer valid values and the new ones are.
     """
 
-    assert GeraetLebenszyklus.IM_EINSATZ.value == "in_service"
-    assert WohnungZustand.BEWOHNT.value == "occupied"
+    assert DeviceLifecycle.IN_SERVICE.value == "in_service"
+    assert ApartmentState.OCCUPIED.value == "occupied"
 
     with pytest.raises(pydantic.ValidationError):
-        Wohnung.model_validate(
+        Apartment.model_validate(
             {
-                "kennung": "haus7-w03",
-                "bezeichnung": "3. OG links",
-                "zustand": "bewohnt",
-                "heizkreise": 6,
+                "id": "house7-a03",
+                "label": "3rd floor, left",
+                "state": "bewohnt",
+                "heating_circuits": 6,
             }
         )
 
 
-def test_wohnung_ohne_pilotbetrieb_ist_nicht_im_erprobungsbetrieb() -> None:
-    wohnung = Wohnung(
-        kennung="haus7-w03",
-        bezeichnung="3. OG links",
-        zustand="occupied",
-        heizkreise=6,
+def test_apartment_without_pilot_mode_is_not_in_pilot_mode() -> None:
+    apartment = Apartment(
+        id="house7-a03",
+        label="3rd floor, left",
+        state="occupied",
+        heating_circuits=6,
     )
 
-    assert wohnung.pilotbetrieb is False
+    assert apartment.pilot_mode is False
 
 
-def test_wohnung_nimmt_keinen_mieternamen_an() -> None:
-    """Abschnitt 20.1/6: 'Kein Mietername, keine Kontaktdaten' -- stellvertretend
+def test_apartment_does_not_accept_a_tenant_name() -> None:
+    """Section 20.1/6: 'no tenant name, no contact details' -- checked
 
-    dafür geprüft: Ein zusätzliches Feld `mietername` wird von Pydantic in der
-    Vorgabeeinstellung ignoriert, landet also nicht im Modell.
+    representatively: an additional `tenant_name` field is ignored by Pydantic
+    under the default configuration, so it does not end up on the model.
     """
 
-    wohnung = Wohnung.model_validate(
+    apartment = Apartment.model_validate(
         {
-            "kennung": "haus7-w03",
-            "bezeichnung": "3. OG links",
-            "zustand": "occupied",
-            "heizkreise": 6,
-            "mietername": "Erika Musterfrau",
+            "id": "house7-a03",
+            "label": "3rd floor, left",
+            "state": "occupied",
+            "heating_circuits": 6,
+            "tenant_name": "Jane Doe",
         }
     )
 
-    assert not hasattr(wohnung, "mietername")
+    assert not hasattr(apartment, "tenant_name")
 
 
-def test_geraet_zustand_ist_eine_abschliessende_aufzaehlung() -> None:
+def test_device_state_is_a_closed_enumeration() -> None:
     with pytest.raises(pydantic.ValidationError):
-        Geraet.model_validate(
+        Device.model_validate(
             {
-                "kennung": "sn-12345",
-                "bauart": "Pi 5",
-                "anschaffungsdatum": "2026-01-15",
-                "oeffentlicher_schluessel_fingerabdruck": "ab:cd:ef",
-                "abbild_fassung": "2026.1",
-                "waechter_fassung": "0.1.0",
-                "zustand": "verschollen",
+                "id": "sn-12345",
+                "model": "Pi 5",
+                "acquisition_date": "2026-01-15",
+                "public_key_fingerprint": "ab:cd:ef",
+                "image_version": "2026.1",
+                "watchdog_version": "0.1.0",
+                "state": "missing",
             }
         )
 
 
-def test_geraet_erlaubt_alle_sieben_zustaende() -> None:
-    for zustand in GeraetLebenszyklus:
-        Geraet.model_validate(
+def test_device_allows_all_seven_states() -> None:
+    for state in DeviceLifecycle:
+        Device.model_validate(
             {
-                "kennung": "sn-12345",
-                "bauart": "Pi 5",
-                "anschaffungsdatum": "2026-01-15",
-                "oeffentlicher_schluessel_fingerabdruck": "ab:cd:ef",
-                "abbild_fassung": "2026.1",
-                "waechter_fassung": "0.1.0",
-                "zustand": zustand,
+                "id": "sn-12345",
+                "model": "Pi 5",
+                "acquisition_date": "2026-01-15",
+                "public_key_fingerprint": "ab:cd:ef",
+                "image_version": "2026.1",
+                "watchdog_version": "0.1.0",
+                "state": state,
             }
         )
 
 
-def test_zuordnung_ist_ein_eigener_eintrag_mit_von_bis_und_grund() -> None:
-    """Abschnitt 20.1: 'nie ein bloßes Feld am Gerät, sondern ein eigener
+def test_assignment_is_its_own_entry_with_from_until_and_reason() -> None:
+    """Section 20.1: 'never a mere field on the device, but its own
 
-    Eintrag mit von, bis und Grund' -- stellvertretend geprüft, dass
-    `Zuordnung` diese drei Felder trägt und `Geraet` keines davon.
+    entry with from, until and reason' -- checked representatively that
+    `Assignment` carries these three fields and `Device` none of them.
     """
 
-    zuordnung = Zuordnung(
-        geraet_kennung="sn-12345",
-        wohnung_kennung="haus7-w03",
-        von="2026-01-15T10:00:00Z",
-        grund="Erstinbetriebnahme",
+    assignment = Assignment(
+        device_id="sn-12345",
+        apartment_id="house7-a03",
+        from_="2026-01-15T10:00:00Z",
+        reason="Initial commissioning",
     )
 
-    assert zuordnung.bis is None
-    assert not hasattr(Geraet, "wohnung_kennung")
+    assert assignment.until is None
+    assert not hasattr(Device, "apartment_id")
 
 
-def test_liegenschaft_minimal() -> None:
-    liegenschaft = Liegenschaft(name="Haus 7", anschrift="Musterstraße 7")
+def test_property_minimal() -> None:
+    property_ = Property(name="House 7", address="Sample Street 7")
 
-    assert liegenschaft.notizen is None
+    assert property_.notes is None

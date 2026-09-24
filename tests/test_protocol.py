@@ -1,10 +1,10 @@
-"""Prüft den Vertrag in `protokoll/` gegen die Spezifikation.
+"""Tests the contract in `protocol/` against the specification.
 
-Kein Alibi-Test: Diese Fälle sind genau die, die CLAUDE.md für das Gerüst
-verlangt -- das Beispiel aus der Spezifikation wird angenommen, ein fehlerhafter
-Herzschlag abgelehnt, ein unbekannter Befehl abgelehnt. Dazu die beiden in
-Abschnitt 18 nachgezogenen Festlegungen: die echte Ereignis-Nutzlast (18.1) und
-die Verträglichkeit älterer Fassungen (18.2).
+Not an alibi test: these are exactly the cases CLAUDE.md requires for the
+scaffold -- the example from the specification is accepted, a malformed
+heartbeat is rejected, an unknown command is rejected. Plus the two decisions
+made in section 18: the real event payload (18.1) and compatibility with older
+versions (18.2).
 """
 
 from __future__ import annotations
@@ -14,247 +14,246 @@ from datetime import UTC, datetime
 import pydantic
 import pytest
 
-from protokoll.befehle import Befehl
-from protokoll.ereignisse import (
-    Ereignis,
-    stoerungsart_aus_schluessel,
-    stoerungsereignis_aus_ereignis,
+from protocol.commands import Command
+from protocol.events import (
+    Event,
+    fault_event_from_event,
+    fault_kind_from_key,
 )
-from protokoll.herzschlag import Herzschlag, Stoerungsart
-from protokoll.version import PROTOKOLLVERSION
+from protocol.heartbeat import FaultKind, Heartbeat
+from protocol.version import PROTOCOL_VERSION
 
-# Wörtlich aus docs/spezifikation.md, Abschnitt 5, ergänzt um
-# "protokollversion" aus Abschnitt 18.2 (dort ohne eigenes Beispiel
-# festgelegt, siehe protokoll/herzschlag.py).
-HERZSCHLAG_BEISPIEL = {
-    "wohnung": "haus7-w03",
-    "gesendet": "2026-09-22T14:03:11Z",
-    "melder": "0.1.0",
-    "protokollversion": PROTOKOLLVERSION,
-    "thermoctl": {"version": "0.9.5", "erreichbar": True, "betriebsart": "scharf"},
-    "regelung": {
-        "letzte_entscheidung": "2026-09-22T14:02:47Z",
-        "zonen": 6,
-        "zonen_mit_waermeanforderung": 2,
-        "zonen_ohne_messwert": 0,
+# Taken literally from docs/specification.md, section 5, extended by
+# "protocol_version" from section 18.2 (fixed there without its own example,
+# see protocol/heartbeat.py).
+HEARTBEAT_EXAMPLE = {
+    "apartment": "house7-a03",
+    "sent_at": "2026-09-22T14:03:11Z",
+    "agent": "0.1.0",
+    "protocol_version": PROTOCOL_VERSION,
+    "thermoctl": {"version": "0.9.5", "reachable": True, "mode": "armed"},
+    "control": {
+        "last_decision": "2026-09-22T14:02:47Z",
+        "zones": 6,
+        "zones_with_heat_demand": 2,
+        "zones_without_reading": 0,
     },
-    "geraete": {
-        "zigbee_bruecke": "verbunden",
-        "schwaechste_batterie_prozent": 62,
-        "schlechteste_funkqualitaet": 47,
-        "stumme_geraete": 0,
+    "devices": {
+        "zigbee_bridge": "connected",
+        "weakest_battery_percent": 62,
+        "worst_signal_quality": 47,
+        "silent_devices": 0,
     },
     "system": {
-        "laufzeit_s": 962114,
-        "speicher_frei_prozent": 41,
-        "datentraeger_frei_prozent": 68,
-        "zeitversatz_s": 0.4,
+        "uptime_s": 962114,
+        "memory_free_percent": 41,
+        "disk_free_percent": 68,
+        "clock_drift_s": 0.4,
     },
-    "offene_stoerungen": [
-        {"art": "sensor_fault", "seit": "2026-09-21T06:12:00Z", "zone": "Bad"}
+    "open_faults": [
+        {"kind": "sensor_fault", "since": "2026-09-21T06:12:00Z", "zone": "bathroom"}
     ],
 }
 
 
-def test_herzschlag_beispiel_aus_spezifikation_wird_angenommen() -> None:
-    herzschlag = Herzschlag.model_validate(HERZSCHLAG_BEISPIEL)
+def test_heartbeat_example_from_specification_is_accepted() -> None:
+    heartbeat = Heartbeat.model_validate(HEARTBEAT_EXAMPLE)
 
-    assert herzschlag.wohnung == "haus7-w03"
-    assert herzschlag.regelung.zonen == 6
-    assert herzschlag.offene_stoerungen[0].zone == "Bad"
+    assert heartbeat.apartment == "house7-a03"
+    assert heartbeat.control.zones == 6
+    assert heartbeat.open_faults[0].zone == "bathroom"
 
 
-def test_herzschlag_ohne_pflichtfeld_wird_abgelehnt() -> None:
-    fehlerhaft = {k: v for k, v in HERZSCHLAG_BEISPIEL.items() if k != "system"}
+def test_heartbeat_without_required_field_is_rejected() -> None:
+    malformed = {k: v for k, v in HEARTBEAT_EXAMPLE.items() if k != "system"}
 
     with pytest.raises(pydantic.ValidationError):
-        Herzschlag.model_validate(fehlerhaft)
+        Heartbeat.model_validate(malformed)
 
 
-def test_herzschlag_mit_unbekannter_stoerungsart_wird_abgelehnt() -> None:
-    fehlerhaft = {
-        **HERZSCHLAG_BEISPIEL,
-        "offene_stoerungen": [
-            {"art": "erfundene_stoerung", "seit": "2026-09-21T06:12:00Z", "zone": "Bad"}
+def test_heartbeat_with_unknown_fault_kind_is_rejected() -> None:
+    malformed = {
+        **HEARTBEAT_EXAMPLE,
+        "open_faults": [
+            {"kind": "invented_fault", "since": "2026-09-21T06:12:00Z", "zone": "bathroom"}
         ],
     }
 
     with pytest.raises(pydantic.ValidationError):
-        Herzschlag.model_validate(fehlerhaft)
+        Heartbeat.model_validate(malformed)
 
 
-def test_befehlsliste_ist_abschliessend() -> None:
-    """Abschnitt 7: 'Die Cloud kann nur, was der Melder kennt. Alles andere lehnt
+def test_command_list_is_closed() -> None:
+    """Section 7: 'The cloud can only do what the agent knows. Everything else
 
-    er ab.' Auf Modellebene heißt das: ein unbekannter Befehlstyp lässt sich mit
-    `Befehl` gar nicht erst bauen.
+    it rejects.' At the model level that means: an unknown command type cannot
+    even be constructed with `Command`.
     """
 
-    gueltig = {
-        "kennung": "123",
-        "befehl": "zustand_jetzt",
-        "verfallszeit": "2026-09-22T14:18:11Z",
+    valid = {
+        "id": "123",
+        "command": "report_now",
+        "expires_at": "2026-09-22T14:18:11Z",
     }
-    Befehl.model_validate(gueltig)
+    Command.model_validate(valid)
 
-    unbekannt = {**gueltig, "befehl": "reboot_alles_sofort"}
+    unknown = {**valid, "command": "reboot_everything_now"}
     with pytest.raises(pydantic.ValidationError):
-        Befehl.model_validate(unbekannt)
+        Command.model_validate(unknown)
 
 
-def test_stufe_2_befehle_sind_nicht_teil_der_aufzaehlung() -> None:
-    """Stufe 2 (dienst_neustart, update_einspielen, kiosk_token_widerrufen,
+def test_stage_2_commands_are_not_part_of_the_enumeration() -> None:
+    """Stage 2 (service_restart, apply_update, revoke_kiosk_token, plus since
 
-    seit Abschnitt 21 dazu zuruecksetzen und zugang_oeffnen) ist laut
-    Abschnitt 7 erst nach Betriebserfahrung dran -- diese fünf Namen dürfen im
-    Gerüst noch nicht als gültiger Befehl akzeptiert werden.
+    section 21 factory_reset and open_access) is, per section 7, not due until
+    after operational experience -- these five names must not yet be accepted
+    as a valid command in the scaffold.
     """
 
     for name in (
-        "dienst_neustart",
-        "update_einspielen",
-        "kiosk_token_widerrufen",
-        "zuruecksetzen",
-        "zugang_oeffnen",
+        "service_restart",
+        "apply_update",
+        "revoke_kiosk_token",
+        "factory_reset",
+        "open_access",
     ):
         with pytest.raises(pydantic.ValidationError):
-            Befehl.model_validate(
+            Command.model_validate(
                 {
-                    "kennung": "123",
-                    "befehl": name,
-                    "verfallszeit": "2026-09-22T14:18:11Z",
+                    "id": "123",
+                    "command": name,
+                    "expires_at": "2026-09-22T14:18:11Z",
                 }
             )
 
 
-def test_diagnose_paket_ist_stufe_1_und_wird_angenommen() -> None:
-    """Abschnitt 21.5: 'diagnose_paket' ist ausdrücklich Stufe 1, anders als
+def test_diagnostic_bundle_is_stage_1_and_is_accepted() -> None:
+    """Section 21.5: 'diagnostic_bundle' is explicitly stage 1, unlike
 
-    die übrigen Neuzugänge aus Abschnitt 21.
+    the other section-21 newcomers.
     """
 
-    Befehl.model_validate(
+    Command.model_validate(
         {
-            "kennung": "123",
-            "befehl": "diagnose_paket",
-            "verfallszeit": "2026-09-22T14:18:11Z",
+            "id": "123",
+            "command": "diagnostic_bundle",
+            "expires_at": "2026-09-22T14:18:11Z",
         }
     )
 
 
-def test_herzschlag_mit_niedrigerer_protokollversion_wird_angenommen() -> None:
-    """Abschnitt 18.2: 'Der Fleet-Dienst nimmt eine ältere Fassung an ... Er
+def test_heartbeat_with_lower_protocol_version_is_accepted() -> None:
+    """Section 18.2: 'The fleet service accepts an older version ... It does
 
-    weist sie nicht ab.' `PROTOKOLLVERSION` steht heute bei 1 -- es gibt noch
-    keine echte ältere Fassung, gegen die man testen könnte. Der Test bildet
-    deshalb die künftige Situation nach: Eine gegenüber einer angenommenen
-    nächsten Fassung ältere `protokollversion` darf `Herzschlag` weiterhin
-    strukturell annehmen. Ob eine Wohnung deswegen als "veraltete Fassung"
-    angezeigt wird, ist eine noch fehlende Anwendungsentscheidung des
-    Fleet-Diensts, keine, die `Herzschlag` selbst trifft.
+    not reject it.' `PROTOCOL_VERSION` is currently 1 -- there is no real older
+    version yet to test against. The test therefore models the future
+    situation: a `protocol_version` older than an assumed next version must
+    still be structurally acceptable to `Heartbeat`. Whether an apartment is
+    therefore shown as "outdated version" is still a missing application
+    decision of the fleet service, not one `Heartbeat` itself makes.
     """
 
-    kuenftige_fassung = PROTOKOLLVERSION + 1
-    aeltere_fassung = {**HERZSCHLAG_BEISPIEL, "protokollversion": PROTOKOLLVERSION}
+    future_version = PROTOCOL_VERSION + 1
+    older_version = {**HEARTBEAT_EXAMPLE, "protocol_version": PROTOCOL_VERSION}
 
-    herzschlag = Herzschlag.model_validate(aeltere_fassung)
+    heartbeat = Heartbeat.model_validate(older_version)
 
-    assert herzschlag.protokollversion < kuenftige_fassung
+    assert heartbeat.protocol_version < future_version
 
 
-def test_ereignis_nimmt_thermoctls_tatsaechliche_webhook_nutzlast_an() -> None:
-    """Abschnitt 18.1: die Nutzlast von thermoctls Störungs-Webhook, unverändert."""
+def test_event_accepts_thermoctls_real_webhook_payload() -> None:
+    """Section 18.1: the payload of thermoctl's fault webhook, unchanged."""
 
-    ereignis = Ereignis.model_validate(
+    event = Event.model_validate(
         {
-            "schluessel": "zigbee2mqtt:brücke",
+            "schluessel": "zigbee2mqtt:bridge",
             "schwere": "stoerung",
-            "titel": "Zigbee2MQTT nicht erreichbar",
-            "text": "Die Bridge antwortet seit 5 Minuten nicht mehr.",
+            "titel": "Zigbee2MQTT unreachable",
+            "text": "The bridge has not responded for 5 minutes.",
         }
     )
 
-    assert ereignis.schluessel == "zigbee2mqtt:brücke"
+    assert event.schluessel == "zigbee2mqtt:bridge"
 
 
-def test_ereignis_ohne_pflichtfeld_wird_abgelehnt() -> None:
+def test_event_without_required_field_is_rejected() -> None:
     with pytest.raises(pydantic.ValidationError):
-        Ereignis.model_validate({"schwere": "stoerung", "titel": "…", "text": "…"})
+        Event.model_validate({"schwere": "stoerung", "titel": "...", "text": "..."})
 
 
 @pytest.mark.parametrize(
-    ("schluessel", "erwartete_art"),
+    ("key", "expected_kind"),
     [
-        ("zigbee2mqtt:brücke", Stoerungsart.BRIDGE_FAULT),
-        ("tenant-report:3:heizung_kalt", Stoerungsart.TENANT_REPORT),
-        ("fenster:3", Stoerungsart.WINDOW_ALARM),
-        ("schaltbefehl:heizkoerper-3", Stoerungsart.COMMAND_FAILURE),
+        ("zigbee2mqtt:bridge", FaultKind.BRIDGE_FAULT),
+        ("tenant-report:3:heating_cold", FaultKind.TENANT_REPORT),
+        ("fenster:3", FaultKind.WINDOW_ALARM),
+        ("schaltbefehl:radiator-3", FaultKind.COMMAND_FAILURE),
     ],
 )
-def test_stoerungsart_aus_schluessel_ordnet_belegte_praefixe_zu(
-    schluessel: str, erwartete_art: Stoerungsart
+def test_fault_kind_from_key_maps_known_prefixes(
+    key: str, expected_kind: FaultKind
 ) -> None:
-    assert stoerungsart_aus_schluessel(schluessel) == erwartete_art
+    assert fault_kind_from_key(key) == expected_kind
 
 
-def test_stoerungsart_aus_schluessel_gibt_none_fuer_unbekanntes_praefix() -> None:
-    """Abschnitt 18.1: Unbekanntes wird als 'sonstige Meldung' behandelt, nicht
+def test_fault_kind_from_key_returns_none_for_unknown_prefix() -> None:
+    """Section 18.1: unknown ones are treated as 'other report', not
 
-    abgelehnt -- hier als `None`, kein Fehler.
+    rejected -- here as `None`, not an error.
     """
 
-    assert stoerungsart_aus_schluessel("etwas_unbekanntes:42") is None
+    assert fault_kind_from_key("something_unknown:42") is None
 
 
-def test_stoerungsart_aus_schluessel_bleibt_bei_sensor_praefix_absichtlich_none() -> None:
-    """Abschnitt 22.1, Sonderfall: 'sensor_fault' und 'stuck_sensor' teilen sich
+def test_fault_kind_from_key_stays_deliberately_none_for_sensor_prefix() -> None:
+    """Section 22.1, special case: 'sensor_fault' and 'stuck_sensor' share
 
-    denselben Schlüssel `sensor:<zonen-id>` -- daraus darf der Fleet-Dienst nicht
-    auf eine der beiden Arten schließen, deshalb bleibt `sensor:` absichtlich
-    ohne Eintrag in der Präfixtabelle.
+    the same key `sensor:<zone-id>` -- the fleet service must not infer either
+    of the two kinds from it, so `sensor:` deliberately stays without an entry
+    in the prefix table.
     """
 
-    assert stoerungsart_aus_schluessel("sensor:3") is None
+    assert fault_kind_from_key("sensor:3") is None
 
 
-def test_stoerungsereignis_aus_ereignis_baut_den_einheitlichen_umschlag() -> None:
-    """Abschnitt 22.1, nachträglich entschieden: Art, Schlüssel, Zeitpunkt,
+def test_fault_event_from_event_builds_the_unified_envelope() -> None:
+    """Section 22.1, decided afterward: kind, key, timestamp, plain text --
 
-    Klartext -- derselbe Umschlag für alle sechs Störungsarten.
+    the same envelope for all six fault kinds.
     """
 
-    ereignis = Ereignis.model_validate(
+    event = Event.model_validate(
         {
             "schluessel": "fenster:3",
             "schwere": "stoerung",
-            "titel": "Fenster offen",
-            "text": "Zone 3 meldet ein offenes Fenster seit 20 Minuten.",
+            "titel": "Window open",
+            "text": "Zone 3 reports an open window for 20 minutes.",
         }
     )
-    empfangen = datetime(2026, 9, 22, 14, 3, 11, tzinfo=UTC)
+    received = datetime(2026, 9, 22, 14, 3, 11, tzinfo=UTC)
 
-    stoerungsereignis = stoerungsereignis_aus_ereignis(ereignis, empfangen)
+    fault_event = fault_event_from_event(event, received)
 
-    assert stoerungsereignis.art == Stoerungsart.WINDOW_ALARM
-    assert stoerungsereignis.schluessel == "fenster:3"
-    assert stoerungsereignis.zeitpunkt == empfangen
-    assert stoerungsereignis.klartext == (
-        "Fenster offen: Zone 3 meldet ein offenes Fenster seit 20 Minuten."
+    assert fault_event.kind == FaultKind.WINDOW_ALARM
+    assert fault_event.key == "fenster:3"
+    assert fault_event.timestamp == received
+    assert fault_event.message == (
+        "Window open: Zone 3 reports an open window for 20 minutes."
     )
 
 
-def test_stoerungsereignis_aus_ereignis_laesst_art_offen_bei_mehrdeutigem_schluessel() -> None:
-    ereignis = Ereignis.model_validate(
+def test_fault_event_from_event_leaves_kind_open_for_ambiguous_key() -> None:
+    event = Event.model_validate(
         {
             "schluessel": "sensor:3",
             "schwere": "stoerung",
-            "titel": "Sensor gestört",
-            "text": "Zone 3 liefert seit 10 Minuten keinen Messwert.",
+            "titel": "Sensor fault",
+            "text": "Zone 3 has not delivered a reading for 10 minutes.",
         }
     )
 
-    stoerungsereignis = stoerungsereignis_aus_ereignis(
-        ereignis, datetime(2026, 9, 22, 14, 3, 11, tzinfo=UTC)
+    fault_event = fault_event_from_event(
+        event, datetime(2026, 9, 22, 14, 3, 11, tzinfo=UTC)
     )
 
-    assert stoerungsereignis.art is None
+    assert fault_event.kind is None
