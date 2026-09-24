@@ -1,6 +1,59 @@
 # Stand
 
-Letzte Aktualisierung: 2026-09-22.
+Letzte Aktualisierung: 2026-09-24.
+
+## Spezifikation nachgezogen, Gerüst für Abschnitt 23/24, Implementierungsplan angelegt
+
+`docs/spezifikation.md` war veraltet (1001 von inzwischen 1235 Zeilen der lokalen
+Quelle) und ist jetzt wieder eine **wortgleiche** Kopie. Neu darin: Abschnitt 22
+(„Nachträge aus dem Bau des Gerüsts" — vier Lesarten, die das Gerüst wählen
+musste, siehe deren jeweilige Fundstellen unten), Abschnitt 23 (Statusanzeige am
+Gerät) und Abschnitt 24 (eSIM-Profile aus der Ferne), dazu in 19.1 die Regel
+**„mainline oder gar nicht"** für ein drittes Abbild außerhalb der
+Raspberry-Familie und in 19 eine Zeile zu ModemManager/LTE-Firmware in der
+Paketliste. Die Spezifikation zählt jetzt **24 Abschnitte**.
+
+**Bekannter toter Verweis in der Spezifikation:** Abschnitt 19.1 verweist auf
+`lokal/recherche/basisstationen-alternativen.md` — ein Pfad, den es nur im lokalen,
+nicht veröffentlichten Dokumentenbestand gibt, nicht in diesem Repository. Die
+Kopie bleibt wortgleich (siehe `CLAUDE.md`, „Maßgeblich ist docs/spezifikation.md"),
+der Verweis wird deshalb hier vermerkt statt im Dokument korrigiert.
+
+**Gerüst für Abschnitt 23 (Statusanzeige, zwei LEDs am 40-poligen Anschluss):**
+`waechter/statusanzeige.go`, neu. `LedVorhanden` ist **echt umgesetzt** (reiner
+`os.Stat`-Aufruf) und dadurch bereits testbar für den zentralen Punkt aus
+23.3: Fehlen die beiden sysfs-Dateien, ist das **kein Fehler**, der Wächter läuft
+unverändert weiter. `LedMusterSetzen` ist Stummel wie die übrigen Funktionen in
+`wache.go` — welches Wächter-Ereignis welches Blinkmuster auslöst, entsteht mit
+`wache.go` selbst (siehe `docs/implementierungsplan.md`, P5.7). Produktionscode
+liegt jetzt bei **273 Zeilen** (vorher 226, Grenze 300), weiterhin **kein**
+Eintrag in `go.mod`. `go vet` und `go test ./...` laufen grün (19 Tests).
+
+**Gerüst für Abschnitt 24 (eSIM):** Vier neue Stummel in `agent/schleife.py`
+(`esim_profile_auflisten`, `esim_profil_laden`, `esim_profil_aktivieren`,
+`esim_profil_loeschen`), dokumentierter Ablauf je Funktion. Alle vier sind **Stufe
+2** und deshalb — wie `zuruecksetzen` und `zugang_oeffnen` — **nicht** in
+`protokoll.befehle.BefehlTyp` aufgenommen. Der sicherheitsrelevante Punkt aus
+Abschnitt 24.4 steht im Docstring von `esim_profil_aktivieren`: Ein Profilwechsel
+kappt die Verbindung, über die der Befehl kam, der Rückfall liegt deshalb beim
+**Wächter**, nicht beim Melder — dieselbe Aufteilung wie beim
+Sollzustandsabgleich, nur mit einem SIM-Profil statt einem Container-Digest.
+
+**Offener Punkt, bewusst nicht entschieden:** Ob `waechter/zustand.go`
+(`gewuenscht`/`bewaehrt`/`seit`) für die Zehn-Minuten-Rückfalluhr aus 24.4 ein
+zusätzliches Feld braucht, oder ob eine eigene Datei für den
+eSIM-Rückfall entsteht, ist offen. Das Dateiformat ist ein sprachübergreifender
+Vertrag mit eigenem Test (`waechter/pruefe_vertrag.sh`) — dieses Gerüst ändert es
+deshalb nicht auf Verdacht. Vor der Umsetzung von P5.7/eSIM-Paketen (siehe
+`docs/implementierungsplan.md`) mit dem Projektinhaber klären: entweder das
+Zustandsdateiformat um ein Feld erweitern (dann `zustand.go`, `zustand_test.go`
+und `waechter_zustand_melden` in `agent/schleife.py` gemeinsam anpassen) oder
+eine zweite, eigene Zustandsdatei nur für den SIM-Rückfall einführen.
+
+**Neu:** `docs/implementierungsplan.md` — Arbeitspakete in der Reihenfolge aus
+Abschnitt 11, je Paket einen Auftrag mit eigenem Worktree groß, mit
+Abnahmekriterium und Checkbox. Ersetzt die Schritt-für-Schritt-Liste, die vorher
+hier stand.
 
 ## Nur ein Gerüst
 
@@ -12,31 +65,17 @@ Schleifengerüst mit `NotImplementedError` an jeder Stelle, an der Umsetzung feh
 Python) mit derselben Idee, in Go-Idiom: Funktionen geben einen Fehler mit
 Abschnittsverweis zurück, mit einer Ausnahme -- der Dateivertrag mit dem Agenten
 (`waechter/zustand.go`, `waechter/gesundmeldung.go`) ist **echt umgesetzt**, nicht
-nur ein Platzhalter, siehe „Der Wächter" unten. `abbild/` (Abschnitt 19) ist ein
-Rezept-Gerüst ohne echten Bildbau, `tools/` prüft dessen Konfiguration. Jede
-Fundstelle trägt einen Verweis auf den Abschnitt in `docs/spezifikation.md`
-(inzwischen 21 Abschnitte).
+nur ein Platzhalter, siehe „Der Wächter" unten -- `waechter/statusanzeige.go`
+(Abschnitt 23) folgt demselben Muster mit einer Ausnahme (`LedVorhanden`, siehe
+oben). `abbild/` (Abschnitt 19) ist ein Rezept-Gerüst ohne echten Bildbau,
+`tools/` prüft dessen Konfiguration. Jede Fundstelle trägt einen Verweis auf den
+Abschnitt in `docs/spezifikation.md` (jetzt 24 Abschnitte).
 
-Die vollständige Umsetzung ist nicht begonnen. Was als Nächstes ansteht, richtet
-sich nach der Reihenfolge in Abschnitt 11 der Spezifikation:
-
-1. Webhook-Empfänger `POST /v1/ereignisse/{wohnung}` in `fleet/` fertigstellen
-   (Tokenprüfung je Wohnung, Ablage, Alarmauswertung über
-   `protokoll.stoerungsart_aus_schluessel`) — **ohne** Änderung an thermoctl.
-2. `POST /v1/herzschlag` fertigstellen, Alarmierung bei Ausbleiben (Abschnitt 8),
-   Anzeige „veraltete Fassung" bei niedrigerer `protokollversion` (Abschnitt 18.2).
-3. Weboberfläche „Das Haus" und „Eine Wohnung" (Abschnitt 9), dazu die vierte
-   Ansicht „Bestand" (Abschnitt 20.4).
-4. Bestandsverwaltung in `fleet/app.py` (Abschnitt 20): die sechs Endpunkte sind
-   angelegt, keiner geprüft oder erzwungen -- siehe „Bestand" unten.
-5. SSE-Kanal `GET /v1/befehle` und die vier Stufe-1-Befehle im Melder, dazu
-   `diagnose_paket` (Abschnitt 21.5, jetzt ebenfalls Stufe 1).
-6. Sollzustandsabgleich (Abschnitt 13) und Sicherung/Wiederherstellung (Abschnitt 15).
-7. Wächter-Hauptschleife (`waechter/wache.go`): Agent-Ende erkennen, Digest
-   starten, Selbsttest abwarten, zurückrollen, bewährten Stand markieren
-   (Abschnitt 17).
-8. Stufe-2-Befehle nach einer Heizperiode Betriebserfahrung, darunter die in
-   Abschnitt 21 neu beschriebenen `zuruecksetzen` und `zugang_oeffnen`.
+Was als Nächstes ansteht, steht jetzt ausschließlich in
+`docs/implementierungsplan.md` (Arbeitspakete P1.1 ff., aus Abschnitt 11
+abgeleitet) -- nicht mehr redundant hier aufgeführt, um genau die Art von
+veraltetem Nebeneinander zu vermeiden, die diese Datei laut `CLAUDE.md` klein
+halten soll.
 
 ## Der Wächter ist jetzt in Go, nicht mehr in Python (Abschnitt 18.3, 18.4)
 
@@ -61,8 +100,9 @@ unverändert**, wie in Abschnitt 18.3 gefordert.
 - Statisch gebaut (`CGO_ENABLED=0`), geprüft für `linux/arm64` und
   `linux/amd64` (lokal cross-kompiliert und mit `file` bestätigt).
 - Produktionscode (`main.go`, `zustand.go`, `gesundmeldung.go`, `wache.go`,
-  ohne Tests) liegt bei **226 Zeilen** -- deutlich unter der Grenze von 300.
-- `go vet` und `go test ./...` laufen grün (15 Tests, siehe Testergebnisse
+  `statusanzeige.go`, ohne Tests) liegt bei **273 Zeilen** -- weiterhin unter
+  der Grenze von 300 (vorher 226, vor Abschnitt 23 gemessen).
+- `go vet` und `go test ./...` laufen grün (19 Tests, siehe Testergebnisse
   unten).
 
 **Der sprachübergreifende Vertragstest** (`waechter/pruefe_vertrag.sh`, Abschnitt
