@@ -30,7 +30,7 @@ parallel with all other packages of the same stage.
   with a valid token the call passes through unchanged to the existing
   `NotImplementedError`. A test for both cases for each affected endpoint.
 - **Parallel to:** nothing (precondition for P1.2, P2.1, P4.x).
-- [ ] done
+- [x] done
 
 ### P1.2 -- Finish `POST /v1/events/{apartment}`
 - **Goal:** store the event and evaluate it via `fault_kind_from_key`;

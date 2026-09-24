@@ -2,6 +2,113 @@
 
 Last updated: 2026-09-24.
 
+## Token check per apartment (P1.1, sections 4, 18.1)
+
+New `fleet/auth.py`, two FastAPI dependencies wired via `Depends(...)` into
+the four endpoints named in the work package (`receive_heartbeat`,
+`receive_event`, `commands_stream`, `receive_command_result`) -- storage
+comes from the existing `Depends(get_storage)` (P1.3), never a new access
+path. `fleet/app.py` is otherwise unchanged: after a successful check every
+endpoint still raises its existing `NotImplementedError` unchanged, exactly
+as the work package's acceptance criterion requires; P1.2 and later
+packages fill the bodies in.
+
+**Status codes:**
+
+- **401**, with `WWW-Authenticate: Bearer` -- no `Authorization` header, a
+  scheme other than `Bearer`, or an empty token. Verified against what
+  FastAPI actually does, not assumed: a bare `if authorization is None:
+  raise HTTPException(...)` *inside* an endpoint function runs too late --
+  with a missing token **and** a structurally malformed body, FastAPI
+  returns its own `422` (body validation happens before the endpoint body
+  itself runs) before the manual check is ever reached. Raising from a
+  `Depends(...)` dependency instead runs during dependency *resolution*,
+  which happens before the endpoint's body parameter is bound and validated
+  -- confirmed with a throwaway script reproducing both shapes side by side,
+  then locked in as
+  `test_heartbeat_missing_token_and_malformed_body_is_401_not_422` and
+  `test_event_missing_token_and_malformed_body_is_401_not_422` (and the
+  equivalent for `receive_command_result`) in `tests/test_fleet.py` -- all
+  three assert `401`, not `422`.
+- **403** -- the token does not match the apartment's stored hash, *or* the
+  apartment does not exist at all. Both cases return the exact same
+  response (status and generic detail text) on purpose -- CLAUDE.md: "no
+  apartment ids ... in the source code" extends here to "do not reveal
+  which apartments exist" over the wire; a caller who gets a different
+  response for "wrong token" than for "no such apartment" could enumerate
+  apartment ids by trial. The comparison against a *known* stored hash uses
+  `hmac.compare_digest`, not `==`, precisely because that comparison is the
+  one place where the number of matching leading bytes could otherwise leak
+  through timing.
+
+**Lookup by hash, not by parsing the token.** `POST /v1/heartbeat`,
+`GET /v1/commands`, and `POST /v1/commands/{id}/result` carry no apartment
+in their address, so the apartment has to be identified from the token
+itself. Section 4's token shape is `agent_<apartment>_<random>`, but
+`random` comes from `secrets.token_urlsafe`, whose alphabet includes `_` --
+splitting the string back apart on `_` is therefore ambiguous and can
+resolve to the wrong apartment for an apartment id that itself contains an
+underscore, or simply guess wrong on which `_` was the intended separator.
+`fleet/storage.py` therefore gained a new lookup,
+`Storage.get_apartment_id_by_token_hash(token_hash)`, doing the reverse of
+the existing `get_apartment_token_hash`: hash the presented token
+(`hash_token`, already used by P1.3), look the hash up directly, return the
+apartment id or `None`. `POST /v1/heartbeat` additionally compares the
+resulting apartment against `heartbeat.apartment` in the body and returns
+`403` on a mismatch -- section 4's registration model is one token per
+apartment; an agent presenting a valid token must not be able to report
+heartbeat data under a different apartment's name by putting a different
+value in the body.
+
+**New migration `0002_apartments_token_hash_unique_index.py`** (never
+editing `0001`, per the work package's own instruction): a unique index on
+`apartments.token_hash`, both because the new by-hash lookup wants an index
+and because two apartments sharing one hash would mean two apartments
+sharing one token, which section 4 ("a separate secret per apartment")
+never produces. `ApartmentRecord.token_hash` in `fleet/storage.py` gained
+matching `unique=True, index=True`, so `alembic.autogenerate
+.compare_metadata` against a freshly migrated database stays empty -- the
+same invariant the P1.3 review checked for `0001`. No test for this
+existed yet, so one was added:
+`test_migrations_match_the_orm_model_exactly` in `tests/test_storage.py`
+runs `compare_metadata` for real (not by re-reading the migration source)
+and asserts the diff is empty.
+
+**Still missing** (explicitly out of scope for this package, tracked here
+instead of invented): a registration endpoint that first sets an
+apartment's token (section 4, "initial registration via a one-time,
+time-limited setup code") -- P1.1's tests create apartments and set tokens
+directly via `Storage.set_apartment_token`, there is no HTTP path for it
+yet; token **rotation** as an endpoint (the storage-level replace-and-
+invalidate behaviour is exercised end to end by
+`test_rotated_token_old_one_is_403_new_one_passes`, but nothing in
+`fleet/app.py` lets the cloud issue a new token over HTTP); revocation; and
+the setup-code/time-limit mechanism itself. The inventory endpoints
+(`read_inventory`, `register_device`, and friends, section 20) are
+deliberately **not** touched by this package -- they were never named in
+the work package's file list and use "a different auth path than section
+4" per their own docstrings (a fleet-UI login, not an agent token); their
+tests are unchanged, still without an `Authorization` header.
+
+**Tests:** `tests/test_fleet.py` was substantially rewritten around a
+`client`/`storage`/`token`/`other_token` fixture set (a real, migrated,
+per-test SQLite database in `tmp_path` via `fleet.storage.upgrade`,
+wired in through `app.dependency_overrides[get_storage]` -- the same
+pattern `tests/test_storage.py` already used, no mock). For each of the
+four protected endpoints: no header, wrong scheme, empty token → 401;
+wrong token, unknown apartment → 403; valid token → passes through
+unchanged to the endpoint's own `NotImplementedError`. Plus: a token valid
+for one apartment presented on another apartment's `/v1/events/{apartment}`
+address → 403; a heartbeat body naming a different apartment than the
+token → 403; a rotated token (old 403, new passes) exercised through both
+the HTTP layer and directly against `Storage`; the missing-token-plus-
+malformed-body → 401-not-422 case for three of the four endpoints (see
+above). Tokens are built at runtime with `secrets.token_urlsafe(32)`
+everywhere, never a literal secret. Full suite: **107 tests** (up from 80),
+coverage **96%** (unchanged from P1.3 -- `fleet/auth.py`, `fleet/app.py`,
+`fleet/storage.py`, and both migrations now at 100%) -- `ruff check .` and
+`mypy .` / `mypy protocol fleet agent tools` all clean.
+
 ## Storage layer (P1.3, section 12)
 
 `fleet/storage.py` (SQLAlchemy 2.x typed ORM) plus Alembic migrations shipped

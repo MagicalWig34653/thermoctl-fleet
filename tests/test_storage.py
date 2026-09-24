@@ -17,13 +17,17 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
+from alembic.autogenerate import compare_metadata
+from alembic.migration import MigrationContext
 from sqlalchemy import inspect
 
 import fleet.storage as storage_module
 from fleet.storage import (
     ApartmentRecord,
+    Base,
     HeartbeatRecord,
     Storage,
+    create_engine_from_url,
     create_storage,
     downgrade,
     get_storage,
@@ -233,6 +237,67 @@ def test_event_titel_and_text_are_not_persisted_anywhere_in_the_row(storage: Sto
     engine = storage.engine
     columns = {col["name"] for col in inspect(engine).get_columns("events")}
     assert columns == {"id", "apartment_id", "schluessel", "schwere", "fault_kind", "received_at"}
+
+
+def test_migrations_match_the_orm_model_exactly(tmp_path: object) -> None:
+    """`alembic.autogenerate.compare_metadata` against a freshly migrated
+    database must be empty -- a mismatch here means a migration
+    (`fleet/migrations/versions/*.py`) and `Base`'s mapped columns (this
+    module) have drifted apart, e.g. an index added to one but not the
+    other (P1.1 added `0002_apartments_token_hash_unique_index.py` together
+    with `ApartmentRecord.token_hash`'s `unique=True, index=True` -- this is
+    exactly the kind of drift that check would have caught)."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_engine_from_url(url)
+
+    with engine.connect() as connection:
+        context = MigrationContext.configure(connection)
+        diff = compare_metadata(context, Base.metadata)
+
+    assert diff == []
+
+
+def test_apartment_token_hash_lookup_by_hash_finds_the_right_apartment(
+    storage: Storage,
+) -> None:
+    """`get_apartment_id_by_token_hash` (P1.1) is the reverse of
+    `get_apartment_token_hash` -- given a hash, find the apartment it
+    belongs to. Two apartments are registered so a wrong match (returning
+    the other apartment) would actually fail this test, not just an
+    unpopulated table passing by accident."""
+
+    token_a = f"agent_house7-a03_{secrets.token_urlsafe(32)}"
+    token_b = f"agent_house7-a04_{secrets.token_urlsafe(32)}"
+    storage.set_apartment_token("house7-a03", token_a)
+    storage.set_apartment_token("house7-a04", token_b)
+
+    assert storage.get_apartment_id_by_token_hash(hash_token(token_a)) == "house7-a03"
+    assert storage.get_apartment_id_by_token_hash(hash_token(token_b)) == "house7-a04"
+
+
+def test_apartment_token_hash_lookup_by_unknown_hash_returns_none(storage: Storage) -> None:
+    unknown_hash = hash_token(secrets.token_urlsafe(32))
+
+    assert storage.get_apartment_id_by_token_hash(unknown_hash) is None
+
+
+def test_apartment_token_hash_lookup_follows_rotation(storage: Storage) -> None:
+    """Once a token is rotated (`set_apartment_token` replaces the hash),
+    the old hash must no longer resolve to the apartment -- see also
+    `tests/test_fleet.py::test_rotated_token_old_one_is_403_new_one_passes`,
+    which checks the same rule through the HTTP layer."""
+
+    apartment = "house7-a03"
+    old_token = f"agent_{apartment}_{secrets.token_urlsafe(32)}"
+    new_token = f"agent_{apartment}_{secrets.token_urlsafe(32)}"
+    storage.set_apartment_token(apartment, old_token)
+
+    storage.set_apartment_token(apartment, new_token)
+
+    assert storage.get_apartment_id_by_token_hash(hash_token(old_token)) is None
+    assert storage.get_apartment_id_by_token_hash(hash_token(new_token)) == apartment
 
 
 def test_apartment_token_hash_can_be_set_and_looked_up(storage: Storage) -> None:
