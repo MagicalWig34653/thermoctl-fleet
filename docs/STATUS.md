@@ -279,10 +279,14 @@ Two independent tracks, as required by section 18.3:
 - **`go.yml`** (Go, new): `go vet` and `go test` for `watchdog/`, building
   one static binary each for `amd64`/`arm64` with a checksum, plus the
   cross-language contract test (see above). Runs only on changes to
-  `watchdog/`, `agent/loop.py`, or `protocol/`.
+  `watchdog/`, `agent/loop.py`, or `protocol/`; can also be started manually
+  for a given commit (`gh workflow run go.yml --ref main`), e.g. to confirm
+  a merge that only touched `fleet/`.
 - **`image.yml`** (new): reads the `image/` configuration and validates the
   package list (`tools/check_image_config.py`) -- **no** real pi-gen/mkosi/
-  debos run, that belongs at the release, not in every commit.
+  debos run, that belongs at the release, not in every commit. Can also be
+  started manually for a given commit (`gh workflow run image.yml --ref
+  main`).
 - **`docker.yml`** builds two images (`thermoctl-fleet`, `thermoctl-agent`)
   for `linux/amd64` and `linux/arm64` to ghcr.io on `v*` tags, and on every
   pull request as a build check without publishing. `watchdog/` goes into

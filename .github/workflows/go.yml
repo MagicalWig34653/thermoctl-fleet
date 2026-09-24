@@ -12,6 +12,8 @@ on:
       - "agent/loop.py"
       - "protocol/**"
       - ".github/workflows/go.yml"
+  # Manual run for a specific commit, e.g. to confirm a merge commit on main.
+  workflow_dispatch:
 
 # Own CI track for the watchdog (section 18.3, conditions): "the existing
 # Python track stays as it is." Therefore runs independently of ci.yml, with
