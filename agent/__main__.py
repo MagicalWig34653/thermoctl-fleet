@@ -1,9 +1,9 @@
-"""Einstiegspunkt des Melders (`python -m agent`).
+"""Entry point of the agent (`python -m agent`).
 
-Ruft noch keine echte Schleife auf -- die Bausteine in `agent/schleife.py` sind
-Platzhalter (siehe deren Docstrings). Dieser Einstiegspunkt macht das beim Start
-ausdrücklich, statt eine Schleife zu bauen, die sofort mit einem unklaren
-Traceback abbricht.
+Does not yet call a real loop -- the building blocks in `agent/loop.py` are
+placeholders (see their docstrings). This entry point says so explicitly at
+startup, instead of building a loop that immediately aborts with a confusing
+traceback.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ import sys
 
 def main() -> int:
     print(
-        "thermoctl-agent (Melder): nur das Gerüst ist vorhanden. "
-        "Siehe docs/STATUS.md für den Umsetzungsstand.",
+        "thermoctl-agent: only the scaffold is in place. "
+        "See docs/STATUS.md for the implementation status.",
         file=sys.stderr,
     )
     return 1
 
 
-if __name__ == "__main__":  # pragma: no cover -- nur ein Einstiegspunkt, keine Logik
+if __name__ == "__main__":  # pragma: no cover -- just an entry point, no logic
     sys.exit(main())

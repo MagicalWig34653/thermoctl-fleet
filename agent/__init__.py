@@ -1,9 +1,8 @@
-"""Melder: Gerät-Seite (docs/spezifikation.md, Abschnitt 2).
+"""Agent: the device side (docs/specification.md, section 2).
 
-Das einzige Programm auf der Basisstation, das mit der Cloud spricht. Liest
-thermoctl ausschließlich über dessen vorhandene REST-Schnittstelle mit einem
-eigenen, nur lesenden Token (`zone.read`, `device.read`, `audit.read`, künftig
-`health.read` -- Abschnitt 10) und entscheidet **lokal**, welche Befehle es
-überhaupt ausführt (Abschnitt 2: der Melder ist die Sicherheitsgrenze, nicht die
-Cloud).
+The only program on the base station that talks to the cloud. Reads thermoctl
+exclusively via its existing REST interface with its own, read-only token
+(`zone.read`, `device.read`, `audit.read`, eventually `health.read` -- section 10)
+and decides **locally** which commands it even executes (section 2: the agent is
+the security boundary, not the cloud).
 """
