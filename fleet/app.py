@@ -15,10 +15,11 @@ have been implemented.
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from protocol import (
     CommandResult,
     DeviceLifecycle,
@@ -45,71 +46,106 @@ def healthz() -> dict[str, str]:
 
 
 @app.post("/v1/heartbeat", status_code=204)
-def receive_heartbeat(heartbeat: Heartbeat) -> None:
+def receive_heartbeat(
+    heartbeat: Heartbeat,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+) -> None:
     """Accepts a heartbeat (section 5).
 
-    Missing: checking the agent's token (section 4), storing the heartbeat
-    including gap detection for caught-up heartbeats (section 5, "The cloud
-    detects gaps by the timestamp"), evaluation of the alarm rules (section 8).
+    The token check (P1.1, sections 4, 18.1) is done: `authenticated_apartment`
+    is the apartment the presented token's hash resolved to (see
+    `fleet/auth.py`), which must equal `heartbeat.apartment` -- an agent must
+    not report for another apartment, so a mismatch is a 403, not a silent
+    overwrite of whichever apartment the token happened to name.
+
+    Still missing: storing the heartbeat, including gap detection for caught-up
+    heartbeats (section 5, "The cloud detects gaps by the timestamp"),
+    evaluation of the alarm rules (section 8).
     """
 
+    if authenticated_apartment != heartbeat.apartment:
+        raise HTTPException(
+            status_code=403,
+            detail="Token is not authorized for the reported apartment.",
+        )
+
     raise NotImplementedError(
-        "Registration check, storage and alarm evaluation are missing -- see "
-        "docs/specification.md sections 4, 5 and 8."
+        "Storage and alarm evaluation are missing -- see docs/specification.md "
+        "sections 5 and 8."
     )
 
 
 @app.post("/v1/events/{apartment}", status_code=204)
-def receive_event(apartment: str, event: Event) -> None:
+def receive_event(
+    apartment: str,
+    event: Event,
+    authenticated_apartment: str = Depends(require_apartment_token),
+) -> None:
     """Accepts an event report (section 11, step 1; section 18.1).
 
     The apartment is embedded in the address, not in the payload -- thermoctl's
     fault webhook sends only `schluessel`/`schwere`/`titel`/`text` unchanged (see
-    `protocol/events.py`). Missing: checking this apartment's
-    `Authorization: Bearer …` token (sections 4, 18.1), storage, mapping the
-    `schluessel` prefix via `protocol.fault_kind_from_key` for alarm evaluation
-    (section 8).
+    `protocol/events.py`). The token check (P1.1, sections 4, 18.1) is done via
+    `require_apartment_token`, which already validated the address apartment
+    against the presented token -- `authenticated_apartment` is that same value.
+
+    Still missing: storage, mapping the `schluessel` prefix via
+    `protocol.fault_kind_from_key` for alarm evaluation (section 8).
     """
 
+    del authenticated_apartment  # equal to `apartment` by construction, see above
+
     raise NotImplementedError(
-        f"Registration check, storage and alarm evaluation for apartment "
-        f"{apartment!r} are missing -- see docs/specification.md sections 4, 8, "
-        "11 and 18.1."
+        f"Storage and alarm evaluation for apartment {apartment!r} are missing "
+        "-- see docs/specification.md sections 8, 11 and 18.1."
     )
 
 
 @app.get("/v1/commands")
-def commands_stream(wait: int = 1) -> StreamingResponse:
+def commands_stream(
+    wait: int = 1,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+) -> StreamingResponse:
     """SSE stream for commands to an apartment (sections 3 and 7).
 
     `wait=0` is the fallback provided for in section 3 (a single poll instead of
-    an open connection) -- which apartment is asking only follows from the
-    registration check that is still missing.
+    an open connection). The token check (P1.1, sections 4, 18.1) is done:
+    `authenticated_apartment` is the apartment the presented token's hash
+    resolved to (see `fleet/auth.py`) -- there is no apartment in this address
+    to compare it against.
 
-    Entirely missing: registration check, `Last-Event-ID` handling for
-    reconnection, actually writing `Command` events into the stream, and the
-    expiry check on delivery (section 7: a command that has passed its expiry is
-    no longer delivered).
+    Still entirely missing: `Last-Event-ID` handling for reconnection, actually
+    writing `Command` events into the stream, and the expiry check on delivery
+    (section 7: a command that has passed its expiry is no longer delivered).
     """
 
     raise NotImplementedError(
-        "SSE delivery of commands is missing -- see docs/specification.md "
-        "sections 3 and 7."
+        f"SSE delivery of commands for apartment {authenticated_apartment!r} is "
+        "missing -- see docs/specification.md sections 3 and 7."
     )
 
 
 @app.post("/v1/commands/{id}/result", status_code=204)
-def receive_command_result(id: str, result: CommandResult) -> None:
+def receive_command_result(
+    id: str,
+    result: CommandResult,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+) -> None:
     """Accepts the result of an executed command (section 7).
 
-    Missing: registration check, matching against the pending command id,
-    storage. `id` from the path and `result.id` will also still need to be
-    checked against each other.
+    The token check (P1.1, sections 4, 18.1) is done: `authenticated_apartment`
+    is the apartment the presented token's hash resolved to (see
+    `fleet/auth.py`).
+
+    Still missing: matching against the pending command id and that it
+    actually belongs to `authenticated_apartment`, storage. `id` from the path
+    and `result.id` will also still need to be checked against each other.
     """
 
     raise NotImplementedError(
-        f"Storing the result for command {id!r} is missing -- see "
-        "docs/specification.md section 7."
+        f"Storing the result for command {id!r} from apartment "
+        f"{authenticated_apartment!r} is missing -- see docs/specification.md "
+        "section 7."
     )
 
 

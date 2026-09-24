@@ -67,7 +67,14 @@ class ApartmentRecord(Base):
     __tablename__ = "apartments"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # unique + indexed (0002_apartments_token_hash_unique_index.py): P1.1 looks
+    # an apartment up *by* its token hash for the two endpoints that carry no
+    # apartment in their address (`GET /v1/commands`,
+    # `POST /v1/commands/{id}/result`) -- see `get_apartment_id_by_token_hash`
+    # below. Unique because two apartments sharing one hash would mean two
+    # apartments sharing one token, which the registration flow (section 4:
+    # "a separate secret per apartment") never produces.
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
 
 
 class HeartbeatRecord(Base):
@@ -176,6 +183,24 @@ class Storage:
         with self.session() as session:
             record = session.get(ApartmentRecord, apartment_id)
             return record.token_hash if record is not None else None
+
+    def get_apartment_id_by_token_hash(self, token_hash: str) -> str | None:
+        """The reverse lookup: which apartment does this token hash belong
+        to, or `None` if no apartment has it (P1.1, section 18.1).
+
+        For the two endpoints that carry no apartment in their address
+        (`GET /v1/commands`, `POST /v1/commands/{id}/result`) -- the
+        apartment is identified by the token's hash, not by parsing it out
+        of the token string (`agent_<apartment>_<random>`): the random
+        suffix from `secrets.token_urlsafe` can itself contain `_`, so
+        splitting the string back apart is ambiguous. See `fleet/auth.py`.
+        """
+
+        with self.session() as session:
+            record = session.scalar(
+                select(ApartmentRecord).where(ApartmentRecord.token_hash == token_hash)
+            )
+            return record.id if record is not None else None
 
     # -- heartbeats ---------------------------------------------------------------
 
