@@ -1,106 +1,111 @@
 # thermoctl-fleet
 
-Ein kleiner Cloud-Dienst für Vermieter mit mehreren [`thermoctl`](../thermoctl)-Anlagen:
-Er empfängt von jeder Wohnung einen Herzschlag mit Gesundheitsdaten, sammelt Störungen,
-alarmiert bei **Ausbleiben** und kann eine kurze, abschließende Liste von
-Wartungsbefehlen an eine Wohnung schicken. Er ist **kein zweiter Regler** — Sollwerte,
-Zeitpläne und das Scharfschalten bleiben in der Wohnung — und **kein Datensammler**:
-Raumtemperaturen, Sollwerte und Mieterdaten werden nicht übertragen. Die vollständige
-Begründung für diesen Zuschnitt steht in [`docs/spezifikation.md`](docs/spezifikation.md).
+A small cloud service for landlords with several [`thermoctl`](../thermoctl)
+installations: it receives a heartbeat with health data from every
+apartment, collects faults, alarms on **absence** of a heartbeat, and can
+send a short, closed list of maintenance commands to an apartment. It is
+**not a second controller** -- setpoints, schedules, and arming stay in the
+apartment -- and **not a data collector**: room temperatures, setpoints, and
+tenant data are not transmitted. The full reasoning for this scope is in
+[`docs/specification.md`](docs/specification.md).
 
-## Verhältnis zu thermoctl
+## Relationship to thermoctl
 
-`thermoctl` bleibt ein eigenständiges, self-hostbares Ein-Wohnungs-Produkt und
-funktioniert ohne diesen Dienst vollständig. `thermoctl-fleet` spricht nicht direkt mit
-`thermoctl`: Auf der Basisstation jeder Wohnung läuft ein eigenes, sehr kleines Programm,
-der **Melder** (`agent/`), der thermoctl ausschließlich über dessen vorhandene, nur
-lesende REST-Schnittstelle abfragt und als einziger mit der Cloud spricht. Diese
-Trennung ist Absicht, nicht Zufall: Der Melder ist die Sicherheitsgrenze — er entscheidet
-lokal, welche Befehle er überhaupt ausführt, unabhängig davon, ob die Cloud kompromittiert
-wurde.
+`thermoctl` stays a standalone, self-hostable single-apartment product and
+works fully without this service. `thermoctl-fleet` does not talk to
+`thermoctl` directly: a separate, very small program runs on each
+apartment's base station, the **agent** (`agent/`), which queries thermoctl
+exclusively through its existing, read-only REST interface and is the only
+thing that talks to the cloud. This separation is deliberate, not
+incidental: the agent is the security boundary -- it decides locally which
+commands it executes at all, regardless of whether the cloud has been
+compromised.
 
-## Ein Repository, zwei Abbilder
+## One repository, two images
 
-`thermoctl-fleet` liefert **zwei** unabhängige Docker-Abbilder aus **einem** Repository:
-`fleet/` (der Cloud-Dienst) und `agent/` (der Melder). Sie laufen auf verschiedener
-Hardware, bei verschiedenen Betreibern, mit unterschiedlichen Lebenszyklen — und stehen
-trotzdem in einem Repository, weil sie über ein gemeinsames Protokoll fest verkoppelt
-sind: das Herzschlag-Schema, die abschließende Befehlsliste und das Sollzustandsformat
-für die vier Container einer Wohnung. Diese Verträge leben als Pydantic-Modelle in
-[`protokoll/`](protokoll/) und werden von beiden Seiten importiert.
+`thermoctl-fleet` ships **two** independent Docker images from **one**
+repository: `fleet/` (the cloud service) and `agent/` (the agent). They run
+on different hardware, at different operators, with different lifecycles --
+and still live in one repository, because they are tightly coupled via a
+shared protocol: the heartbeat schema, the closed command list, and the
+desired-state format for an apartment's four containers. These contracts
+live as Pydantic models in [`protocol/`](protocol/) and are imported by both
+sides.
 
-Getrennte Repositories würden diese Verträge zwangsläufig verdoppeln — einmal in
-`fleet`, einmal in `agent`, ohne dass ein Werkzeug ihre Übereinstimmung erzwingt — und
-Vertragstests unmöglich machen: [`tests/`](tests/) prüft unter anderem, dass ein
-Beispiel-Herzschlag aus der Spezifikation von genau demselben Modell angenommen wird,
-das auch die Cloud-Seite entgegennimmt. Das setzt voraus, dass beide Seiten dasselbe
-Modul importieren, nicht zwei Abschriften davon.
+Separate repositories would inevitably duplicate these contracts -- once in
+`fleet`, once in `agent`, with no tool enforcing that they match -- and
+would make contract tests impossible: [`tests/`](tests/) checks, among other
+things, that an example heartbeat from the specification is accepted by
+exactly the same model that the cloud side also accepts. That requires both
+sides to import the same module, not two copies of it.
 
-Zwei weitere Teile im selben Repository, aus demselben Grund, aber ohne eigenes
-Docker-Abbild:
+Two further parts in the same repository, for the same reason, but without
+their own Docker image:
 
-- **[`waechter/`](waechter/)** -- in Go geschrieben, nicht in Python: Er ist das Einzige
-  auf dem Gerät, was funktionieren muss, wenn alles andere kaputt ist, und ein
-  statisch gebundenes Binärprogramm kennt Fehlerklassen (kaputter Interpreter,
-  halb angewandtes Systemupdate) nicht, die einen Python-Prozess lahmlegen können.
-  Er teilt mit dem Agenten eine zeilenbasierte Zustandsdatei (kein JSON, damit sie
-  in jeder Sprache mit Bordmitteln lesbar bleibt) -- `waechter/pruefe_vertrag.sh`
-  prüft diesen Vertrag sprachübergreifend: Python schreibt, das gebaute
-  Go-Binärprogramm liest.
-- **[`abbild/`](abbild/)** -- das Rezept für die vorbereiteten Systemabbilder der
-  Basisstation (Raspberry Pi OS bzw. Debian, beide 64-Bit). Kein eigenes
-  Betriebssystem, nur Paketliste, Einheiten und Konfiguration auf fertigem Debian.
+- **[`watchdog/`](watchdog/)** -- written in Go, not in Python: it is the
+  one thing on the device that has to work when everything else is broken,
+  and a statically linked binary does not know the classes of failure
+  (a broken interpreter, a half-applied system update) that can disable a
+  Python process. It shares a line-based state file with the agent (not
+  JSON, so it stays readable in every language with built-in tools) --
+  `watchdog/check_contract.sh` checks this contract across languages:
+  Python writes, the built Go binary reads.
+- **[`image/`](image/)** -- the recipe for the base station's prepared
+  system images (Raspberry Pi OS or Debian, both 64-bit). No custom
+  operating system, just a package list, units, and configuration on top of
+  plain Debian.
 
-## Aufbau
+## Layout
 
 ```
-fleet/       Cloud-Dienst (FastAPI): Herzschlag- und Ereignisempfang, SSE-Befehlsausgabe
-agent/       Melder auf der Basisstation: Herzschlag senden, Befehle ausführen,
-             Sollzustandsabgleich, Sicherung
-protokoll/   Gemeinsame Pydantic-Modelle -- der eigentliche Vertrag zwischen beiden
-waechter/    Go-Modul: tauscht den Agent-Container, kein Docker-Abbild
-abbild/      Rezept für die vorbereiteten Systemabbilder (Raspberry Pi OS, Debian)
-tools/       Bau-/CI-Werkzeuge, u. a. die Prüfung der abbild/-Konfiguration
-docs/        Spezifikation (unverändert übernommen) und STATUS.md
+fleet/       Cloud service (FastAPI): heartbeat and event receipt, SSE command output
+agent/       Agent on the base station: sending heartbeats, executing commands,
+             desired-state reconciliation, backup
+protocol/    Shared Pydantic models -- the actual contract between both sides
+watchdog/    Go module: swaps the agent container, no Docker image
+image/       Recipe for the prepared system images (Raspberry Pi OS, Debian)
+tools/       Build/CI tooling, among other things the check of the image/ configuration
+docs/        Specification (adopted unchanged) and STATUS.md
 ```
 
-**Stand:** Dies ist ein Gerüst, keine fertige Anwendung. Jede fehlende Stelle in
-`fleet/`, `agent/` und `waechter/` trägt einen Verweis auf den betreffenden Abschnitt
-der Spezifikation (`NotImplementedError` in Python, ein Fehlerwert mit
-Abschnittsverweis in Go). Der aktuelle Stand und die offenen Punkte stehen in
-[`docs/STATUS.md`](docs/STATUS.md).
+**Status:** this is a scaffold, not a finished application. Every missing
+piece in `fleet/`, `agent/`, and `watchdog/` carries a reference to the
+relevant section of the specification (`NotImplementedError` in Python, an
+error value referencing the section in Go). The current status and open
+points are in [`docs/STATUS.md`](docs/STATUS.md).
 
-## Lokal starten
+## Running locally
 
 ```bash
 python3.13 -m venv .venv && .venv/bin/pip install -e ".[dev,fleet,agent]"
 .venv/bin/python -m pytest
 ```
 
-`python -m pytest` statt `.venv/bin/pytest`: Das Konsolenskript unter `.venv/bin`
-funktioniert bei einer editierbaren Installation unter macOS nicht zuverlässig --
-dieselbe Ursache, die thermoctls README für dessen eigenen Konsolenbefehl nennt
-(die Datei, die das Paket dort auffindbar macht, wird als versteckt markiert und
-beim Start übersprungen). `python -m pytest` nimmt stattdessen das
-Projektverzeichnis regulär in den Modulpfad.
+`python -m pytest` instead of `.venv/bin/pytest`: the console script under
+`.venv/bin` does not work reliably with an editable install on macOS --
+the same cause thermoctl's README names for its own console command (the
+file that makes the package discoverable there is marked hidden and skipped
+at startup). `python -m pytest` instead takes the project directory into
+the module path in the regular way.
 
-Den Cloud-Dienst gegen sich selbst laufen lassen (ohne Datenbank, ohne Anmeldung --
-siehe `docs/STATUS.md`):
+Run the cloud service against itself (without a database, without
+authentication -- see `docs/STATUS.md`):
 
 ```bash
 .venv/bin/uvicorn fleet.app:app --reload
 ```
 
-Ein Beispiel-Zusammenspiel beider Abbilder über Docker Compose steht in
-[`docker/compose.beispiel.yml`](docker/compose.beispiel.yml).
+An example interplay of both images via Docker Compose is in
+[`docker/compose.example.yml`](docker/compose.example.yml).
 
-Den Wächter prüfen (eigene Toolchain, siehe [`waechter/README.md`](waechter/README.md)):
+Check the watchdog (own toolchain, see
+[`watchdog/README.md`](watchdog/README.md)):
 
 ```bash
-cd waechter && go vet ./... && go test ./...
+cd watchdog && go vet ./... && go test ./...
 ```
 
-## Lizenz
+## License
 
-`thermoctl-fleet` steht wie `thermoctl` unter der
+`thermoctl-fleet`, like `thermoctl`, is licensed under the
 [GNU Affero General Public License, Version 3](LICENSE) (AGPL-3.0-only).

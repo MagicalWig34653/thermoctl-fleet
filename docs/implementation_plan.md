@@ -1,277 +1,296 @@
-# Implementierungsplan
+# Implementation plan
 
-Arbeitspakete für die Umsetzung des Gerüsts, zugeschnitten auf die Reihenfolge aus
-[`docs/spezifikation.md`](spezifikation.md), Abschnitt 11. Jedes Paket ist so
-bemessen, dass es **ein Auftrag mit eigenem Worktree** ist — nicht größer. Nach der
-Arbeitsweise aus `CLAUDE.md`: eigener Branch, Review kreuzweise mit echtem Testlauf,
-Commit inklusive nachgezogenem `docs/STATUS.md`, Haken hier erst nach bestandenem
-Review setzen.
+Work packages for implementing the scaffold, sized to the order from
+[`docs/specification.md`](specification.md), section 11. Each package is
+sized so that it is **one task with its own worktree** -- not larger.
+Following the working method from `CLAUDE.md`: its own branch, cross-review
+with a real test run, commit including the updated `docs/STATUS.md`, check
+the box here only after the review has passed.
 
-Sicherheitsrelevante Pakete (markiert **SR**) werden zusätzlich in der Hauptsession
-gegengelesen (Grundsatz 7 / die sechs Sicherheitsgrundsätze in `CLAUDE.md`).
+Security-relevant packages (marked **SR**) are additionally read back in the
+main session (principle 7 / the six security principles in `CLAUDE.md`).
 
-Reihenfolge der Abschnitte unten folgt Schritt 1–5 aus Abschnitt 11. Pakete ohne
-Abhängigkeitshinweis können, sobald ihre Voraussetzung steht, parallel zu allen
-anderen Paketen derselben Stufe laufen.
-
----
-
-## Schritt 1 — Webhook-Empfänger (Cloud, keine Änderung an thermoctl)
-
-### P1.1 — Tokenprüfung je Wohnung
-- **Ziel:** `Authorization: Bearer …` gegen das hinterlegte Token der Wohnung aus der
-  Adresse (`{wohnung}`) prüfen, bevor ein Endpunkt seine eigentliche Arbeit beginnt.
-- **Dateien:** `fleet/app.py` (Abhängigkeit/Middleware für `herzschlag_empfangen`,
-  `ereignis_empfangen`, `befehle_stream`, `befehlsergebnis_empfangen`), neues Modul
-  für die Prüfung selbst.
-- **Abschnitt:** 4, 18.1.
-- **Abnahme:** Ein Aufruf ohne oder mit falschem Token liefert `401`/`403`, mit
-  gültigem Token kommt der Aufruf unverändert bis zum bisherigen
-  `NotImplementedError` durch. Test für beide Fälle je betroffenem Endpunkt.
-- **Parallel zu:** nichts (Voraussetzung für P1.2, P2.1, P4.x).
-- [ ] erledigt
-
-### P1.2 — `POST /v1/ereignisse/{wohnung}` fertigstellen
-- **Ziel:** Ereignis ablegen und über `stoerungsart_aus_schluessel` auswerten;
-  unbekanntes Präfix als „sonstige Meldung" führen, nie als Fehler.
-- **Dateien:** `fleet/app.py::ereignis_empfangen`, Ablageschicht (siehe P1.3).
-- **Abschnitt:** 6, 8, 18.1, 22.1 (Schlüsseltabelle).
-- **Abnahme:** Alle sechs Störungsarten aus Abschnitt 22.1 sowie ein unbekanntes
-  Präfix sind per Test abgedeckt; Test bestätigt insbesondere den Sonderfall
-  „Sensorstörung und festhängender Messwert teilen sich denselben Schlüssel".
-- **Abhängig von:** P1.1, P1.3.
-
-### P1.3 — Ablageschicht (Datenbank)
-- **Ziel:** Persistenz für Herzschläge, Ereignisse, Bestand einrichten — die
-  Spezifikation und `STATUS.md` legen kein Schema fest, das entsteht hier.
-  Datenbankwahl und Migrationswerkzeug sind offen; an Abschnitt 12 orientieren
-  (Aufbewahrung: Vorschlag 90 Tage Herzschläge, 365 Tage Störungen — mit dem
-  Projektinhaber vor der Umsetzung absichern, „Vorschlag" ist keine Festlegung).
-- **Dateien:** neues Modul, z. B. `fleet/ablage.py`, plus Migrationsverzeichnis.
-- **Abschnitt:** 12.
-- **Abnahme:** Ein Ereignis und ein Herzschlag lassen sich schreiben und wieder
-  lesen; Test läuft gegen eine echte, wenn auch leichte Datenbank (kein Mock).
-- **Parallel zu:** P1.1.
+The order of the sections below follows steps 1-5 from section 11. Packages
+without a dependency note can, once their precondition is met, run in
+parallel with all other packages of the same stage.
 
 ---
 
-## Schritt 2 — Herzschlag und Ausbleib-Alarmierung
+## Step 1 -- Webhook receiver (cloud, no change to thermoctl)
 
-### P2.1 — `POST /v1/herzschlag` fertigstellen
-- **Ziel:** Herzschlag entgegennehmen, ablegen, bei niedrigerer
-  `protokollversion` als der eigenen „veraltete Fassung" vermerken (Abschnitt
-  18.2 — „ein Feld darf nur hinzukommen").
-- **Dateien:** `fleet/app.py::herzschlag_empfangen`.
-- **Abschnitt:** 5, 18.2.
-- **Abnahme:** Test mit gleicher, niedrigerer und höherer `protokollversion`;
-  letztere darf nicht abgelehnt werden (Vorwärtskompatibilität).
-- **Abhängig von:** P1.1, P1.3.
+### P1.1 -- Token check per apartment
+- **Goal:** check `Authorization: Bearer …` against the apartment's stored
+  token from the address (`{apartment}`), before an endpoint begins its
+  actual work.
+- **Files:** `fleet/app.py` (dependency/middleware for `receive_heartbeat`,
+  `receive_event`, `commands_stream`, `receive_command_result`), a new
+  module for the check itself.
+- **Section:** 4, 18.1.
+- **Acceptance:** a call without or with a wrong token returns `401`/`403`,
+  with a valid token the call passes through unchanged to the existing
+  `NotImplementedError`. A test for both cases for each affected endpoint.
+- **Parallel to:** nothing (precondition for P1.2, P2.1, P4.x).
+- [ ] done
 
-### P2.2 — Ausbleib-Alarmierung
-- **Ziel:** Bleibt der Herzschlag einer Wohnung aus, alarmieren (Abschnitt 8).
-- **Dateien:** neues Modul für die Prüfung (Hintergrundaufgabe/Scheduler), Anbindung
-  an eine Benachrichtigung (Kanal offen laut Abschnitt 8 — mit Projektinhaber klären,
-  bevor ein Dienst fest verdrahtet wird, Grundsatz 1 aus thermoctls CLAUDE.md).
-- **Abschnitt:** 8.
-- **Abnahme:** Test simuliert Ausbleiben über die Zeit (kein echtes Warten), prüft
-  dass genau einmal alarmiert wird, nicht bei jedem Prüflauf erneut.
-- **Abhängig von:** P2.1.
+### P1.2 -- Finish `POST /v1/events/{apartment}`
+- **Goal:** store the event and evaluate it via `fault_kind_from_key`;
+  treat an unknown prefix as "other report", never as an error.
+- **Files:** `fleet/app.py::receive_event`, storage layer (see P1.3).
+- **Section:** 6, 8, 18.1, 22.1 (key table).
+- **Acceptance:** all six fault kinds from section 22.1 plus an unknown
+  prefix are covered by a test; the test in particular confirms the special
+  case "sensor fault and stuck reading share the same key".
+- **Depends on:** P1.1, P1.3.
 
-### P2.3 — Melder: Herzschlag erfassen und senden
-- **Ziel:** `agent/schleife.py::herzschlag_erfassen` (thermoctl-REST-Client) und
-  `herzschlag_senden` (TLS-Pinning, Nachliefern bei Ausfall, höchstens 240
-  gepuffert) umsetzen.
-- **Dateien:** `agent/schleife.py`, neuer thermoctl-Client (`agent/thermoctl_client.py`
-  o. ä.).
-- **Abschnitt:** 3, 4, 5, 10.
-- **Abnahme:** Test gegen einen gestellten thermoctl-`/api/v1/health`-Endpunkt
-  (Fixture, kein echter Dienst); Puffer-Grenze von 240 per Test belegt.
-- **Parallel zu:** P2.1, P2.2 (andere Seite der Leitung).
-
----
-
-## Schritt 3 — Oberfläche
-
-### P3.1 — Ansicht „Das Haus"
-- **Ziel:** Übersicht aller Wohnungen mit Status.
-- **Dateien:** `fleet/` Templates/Views (Verzeichnis noch nicht angelegt), `fleet/app.py`.
-- **Abschnitt:** 9.
-- **Abnahme:** Seite lädt, zeigt jede Wohnung mit Herzschlag-Alter und offenen
-  Störungen; Test über den HTTP-Client von FastAPI.
-- **Abhängig von:** P1.3, P2.1.
-
-### P3.2 — Ansicht „Eine Wohnung"
-- **Ziel:** Detailansicht einer einzelnen Wohnung.
-- **Dateien:** wie P3.1.
-- **Abschnitt:** 9.
-- **Abnahme:** Seite zeigt Verlauf, offene Störungen, letzte Befehle einer Wohnung.
-- **Abhängig von:** P3.1 (gemeinsame Vorlagen/Navigation).
-
-### P3.3 — Ansicht „Bestand"
-- **Ziel:** Vierte Ansicht für Liegenschaft/Wohnung/Gerät/Zuordnung.
-- **Dateien:** wie P3.1, liest `fleet/app.py`-Bestandsendpunkte (siehe P4.x).
-- **Abschnitt:** 20.4.
-- **Abnahme:** Seite zeigt alle vier Wesenheiten; Test prüft, dass jeder Verweis
-  darin erreichbar ist (`tests/test_smoke_test.py`-Muster aus thermoctl beachten).
-- **Abhängig von:** P4.1 (mindestens lesender Bestandsendpunkt).
-- **Parallel zu:** P3.1, P3.2 sobald deren Vorlagen stehen.
+### P1.3 -- Storage layer (database)
+- **Goal:** set up persistence for heartbeats, events, inventory -- the
+  specification and `STATUS.md` do not fix a schema, that is created here.
+  Database choice and migration tool are open; orient on section 12
+  (retention: proposal 90 days for heartbeats, 365 days for faults -- clear
+  with the project owner before implementing, "proposal" is not a
+  decision).
+- **Files:** new module, e.g. `fleet/storage.py`, plus a migrations
+  directory.
+- **Section:** 12.
+- **Acceptance:** an event and a heartbeat can be written and read back;
+  the test runs against a real, even if lightweight, database (no mock).
+- **Parallel to:** P1.1.
 
 ---
 
-## Schritt 4 — Bestandsverwaltung (Abschnitt 20)
+## Step 2 -- Heartbeat and absence alarming
 
-Die sechs Endpunkte in `fleet/app.py` sind angelegt; keiner prüft oder erzwingt
-etwas. Aufgeteilt nach den drei Regeln aus Abschnitt 20.3, damit kein Paket alle
-sechs Endpunkte auf einmal anfasst.
+### P2.1 -- Finish `POST /v1/heartbeat`
+- **Goal:** accept the heartbeat, store it, flag it as "outdated version"
+  if `protocol_version` is lower than our own (section 18.2 -- "a field may
+  only ever be added").
+- **Files:** `fleet/app.py::receive_heartbeat`.
+- **Section:** 5, 18.2.
+- **Acceptance:** test with equal, lower, and higher `protocol_version`;
+  the higher one must not be rejected (forward compatibility).
+- **Depends on:** P1.1, P1.3.
 
-### P4.1 — Bestand lesen, Gerät erfassen
-- **Ziel:** `bestand_lesen`, `geraet_erfassen` umsetzen (lesend bzw. reine Anlage,
-  keine der drei Regeln aus 20.3 betroffen).
-- **Dateien:** `fleet/app.py`, P1.3-Ablageschicht.
-- **Abschnitt:** 20.1–20.3.
-- **Abnahme:** Test legt ein Gerät an und liest es über `bestand_lesen` wieder.
-- **Abhängig von:** P1.3.
+### P2.2 -- Absence alarming
+- **Goal:** if an apartment's heartbeat fails to arrive, alarm (section 8).
+- **Files:** new module for the check (background task/scheduler),
+  connection to a notification (channel left open per section 8 -- clarify
+  with the project owner before hard-coding a service, principle 1 from
+  thermoctl's CLAUDE.md).
+- **Section:** 8.
+- **Acceptance:** test simulates absence over time (no real waiting),
+  checks that exactly one alarm fires, not again on every check run.
+- **Depends on:** P2.1.
 
-### P4.2 — Gerät vorbereiten, Meldung bestätigen und zuordnen
-- **Ziel:** `geraet_vorbereiten`, `geraet_meldung_bestaetigen` umsetzen, inklusive
-  „keine Freigabe ohne bestätigte Prüfziffer" (20.3) und „ein Gerät gehört zu
-  höchstens einer Wohnung" bei der Zuordnung.
-- **Dateien:** `fleet/app.py`.
-- **Abschnitt:** 15.3, 20.3.
-- **Abnahme:** Test belegt beide Regeln negativ (Zuordnungsversuch ohne bestätigte
-  Prüfziffer schlägt fehl; Doppelzuordnung schlägt fehl).
-- **Abhängig von:** P4.1.
-
-### P4.3 — Gerät ersetzen, Zustand ändern
-- **Ziel:** `geraet_ersetzen`, `geraet_zustand_aendern` umsetzen, inklusive „höchstens
-  ein aktives Gerät je Wohnung".
-- **Dateien:** `fleet/app.py`.
-- **Abschnitt:** 15 (Gerätetausch), 20.3.
-- **Abnahme:** Test belegt: ein zweites aktives Gerät für dieselbe Wohnung wird
-  abgelehnt; ein Zustandswechsel in `GeraetLebenszyklus` außerhalb der sieben
-  erlaubten Werte ist bereits durch Pydantic ausgeschlossen (nur der Übergang
-  selbst ist hier zu prüfen, z. B. „ausgemustert" nicht rückgängig machbar, falls
-  die Spezifikation das verlangt — sonst offener Punkt für `STATUS.md`, keine
-  eigene Erfindung).
-- **Abhängig von:** P4.1.
-- **Parallel zu:** P4.2.
+### P2.3 -- Agent: collect and send heartbeat
+- **Goal:** implement `agent/loop.py::collect_heartbeat` (thermoctl REST
+  client) and `send_heartbeat` (TLS pinning, catch-up delivery after an
+  outage, buffered up to 240 entries).
+- **Files:** `agent/loop.py`, a new thermoctl client (`agent/thermoctl_client.py`
+  or similar).
+- **Section:** 3, 4, 5, 10.
+- **Acceptance:** test against a stubbed thermoctl `/api/v1/health`
+  endpoint (fixture, no real service); the 240-entry buffer limit is
+  demonstrated by a test.
+- **Parallel to:** P2.1, P2.2 (the other end of the line).
 
 ---
 
-## Schritt 5 — SSE-Kanal und Stufe-1-Befehle **SR**
+## Step 3 -- UI
 
-### P5.1 — SSE-Kanal `GET /v1/befehle`
-- **Ziel:** `fleet/app.py::befehle_stream` und `agent/schleife.py::befehle_empfangen`
-  umsetzen: SSE-Versand, `Last-Event-ID`-Wiederverbindung, 60-s-Rückfallebene bei
-  unterbrochener Verbindung.
-- **Dateien:** `fleet/app.py`, `agent/schleife.py`.
-- **Abschnitt:** 3, 7.
-- **Abnahme:** Test hält eine SSE-Verbindung, unterbricht sie, bestätigt die
-  60-s-Abfrage als Rückfall.
-- **Abhängig von:** P1.1.
+### P3.1 -- "The house" view
+- **Goal:** overview of all apartments with status.
+- **Files:** `fleet/` templates/views (directory not yet created),
+  `fleet/app.py`.
+- **Section:** 9.
+- **Acceptance:** page loads, shows every apartment with heartbeat age and
+  open faults; test via FastAPI's HTTP client.
+- **Depends on:** P1.3, P2.1.
 
-### P5.2 — Befehlsausführung im Melder **SR**
-- **Ziel:** `agent/schleife.py::befehl_ausfuehren` für die vier Stufe-1-Befehle
-  (`ZUSTAND_JETZT`, `PROTOKOLL_HOLEN`, `SICHERUNG_JETZT`, `MELDER_NEUSTART`) plus
-  Kennungs- und Verfallszeitprüfung, lokales Protokoll je Befehl und Ablehnung.
-- **Dateien:** `agent/schleife.py`, Persistenz für `ausgefuehrte_kennungen` über
-  Neustarts hinweg (offener Punkt aus `MelderZustand`-Docstring — hier zu lösen).
-- **Abschnitt:** 7.
-- **Abnahme:** Test je Befehlstyp, dazu: doppelte Kennung wird abgelehnt, abgelaufene
-  Verfallszeit wird abgelehnt, unbekannter Befehl lässt sich mangels `BefehlTyp`-Wert
-  gar nicht erst konstruieren (Modelltest genügt hier).
-- **Abhängig von:** P5.1.
-- **Gegenlese:** Hauptsession (Sicherheitsgrenze Melder, Grundsatz 5).
+### P3.2 -- "One apartment" view
+- **Goal:** detail view of a single apartment.
+- **Files:** as P3.1.
+- **Section:** 9.
+- **Acceptance:** page shows an apartment's history, open faults, and last
+  commands.
+- **Depends on:** P3.1 (shared templates/navigation).
 
-### P5.3 — Ergebnismeldung und `diagnose_paket_erstellen`
-- **Ziel:** `agent/schleife.py::ergebnis_melden` sowie
-  `diagnose_paket_erstellen` (Stufe 1) umsetzen, inklusive Maskierung von
-  Zugangsdaten/Mieterdaten in den gesammelten Protokollen. **SR** wegen der
-  Maskierung (Abschnitt 21.5, Docstring in `schleife.py`).
-- **Dateien:** `agent/schleife.py`, `fleet/app.py::befehlsergebnis_empfangen`.
-- **Abschnitt:** 21.5.
-- **Abnahme:** Test belegt, dass ein bekanntes Geheimnis-Muster (Beispieltoken,
-  nicht echt) im erzeugten Paket maskiert erscheint.
-- **Abhängig von:** P5.2.
-- **Gegenlese:** Hauptsession (Maskierung ist sicherheitsrelevant).
-
-### P5.4 — Sollzustandsabgleich **SR**
-- **Ziel:** `agent/schleife.py::sollzustand_abgleichen` vollständig (Vorprüfung,
-  Sicherung, Digest gegen fest eingebaute Quellenliste, Tausch, 15-Minuten-Frist,
-  Rollback).
-- **Dateien:** `agent/schleife.py`, neues Modul für die Quellenliste
-  (`agent/quellen.py` o. ä. — **Konstante im Agent-Paket**, nicht aus der Cloud,
-  Sicherheitsgrundsatz 2).
-- **Abschnitt:** 13.
-- **Abnahme:** Test belegt: fehlender Digest verhindert den Start; ein Digest aus
-  einer nicht gelisteten Quelle wird abgelehnt; Ausbleiben der Gesundheit nach 15
-  Minuten löst Rollback aus.
-- **Abhängig von:** P5.1 (Sollzustand kommt über denselben Kanal wie Befehle,
-  siehe Abschnitt 13).
-- **Gegenlese:** Hauptsession (Digest-Prüfung ist der zentrale Schutz aus
-  Sicherheitsgrundsatz 2).
-
-### P5.5 — Sicherung und Wiederherstellung **SR**
-- **Ziel:** `agent/schleife.py::sicherung_erstellen` für beide Sicherungsarten,
-  inklusive Verschlüsselung der Betriebsdaten-Sicherung vor dem Hochladen
-  (Sicherheitsgrundsatz 4) sowie den Gegenpart „Wiederherstellung" (Abschnitt 15.2),
-  der bisher noch keinen Stummel hat.
-- **Dateien:** `agent/schleife.py`, neues Modul für Verschlüsselung.
-- **Abschnitt:** 15.1, 15.2.
-- **Abnahme:** Test belegt, dass eine Betriebsdaten-Sicherung ohne gültigen
-  lokalen Schlüssel nicht lesbar ist (echte Ver-/Entschlüsselung, kein Mock);
-  Gerätekonfiguration bleibt Klartext, Test belegt die getrennte Behandlung.
-- **Abhängig von:** nichts aus Schritt 5, kann parallel zu P5.1–P5.4 beginnen.
-- **Gegenlese:** Hauptsession (Verschlüsselung, Sicherheitsgrundsatz 4).
-
-### P5.6 — Wächter-Hauptschleife (`waechter/wache.go`)
-- **Ziel:** `AgentGestoppt`, `DigestStarten`, `GesundmeldungAbwarten`,
-  `AufBewaehrtZuruecksetzen` echt umsetzen. Bleibt **ohne** Abhängigkeit in
-  `go.mod`, Produktionscode unter 300 Zeilen (aktuell 299, knapp, siehe
-  `docs/STATUS.md` — beim Einbau von P5.6 nachmessen, ggf. `zeilendatei.go`
-  als Vorbild für weitere Kürzungen nehmen).
-- **Dateien:** `waechter/wache.go`, `waechter/main.go`.
-- **Abschnitt:** 17, 18.3.
-- **Abnahme:** `go test ./...` grün, `go vet ./...` sauber, Vertragstest
-  (`waechter/pruefe_vertrag.sh`) weiterhin bestanden, Zeilenzahl dokumentiert.
-- **Abhängig von:** nichts aus Schritt 5, sprachlich getrennt — kann parallel zu
-  jedem Python-Paket laufen.
-
-### P5.7 — Statusanzeige einbinden (Abschnitt 23)
-- **Ziel:** `waechter/statusanzeige.go` (`LedMusterSetzen`) an die Zustände aus
-  P5.6 anschließen: welcher Wächter-Zustand welches Muster aus Abschnitt 23.2
-  auslöst.
-- **Dateien:** `waechter/wache.go`, `waechter/statusanzeige.go`.
-- **Abschnitt:** 23.
-- **Abnahme:** Test belegt je Zustand das richtige Muster; Zeilenzahl weiterhin
-  unter 300 Zeilen Produktionscode.
-- **Abhängig von:** P5.6.
+### P3.3 -- "Inventory" view
+- **Goal:** fourth view for property/apartment/device/assignment.
+- **Files:** as P3.1, reads `fleet/app.py`'s inventory endpoints (see
+  P4.x).
+- **Section:** 20.4.
+- **Acceptance:** page shows all four entities; test checks that every
+  reference in it is reachable (follow the `tests/test_smoke_test.py`
+  pattern from thermoctl).
+- **Depends on:** P4.1 (at least a reading inventory endpoint).
+- **Parallel to:** P3.1, P3.2 once their templates exist.
 
 ---
 
-## Erst nach Betriebserfahrung (Stufe 2, Abschnitt 21 und 24)
+## Step 4 -- Inventory management (section 20)
 
-Nach der Spezifikation ausdrücklich erst nach einer Heizperiode Betriebserfahrung
-und nach ausdrücklicher Freigabe durch den Projektinhaber (Sicherheitsgrundsatz 1
-in `CLAUDE.md`). Kein Paket hier beginnt, ohne dass diese Freigabe vorliegt —
-das Anlegen eines Worktrees dafür ist selbst schon eine Ausnahme, die angesagt und
-begründet werden muss.
+The six endpoints in `fleet/app.py` are laid out; none checks or enforces
+anything. Split by the three rules from section 20.3, so that no package
+touches all six endpoints at once.
 
-- **`zuruecksetzen`** (Abschnitt 21.2): Sicherung-vor-Löschen-Reihenfolge, Schlüssel-
-  und Tokenverwerfung, Neuanmeldung mit neuer Prüfziffer. **SR.**
-- **`zugang_oeffnen`** (Abschnitt 21.4): SSH-Zertifikat, Rückkanal, 60-Minuten-Frist,
-  Protokollierung. Die `pilotbetrieb`-Ablehnung ist bereits scharf umgesetzt und
-  bleibt es — dieses Paket baut nur das, was danach noch fehlt. **SR.**
-- **`esim_profile_auflisten`, `esim_profil_laden`** (Abschnitt 24.3): `lpac`-Anbindung,
-  Aktivierungscode-Handling ohne Protokollspur.
-- **`esim_profil_aktivieren`** (Abschnitt 24.3, 24.4): die Rückfalluhr — das
-  Dateiformat dafür ist entschieden (`esim_vorheriges_profil=`/`esim_frist=`
-  als zwei weitere Zeilen in der bestehenden Zustandsdatei, siehe
-  `docs/STATUS.md`); dieses Paket ruft `agent.schleife.waechter_zustand_melden`
-  damit auf und baut den Rest der Funktion. **SR.**
-- **`esim_profil_loeschen`** (Abschnitt 24.3).
-- **A/B-Systempartitionen** (Abschnitt 21.3): laut Projektinhaber ausdrücklich
-  zurückgestellt, kein Paket, bis eine Heizperiode zeigt, dass Vor-Ort-Termine
-  tatsächlich am Betriebssystem liegen.
-- **eSIM-Betrieb im großen Maßstab** (Abschnitt 24.5): erst nach dem in Abschnitt
-  24.5 geforderten Durchspielen an einer Karte/einem Gerät.
+### P4.1 -- Read inventory, register device
+- **Goal:** implement `read_inventory`, `register_device` (reading and
+  plain creation respectively, none of the three rules from 20.3 apply).
+- **Files:** `fleet/app.py`, P1.3's storage layer.
+- **Section:** 20.1-20.3.
+- **Acceptance:** test registers a device and reads it back via
+  `read_inventory`.
+- **Depends on:** P1.3.
+
+### P4.2 -- Prepare device, confirm registration and assign
+- **Goal:** implement `prepare_device`, `confirm_device_registration`,
+  including "no release without a confirmed verification code" (20.3) and
+  "a device belongs to at most one apartment" on assignment.
+- **Files:** `fleet/app.py`.
+- **Section:** 15.3, 20.3.
+- **Acceptance:** test demonstrates both rules negatively (an assignment
+  attempt without a confirmed verification code fails; a double assignment
+  fails).
+- **Depends on:** P4.1.
+
+### P4.3 -- Replace device, change state
+- **Goal:** implement `replace_device`, `change_device_state`, including
+  "at most one active device per apartment".
+- **Files:** `fleet/app.py`.
+- **Section:** 15 (device swap), 20.3.
+- **Acceptance:** test demonstrates: a second active device for the same
+  apartment is rejected; a state transition in `DeviceLifecycle` outside
+  the seven allowed values is already excluded by Pydantic (only the
+  transition itself needs checking here, e.g. "decommissioned" not
+  reversible, if the specification requires it -- otherwise an open point
+  for `STATUS.md`, not an invention of our own).
+- **Depends on:** P4.1.
+- **Parallel to:** P4.2.
+
+---
+
+## Step 5 -- SSE channel and stage-1 commands **SR**
+
+### P5.1 -- SSE channel `GET /v1/commands`
+- **Goal:** implement `fleet/app.py::commands_stream` and
+  `agent/loop.py::receive_commands`: SSE delivery, `Last-Event-ID`
+  reconnection, 60-second poll fallback on an interrupted connection.
+- **Files:** `fleet/app.py`, `agent/loop.py`.
+- **Section:** 3, 7.
+- **Acceptance:** test holds an SSE connection, interrupts it, confirms
+  the 60-second poll as the fallback.
+- **Depends on:** P1.1.
+
+### P5.2 -- Command execution in the agent **SR**
+- **Goal:** implement `agent/loop.py::execute_command` for the four
+  stage-1 commands (`REPORT_NOW`, `FETCH_LOGS`, `BACKUP_NOW`,
+  `AGENT_RESTART`) plus id and expiry checking, a local log per command and
+  rejection.
+- **Files:** `agent/loop.py`, persistence for `executed_ids` across
+  restarts (open point from the `AgentState` docstring -- to be resolved
+  here).
+- **Section:** 7.
+- **Acceptance:** test per command type, plus: a duplicate id is rejected,
+  an expired command is rejected, an unknown command cannot even be
+  constructed for lack of a `CommandType` value (a model test is enough
+  here).
+- **Depends on:** P5.1.
+- **Read back by:** main session (agent security boundary, principle 5).
+
+### P5.3 -- Result reporting and `create_diagnostic_bundle`
+- **Goal:** implement `agent/loop.py::report_result` and
+  `create_diagnostic_bundle` (stage 1), including masking of
+  credentials/tenant data in the collected logs. **SR** because of the
+  masking (section 21.5, docstring in `loop.py`).
+- **Files:** `agent/loop.py`, `fleet/app.py::receive_command_result`.
+- **Section:** 21.5.
+- **Acceptance:** test demonstrates that a known secret pattern (example
+  token, not real) appears masked in the generated bundle.
+- **Depends on:** P5.2.
+- **Read back by:** main session (masking is security-relevant).
+
+### P5.4 -- Desired-state reconciliation **SR**
+- **Goal:** complete `agent/loop.py::reconcile_desired_state` (pre-check,
+  backup, digest against the hard-coded source list, swap, 15-minute
+  deadline, rollback).
+- **Files:** `agent/loop.py`, a new module for the source list
+  (`agent/sources.py` or similar -- **a constant in the agent package**,
+  not from the cloud, security principle 2).
+- **Section:** 13.
+- **Acceptance:** test demonstrates: a missing digest prevents the start;
+  a digest from an unlisted source is rejected; absence of health after
+  15 minutes triggers a rollback.
+- **Depends on:** P5.1 (the desired state arrives over the same channel as
+  commands, see section 13).
+- **Read back by:** main session (the digest check is the central
+  safeguard from security principle 2).
+
+### P5.5 -- Backup and restore **SR**
+- **Goal:** implement `agent/loop.py::create_backup` for both kinds of
+  backup, including encrypting the operational-data backup before upload
+  (security principle 4) plus the counterpart "restore" (section 15.2),
+  which so far has no stub at all.
+- **Files:** `agent/loop.py`, a new module for encryption.
+- **Section:** 15.1, 15.2.
+- **Acceptance:** test demonstrates that an operational-data backup is not
+  readable without a valid local key (real encryption/decryption, no
+  mock); device configuration stays plain text, test demonstrates the
+  separate handling.
+- **Depends on:** nothing from step 5, can start in parallel with
+  P5.1-P5.4.
+- **Read back by:** main session (encryption, security principle 4).
+
+### P5.6 -- Watchdog main loop (`watchdog/watch.go`)
+- **Goal:** actually implement `AgentStopped`, `StartDigest`,
+  `AwaitHealthReport`, `RollBackToProven`. Stays **without** a dependency
+  in `go.mod`, production code under 300 lines under the new,
+  statements-only counting method (section 18.3; see `docs/STATUS.md` for
+  the current figure -- remeasure when P5.6 lands, use `linefile.go` as a
+  model for further trimming if needed).
+- **Files:** `watchdog/watch.go`, `watchdog/main.go`.
+- **Section:** 17, 18.3.
+- **Acceptance:** `go test ./...` green, `go vet ./...` clean, the
+  contract test (`watchdog/check_contract.sh`) still passing, the line
+  count documented.
+- **Depends on:** nothing from step 5, separated by language -- can run in
+  parallel with any Python package.
+
+### P5.7 -- Wire up the status display (section 23)
+- **Goal:** connect `watchdog/leds.go` (`LedSetPattern`) to the states from
+  P5.6: which watchdog state triggers which pattern from section 23.2.
+- **Files:** `watchdog/watch.go`, `watchdog/leds.go`.
+- **Section:** 23.
+- **Acceptance:** test demonstrates the correct pattern per state; the
+  line count stays under the 300-line production-code limit.
+- **Depends on:** P5.6.
+
+---
+
+## Only after operational experience (stage 2, sections 21 and 24)
+
+Per the specification, explicitly not before a heating season of
+operational experience and explicit approval by the project owner
+(security principle 1 in `CLAUDE.md`). No package here starts without that
+approval -- even creating a worktree for it is itself already an exception
+that must be announced and justified.
+
+- **`factory_reset`** (section 21.2): backup-before-delete order, key and
+  token revocation, re-registration with a new verification code. **SR.**
+- **`open_access`** (section 21.4): SSH certificate, back-channel,
+  60-minute deadline, logging. The `pilot_mode` rejection is already
+  actually implemented and stays that way -- this package only builds what
+  is still missing after that. **SR.**
+- **`esim_profiles_list`, `esim_profile_load`** (section 24.3): `lpac`
+  integration, activation-code handling without a log trace.
+- **`esim_profile_activate`** (sections 24.3, 24.4): the fallback clock --
+  the file format for this is decided (`esim_previous_profile=`/
+  `esim_deadline=` as two further lines in the existing state file, see
+  `docs/STATUS.md`); this package calls
+  `agent.loop.report_watchdog_state` with these and builds the rest of the
+  function. **SR.**
+- **`esim_profile_delete`** (section 24.3).
+- **A/B system partitions** (section 21.3): explicitly deferred per the
+  project owner, no package until a heating season shows that on-site
+  visits actually are caused by the operating system.
+- **eSIM at scale** (section 24.5): only after the trial run on one card/
+  device required by section 24.5.

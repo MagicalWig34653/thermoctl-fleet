@@ -1,136 +1,138 @@
 # CLAUDE.md
 
-Arbeitsanweisung für Claude Code in diesem Repository.
+Working instructions for Claude Code in this repository.
 
-## Was das hier ist
+## What this is
 
-`thermoctl-fleet` ist die Übersicht des Vermieters über alle Wohnungen: ein
-Cloud-Dienst (`fleet/`), der von jeder Wohnung einen Herzschlag mit
-Gesundheitsdaten empfängt, Störungen sammelt, **Ausbleiben** alarmiert und eine
-kurze, abschließende Liste von Wartungsbefehlen an einen Melder (`agent/`) auf
-der Basisstation der Wohnung schicken kann. `protokoll/` ist der gemeinsame
-Vertrag zwischen beiden Seiten. Dazu zwei weitere Teile, beide ohne eigenes
-Docker-Abbild: `waechter/` (in Go, tauscht den Agent-Container, läuft außerhalb
-der Containerlaufzeit, eigene CI-Spur) und `abbild/` (das Rezept für die
-vorbereiteten Systemabbilder der Basisstation).
+`thermoctl-fleet` is the landlord's overview across all apartments: a cloud
+service (`fleet/`) that receives a heartbeat with health data from every
+apartment, collects faults, alarms on **absence** of a heartbeat, and can
+send a short, closed list of maintenance commands to an agent (`agent/`) on
+the apartment's base station. `protocol/` is the shared contract between
+both sides. Plus two further parts, neither with its own Docker image:
+`watchdog/` (in Go, swaps the agent container, runs outside the container
+runtime, own CI track) and `image/` (the recipe for the base station's
+prepared system images).
 
-**Maßgeblich ist [`docs/spezifikation.md`](docs/spezifikation.md).** Sie ist eine
-unveränderte Kopie eines lokalen, nicht veröffentlichten Dokuments und die
-einzige verbindliche Quelle für Feldnamen, Abläufe und Begründungen. Bei jedem
-Zweifel: dort nachlesen, nicht raten. Der aktuelle Stand steht in
-[`docs/STATUS.md`](docs/STATUS.md) — offene Punkte des Gerüsts zuerst dort
-nachsehen, bevor eine Lücke als Bug gemeldet wird.
+**[`docs/specification.md`](docs/specification.md) is authoritative.** It is
+an unchanged copy of a local, unpublished document and the only binding
+source for field names, flows, and reasoning. Whenever in doubt: read it
+there, don't guess. The current status is in
+[`docs/STATUS.md`](docs/STATUS.md) -- check the scaffold's open points there
+first, before reporting a gap as a bug.
 
-## Was der Dienst ausdrücklich nicht ist (Spezifikation, Abschnitt 1)
+## What the service explicitly is not (specification, section 1)
 
-- **Kein zweiter Regler.** Sollwerte, Zeitpläne, Frostschutz und das
-  Scharfschalten bleiben in der Wohnung. Die Cloud kann sie nicht ändern — nicht
-  „ist nicht vorgesehen", sondern „der Befehl existiert nicht". Es gibt keinen
-  Weg, das über eine Erweiterung der Befehlsliste nachzurüsten, ohne dass es
-  vorher ausdrücklich mit dem Projektinhaber abgesprochen wird.
-- **Kein Datensammler.** Raumtemperaturen, Sollwerte, Zeitpläne, Abwesenheitszeiträume,
-  Namen und Kontaktdaten von Mietern werden **nicht** übertragen (Abschnitt 6). Ein
-  Feld, das eine dieser Kategorien transportiert, gehört nicht in `protokoll/` — auch
-  nicht „nur für ein Diagramm" oder „nur optional".
-- **Kein Ersatz für die Wohnungssicht.** Der Mieter sieht die Cloud nie.
+- **Not a second controller.** Setpoints, schedules, frost protection, and
+  arming stay in the apartment. The cloud cannot change them -- not "not
+  planned", but "the command does not exist". There is no way to retrofit
+  this via an extension of the command list without first explicitly
+  clearing it with the project owner.
+- **Not a data collector.** Room temperatures, setpoints, schedules, absence
+  periods, tenant names and contact details are **not** transmitted
+  (section 6). A field that carries one of these categories does not belong
+  in `protocol/` -- not even "just for a chart" or "just optional".
+- **Not a replacement for the apartment view.** The tenant never sees the
+  cloud.
 
-## Sicherheitsgrundsätze (nicht neu verhandeln)
+## Security principles (do not renegotiate)
 
-1. **Die Befehlsliste ist abschließend.** `protokoll.befehle.BefehlTyp` enthält
-   ausschließlich die von der Spezifikation freigegebenen Stufe-1-Befehle. Ein neuer
-   Wert dort ist niemals eine kleine Ergänzung — er erweitert, was ein potenziell
-   kompromittierter Fleet-Server einer Wohnung befehlen kann. Stufe 2
-   (Abschnitt 7) erst nach ausdrücklicher Freigabe durch den Projektinhaber, nach
-   einer Heizperiode Betriebserfahrung, wie die Spezifikation vorschreibt.
-2. **Abbild-Quellen sind im Melder fest eingebaut, nicht in der Cloud.** Die
-   Präfixliste erlaubter Registries lebt als Konstante im `agent`-Paket. Die Cloud
-   nennt Version und Digest, nie die Quelle (Abschnitt 13). Kein Digest, kein Start
-   — „latest" oder ein Tag ohne Digest wird abgelehnt, ausnahmslos.
-3. **Keine privaten Schlüssel in der Cloud.** WireGuard- und Geräte-Schlüsselpaare
-   entstehen auf der Basisstation und verlassen sie nie; die Cloud sieht nur
-   öffentliche Schlüssel (Abschnitt 14, 15.3). Ein Endpunkt oder ein Modell, das
-   einen privaten Schlüssel entgegennimmt oder zurückgibt, ist ein Entwurfsfehler,
-   kein Feature.
-4. **Keine Mieterdaten im Klartext in der Cloud.** Betriebsdaten-Sicherungen
-   (thermoctl-Datenbank, Zigbee2MQTT-Gerätetabelle) werden auf dem Gerät
-   verschlüsselt, bevor sie hochgeladen werden; die Cloud speichert nur den
-   undurchsichtigen Block und nie den Schlüssel (Abschnitt 15.1). Gerätekonfiguration
-   ohne Mieterbezug darf im Klartext liegen — die beiden Sicherungsarten dürfen nicht
-   vermischt werden.
-5. **Der Melder ist die Sicherheitsgrenze, nicht die Cloud.** Jede Prüfung, ob ein
-   Befehl ausgeführt wird (Kennung schon gesehen? Verfallszeit überschritten?
-   Vorbedingung für einen Sollzustandswechsel erfüllt?), gehört in `agent/` und wird
-   dort durchgesetzt, selbst wenn die Cloud etwas anderes sagt. Konkretes Beispiel
-   in `agent.schleife.zugang_oeffnen` (Abschnitt 21.4): Fehlt einer Wohnung das
-   Kennzeichen `pilotbetrieb`, lehnt **der Agent** den Befehl `zugang_oeffnen` ab
-   -- nicht die Fleet-Oberfläche. Eine übernommene Cloud kann damit in
-   produktiven Wohnungen keine SSH-Sitzung öffnen. Diese Prüfung in die
-   Oberfläche statt in den Agenten zu verlegen (etwa "der Knopf ist ja eh
-   ausgegraut") würde genau die Schutzwirkung aufheben, für die sie gebaut ist.
-6. **Der Wächter kennt kein Netz und keine Registry, und sein `go.mod` bleibt
-   ohne eine einzige Abhängigkeit.** Arbeitsteilung aus Abschnitt 17/18.3: Der
-   Agent lädt ein neues Abbild und prüft dessen Digest gegen die fest
-   eingebauten Quellen (Grundsatz 2 oben) — der Wächter tauscht danach nur
-   zwischen zwei bereits lokal vorhandenen, bereits geprüften Digests. Er ist
-   in Go geschrieben, statisch gebaut, unter 300 Zeilen — genau deshalb, weil
-   er das Einzige sein muss, was noch funktioniert, wenn alles andere kaputt
-   ist (Abschnitt 18.3). Ein `go.mod`-Eintrag für eine Fremdbibliothek (auch
-   ein Docker-SDK „nur zum Ansprechen der Laufzeit") oder Wächter-Code, der
-   eine Netzwerkverbindung öffnet oder eine Registry anspricht, verletzt
-   diesen Grundsatz unabhängig davon, wie klein die Änderung aussieht.
+1. **The command list is closed.** `protocol.commands.CommandType` contains
+   exclusively the stage-1 commands released by the specification. A new
+   value there is never a small addition -- it extends what a potentially
+   compromised fleet server can command an apartment to do. Stage 2
+   (section 7) only after explicit approval by the project owner, after a
+   heating season of operational experience, as the specification requires.
+2. **Image sources are hard-coded in the agent, not in the cloud.** The
+   prefix list of allowed registries lives as a constant in the `agent`
+   package. The cloud only names version and digest, never the source
+   (section 13). No digest, no start -- "latest" or a tag without a digest
+   is rejected, without exception.
+3. **No private keys in the cloud.** WireGuard and device key pairs are
+   generated on the base station and never leave it; the cloud only ever
+   sees public keys (sections 14, 15.3). An endpoint or a model that accepts
+   or returns a private key is a design error, not a feature.
+4. **No tenant data in plain text in the cloud.** Operational-data backups
+   (thermoctl database, Zigbee2MQTT device table) are encrypted on the
+   device before being uploaded; the cloud stores only the opaque block and
+   never the key (section 15.1). Device configuration with no tenant
+   relation may be stored in plain text -- the two kinds of backup must not
+   be mixed.
+5. **The agent is the security boundary, not the cloud.** Every check on
+   whether a command gets executed (id already seen? expiry exceeded?
+   precondition for a desired-state change met?) belongs in `agent/` and is
+   enforced there, even if the cloud says otherwise. Concrete example in
+   `agent.loop.open_access` (section 21.4): if an apartment lacks the
+   `pilot_mode` flag, **the agent** rejects the `open_access` command -- not
+   the fleet UI. A compromised cloud can therefore not open an SSH session
+   in production apartments. Moving this check into the UI instead of the
+   agent (e.g. "the button is greyed out anyway") would cancel out exactly
+   the protection it was built for.
+6. **The watchdog knows no network and no registry, and its `go.mod` stays
+   without a single dependency.** Division of labor from section 17/18.3:
+   the agent downloads a new image and checks its digest against the
+   hard-coded sources (principle 2 above) -- the watchdog afterward only
+   swaps between two already locally present, already checked digests. It
+   is written in Go, statically built, under 300 lines -- exactly because it
+   has to be the one thing that still works when everything else is broken
+   (section 18.3). A `go.mod` entry for a third-party library (even a
+   Docker SDK "just to address the runtime") or watchdog code that opens a
+   network connection or addresses a registry violates this principle
+   regardless of how small the change looks.
 
-Änderungen an einem dieser sechs Punkte sind sicherheitsrelevant im Sinn von
-Grundsatz 7 aus thermoctls `CLAUDE.md` (unten übernommen) und werden in der
-Hauptsession gegengelesen, nicht nur im Kreuzreview.
+Changes to any of these six points are security-relevant in the sense of
+principle 7 from thermoctl's `CLAUDE.md` (adopted below) and are read back
+in the main session, not only in cross-review.
 
-## Arbeitsweise
+## Working method
 
-Übernommen aus [thermoctls `CLAUDE.md`](../thermoctl/CLAUDE.md), Abschnitt
-„Arbeitsweise" — hier nur die Kernpunkte, im Zweifel gilt dort das Original:
+Adopted from [thermoctl's `CLAUDE.md`](../thermoctl/CLAUDE.md), the "Working
+method" section -- only the core points here, the original there governs in
+case of doubt:
 
-- **Aufgaben gehen an Agents, nicht an die Hauptsession.** In der Hauptsession
-  bleiben nur: Auth- und Sicherheitslogik (siehe die sechs Punkte oben), das
-  Zusammenführen von Zweigen und Sammeldateien, das Gegenlesen von
-  Sicherheitsrelevantem, das Zerlegen der Arbeit in Aufträge.
-- **Review kreuzweise.** Wer implementiert hat, reviewt nicht. Jedes Review führt
-  die Testsuite selbst aus (ruff, mypy, pytest) und berichtet das Ergebnis im
-  Wortlaut — der Bericht des Umsetzenden allein zählt nicht.
-- **Ein Worktree je Aufgabe**, eigener Branch, Merge nach bestandenem Review.
-- **Jede abgeschlossene Änderung wird committet**, zusammen mit dem
-  nachgezogenen `docs/STATUS.md`. Keine Sammelcommits über mehrere Aufgaben.
-- **Opus nur nach ausdrücklicher Genehmigung des Nutzers** — vorher fragen.
-- **Zu jedem Endpunkt und jeder Funktion gehört ein Test.** Ein Test, der nur
-  bestätigt, was der Code ohnehin tut, zählt nicht. Wo eine Zeile nur durch eine
-  künstliche Konstruktion erreichbar wäre, ist `# pragma: no cover` mit Begründung
-  die ehrlichere Antwort.
-- **Nichts hart verdrahtet außer den Sicherheitsgrundsätzen oben.** Keine
-  Wohnungskennungen, Adressen oder Zugangsdaten im Quelltext.
-- **Keine Secrets im Repo**, auch nicht als Beispielwert mit echtem Aussehen (siehe
-  die Begründung in `protokoll/anmeldung.py`).
+- **Tasks go to agents, not to the main session.** Only these stay in the
+  main session: auth and security logic (see the six points above), merging
+  branches and collection files, reading back security-relevant work,
+  breaking work down into tasks.
+- **Review crosswise.** Whoever implemented does not review. Every review
+  runs the test suite itself (ruff, mypy, pytest) and reports the result
+  verbatim -- the implementer's own report alone does not count.
+- **One worktree per task**, its own branch, merge after the review passes.
+- **Every completed change gets committed**, together with the updated
+  `docs/STATUS.md`. No batched commits across multiple tasks.
+- **Opus only with the user's explicit approval** -- ask beforehand.
+- **Every endpoint and every function gets a test.** A test that only
+  confirms what the code does anyway does not count. Where a line would
+  only be reachable through an artificial construction, `# pragma: no
+  cover` with a reason is the more honest answer.
+- **Nothing hard-coded except the security principles above.** No apartment
+  ids, addresses, or credentials in the source code.
+- **No secrets in the repo**, not even as a real-looking example value (see
+  the reasoning in `protocol/registration.py`).
 
-## Technischer Rahmen
+## Technical framework
 
 | | |
 |---|---|
-| Backend | Python, FastAPI (`fleet/`), reiner Python-Client (`agent/`) |
-| Gemeinsamer Vertrag | Pydantic-Modelle in `protokoll/`, von beiden Seiten importiert |
-| Verbindung | HTTPS hinauf (`POST`), SSE hinunter (`GET /v1/befehle`) — kein MQTT im Internet, kein eigenes Rahmenprotokoll (Abschnitt 3) |
-| Betrieb (Cloud/Gerät) | Zwei eigene Docker-Abbilder aus einem Repository (`docker/Dockerfile.fleet`, `docker/Dockerfile.agent`) |
-| Wächter | `waechter/`, Go ohne Abhängigkeiten, statisch gebaut, systemd-Einheit, kein Docker-Abbild |
-| Basisstation | `abbild/`, vorbereitetes Debian-13-Abbild (Raspberry Pi OS bzw. amd64), kein eigenes Betriebssystem, kein Docker-Abbild |
+| Backend | Python, FastAPI (`fleet/`), plain Python client (`agent/`) |
+| Shared contract | Pydantic models in `protocol/`, imported by both sides |
+| Connection | HTTPS upstream (`POST`), SSE downstream (`GET /v1/commands`) -- no MQTT over the internet, no custom framing protocol (section 3) |
+| Operation (cloud/device) | Two separate Docker images from one repository (`docker/Dockerfile.fleet`, `docker/Dockerfile.agent`) |
+| Watchdog | `watchdog/`, Go with no dependencies, statically built, systemd unit, no Docker image |
+| Base station | `image/`, a prepared Debian 13 image (Raspberry Pi OS or amd64), no custom operating system, no Docker image |
 
-Ein Repository für beide Docker-Abbilder plus Wächter plus Systemabbild-Rezept,
-weil alle vier über denselben Vertrag fest verkoppelt sind — Begründung in
-`README.md`.
+One repository for both Docker images plus the watchdog plus the system
+image recipe, because all four are tightly coupled via the same contract --
+reasoning in `README.md`.
 
-**Die Sprachregel (Abschnitt 18.4): Auf dem Blech Go, im Container Python.**
-Der Wächter ist die Ausnahme, nicht der Anfang einer Wanderung — er läuft auf
-dem blanken System und muss auch dann starten, wenn der Interpreter des
-Betriebssystems beschädigt ist. Der Agent bringt seine Laufzeit im eigenen
-Abbild mit und ist von dieser Fehlerklasse gar nicht betroffen; ihn in Go zu
-schreiben, kostete nur das gemeinsame Protokollpaket mit dem Cloud-Dienst
-(`protokoll/`) — doppelt gepflegt statt einmal. Muss künftig ein Teil des
-Agenten auf dem blanken System laufen (denkbar beim WireGuard-Tunnel aus
-Abschnitt 14, der eine Netzwerkschnittstelle einrichtet), **wandert dieses
-Stück zum Wächter-Binärprogramm**, statt den Agenten umzuschreiben oder eine
-dritte Sprache einzuführen.
+**The language rule (section 18.4): Go on the bare metal, Python in the
+container.** The watchdog is the exception, not the start of a migration --
+it runs on the bare system and must start even when the operating system's
+interpreter is broken. The agent brings its own runtime in its own image
+and is not affected by this class of failure at all; writing it in Go would
+only have cost the shared protocol package with the cloud service
+(`protocol/`) -- maintained twice instead of once. Should a part of the
+agent ever need to run on the bare system in the future (conceivable for
+the WireGuard tunnel from section 14, which sets up a network interface),
+**that piece moves to the watchdog binary**, instead of rewriting the agent
+or introducing a third language.

@@ -1,34 +1,33 @@
-# abbild/gemeinsam/ — was beide Abbilder teilen (Abschnitt 19.3)
+# image/common/ -- what both images share (section 19.3)
 
-Alles hier gilt unverändert für `abbild/pi/` und `abbild/x86/`. Der Grund ist
-Abschnitt 19.1: Raspberry Pi OS ist Debian, also braucht es keine zweite
-Fassung von Paketnamen, Einheiten oder Aktualisierungsregeln -- nur zweimal
-denselben Kernschritt "fertiges Debian nehmen, das hier anwenden".
+Everything here applies unchanged to `image/pi/` and `image/x86/`. The
+reason is section 19.1: Raspberry Pi OS is Debian, so it needs no second
+version of package names, units, or update rules -- just the same core step
+twice, "take a finished Debian, apply this to it".
 
-| Datei/Ordner | Zweck |
+| File/folder | Purpose |
 |---|---|
-| `paketliste.txt` | Pakete, die beide Abbilder installieren (Container-Laufzeit, Zeitsynchronisation, Hardware-Watchdog, `unattended-upgrades`, log2ram, udev, WireGuard-Werkzeuge) |
-| `udev/99-zigbee-stick.rules` | Fester Gerätename für den Zigbee-Funkstick, damit er nicht mal `ttyUSB0`, nach einem Neustart `ttyUSB1` heißt |
-| `unattended-upgrades/` | Sicherheitsaktualisierungen automatisch, Neustart nur im Zeitfenster |
-| `melder-anmeldung.leer.json` | Vorlage für die Startpartition (Abschnitt 15.3, 19.5) -- die Felder aus `protokoll.anmeldung.MelderAnmeldedatei`, leer, bis das Vorbereitungswerkzeug sie beim Schreiben des Abbilds füllt |
+| `packages.txt` | Packages both images install (container runtime, time sync, hardware watchdog, `unattended-upgrades`, log2ram, udev, WireGuard tools) |
+| `udev/99-zigbee-stick.rules` | Fixed device name for the Zigbee radio stick, so it is not `ttyUSB0` once and `ttyUSB1` after a reboot |
+| `unattended-upgrades/` | Security updates automatically, reboot only within the maintenance window |
+| `agent-registration.empty.json` | Template for the boot partition (sections 15.3, 19.5) -- the fields from `protocol.registration.AgentRegistrationFile`, empty, until the preparation tool fills them when writing the image |
 
-**Die systemd-Einheit des Wächters liegt bewusst nicht hier**, sondern bei
-ihrem Code unter
-[`../../waechter/thermoctl-waechter.service`](../../waechter/thermoctl-waechter.service).
-Eine Kopie an zwei Stellen im selben Repository wäre genau die Art von
-Doppelpflege, die dieses Repository überall sonst vermeidet (siehe
-`README.md`, "Ein Repository, zwei Abbilder"); der Bauschritt in `pi/` und
-`x86/` kopiert sie stattdessen von dort ins Abbild.
+**The watchdog's systemd unit deliberately does not live here**, but with
+its code at
+[`../../watchdog/thermoctl-watchdog.service`](../../watchdog/thermoctl-watchdog.service).
+A copy in two places in the same repository would be exactly the kind of
+double maintenance this repository avoids everywhere else (see `README.md`,
+"One repository, two images"); the build step in `pi/` and `x86/` instead
+copies it from there into the image.
 
-## Was laut Abschnitt 19.3 sonst noch in beide Abbilder gehört
+## What else belongs in both images per section 19.3
 
-Noch nicht als Datei hier angelegt, weil es keine reine Konfigurationsdatei
-ist, sondern einen echten Bauschritt braucht (siehe `docs/STATUS.md`):
+Not yet laid out as a file here, because it is not a plain configuration
+file but needs a real build step (see `docs/STATUS.md`):
 
-- Container-Laufzeit und Hardware-Watchdog **eingeschaltet** (nicht nur
-  installiert).
-- Agent-Abbild bereits vorgeladen (`docker pull`/`docker load` während des
-  Baus, nicht zur Laufzeit).
-- WireGuard **installiert, aber nicht eingerichtet** (Abschnitt 14).
-- Kein SSH-Passwortzugang; Schlüssel werden beim Vorbereiten hinterlegt oder
-  gar nicht (Abschnitt 19.3).
+- Container runtime and hardware watchdog **enabled** (not just installed).
+- Agent image already preloaded (`docker pull`/`docker load` during the
+  build, not at runtime).
+- WireGuard **installed but not configured** (section 14).
+- No SSH password access; keys are deposited during preparation or not at
+  all (section 19.3).

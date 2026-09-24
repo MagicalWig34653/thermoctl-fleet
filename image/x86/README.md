@@ -1,34 +1,35 @@
-# abbild/x86/ — Debian 13 „Trixie" amd64, minimal (Abschnitt 19.1)
+# image/x86/ -- Debian 13 "Trixie" amd64, minimal (section 19.1)
 
 | | |
 |---|---|
-| Grundlage | Debian 13 „Trixie" **amd64**, minimal |
-| Ziel | Mini-PC mit N100, Thin Client, alles, was kein Raspberry Pi ist |
-| Architektur | `amd64` -- nur 64-Bit, siehe `abbild/README.md` |
-| Start | EFI, Debian-Standardkernel |
-| Alles andere | siehe [`../gemeinsam/`](../gemeinsam/) -- Paketliste, udev-Regel, `unattended-upgrades`, Wächter-Einheit |
+| Base | Debian 13 "Trixie" **amd64**, minimal |
+| Target | Mini PC with N100, thin client, anything that is not a Raspberry Pi |
+| Architecture | `amd64` -- 64-bit only, see `image/README.md` |
+| Boot | EFI, Debian's standard kernel |
+| Everything else | see [`../common/`](../common/) -- package list, udev rule, `unattended-upgrades`, watchdog unit |
 
-Dieselbe Grundlage wie `abbild/pi/` (Debian 13), nur ohne Raspberry-Pi-Kernel
-und mit EFI-Start statt FAT32-`/boot/firmware`. Die Begründung für "Debian statt
-Alpine" steht in `abbild/README.md`.
+The same base as `image/pi/` (Debian 13), just without the Raspberry Pi
+kernel and with EFI boot instead of a FAT32 `/boot/firmware`. The reasoning
+for "Debian instead of Alpine" is in `image/README.md`.
 
-## Stand dieses Gerüsts
+## State of this scaffold
 
-Kein Abbild wird hier gebaut. Vorgesehener Bauweg (Abschnitt 19.4): **`mkosi`**
-oder **`debos`** -- beide erzeugen aus einer deklarativen Konfiguration ein
-fertiges Debian-Abbild, ohne einen eigenen Installationsvorgang nachzubauen.
-Welches der beiden Werkzeuge, ist noch nicht entschieden (siehe
-docs/STATUS.md) -- `mkosi` ist enger an systemd angelehnt (passend zum
-Wächter), `debos` ist älter und in Debian selbst paketiert.
+No image is built here. Intended build path (section 19.4): **`mkosi`** or
+**`debos`** -- both produce a finished Debian image from a declarative
+configuration, without rebuilding a custom installation process. Which of
+the two tools is not yet decided (see docs/STATUS.md) -- `mkosi` is more
+closely aligned with systemd (fitting for the watchdog), `debos` is older
+and packaged in Debian itself.
 
-Fehlt vollständig:
+Entirely missing:
 
-- eine `mkosi.conf`/`debos`-Rezeptdatei, die dieselben gemeinsamen Schritte
-  wie `abbild/pi/` ausführt: `abbild/gemeinsam/paketliste.txt` installieren,
-  udev-Regel und `unattended-upgrades`-Konfiguration einspielen, die
-  Wächter-Einheit aus `../../waechter/thermoctl-waechter.service` kopieren und
-  aktivieren, `melder-anmeldung.leer.json` als `melder-anmeldung.json` auf die
-  Startpartition legen,
-- EFI-Bootpartition und -Bootloader-Konfiguration,
-- das Vorladen des Agent-Container-Abbilds,
-- Kompression, Prüfsummenbildung, Anbindung an `v*`-Tags -- wie bei `abbild/pi/`.
+- an `mkosi.conf`/`debos` recipe file that carries out the same shared
+  steps as `image/pi/`: installing `image/common/packages.txt`, applying
+  the udev rule and the `unattended-upgrades` configuration, copying and
+  enabling the watchdog unit from
+  `../../watchdog/thermoctl-watchdog.service`, placing
+  `agent-registration.empty.json` on the boot partition as
+  `agent-registration.json`,
+- the EFI boot partition and bootloader configuration,
+- preloading the agent container image,
+- compression, checksumming, connection to `v*` tags -- as with `image/pi/`.
