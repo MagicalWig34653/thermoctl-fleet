@@ -8,7 +8,15 @@ from __future__ import annotations
 
 import pytest
 
-from agent.schleife import diagnose_paket_erstellen, zugang_oeffnen, zurueck_setzen
+from agent.schleife import (
+    diagnose_paket_erstellen,
+    esim_profil_aktivieren,
+    esim_profil_laden,
+    esim_profil_loeschen,
+    esim_profile_auflisten,
+    zugang_oeffnen,
+    zurueck_setzen,
+)
 
 
 def test_zurueck_setzen_meldet_fehlende_umsetzung() -> None:
@@ -40,3 +48,23 @@ def test_zugang_oeffnen_meldet_fehlende_umsetzung_wenn_pilotbetrieb_gesetzt() ->
 
     with pytest.raises(NotImplementedError):
         zugang_oeffnen(pilotbetrieb=True)
+
+
+def test_esim_profile_auflisten_meldet_fehlende_umsetzung() -> None:
+    with pytest.raises(NotImplementedError):
+        esim_profile_auflisten()
+
+
+def test_esim_profil_laden_meldet_fehlende_umsetzung() -> None:
+    with pytest.raises(NotImplementedError):
+        esim_profil_laden("LPA:1$rsp.example.com$ABCDEF")
+
+
+def test_esim_profil_aktivieren_meldet_fehlende_umsetzung() -> None:
+    with pytest.raises(NotImplementedError):
+        esim_profil_aktivieren("profil-1")
+
+
+def test_esim_profil_loeschen_meldet_fehlende_umsetzung() -> None:
+    with pytest.raises(NotImplementedError):
+        esim_profil_loeschen("profil-1")

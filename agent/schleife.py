@@ -278,3 +278,101 @@ def zugang_oeffnen(pilotbetrieb: bool) -> None:
         "Aufbau des befristeten SSH-Rückkanals fehlt -- siehe "
         "docs/spezifikation.md Abschnitt 21.4."
     )
+
+
+# eSIM-Profile (Abschnitt 24). Alle vier Befehle sind Stufe 2 (Abschnitt 24.3)
+# und deshalb -- wie `zurueck_setzen` und `zugang_oeffnen` oben -- **nicht**
+# in `protokoll.befehle.BefehlTyp` aufgenommen; siehe die Begründung dort.
+# Ohne einen Wert in `BefehlTyp` lässt sich keine der vier Funktionen unten
+# über den Befehlskanal überhaupt anstoßen, mit derselben Absicht wie bei den
+# beiden anderen Stufe-2-Stummeln.
+
+
+def esim_profile_auflisten() -> list[dict[str, str]]:
+    """Listet die Profile der eUICC-Karte (Abschnitt 24.3, Befehl
+    `esim_profile_auflisten`, Stufe 2).
+
+    Rein lesend, keine Auflage. Ruft `lpac` (`estkme-group/lpac`) über den
+    AT-Kanal des Modems auf und meldet Kennung, Name und Zustand je Profil --
+    die Spezifikation legt kein Feldschema für die einzelnen Profile fest,
+    deshalb erfindet dieser Stummel keines; das entsteht mit der echten
+    Umsetzung.
+    """
+
+    raise NotImplementedError(
+        "Auflisten der eSIM-Profile über lpac fehlt -- siehe "
+        "docs/spezifikation.md Abschnitt 24.3."
+    )
+
+
+def esim_profil_laden(aktivierungscode: str) -> None:
+    """Lädt ein Profil über einen Aktivierungscode (`LPA:1$…`) herunter, ohne
+    es zu aktivieren (Abschnitt 24.3, Befehl `esim_profil_laden`, Stufe 2).
+
+    Auflage: nur eine Wohnung gleichzeitig (fleet-seitige Aufgabe, nicht
+    dieser Funktion). **Sicherheitsrelevant:** Der Aktivierungscode wird nach
+    der Ausführung aus dem Befehlssatz gelöscht und darf **nie** im lokalen
+    Protokoll oder im Ergebnis an die Cloud landen -- weder im Erfolgs- noch
+    im Fehlerfall. Diese Funktion ist deshalb noch nicht mit einem einfachen
+    Rückruf auf `sicherung_erstellen` oder `diagnose_paket_erstellen`
+    vergleichbar: jede spätere Fehlerbehandlung hier muss den Code aus
+    Fehlermeldungen fernhalten, bevor sie geschrieben wird.
+    """
+
+    raise NotImplementedError(
+        "Laden eines eSIM-Profils über lpac fehlt -- siehe "
+        "docs/spezifikation.md Abschnitt 24.3."
+    )
+
+
+def esim_profil_aktivieren(profil_kennung: str) -> None:
+    """Schaltet auf ein bereits geladenes Profil um (Abschnitt 24.3, Befehl
+    `esim_profil_aktivieren`, Stufe 2) -- **nur mit Rückfalluhr** (Abschnitt
+    24.4).
+
+    Sicherheitsrelevant, deshalb hier ausführlich (Grundsatz 7 aus thermoctls
+    CLAUDE.md, hier übernommen): Ein Profilwechsel kappt **genau die
+    Verbindung, über die dieser Befehl kam** -- das Modem meldet sich beim
+    Umschalten neu am Netz an. Der Melder kann sich deshalb nicht selbst
+    zurückfallen; fällt der Wechsel aus, ist er es ja gerade, der nicht mehr
+    erreichbar ist. Der Rückfall liegt beim **Wächter**, nicht beim Melder
+    (dieselbe Aufteilung wie beim Sollzustandsabgleich in Abschnitt 13, nur
+    mit einem SIM-Profil statt einem Container-Digest als Inhalt):
+
+    1. Vor dem Umschalten das aktuell aktive Profil in die Zustandsdatei des
+       Wächters schreiben und eine Frist von zehn Minuten setzen.
+    2. Auf `profil_kennung` umschalten; das Modem meldet sich neu am Netz an.
+    3. Kommt innerhalb der Frist ein bestätigter Herzschlag durch, löscht der
+       Melder die Frist -- fertig.
+    4. Läuft die Frist ab, schaltet der **Wächter** auf das zuvor gemerkte
+       Profil zurück, nicht der Melder (Abschnitt 24.4).
+
+    **Offener Punkt, absichtlich nicht hier entschieden:** Ob
+    `waechter/zustand.go` (`gewuenscht`/`bewaehrt`/`seit`, Abschnitt 17/18.3)
+    für diese Rückfalluhr ein zusätzliches Feld braucht oder ob eine eigene
+    Datei entsteht, legt dieser Stummel **nicht** fest -- das Format ist ein
+    sprachübergreifender Vertrag mit eigenem Test
+    (`waechter/pruefe_vertrag.sh`) und wird nicht nebenbei erweitert. Siehe
+    docs/STATUS.md, offener Punkt „Rückfalluhr für eSIM-Profilwechsel".
+    """
+
+    raise NotImplementedError(
+        "Aktivieren eines eSIM-Profils samt Rückfalluhr fehlt -- siehe "
+        "docs/spezifikation.md Abschnitt 24.3 und 24.4."
+    )
+
+
+def esim_profil_loeschen(profil_kennung: str) -> None:
+    """Entfernt ein Profil von der Karte (Abschnitt 24.3, Befehl
+    `esim_profil_loeschen`, Stufe 2).
+
+    Auflage: niemals das aktive Profil löschen; Ablehnung, wenn es das
+    einzige geladene ist. Diese Prüfung gehört -- wie jede
+    Ausführungsvoraussetzung eines Befehls -- in den Melder, nicht in die
+    Cloud (Grundsatz 5 aus dieser CLAUDE.md).
+    """
+
+    raise NotImplementedError(
+        "Löschen eines eSIM-Profils über lpac fehlt -- siehe "
+        "docs/spezifikation.md Abschnitt 24.3."
+    )
