@@ -82,21 +82,18 @@ never even reads a `Heartbeat`/`Event` body in the first place, only
 itself, so there is structurally nothing sensitive to leak, not merely
 "tested to be absent".
 
-**Persistence: new migration.** The work package named this file
-`0003_alarms`, but the brief was corrected mid-task once the parallel
-P2.1b package's actual migration situation was known: **P2.1b
-(`worktree-agent-a2fd3ba1cae8a5102`, commit `733b780`, "accept caught-up
-heartbeats in one batch") does not in fact add a migration** -- its own
-`Storage.save_heartbeats_batch` docstring records a deliberate choice to
-enforce heartbeat-batch idempotency at the query level instead of via a
-unique index, specifically to avoid needing a `0003` migration for it. To
-keep `0003` free for that package regardless (in case a later revision of
-it does add one), this package's migration is
-**`fleet/migrations/versions/0004_alarms.py`**, `revision = "0004"`,
-**`down_revision` still `"0002"`** (there is no `0003` on this branch to
-chain onto yet) -- **the main session needs to re-chain this onto a real
-`0003` if/when one appears**, exactly as the corrected instruction
-anticipated. `alarms` table: `apartment_id` (indexed), `kind` (closed
+**Persistence: new migration.** The work package originally named this file
+`0003_alarms`; P2.1b (parallel package, "accept caught-up heartbeats in one
+batch") went through two revisions of its own -- its first version added no
+migration at all (heartbeat-batch idempotency enforced at the query level),
+its amended version added `0003_heartbeats_unique_sent_at.py` (a unique
+index on `heartbeats(apartment_id, sent_at)`, `revision = "0003"`) after a
+cross-review found the query-level check unsafe under concurrent writers.
+This package's migration is **`fleet/migrations/versions/0004_alarms.py`**,
+`revision = "0004"`, **`down_revision = "0003"`** -- chained onto P2.1b's
+migration now that both branches are merged together (`git merge main`,
+merge commit noted at the end of this section). `alarms` table:
+`apartment_id` (indexed), `kind` (closed
 `AlarmKind` enum, currently only `not_reporting`, stored as a plain string
 -- mirrors how `EventRecord.fault_kind` already stores `FaultKind`, so
 `fleet/storage.py` does not need to import `fleet/alarms.py`'s enum types
@@ -187,12 +184,65 @@ installs the `fleet` extra via `pip install ".[fleet]"`, and `httpx` was
 added to that extra (not a new dependency for the image: `agent` already
 depended on it, `fleet` did not until now).
 
-Full suite: **178 tests** (up from 128 -- this branch is based on P2.1's
-`1bfe413`, not on the parallel P2.1b branch, which is not yet merged),
-coverage **98%**
-(`fleet/alarms.py`, `fleet/app.py`, `fleet/storage.py`, `fleet/auth.py`, and
-all four migrations at 100%) -- `ruff check .` and `mypy .` /
-`mypy protocol fleet agent tools` all clean.
+**Follow-up: merged with P2.1b, migration re-chained, one real test bug
+fixed.** P2.1b was later merged into `main` (`e3a5236`) with its amended
+`0003_heartbeats_unique_sent_at.py`. `git merge main` into this branch
+(merge commit `0821e07`) needed one manual conflict resolution in
+`fleet/storage.py` -- both sides had added imports on the same lines
+(P2.1b: `Index`, the `postgresql`/`sqlite` dialect modules; this package:
+`Boolean`) -- resolved by keeping both. `0004_alarms.py` was re-chained
+onto `0003` (`down_revision = "0004" -> "0003"`, was `"0002"`).
+
+**Two real problems found and fixed while re-running the suite against the
+merged code, not papered over:**
+
+1. **Duplicate `sent_at` silently deduplicated.** Three tests in
+   `tests/test_alarms.py` (`test_heartbeat_returns_all_clear_notified_once`,
+   `test_new_outage_after_an_all_clear_raises_a_new_alarm`,
+   `test_failing_clear_notifier_is_retried_next_run_and_not_marked_sent`)
+   saved a second heartbeat for the same apartment using the test's
+   `_make_heartbeat()` helper, which always built the same literal
+   `sent_at`. Against `0003`'s new unique index on
+   `heartbeats(apartment_id, sent_at)`, the second heartbeat silently
+   deduped to the first row instead of being stored -- the alarm never saw
+   a fresh `received_at` and the tests failed for the right reason (the
+   apartment genuinely never "reported again" as far as storage was
+   concerned). Fixed by giving `_make_heartbeat` an optional `sent_at`
+   parameter and passing a distinct value at each of those three call
+   sites -- not by weakening what the tests assert.
+2. **A genuinely flaky test, root-caused, not hidden.**
+   `test_webhook_notifier_raises_when_the_server_errors` failed
+   intermittently (about 1 run in 7-15, reproduced even running that one
+   test alone, repeatedly, with nothing else in the suite running --
+   ruling out cross-test resource contention). Root cause, found by reading
+   the actual traceback instead of guessing: the test's `_FailingHandler
+   .do_POST` never read the request body before responding with 500 and
+   returning. `BaseHTTPRequestHandler` then closes the connection
+   immediately after `do_POST` returns; closing a TCP socket while there
+   are still unread bytes in its receive buffer makes the OS send a **RST**
+   instead of a clean FIN. That RST races the client's read of the 500
+   response and, when it wins, surfaces in `httpx` as `httpcore.ReadError:
+   Connection reset by peer` instead of the intended `httpx.HTTPStatusError`
+   -- exactly the "read timeout"-shaped failure originally seen, just with
+   its real name once the assertion stopped being widened to catch it.
+   Fixed by draining the request body first (`self.rfile.read(length)`,
+   mirroring what the passing `_CapturingWebhookHandler.do_POST` already
+   did next to it), which avoids the RST entirely -- the assertion is back
+   to the specific `httpx.HTTPStatusError` it should have been all along.
+   Both `HTTPServer` fixtures/tests in that file also gained an explicit
+   `server.server_close()` in teardown (previously only `shutdown()`,
+   which stops the accept loop but leaves the socket's file descriptor
+   open) -- a correctness fix in its own right, independent of the RST
+   issue. Verified stable: 30 consecutive runs of the fixed test alone, 20
+   consecutive runs of the full `test_alarms.py` module, and 5 consecutive
+   full-suite runs, all green.
+
+Full suite: **199 tests** (up from 178 before this merge; 128 before P2.2
+itself), coverage **98%** (852 statements, 20 missed -- `fleet/alarms.py`,
+`fleet/app.py`, `fleet/storage.py`, `fleet/auth.py`, and all four
+migrations at 100%) -- `ruff check .` and `mypy .` /
+`mypy protocol fleet agent tools` all clean. Merge commit `0821e07`,
+follow-up fix commit noted in this package's own commit trailer.
 
 ## Token check per apartment (P1.1, sections 4, 18.1)
 

@@ -11,21 +11,14 @@ has ... a snooze") suppresses a *retried* raise-notification (after a
 notifier failure) until that time, not the alarm itself.
 
 Revision ID: 0004
-Revises: 0002 (see below)
+Revises: 0003
 Create Date: 2026-09-24
 
-**Numbered `0004`, not `0003`:** the work package reserves `0003` for
-P2.1b (`0003_heartbeats_unique_sent_at`), developed in parallel. As of this
-migration's own `Create Date`, P2.1b's branch
-(`worktree-agent-a2fd3ba1cae8a5102`, commit `733b780`) does **not** in fact
-add a migration -- its own commit message documents a deliberate choice to
-enforce heartbeat-batch idempotency at the query level instead of via a
-unique index (see `fleet/storage.py::Storage.save_heartbeats_batch`'s
-docstring on that branch), so no `0003` exists to chain onto yet.
-`down_revision` therefore still points at `"0002"` here, not `"0003"` --
-**the main session must re-chain this once/if a `0003` migration does
-appear**, per the work package's own instruction to keep this file's own
-numbering (`0004_alarms`) stable regardless.
+**Numbered `0004`, not `0003`:** `0003` is P2.1b's
+`0003_heartbeats_unique_sent_at.py` (a unique index on
+`heartbeats(apartment_id, sent_at)`), developed in parallel and merged in
+afterward -- this migration chains onto it (`down_revision = "0003"`), not
+onto `0002` directly, once both packages' branches were merged together.
 """
 
 from __future__ import annotations
@@ -36,7 +29,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0004"
-down_revision: str | Sequence[str] | None = "0002"
+down_revision: str | Sequence[str] | None = "0003"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

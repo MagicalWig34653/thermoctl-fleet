@@ -23,6 +23,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import httpx
 import pytest
 from aiosmtpd.controller import Controller
 
@@ -58,11 +59,20 @@ def _database_url(tmp_path: object) -> str:
     return f"sqlite:///{tmp_path}/alarms-test.db"
 
 
-def _make_heartbeat(apartment: str = APARTMENT) -> Heartbeat:
+def _make_heartbeat(apartment: str = APARTMENT, sent_at: datetime | None = None) -> Heartbeat:
+    """`sent_at` defaults to a fixed literal for callers that only ever save
+    one heartbeat per apartment in a test. Callers that save *several*
+    heartbeats for the same apartment must pass distinct `sent_at` values --
+    `heartbeats(apartment_id, sent_at)` has been unique since P2.1b's
+    `0003_heartbeats_unique_sent_at` migration, so two heartbeats sharing
+    both would silently dedupe to one row instead of the two (or more) the
+    test means to store."""
+
+    sent_at_value = sent_at if sent_at is not None else datetime(2026, 9, 22, 14, 3, 11, tzinfo=UTC)
     return Heartbeat.model_validate(
         {
             "apartment": apartment,
-            "sent_at": "2026-09-22T14:03:11Z",
+            "sent_at": sent_at_value.isoformat(),
             "agent": "0.1.0",
             "protocol_version": 1,
             "thermoctl": {"version": "0.9.5", "reachable": True, "mode": "armed"},
@@ -171,7 +181,11 @@ def test_heartbeat_returns_all_clear_notified_once(storage: Storage) -> None:
     assert len(notifier.notifications) == 1  # the raise
 
     # The apartment reports again.
-    storage.save_heartbeat(APARTMENT, _make_heartbeat(), BASE_TIME + timedelta(minutes=11))
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(sent_at=BASE_TIME + timedelta(minutes=11)),
+        BASE_TIME + timedelta(minutes=11),
+    )
     check_absence_alarms(storage, BASE_TIME + timedelta(minutes=12), [notifier])
 
     assert len(notifier.notifications) == 2
@@ -195,7 +209,11 @@ def test_new_outage_after_an_all_clear_raises_a_new_alarm(storage: Storage) -> N
     notifier = _RecordingNotifier()
     check_absence_alarms(storage, BASE_TIME + timedelta(minutes=10), [notifier])
 
-    storage.save_heartbeat(APARTMENT, _make_heartbeat(), BASE_TIME + timedelta(minutes=11))
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(sent_at=BASE_TIME + timedelta(minutes=11)),
+        BASE_TIME + timedelta(minutes=11),
+    )
     check_absence_alarms(storage, BASE_TIME + timedelta(minutes=12), [notifier])
     assert len(notifier.notifications) == 2  # raise, clear
 
@@ -259,7 +277,11 @@ def test_failing_clear_notifier_is_retried_next_run_and_not_marked_sent(storage:
     recording = _RecordingNotifier()
     check_absence_alarms(storage, BASE_TIME + timedelta(minutes=7), [recording])
 
-    storage.save_heartbeat(APARTMENT, _make_heartbeat(), BASE_TIME + timedelta(minutes=8))
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(sent_at=BASE_TIME + timedelta(minutes=8)),
+        BASE_TIME + timedelta(minutes=8),
+    )
     failing = _FailingNotifier()
     check_absence_alarms(storage, BASE_TIME + timedelta(minutes=9), [failing])
     assert failing.calls == 1
@@ -390,6 +412,14 @@ def webhook_server() -> Iterator[str]:
     finally:
         server.shutdown()
         thread.join()
+        # `shutdown()` only stops `serve_forever()`'s loop -- it does not
+        # close the listening socket. Without this, the socket's file
+        # descriptor stays open for the rest of the process (this module
+        # alone opens several of these servers across its tests), which
+        # under full-suite load was found to starve later socket
+        # operations enough to intermittently time out a *different*
+        # test's request (see `test_webhook_notifier_raises_when_the_server_errors`).
+        server.server_close()
 
 
 def test_webhook_notifier_posts_the_payload_to_a_real_local_server(webhook_server: str) -> None:
@@ -416,6 +446,25 @@ def test_webhook_notifier_posts_the_payload_to_a_real_local_server(webhook_serve
 def test_webhook_notifier_raises_when_the_server_errors() -> None:
     class _FailingHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
+            # **The actual, reproducible cause of the flake this test used
+            # to have** (found by running it alone, repeatedly, until it
+            # failed even with no other test running -- so not resource
+            # contention from elsewhere): this handler never read the
+            # request body. `WebhookNotifier.notify` sends a JSON body with
+            # `Content-Length` set; leaving those bytes unread in the
+            # socket's receive buffer and then closing the connection (as
+            # `BaseHTTPRequestHandler` does once `do_POST` returns, since
+            # `send_response(500)` implies HTTP/1.0-style "close signals
+            # end of body") makes the OS send a TCP RST instead of a clean
+            # FIN, which httpx then surfaces as `httpcore.ReadError:
+            # Connection reset by peer` while reading the response --
+            # racing with, and occasionally replacing, the intended
+            # `httpx.HTTPStatusError` from the 500 status. Draining the
+            # body first (same as `_CapturingWebhookHandler.do_POST` above
+            # already does) avoids the RST entirely.
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
             self.send_response(500)
             self.end_headers()
 
@@ -434,19 +483,19 @@ def test_webhook_notifier_raises_when_the_server_errors() -> None:
             event="raised",
             raised_at=BASE_TIME,
         )
-        # A real local server can fail the request in more than one way
-        # under load (a 500 -> `httpx.HTTPStatusError`, but a connection
-        # reset or a read timeout under test-suite-wide thread contention
-        # surfaces as a different `httpx`/`httpcore` exception) -- the
-        # point under test is only that *something* propagates out of
-        # `notify`, not the specific exception type, so a blind `Exception`
-        # is the honest assertion here, not a narrower one that would make
-        # this test flaky. noqa: B017
-        with pytest.raises(Exception):  # noqa: B017
+        with pytest.raises(httpx.HTTPStatusError):
             notifier.notify(notification)
     finally:
         server.shutdown()
         thread.join()
+        # See `webhook_server`'s fixture teardown above for why this
+        # matters: without it, this test's socket stays open for the rest
+        # of the process and was found to be the actual cause of an
+        # intermittent `ReadTimeout` in a *different*, later test in this
+        # module under full-suite load -- not genuine server slowness (the
+        # server here always responds immediately), but resource pressure
+        # from accumulated, never-closed listening sockets.
+        server.server_close()
 
 
 def test_webhook_notifier_end_to_end_through_check_absence_alarms(
