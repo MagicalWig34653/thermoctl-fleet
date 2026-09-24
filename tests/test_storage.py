@@ -25,6 +25,7 @@ from sqlalchemy import inspect
 import fleet.storage as storage_module
 from fleet.alarms import AlarmKind, Urgency
 from fleet.storage import (
+    AlarmRecord,
     ApartmentRecord,
     Base,
     HeartbeatRecord,
@@ -733,6 +734,7 @@ def test_raise_alarm_creates_an_open_unnotified_alarm(storage: Storage) -> None:
         "house7-a03", AlarmKind.NOT_REPORTING.value, Urgency.HIGH.value, raised_at
     )
 
+    assert alarm is not None
     assert alarm.apartment_id == "house7-a03"
     assert alarm.kind == AlarmKind.NOT_REPORTING.value
     assert alarm.urgency == Urgency.HIGH.value
@@ -752,6 +754,7 @@ def test_clear_alarm_sets_cleared_at_and_resets_clear_notified(storage: Storage)
     alarm = storage.raise_alarm(
         "house7-a03", AlarmKind.NOT_REPORTING.value, Urgency.HIGH.value, raised_at
     )
+    assert alarm is not None
     storage.mark_alarm_clear_notified(alarm.id)  # pretend a stale True was set
 
     storage.clear_alarm(alarm.id, cleared_at)
@@ -773,6 +776,7 @@ def test_mark_alarm_raise_notified(storage: Storage) -> None:
         Urgency.HIGH.value,
         datetime(2026, 9, 22, tzinfo=UTC),
     )
+    assert alarm is not None
 
     storage.mark_alarm_raise_notified(alarm.id)
 
@@ -796,6 +800,7 @@ def test_set_alarm_snoozed_until(storage: Storage) -> None:
         Urgency.HIGH.value,
         datetime(2026, 9, 22, tzinfo=UTC),
     )
+    assert alarm is not None
     until = datetime(2026, 9, 23, 8, 0, 0, tzinfo=UTC)
 
     storage.set_alarm_snoozed_until(alarm.id, until)
@@ -816,6 +821,7 @@ def test_get_latest_alarm_returns_the_most_recently_raised_of_several(storage: S
         Urgency.HIGH.value,
         datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC),
     )
+    assert older is not None
     storage.clear_alarm(older.id, datetime(2026, 9, 22, 10, 5, 0, tzinfo=UTC))
     newer = storage.raise_alarm(
         "house7-a03",
@@ -823,10 +829,91 @@ def test_get_latest_alarm_returns_the_most_recently_raised_of_several(storage: S
         Urgency.HIGH.value,
         datetime(2026, 9, 22, 11, 0, 0, tzinfo=UTC),
     )
+    assert newer is not None
 
     latest = storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value)
     assert latest is not None
     assert latest.id == newer.id
+
+
+def test_raise_alarm_returns_none_when_one_is_already_open(storage: Storage) -> None:
+    """The partial unique index `ux_alarms_apartment_id_kind_open`
+    (`0004_alarms.py`) makes a second raise for an already-open
+    `(apartment_id, kind)` a no-op rather than a second row -- exercised
+    here single-threaded first; `test_raise_alarm_is_safe_under_concurrent_
+    calls` below exercises the actual race with real threads."""
+
+    first = storage.raise_alarm(
+        "house7-a03",
+        AlarmKind.NOT_REPORTING.value,
+        Urgency.HIGH.value,
+        datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC),
+    )
+    assert first is not None
+
+    second = storage.raise_alarm(
+        "house7-a03",
+        AlarmKind.NOT_REPORTING.value,
+        Urgency.HIGH.value,
+        datetime(2026, 9, 22, 10, 1, 0, tzinfo=UTC),
+    )
+
+    assert second is None
+    latest = storage.get_latest_alarm("house7-a03", AlarmKind.NOT_REPORTING.value)
+    assert latest is not None
+    assert latest.id == first.id  # still the first row, not overwritten
+
+
+def test_raise_alarm_is_safe_under_concurrent_calls(tmp_path: object) -> None:
+    """Cross-review reproduced the bug this guards against: 5 concurrent
+    `check_absence_alarms` runs for one absent apartment produced 4
+    duplicate open alarms and 5 raise notifications, because the original
+    `raise_alarm` was a plain INSERT with no database-level guard. Against
+    a real, migrated SQLite database, with real threads (not a mock), the
+    partial unique index plus the insert-or-ignore write path must leave
+    exactly one open row and let exactly one thread's call return a
+    non-`None` record."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    apartment = "house7-a03"
+    raised_at = datetime(2026, 9, 22, 10, 0, 0, tzinfo=UTC)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def _raise() -> None:
+        try:
+            results.append(
+                storage.raise_alarm(
+                    apartment, AlarmKind.NOT_REPORTING.value, Urgency.HIGH.value, raised_at
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 -- captured to fail the test explicitly
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_raise) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1  # exactly one thread created the row
+
+    with storage.session() as session:
+        open_rows = list(
+            session.query(AlarmRecord)
+            .filter(
+                AlarmRecord.apartment_id == apartment,
+                AlarmRecord.kind == AlarmKind.NOT_REPORTING.value,
+                AlarmRecord.cleared_at.is_(None),
+            )
+            .all()
+        )
+        session.expunge_all()
+    assert len(open_rows) == 1
 
 
 def test_migration_0004_alarms_upgrade_creates_the_table(tmp_path: object) -> None:

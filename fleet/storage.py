@@ -73,6 +73,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     select,
+    text,
 )
 from sqlalchemy.dialects import postgresql as _postgresql_dialect
 from sqlalchemy.dialects import sqlite as _sqlite_dialect
@@ -156,6 +157,28 @@ class EventRecord(Base):
 
 class AlarmRecord(Base):
     __tablename__ = "alarms"
+    __table_args__ = (
+        # Cross-review, P2.2: 5 concurrent `check_absence_alarms` runs for
+        # one absent apartment produced 4 duplicate open alarms and 5 raise
+        # notifications -- the same class of bug `0003_heartbeats_unique_
+        # sent_at.py` fixed for heartbeats, reproduced here for alarms. A
+        # *partial* unique index (only `WHERE cleared_at IS NULL`, not
+        # every row) is what "at most one row per `(apartment_id, kind)`
+        # may be open at a time" actually means: a cleared alarm must not
+        # block a later, genuinely new outage from opening a fresh row.
+        # `Storage.raise_alarm` below performs the insert as a
+        # dialect-native `INSERT ... ON CONFLICT ... WHERE cleared_at IS
+        # NULL DO NOTHING`, turning the race into a database-level
+        # guarantee rather than a Python check-then-insert.
+        Index(
+            "ux_alarms_apartment_id_kind_open",
+            "apartment_id",
+            "kind",
+            unique=True,
+            sqlite_where=text("cleared_at IS NULL"),
+            postgresql_where=text("cleared_at IS NULL"),
+        ),
+    )
 
     # One row per raised alarm instance (P2.2, section 8). `kind`/`urgency`
     # are plain strings, not FK'd to an enum type -- `fleet/alarms.py` owns
@@ -567,21 +590,72 @@ class Storage:
 
     def raise_alarm(
         self, apartment_id: str, kind: str, urgency: str, raised_at: datetime
-    ) -> AlarmRecord:
-        """Creates a new, open alarm row (`raise_notified=False`) -- one row
-        per raised instance; a later, separate outage after an all-clear
-        creates a new row rather than reopening this one (section 8: "a new
-        outage after an all-clear raises a new alarm")."""
+    ) -> AlarmRecord | None:
+        """Atomically creates a new, open alarm row (`raise_notified=False`)
+        for `(apartment_id, kind)`, or returns `None` if one is already
+        open -- enforced by the partial unique index
+        `ux_alarms_apartment_id_kind_open`
+        (`fleet/migrations/versions/0004_alarms.py`), via a dialect-native
+        `INSERT ... ON CONFLICT ... WHERE cleared_at IS NULL DO NOTHING ...
+        RETURNING id`, not a Python-level check-then-insert. Cross-review
+        reproduced the gap this closes: 5 concurrent `check_absence_alarms`
+        runs for one absent apartment produced 4 duplicate open alarms and
+        5 raise notifications -- the same class of race
+        `_insert_heartbeats_ignoring_conflicts` fixes for heartbeats
+        (P2.1b), here for alarms.
 
+        **Only a caller that gets back a non-`None` record may notify**
+        (see `fleet/alarms.py::_handle_absent`) -- every other concurrent
+        caller lost the race and must not duplicate the notification; the
+        alarm it "lost" to is either already notified, or will be picked
+        up (and its notification retried, if that one failed) by a later
+        check run through the normal `raise_notified` path.
+
+        A later, separate outage after an all-clear still creates a new
+        row (section 8: "a new outage after an all-clear raises a new
+        alarm") -- the partial index only ever restricts `cleared_at IS
+        NULL` rows, so an already-cleared alarm never blocks this insert.
+        """
+
+        values: dict[str, object] = {
+            "apartment_id": apartment_id,
+            "kind": kind,
+            "urgency": urgency,
+            "raised_at": _naive_utc(raised_at),
+            "cleared_at": None,
+            "snoozed_until": None,
+            "raise_notified": False,
+            "clear_notified": False,
+        }
         with self.session() as session:
-            record = AlarmRecord(
-                apartment_id=apartment_id,
-                kind=kind,
-                urgency=urgency,
-                raised_at=_naive_utc(raised_at),
-            )
-            session.add(record)
-            session.flush()
+            dialect = session.get_bind().dialect.name
+            # See `_insert_heartbeats_ignoring_conflicts` above for why this
+            # branches on dialect name and why `postgresql`/`else` are
+            # excluded from coverage -- the same reasoning applies here
+            # unchanged (SQLite is this repository's only real database
+            # today; a real PostgreSQL target is needed to exercise that
+            # branch meaningfully, not just select it).
+            statement: Any
+            if dialect == "sqlite":
+                statement = _sqlite_dialect.insert(AlarmRecord).values(**values)
+            elif dialect == "postgresql":  # pragma: no cover -- see above
+                statement = _postgresql_dialect.insert(AlarmRecord).values(**values)
+            else:  # pragma: no cover -- see above
+                raise NotImplementedError(
+                    f"Insert-or-ignore for alarms is not implemented for the "
+                    f"{dialect!r} SQLAlchemy dialect -- see "
+                    "_insert_heartbeats_ignoring_conflicts's docstring for "
+                    "the same gap on the heartbeats table."
+                )
+            statement = statement.on_conflict_do_nothing(
+                index_elements=["apartment_id", "kind"],
+                index_where=text("cleared_at IS NULL"),
+            ).returning(AlarmRecord.id)
+            inserted_id = session.execute(statement).scalar()
+            if inserted_id is None:
+                return None
+            record = session.get(AlarmRecord, inserted_id)
+            assert record is not None  # just inserted in this same transaction
             session.expunge(record)
             return record
 

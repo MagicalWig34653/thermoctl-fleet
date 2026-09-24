@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import fleet.storage as storage_module
+from fleet.alarms import NotifierConfigError
 from fleet.app import app
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from protocol import Heartbeat
@@ -146,6 +147,33 @@ def test_lifespan_starts_and_cancels_the_alarm_background_task(
         with TestClient(app) as lifespan_client:
             response = lifespan_client.get("/healthz")
             assert response.status_code == 200
+    finally:
+        storage_module._storage_singleton = None
+
+
+def test_lifespan_fails_loudly_on_a_misconfigured_alert_channel(
+    monkeypatch: pytest.MonkeyPatch, db_path: str
+) -> None:
+    """Cross-review: `load_notifiers_from_env` used to be called from
+    *inside* `_alarm_check_loop`, so a misconfigured alert channel (here:
+    `FLEET_ALERT_SMTP_HOST` set without the required `FLEET_ALERT_SMTP_FROM`/
+    `FLEET_ALERT_SMTP_TO`) raised on the background task's first iteration,
+    got caught by the task's own `except Exception`, logged once, and the
+    service then ran forever with silently no notifier configured at all --
+    contrary to what the surrounding comment claimed. `fleet.app.lifespan`
+    now parses the configuration itself, before the task ever starts, so
+    entering the app's lifespan (as `TestClient(app)`'s `with` block does)
+    must raise `NotifierConfigError` here -- application *startup* fails
+    loudly, not a background task nobody is watching."""
+
+    monkeypatch.setenv("FLEET_DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("FLEET_ALERT_SMTP_HOST", "smtp.example.invalid")
+    monkeypatch.delenv("FLEET_ALERT_SMTP_FROM", raising=False)
+    monkeypatch.delenv("FLEET_ALERT_SMTP_TO", raising=False)
+    storage_module._storage_singleton = None
+    try:
+        with pytest.raises(NotifierConfigError), TestClient(app):
+            pass
     finally:
         storage_module._storage_singleton = None
 

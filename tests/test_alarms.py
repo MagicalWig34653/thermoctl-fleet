@@ -15,6 +15,7 @@ written out as literals (CLAUDE.md).
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import socket
 import ssl
@@ -23,7 +24,6 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import httpx
 import pytest
 from aiosmtpd.controller import Controller
 
@@ -43,6 +43,7 @@ from fleet.alarms import (
     SmtpNotifier,
     SmtpTlsMode,
     Urgency,
+    WebhookDeliveryError,
     WebhookNotifier,
     check_absence_alarms,
     load_notifiers_from_env,
@@ -230,6 +231,58 @@ def test_new_outage_after_an_all_clear_raises_a_new_alarm(storage: Storage) -> N
     assert alarms_of_kind[0].cleared_at is None  # the new alarm is open again
 
 
+def test_clock_going_backwards_does_not_produce_a_false_all_clear(storage: Storage) -> None:
+    """Cross-review reproduced `cleared_at < raised_at`: a check run whose
+    `now` moves *backwards* relative to an earlier run can make `now -
+    latest_received_at` drop back under the six-minute threshold without
+    any new heartbeat ever having arrived -- the same, still-stale
+    heartbeat just looks "recent" again because the clock, not the
+    apartment, moved. An alarm must only ever be cleared by a heartbeat
+    whose own `received_at` is genuinely after the alarm's `raised_at`."""
+
+    _register_and_heartbeat(storage, APARTMENT, BASE_TIME)
+    notifier = _RecordingNotifier()
+
+    check_absence_alarms(storage, BASE_TIME + timedelta(minutes=10), [notifier])
+    assert len(notifier.notifications) == 1
+    alarm = storage.get_latest_alarm(APARTMENT, AlarmKind.NOT_REPORTING.value)
+    assert alarm is not None
+    assert alarm.raised_at == (BASE_TIME + timedelta(minutes=10)).replace(tzinfo=None)
+
+    # The clock goes backwards -- still no new heartbeat has arrived, but
+    # `now - received_at` (5 min) is now under the 6-minute threshold.
+    check_absence_alarms(storage, BASE_TIME + timedelta(minutes=5), [notifier])
+
+    assert len(notifier.notifications) == 1  # no all-clear was sent
+    alarm = storage.get_latest_alarm(APARTMENT, AlarmKind.NOT_REPORTING.value)
+    assert alarm is not None
+    assert alarm.cleared_at is None  # still open
+    assert alarm.clear_notified is False
+
+
+def test_a_heartbeat_genuinely_after_raised_at_still_clears_normally(storage: Storage) -> None:
+    """The guard above must not block the ordinary, correct case: a
+    heartbeat whose `received_at` really is after the alarm's `raised_at`
+    still produces exactly one all-clear."""
+
+    _register_and_heartbeat(storage, APARTMENT, BASE_TIME)
+    notifier = _RecordingNotifier()
+    check_absence_alarms(storage, BASE_TIME + timedelta(minutes=10), [notifier])
+
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(sent_at=BASE_TIME + timedelta(minutes=11)),
+        BASE_TIME + timedelta(minutes=11),
+    )
+    check_absence_alarms(storage, BASE_TIME + timedelta(minutes=12), [notifier])
+
+    assert len(notifier.notifications) == 2
+    assert notifier.notifications[1].event == "cleared"
+    alarm = storage.get_latest_alarm(APARTMENT, AlarmKind.NOT_REPORTING.value)
+    assert alarm is not None
+    assert alarm.cleared_at is not None
+
+
 def test_snoozed_alarm_is_not_re_notified_before_the_snooze_expires(storage: Storage) -> None:
     _register_and_heartbeat(storage, APARTMENT, BASE_TIME)
     failing = _FailingNotifier()
@@ -338,6 +391,30 @@ def test_apartments_that_have_never_sent_a_heartbeat_are_not_alarmed(storage: St
     notifier = _RecordingNotifier()
 
     check_absence_alarms(storage, BASE_TIME + timedelta(days=1), [notifier])
+
+    assert notifier.notifications == []
+    assert storage.get_latest_alarm(APARTMENT, AlarmKind.NOT_REPORTING.value) is None
+
+
+def test_check_absence_alarms_does_not_notify_when_it_loses_the_race_to_raise_alarm(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Storage.raise_alarm` returning `None` means another, concurrent
+    caller already created the open alarm (see its own docstring) --
+    `check_absence_alarms` must not notify in that case, only the run that
+    actually created the row may. The real race itself, with actual
+    concurrent threads against a real database, is exercised end to end in
+    `tests/test_storage.py::test_raise_alarm_is_safe_under_concurrent_calls`;
+    this test is at the `fleet.alarms` level (what a caller does with a
+    `None` result), exercised here by monkeypatching `raise_alarm` to
+    return it directly rather than needing to actually win/lose a real
+    race to reach this branch deterministically."""
+
+    _register_and_heartbeat(storage, APARTMENT, BASE_TIME)
+    monkeypatch.setattr(storage, "raise_alarm", lambda *args, **kwargs: None)
+    notifier = _RecordingNotifier()
+
+    check_absence_alarms(storage, BASE_TIME + timedelta(minutes=10), [notifier])
 
     assert notifier.notifications == []
     assert storage.get_latest_alarm(APARTMENT, AlarmKind.NOT_REPORTING.value) is None
@@ -483,7 +560,10 @@ def test_webhook_notifier_raises_when_the_server_errors() -> None:
             event="raised",
             raised_at=BASE_TIME,
         )
-        with pytest.raises(httpx.HTTPStatusError):
+        # Cross-review: `WebhookNotifier` raises its own `WebhookDeliveryError`
+        # now, not the raw `httpx.HTTPStatusError` (which would put the full
+        # URL -- possibly carrying an auth token -- in the message).
+        with pytest.raises(WebhookDeliveryError, match="HTTP 500"):
             notifier.notify(notification)
     finally:
         server.shutdown()
@@ -495,6 +575,143 @@ def test_webhook_notifier_raises_when_the_server_errors() -> None:
         # module under full-suite load -- not genuine server slowness (the
         # server here always responds immediately), but resource pressure
         # from accumulated, never-closed listening sockets.
+        server.server_close()
+
+
+def test_webhook_notifier_reports_a_connection_error_without_the_status_error_path() -> None:
+    """`WebhookNotifier` catches `httpx.HTTPError` generically, not just
+    `HTTPStatusError` -- a URL nothing is listening on triggers
+    `httpx.ConnectError` (no response at all, so no status code), which
+    must still be collected and summarized by `type(exc).__name__`, not
+    left to propagate as the raw `httpx` exception (which would put the
+    full URL in its message, see `WebhookDeliveryError`'s docstring)."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+    # The socket above is closed by the `with` block exiting -- nothing
+    # listens on `closed_port` now, so a connection attempt is refused.
+
+    notifier = WebhookNotifier([f"http://127.0.0.1:{closed_port}/hook"], timeout_s=2.0)
+    notification = AlarmNotification(
+        apartment_id=APARTMENT,
+        kind=AlarmKind.NOT_REPORTING,
+        urgency=Urgency.HIGH,
+        event="raised",
+        raised_at=BASE_TIME,
+    )
+
+    with pytest.raises(WebhookDeliveryError, match="ConnectError") as excinfo:
+        notifier.notify(notification)
+
+    assert f":{closed_port}/hook" not in str(excinfo.value)
+
+
+def test_webhook_notifier_still_posts_to_the_second_url_when_the_first_fails(
+    webhook_server: str,
+) -> None:
+    """Cross-review: the original implementation stopped at the first
+    failing URL, so a second, otherwise-reachable recipient never got the
+    POST at all. `WebhookNotifier` must try every configured URL
+    regardless of an earlier failure, then raise one aggregated error."""
+
+    class _FailingHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass
+
+    failing_server = HTTPServer(("127.0.0.1", 0), _FailingHandler)
+    thread = threading.Thread(target=failing_server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        notifier = WebhookNotifier(
+            [f"http://127.0.0.1:{failing_server.server_port}/hook", webhook_server]
+        )
+        notification = AlarmNotification(
+            apartment_id=APARTMENT,
+            kind=AlarmKind.NOT_REPORTING,
+            urgency=Urgency.HIGH,
+            event="raised",
+            raised_at=BASE_TIME,
+        )
+
+        with pytest.raises(WebhookDeliveryError, match="1 of 2 webhook"):
+            notifier.notify(notification)
+
+        # The second, real local receiver still got the POST despite the
+        # first URL failing -- not skipped.
+        assert len(_CapturingWebhookHandler.received) == 1
+        assert _CapturingWebhookHandler.received[0]["apartment"] == APARTMENT
+    finally:
+        failing_server.shutdown()
+        thread.join()
+        failing_server.server_close()
+
+
+def test_webhook_notifier_error_never_contains_the_configured_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cross-review: a webhook URL commonly embeds an auth token (e.g. a
+    Slack/Mattermost incoming-webhook path). `httpx.HTTPStatusError`'s own
+    message contains the full URL; `WebhookNotifier` must not let that (or
+    any chained exception carrying it) reach a log line. A URL with a
+    unique marker token is used here and asserted absent from the raised
+    error's message *and* from every captured log record, including its
+    formatted traceback text (`exc_text`) -- checking only `record.message`
+    would miss a leak hiding in a chained `__cause__`/`__context__`."""
+
+    class _FailingHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass
+
+    marker_token = secrets.token_urlsafe(24)
+    server = HTTPServer(("127.0.0.1", 0), _FailingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/hook/{marker_token}"
+        notifier = WebhookNotifier([url])
+        notification = AlarmNotification(
+            apartment_id=APARTMENT,
+            kind=AlarmKind.NOT_REPORTING,
+            urgency=Urgency.HIGH,
+            event="raised",
+            raised_at=BASE_TIME,
+        )
+
+        caught: WebhookDeliveryError | None = None
+        with caplog.at_level("WARNING"):
+            try:
+                notifier.notify(notification)
+            except WebhookDeliveryError as exc:
+                caught = exc
+                logger = logging.getLogger("fleet.alarms")
+                # Mirrors exactly what `fleet.alarms._try_notify` does with
+                # a notifier's exception -- this test exercises the actual
+                # logging path, not just the exception object in isolation.
+                logger.exception("Notifier failed")
+
+        assert caught is not None
+        assert marker_token not in str(caught)
+        for record in caplog.records:
+            assert marker_token not in record.getMessage()
+            assert marker_token not in (record.exc_text or "")
+    finally:
+        server.shutdown()
+        thread.join()
         server.server_close()
 
 
@@ -709,6 +926,31 @@ def test_smtp_notifier_end_to_end_through_check_absence_alarms(
     check_absence_alarms(storage, BASE_TIME + timedelta(minutes=10), [notifier])
 
     assert len(handler.envelopes) == 1
+
+
+def test_smtp_config_repr_never_contains_the_password() -> None:
+    """Cross-review: `SmtpConfig` is a plain `dataclass`, whose
+    auto-generated `__repr__` includes every field by default -- an
+    uncaught exception's traceback, or a stray `logger.debug("%r", cfg)`,
+    would otherwise print the SMTP password verbatim. `password` is the
+    only field marked `field(repr=False)`; every other field must still
+    show up."""
+
+    password = secrets.token_urlsafe(16)
+    config = SmtpConfig(
+        host="smtp.example.invalid",
+        port=587,
+        from_addr="fleet@example.invalid",
+        to_addrs=("landlord@example.invalid",),
+        user="fleet-alerts",
+        password=password,
+    )
+
+    rendered = repr(config)
+
+    assert password not in rendered
+    assert "smtp.example.invalid" in rendered
+    assert "fleet-alerts" in rendered
 
 
 # -- LogNotifier --------------------------------------------------------------

@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -27,7 +27,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from fleet.alarms import check_absence_alarms, load_notifiers_from_env
+from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from fleet.storage import Storage, get_storage
 from protocol import (
@@ -50,20 +50,34 @@ _ALARM_CHECK_INTERVAL_ENV = "FLEET_ALARM_CHECK_INTERVAL_S"
 _DEFAULT_ALARM_CHECK_INTERVAL_S = 60.0
 
 
-async def _alarm_check_loop(interval_s: float) -> None:  # pragma: no cover
+async def _alarm_check_loop(  # pragma: no cover
+    interval_s: float, notifiers: Sequence[Notifier]
+) -> None:
     # Thin scheduling wrapper, deliberately untested here (an infinite loop
     # with a real `asyncio.sleep` would either need a real wait in the test
     # suite or an artificial construction that tests the wrapper instead of
     # anything real) -- the logic it calls, `check_absence_alarms`, is fully
     # covered with an injected clock in `tests/test_alarms.py`, per the work
     # package's own instruction that only the loop wrapper may carry this
-    # pragma. `get_storage()`/`load_notifiers_from_env` failures are caught
-    # so a misconfiguration (e.g. a missing `FLEET_DATABASE_URL`) logs
-    # instead of silently killing the background task forever.
-    notifiers = load_notifiers_from_env(os.environ)
+    # pragma. `get_storage()` failures (e.g. a missing `FLEET_DATABASE_URL`)
+    # are caught so a misconfiguration logs instead of silently killing the
+    # background task forever -- `notifiers` itself is parsed once, in
+    # `lifespan`, *before* this task ever starts (see there for why).
+    #
+    # `check_absence_alarms` is entirely synchronous, blocking I/O
+    # (SQLAlchemy, `httpx`, `smtplib` -- none of it `async`) -- cross-review:
+    # calling it directly on this coroutine would run it *on the event
+    # loop*, so a hanging SMTP server (up to its own timeout, see
+    # `fleet.alarms.SmtpConfig.timeout_s`) would freeze every other request
+    # the fleet service is serving for that whole time. Running it via
+    # `asyncio.to_thread` keeps it off the event loop -- the loop stays
+    # responsive to every other request regardless of how slow a single
+    # notifier is.
     while True:
         try:
-            check_absence_alarms(get_storage(), datetime.now(UTC), notifiers)
+            await asyncio.to_thread(
+                check_absence_alarms, get_storage(), datetime.now(UTC), notifiers
+            )
         except Exception:
             logger.exception("Absence alarm check failed")
         await asyncio.sleep(interval_s)
@@ -76,10 +90,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     themselves do not depend on this task in any way -- a test that only
     exercises an endpoint via `TestClient` and never enters this lifespan
     (as most of `tests/test_fleet.py` does not) is unaffected by it.
+
+    **Notifier configuration is parsed here, before the task starts** (cross-
+    review): `load_notifiers_from_env` used to be called from inside
+    `_alarm_check_loop` itself, so a misconfigured alert channel (e.g.
+    `FLEET_ALERT_SMTP_TLS_MODE=plaintext` without the explicit opt-in, or a
+    missing `FLEET_ALERT_SMTP_FROM`) raised *inside* the background task on
+    its very first iteration -- caught by the task's own `except Exception`,
+    logged once, and then the task carried on forever with **no** notifier
+    configured at all, silently, exactly the "alarms still recorded and
+    logged" fallback the module docstring describes for "nothing
+    configured", not for "something configured wrong". Parsing it here
+    instead means a bad configuration raises `NotifierConfigError` straight
+    out of application startup -- loud, not silent -- before the task (and
+    therefore any alarm evaluation at all) ever begins.
     """
 
     interval_s = float(os.environ.get(_ALARM_CHECK_INTERVAL_ENV, _DEFAULT_ALARM_CHECK_INTERVAL_S))
-    task = asyncio.create_task(_alarm_check_loop(interval_s))
+    notifiers = load_notifiers_from_env(os.environ)
+    task = asyncio.create_task(_alarm_check_loop(interval_s, notifiers))
     try:
         yield
     finally:

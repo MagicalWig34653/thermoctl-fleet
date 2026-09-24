@@ -63,7 +63,7 @@ import logging
 import smtplib
 import ssl
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from enum import StrEnum
@@ -156,11 +156,35 @@ def _payload_dict(notification: AlarmNotification) -> dict[str, str | None]:
 # -- webhook notifier -------------------------------------------------------------
 
 
+class WebhookDeliveryError(RuntimeError):
+    """One or more configured webhook URLs failed to deliver a
+    notification. **Deliberately never carries a configured URL in its
+    message** -- a webhook URL commonly embeds an authentication token in
+    its path or query string (e.g. a Slack/Mattermost incoming-webhook
+    URL), and `httpx`'s own exceptions (`HTTPStatusError`, `ConnectError`,
+    ...) put the full request URL in *their* message by default. Letting
+    one of those propagate as-is (or chaining it as this error's `__cause__`
+    /`__context__`, which `logging.exception` would still print in full)
+    would put that token in the fleet service's own logs -- cross-review
+    caught this. Only the URL's position among the configured list and its
+    host (never path or query) are ever included here."""
+
+
 class WebhookNotifier:
     """Generic HTTP POST of the JSON payload to every configured URL. TLS
     verification is never disabled -- there is no `verify` parameter here
     to turn it off with, `httpx`'s default (`verify=True`) is the only
-    behaviour this class offers."""
+    behaviour this class offers.
+
+    **Tries every URL, does not stop at the first failure** (cross-review):
+    each configured URL is meant to reach a different recipient, so one
+    failing must not silently skip the rest. Failures are collected and
+    raised together, once, as a single `WebhookDeliveryError` after every
+    URL has been attempted -- `fleet.alarms._try_notify` treats any
+    exception from `notify` as "this channel failed" either way, so
+    aggregating costs nothing there and gains "every reachable recipient
+    still got the POST" here.
+    """
 
     def __init__(self, urls: Sequence[str], *, timeout_s: float = 10.0) -> None:
         self._urls = list(urls)
@@ -168,10 +192,32 @@ class WebhookNotifier:
 
     def notify(self, notification: AlarmNotification) -> None:
         payload = _payload_dict(notification)
+        failures: list[str] = []
         with httpx.Client(timeout=self._timeout_s) as client:
-            for url in self._urls:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
+            for index, url in enumerate(self._urls):
+                # `.host` only -- never the full URL, see
+                # `WebhookDeliveryError`'s docstring on why.
+                host = httpx.URL(url).host
+                try:
+                    response = client.post(url, json=payload)
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    failures.append(
+                        f"webhook #{index} ({host}): HTTP {exc.response.status_code}"
+                    )
+                except httpx.HTTPError as exc:
+                    failures.append(f"webhook #{index} ({host}): {type(exc).__name__}")
+        if failures:
+            # Raised with no active exception context at this point (every
+            # `httpx` exception above was already fully handled inside its
+            # own `except` block, not left to propagate) -- nothing for
+            # Python to implicitly chain as `__context__` here, so this is
+            # the only exception `_try_notify`'s `logger.exception` will
+            # ever see or log for a webhook failure.
+            raise WebhookDeliveryError(
+                f"{len(failures)} of {len(self._urls)} webhook(s) failed: "
+                + "; ".join(failures)
+            )
 
 
 # -- SMTP notifier ------------------------------------------------------------
@@ -190,7 +236,13 @@ class SmtpConfig:
     from_addr: str
     to_addrs: tuple[str, ...]
     user: str | None = None
-    password: str | None = None
+    # Cross-review: a plain `dataclass` field is included in the
+    # auto-generated `__repr__` by default -- `repr(config)` (e.g. from an
+    # uncaught exception's traceback, or a stray `logger.debug("%r", cfg)`
+    # someone adds later) would otherwise print the SMTP password in full.
+    # `field(repr=False)` removes it from that repr without changing
+    # anything else about the field.
+    password: str | None = field(default=None, repr=False)
     tls_mode: SmtpTlsMode = SmtpTlsMode.STARTTLS
     timeout_s: float = 10.0
 
@@ -437,6 +489,17 @@ def check_absence_alarms(
     section 8 does not say what should happen for one, and this project
     does not invent alarm rules the specification is silent on (see the
     module docstring and `docs/STATUS.md`).
+
+    **Clock going backwards cannot manufacture a false all-clear**
+    (cross-review reproduced `cleared_at < raised_at` before this guard: a
+    backward clock jump can make `now - latest_received_at` drop back
+    under the threshold without any new heartbeat ever having arrived).
+    `_handle_present` therefore never clears an open alarm on "not
+    currently absent by the threshold" alone -- it additionally requires
+    that the *latest heartbeat's own receipt time* is strictly after the
+    alarm's `raised_at`, i.e. a heartbeat genuinely arrived *after* the
+    alarm fired, not merely that the clock now measures a smaller gap to
+    the same stale heartbeat that caused the alarm in the first place.
     """
 
     now_naive = _ensure_naive_utc(now)
@@ -455,7 +518,7 @@ def check_absence_alarms(
         if is_absent:
             _handle_absent(storage, notifiers, apartment_id, latest_alarm, is_open, now_naive)
         else:
-            _handle_present(storage, notifiers, latest_alarm, is_open, now_naive)
+            _handle_present(storage, notifiers, latest_alarm, is_open, received_at, now_naive)
 
 
 def _handle_absent(
@@ -470,6 +533,16 @@ def _handle_absent(
         alarm = storage.raise_alarm(
             apartment_id, AlarmKind.NOT_REPORTING.value, Urgency.HIGH.value, now_naive
         )
+        if alarm is None:
+            # Lost a concurrent race to `Storage.raise_alarm`'s partial
+            # unique index (`ux_alarms_apartment_id_kind_open`) -- another
+            # check run (this process or another one, see `docs/STATUS.md`
+            # on multi-process safety) already opened this alarm. Only the
+            # run that actually created the row may notify; this run does
+            # nothing further, the normal `raise_notified` retry path on a
+            # later run covers the case where that other run's own
+            # notification attempt failed.
+            return
         _notify_raise(storage, notifiers, alarm)
         return
 
@@ -486,12 +559,27 @@ def _handle_present(
     notifiers: Sequence[Notifier],
     latest_alarm: AlarmRecord | None,
     is_open: bool,
+    received_at: datetime,
     now_naive: datetime,
 ) -> None:
     if latest_alarm is None:
         return
 
     if is_open:
+        if received_at <= latest_alarm.raised_at or now_naive < latest_alarm.raised_at:
+            # No heartbeat has actually arrived since the alarm was raised
+            # (`received_at <= raised_at`) -- "not currently absent by the
+            # threshold" here is an artifact of a clock that moved
+            # backwards, not a real recovery. The second condition is the
+            # same guard from the other direction: even if a heartbeat's
+            # `received_at` genuinely is after `raised_at`, `now_naive`
+            # itself must not be before `raised_at` either, or the
+            # all-clear this would write (`cleared_at = now_naive`) would
+            # still violate `cleared_at >= raised_at`. Either way: leave
+            # the alarm open, manufacture no all-clear, and do not
+            # re-raise (it already is raised) -- the next run with an
+            # honest clock resolves this correctly.
+            return
         storage.clear_alarm(latest_alarm.id, now_naive)
         _notify_clear(storage, notifiers, latest_alarm, now_naive)
     elif latest_alarm.cleared_at is not None and not latest_alarm.clear_notified:

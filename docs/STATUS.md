@@ -23,10 +23,21 @@ outage to age past the threshold.
   open alarm (`Storage.clear_alarm`) and the all-clear is notified exactly
   once. A later, separate outage after an all-clear raises a genuinely new
   `AlarmRecord`, not a reopening of the cleared one.
-- **Snooze.** `Storage.set_alarm_snoozed_until(alarm_id, until)` stores a
-  point in time before which a *retried* raise-notification (reached only
-  after a notifier failure -- the ordinary "already notified" case is
-  bundled regardless of snooze) is suppressed.
+- **Snooze -- what it suppresses today, precisely (clarified after cross-
+  review asked).** `Storage.set_alarm_snoozed_until(alarm_id, until)` stores
+  a point in time on an **already-open** alarm. The one and only thing it
+  changes is whether a *retried* raise-notification is attempted -- i.e.
+  it only ever matters after a notifier has already failed once for that
+  alarm (`raise_notified` is still `False`) and a later check run would
+  otherwise retry it; while snoozed, that retry is skipped. It does
+  **not** need to suppress "one notification per outage" in the ordinary
+  case, because that is already the unconditional default described in
+  the bullet above -- an alarm whose raise-notification already succeeded
+  is never re-notified regardless of snooze, and snooze cannot make an
+  already-silent alarm noisy again. It has no effect on whether a new
+  alarm gets raised in the first place, and no effect on all-clear
+  notifications (an apartment recovering while snoozed still gets its
+  all-clear). There is no HTTP/UI endpoint for it yet, see below.
 - **Retry, never silently dropped.** A notifier's exception is caught and
   logged per notifier (`_try_notify`), never crashes the check. The
   notification only counts as sent -- and `raise_notified`/`clear_notified`
@@ -105,6 +116,21 @@ and risk a circular import), `urgency`, `raised_at`, `cleared_at`
 `set_alarm_snoozed_until` -- `tests/test_storage.py::
 test_migrations_match_the_orm_model_exactly` (pre-existing, unchanged)
 continues to assert `compare_metadata` is empty, now covering `0004` too.
+
+**Safe for more than one fleet process (added after the second cross-
+review, see "Second cross-review" below for the full story).** `alarms`
+also carries a **partial** unique index,
+`ux_alarms_apartment_id_kind_open` (`apartment_id`, `kind`,
+`WHERE cleared_at IS NULL`, both SQLite and PostgreSQL support a partial
+index this way) -- at most one *open* row per `(apartment_id, kind)` can
+exist at the database level, enforced there, not just by application
+logic in `fleet/alarms.py`. This is what makes `check_absence_alarms`
+safe to run from more than one fleet process/worker at once (e.g. two
+uvicorn workers, or a horizontally scaled deployment each running the
+same background task): whichever process's `Storage.raise_alarm` insert
+wins the race gets the new row back and is the only one that notifies;
+every other process's concurrent call for the same apartment gets `None`
+and does nothing, by construction, not by coincidence of timing.
 
 **Scheduling.** `fleet/app.py` gained a `lifespan` context manager (wired
 into `FastAPI(..., lifespan=lifespan)`) that starts one asyncio background
@@ -237,12 +263,104 @@ merged code, not papered over:**
    consecutive runs of the full `test_alarms.py` module, and 5 consecutive
    full-suite runs, all green.
 
-Full suite: **199 tests** (up from 178 before this merge; 128 before P2.2
-itself), coverage **98%** (852 statements, 20 missed -- `fleet/alarms.py`,
-`fleet/app.py`, `fleet/storage.py`, `fleet/auth.py`, and all four
-migrations at 100%) -- `ruff check .` and `mypy .` /
+Full suite (before the second cross-review below): **199 tests**, coverage
+**98%** (852 statements, 20 missed) -- `ruff check .` and `mypy .` /
 `mypy protocol fleet agent tools` all clean. Merge commit `0821e07`,
 follow-up fix commit `505b102`.
+
+**Second cross-review: seven further issues found, all fixed, `0004_alarms.py`
+edited in place (not yet on `main`, so no re-chaining needed for this
+round).**
+
+1. **Duplicate open alarms under concurrent checks.** Reproduced: 5
+   concurrent `check_absence_alarms` runs for one absent apartment
+   produced 4 duplicate open alarms and 5 raise notifications --
+   `Storage.raise_alarm` was a plain `INSERT`, no different from
+   `save_heartbeat` before `0003_heartbeats_unique_sent_at.py` existed.
+   Fixed with the same technique, one level more precise: a **partial**
+   unique index, `ux_alarms_apartment_id_kind_open` on
+   `(apartment_id, kind) WHERE cleared_at IS NULL` (see "Safe for more
+   than one fleet process" above), plus `Storage.raise_alarm` rewritten as
+   a dialect-native `INSERT ... ON CONFLICT ... WHERE cleared_at IS NULL
+   DO NOTHING ... RETURNING id` -- it now returns `AlarmRecord | None`,
+   `None` meaning "another caller already has one open, and only that
+   caller may notify" (`fleet/alarms.py::_handle_absent` acts on this).
+   Regression test with real threads,
+   `tests/test_storage.py::test_raise_alarm_is_safe_under_concurrent_calls`
+   (5 threads, same pattern as P2.1b's own heartbeat-batch concurrency
+   test), plus a single-threaded
+   `test_raise_alarm_returns_none_when_one_is_already_open` and a
+   `fleet.alarms`-level `test_check_absence_alarms_does_not_notify_when_it_loses_the_race_to_raise_alarm`.
+   `compare_metadata` stays empty (checked).
+2. **`WebhookNotifier` stopped at the first failing URL.** Fixed: every
+   configured URL is now attempted regardless of an earlier one failing;
+   failures are collected and raised together, once, as a new
+   `WebhookDeliveryError` after the loop. Tested with two URLs, the first
+   pointing at a server that always 500s, the second a real local receiver
+   that must still get (and does get) the POST.
+3. **A webhook URL can carry an auth token; it must never reach a log
+   line.** `httpx.HTTPStatusError`'s own message includes the full request
+   URL, and `_try_notify`'s `logger.exception` would print that (plus any
+   chained cause) in full. `WebhookNotifier` now catches `httpx.HTTPError`
+   (both `HTTPStatusError` and connection-level errors like
+   `ConnectError`) itself and raises `WebhookDeliveryError` naming only
+   each failed URL's **index and host** (never path or query, where a
+   token would live) and, for a status error, the status code -- with no
+   active exception being handled at the point it is raised, so there is
+   nothing left for Python to chain as `__context__` either. Tested with a
+   URL containing a `secrets.token_urlsafe` marker: asserted absent from
+   the raised error's own message *and* from every captured log record
+   (`record.getMessage()`) *and* its formatted traceback text
+   (`record.exc_text`) -- the last one specifically because a chained
+   cause hides there, not in the plain message.
+4. **Blocking calls on the event loop.** `_alarm_check_loop` called
+   `check_absence_alarms` (SQLAlchemy, `httpx`, `smtplib` -- all
+   synchronous) directly on the coroutine; a hanging SMTP server would
+   have frozen every other request the fleet service was serving for its
+   whole timeout. Fixed: the call now goes through `asyncio.to_thread`.
+   `httpx`/`smtplib` calls already carried explicit timeouts
+   (`WebhookNotifier`'s `timeout_s`, `SmtpConfig.timeout_s`, both
+   default `10.0`, passed into every `httpx.Client`/`smtplib.SMTP`/
+   `SMTP_SSL` construction) -- confirmed, not newly added.
+5. **A misconfigured alert channel used to die silently.**
+   `load_notifiers_from_env` was called from *inside* `_alarm_check_loop`,
+   so a bad config (e.g. `FLEET_ALERT_SMTP_HOST` without
+   `FLEET_ALERT_SMTP_FROM`/`_TO`) raised on the task's first iteration, was
+   swallowed by the task's own `except Exception`, logged once, and the
+   service then ran forever with no notifier configured at all -- the
+   comment at the time claimed something different from what actually
+   happened. Fixed: `fleet.app.lifespan` now parses the configuration
+   itself, *before* creating the background task, so a bad configuration
+   makes application **startup** raise `NotifierConfigError` loudly.
+   Tested via `tests/test_fleet.py::
+   test_lifespan_fails_loudly_on_a_misconfigured_alert_channel` (entering
+   `TestClient(app)`'s lifespan with a deliberately incomplete SMTP
+   configuration).
+6. **`SmtpConfig.password` in the dataclass's auto-generated `repr`.**
+   `field(repr=False)` fixes it -- every other field still appears.
+   Tested: `repr(config)` built with a random password asserts the
+   password string absent, host/user present.
+7. **Clock going backwards could produce a false all-clear.** Reproduced
+   (`cleared_at < raised_at`): a backward clock jump can make `now -
+   latest_received_at` drop back under the six-minute threshold without
+   any new heartbeat ever arriving -- the same stale heartbeat just looks
+   "recent" again because the clock moved, not the apartment. Fixed:
+   `_handle_present` now only clears an open alarm when the latest
+   heartbeat's own `received_at` is strictly after the alarm's
+   `raised_at` (a heartbeat genuinely arrived since the alarm fired), and
+   additionally refuses to clear if `now` itself is before `raised_at` --
+   either guard failing leaves the alarm open and manufactures no
+   all-clear. Tested with a backwards clock
+   (`test_clock_going_backwards_does_not_produce_a_false_all_clear`) and,
+   to confirm the guard does not also break the ordinary case,
+   `test_a_heartbeat_genuinely_after_raised_at_still_clears_normally`.
+
+Full suite (final): **209 tests**, coverage **98%** (878 statements, 20
+missed -- `fleet/alarms.py`, `fleet/app.py`, `fleet/storage.py`,
+`fleet/auth.py`, and all four migrations at 100%) -- `ruff check .` and
+`mypy .` / `mypy protocol fleet agent tools` all clean. Verified stable:
+the full suite 3 times and `tests/test_alarms.py` 10 times, all green.
+Follow-up fix commit for this round noted in this package's git history.
 
 ## Token check per apartment (P1.1, sections 4, 18.1)
 
