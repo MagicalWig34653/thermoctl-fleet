@@ -12,14 +12,42 @@ from __future__ import annotations
 import pydantic
 import pytest
 
-from protokoll.bestand import Geraet, GeraetLebenszyklus, Liegenschaft, Wohnung, Zuordnung
+from protokoll.bestand import (
+    Geraet,
+    GeraetLebenszyklus,
+    Liegenschaft,
+    Wohnung,
+    WohnungZustand,
+    Zuordnung,
+)
+
+
+def test_zustandsnamen_sind_englisch_abschnitt_20_1_22_4() -> None:
+    """Abschnitt 20.1/22.4: nachträglich als englische Werte festgelegt --
+
+    stellvertretend geprüft, dass die frühere deutsche Schreibweise ('im_einsatz',
+    'bewohnt') keine gültigen Werte mehr sind und die neuen es sind.
+    """
+
+    assert GeraetLebenszyklus.IM_EINSATZ.value == "in_service"
+    assert WohnungZustand.BEWOHNT.value == "occupied"
+
+    with pytest.raises(pydantic.ValidationError):
+        Wohnung.model_validate(
+            {
+                "kennung": "haus7-w03",
+                "bezeichnung": "3. OG links",
+                "zustand": "bewohnt",
+                "heizkreise": 6,
+            }
+        )
 
 
 def test_wohnung_ohne_pilotbetrieb_ist_nicht_im_erprobungsbetrieb() -> None:
     wohnung = Wohnung(
         kennung="haus7-w03",
         bezeichnung="3. OG links",
-        zustand="bewohnt",
+        zustand="occupied",
         heizkreise=6,
     )
 
@@ -37,7 +65,7 @@ def test_wohnung_nimmt_keinen_mieternamen_an() -> None:
         {
             "kennung": "haus7-w03",
             "bezeichnung": "3. OG links",
-            "zustand": "bewohnt",
+            "zustand": "occupied",
             "heizkreise": 6,
             "mietername": "Erika Musterfrau",
         }

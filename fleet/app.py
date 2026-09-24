@@ -135,7 +135,7 @@ class GeraetZustandAnfrage(BaseModel):
 
 @app.get("/v1/bestand")
 def bestand_lesen() -> None:
-    """Liegenschaften, Wohnungen, Geräte, mit Filter auf "im Regal"/"defekt"
+    """Liegenschaften, Wohnungen, Geräte, mit Filter auf "in_storage"/"faulty"
     (Abschnitt 20.4, die vierte Ansicht "Bestand").
 
     Fehlt: Anmeldungsprüfung der Fleet-Oberfläche (nicht des Melders -- ein
@@ -150,12 +150,12 @@ def bestand_lesen() -> None:
 @app.post("/v1/geraete", status_code=201)
 def geraet_erfassen(geraet: Geraet) -> None:
     """Ein Gerät im Verzeichnis anlegen, "physisch noch nicht vorbereitet"
-    (Abschnitt 20.1, Zustand `erfasst`; Abschnitt 20.2, Erstinbetriebnahme
+    (Abschnitt 20.1, Zustand `registered`; Abschnitt 20.2, Erstinbetriebnahme
     Schritt 1).
 
-    Fehlt: Anmeldungsprüfung, Ablage, Erzwingen des Anfangszustands `erfasst`
+    Fehlt: Anmeldungsprüfung, Ablage, Erzwingen des Anfangszustands `registered`
     unabhängig davon, was `geraet.zustand` im Anfragekörper trägt -- ein
-    Aufrufer darf ein Gerät nicht in einem anderen Zustand als `erfasst`
+    Aufrufer darf ein Gerät nicht in einem anderen Zustand als `registered`
     erfassen.
     """
 
@@ -174,7 +174,7 @@ def geraet_vorbereiten(geraet_kennung: str) -> None:
     dieser Endpunkt liefert nur den einmaligen, zeitlich begrenzten Code für
     `melder-anmeldung.json` (Abschnitt 4). Fehlt vollständig:
     Anmeldungsprüfung, Erzeugen und Speichern des Codes, Zustandswechsel auf
-    `vorbereitet`.
+    `prepared`.
     """
 
     raise NotImplementedError(
@@ -193,7 +193,7 @@ def geraet_meldung_bestaetigen(
     "Erst diese Bestätigung gibt die Konfiguration frei" (15.3) -- Abschnitt
     20.3: "Keine Freigabe ohne bestätigte Prüfziffer. Die Kennung allein
     genügt nie." Fehlt vollständig: Anmeldungsprüfung, Prüfzifferabgleich,
-    Anlegen der `Zuordnung`, Zustandswechsel auf `im_einsatz`, Freigabe der
+    Anlegen der `Zuordnung`, Zustandswechsel auf `in_service`, Freigabe der
     Konfiguration.
     """
 
@@ -224,12 +224,12 @@ def geraet_ersetzen(wohnung_kennung: str, anfrage: GeraetErsetzenAnfrage) -> Non
 
 @app.post("/v1/geraete/{geraet_kennung}/zustand", status_code=200)
 def geraet_zustand_aendern(geraet_kennung: str, anfrage: GeraetZustandAnfrage) -> None:
-    """Zustand ändern (Abschnitt 20.1, Zustandsautomat `erfasst` → `vorbereitet`
-    → `gemeldet` → `im Einsatz`, daneben `im Regal`, `defekt`, `ausgemustert`).
+    """Zustand ändern (Abschnitt 20.1, Zustandsautomat `registered` → `prepared`
+    → `reported` → `in_service`, daneben `in_storage`, `faulty`, `decommissioned`).
 
     Fehlt vollständig: Anmeldungsprüfung, Prüfung auf erlaubte Übergänge (die
     Aufzählung `GeraetLebenszyklus` erlaubt jeden Wert an jeder Stelle -- ein
-    Sprung von `erfasst` direkt auf `im_einsatz` ist strukturell nicht
+    Sprung von `registered` direkt auf `in_service` ist strukturell nicht
     ausgeschlossen und muss hier verhindert werden), Protokollierung
     (Abschnitt 20.3: "Jede Änderung an Zuordnung, Zustand oder Token wird
     protokolliert").

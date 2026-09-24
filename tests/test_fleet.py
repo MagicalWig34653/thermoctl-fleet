@@ -109,7 +109,7 @@ GERAET_BEISPIEL = {
     "oeffentlicher_schluessel_fingerabdruck": "ab:cd:ef",
     "abbild_fassung": "2026.1",
     "waechter_fassung": "0.1.0",
-    "zustand": "erfasst",
+    "zustand": "registered",
 }
 
 
@@ -154,7 +154,7 @@ def test_geraet_ersetzen_meldet_fehlende_umsetzung() -> None:
 
 def test_geraet_zustand_aendern_meldet_fehlende_umsetzung() -> None:
     with pytest.raises(NotImplementedError):
-        client.post("/v1/geraete/sn-12345/zustand", json={"zustand": "im_regal"})
+        client.post("/v1/geraete/sn-12345/zustand", json={"zustand": "in_storage"})
 
 
 def test_geraet_zustand_aendern_lehnt_unbekannten_zustand_strukturell_ab() -> None:

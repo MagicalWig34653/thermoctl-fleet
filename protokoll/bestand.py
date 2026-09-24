@@ -9,12 +9,12 @@ anfügen würde, spart ein Modell und verliert die Historie -- deshalb bewusst
 so und nicht einfacher gebaut, obwohl ein Feld näher läge.
 
 Die konkreten Zustandsnamen (`WohnungZustand`, `GeraetLebenszyklus`) stehen in der
-Spezifikation nur als deutsche Prosa in einer Tabelle, nicht als
-maschinenlesbare Werte wie bei `Stoerungsart` (Abschnitt 5). Die
-Schreibweisen hier (`im_umbau`, `im_einsatz`, `im_regal`, ...) sind deshalb
-eine **Wahl dieses Gerüsts**, keine wörtliche Übernahme -- vor der echten
-Umsetzung mit dem Projektinhaber absichern, falls eine Oberfläche oder ein
-externes System bereits eigene Bezeichner erwartet.
+Spezifikation als deutsche Prosa in einer Tabelle -- maschinenlesbar gelten seit
+Abschnitt 20.1/22.4 **englische** Werte (`occupied`, `in_service`, ...), nachträglich
+vom Projektinhaber entschieden: Eine spätere Oberfläche oder ein externes System
+erwartet eher englische Bezeichner, wie es bei `Stoerungsart` (Abschnitt 5) schon
+der Fall war. **Nur die Werte sind englisch** -- Klassen- und Feldnamen
+(`WohnungZustand`, `GeraetLebenszyklus`, `zustand`, ...) bleiben deutsch.
 """
 
 from __future__ import annotations
@@ -34,10 +34,12 @@ class Liegenschaft(BaseModel):
 
 
 class WohnungZustand(StrEnum):
-    BEWOHNT = "bewohnt"
-    LEER = "leer"
-    IM_UMBAU = "im_umbau"
-    STILLGELEGT = "stillgelegt"
+    """Werte englisch (Abschnitt 20.1/22.4), Bedeutung siehe dortige Tabelle."""
+
+    BEWOHNT = "occupied"
+    LEER = "vacant"
+    IM_UMBAU = "renovating"
+    STILLGELEGT = "retired"
 
 
 class Wohnung(BaseModel):
@@ -69,13 +71,15 @@ class Wohnung(BaseModel):
 
 
 class GeraetLebenszyklus(StrEnum):
-    ERFASST = "erfasst"
-    VORBEREITET = "vorbereitet"
-    GEMELDET = "gemeldet"
-    IM_EINSATZ = "im_einsatz"
-    IM_REGAL = "im_regal"
-    DEFEKT = "defekt"
-    AUSGEMUSTERT = "ausgemustert"
+    """Werte englisch (Abschnitt 20.1/22.4), Bedeutung siehe dortige Tabelle."""
+
+    ERFASST = "registered"
+    VORBEREITET = "prepared"
+    GEMELDET = "reported"
+    IM_EINSATZ = "in_service"
+    IM_REGAL = "in_storage"
+    DEFEKT = "faulty"
+    AUSGEMUSTERT = "decommissioned"
 
 
 class Geraet(BaseModel):
