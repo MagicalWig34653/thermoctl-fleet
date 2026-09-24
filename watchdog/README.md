@@ -49,9 +49,12 @@ point where it matters, so it is not lost if someone later wants to
 "simplify" the format:
 
 - `state.go`: reads the state file written by Python
-  (`agent.loop.report_watchdog_state`) (`desired`, `proven`, `since`).
+  (`agent.loop.report_watchdog_state`) (`desired`, `proven`, `since`, plus the
+  two eSIM rollback lines from section 24.4).
 - `health.go`: reads the health report periodically written by the running
-  agent (a Unix timestamp).
+  agent -- three lines (`timestamp=`, `digest=`, `version=`), not a bare
+  timestamp. The digest is the point: it lets the watchdog tell that *the right*
+  version is alive, not merely that something is (section 22.3).
 
 `check_contract.sh` is the cross-language contract test from section 18.3:
 Python writes, the built Go binary reads in check mode (`-check-mode`), the
