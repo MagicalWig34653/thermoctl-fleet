@@ -1,16 +1,16 @@
-"""FastAPI-Anwendung des Fleet-Dienstes -- Endpunktgerüst.
+"""FastAPI application of the fleet service -- endpoint scaffold.
 
-Jeder Endpunkt nimmt die zugehörigen Modelle aus `protokoll` entgegen und prüft
-sie damit bereits strukturell (Pydantic lehnt einen unbekannten Befehl oder ein
-fehlendes Herzschlagfeld ab, siehe `tests/test_protokoll.py`). Was hier fehlt --
-Anmeldungsprüfung, Ablage in einer Datenbank, der SSE-Versand selbst -- ist
-jeweils als `NotImplementedError` mit Verweis auf den Spezifikationsabschnitt
-markiert. **Keine erfundene Funktionalität**: Nichts davon wird stillschweigend
-mit einer Zwischenlösung gefüllt, weder In-Memory-Dict noch Platzhalter-Auth.
+Every endpoint accepts the corresponding models from `protocol` and thereby
+already checks them structurally (Pydantic rejects an unknown command or a missing
+heartbeat field, see `tests/test_protocol.py`). What is missing here --
+registration checks, storage in a database, the SSE delivery itself -- is each
+marked as a `NotImplementedError` with a reference to the specification section.
+**No invented functionality**: none of it is silently filled with a stopgap,
+neither an in-memory dict nor placeholder auth.
 
-`GET /healthz` ist die eine Ausnahme -- ein Übersichtsdienst braucht eine
-funktionierende eigene Gesundheitsprüfung von der ersten Zeile an, nicht erst
-nach der Umsetzung von Anmeldung und Ablage.
+`GET /healthz` is the one exception -- an overview service needs a working health
+check of its own from the first line on, not only after registration and storage
+have been implemented.
 """
 
 from __future__ import annotations
@@ -19,224 +19,222 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from protokoll import (
-    Anmeldebestaetigung,
-    BefehlErgebnis,
-    Ereignis,
-    GeraetLebenszyklus,
-    Herzschlag,
+from protocol import (
+    CommandResult,
+    DeviceLifecycle,
+    Event,
+    Heartbeat,
+    RegistrationConfirmation,
 )
-from protokoll.bestand import Geraet
-from protokoll.version import PROTOKOLLVERSION
+from protocol.inventory import Device
+from protocol.version import PROTOCOL_VERSION
 
-app = FastAPI(title="thermoctl-fleet", version=str(PROTOKOLLVERSION))
+app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION))
 
 
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
-    """Gesundheitsprüfung des Fleet-Dienstes selbst (nicht einer Wohnung).
+    """Health check of the fleet service itself (not of an apartment).
 
-    Bewusst ohne Datenbankzugriff: Ein Übersichtsdienst, dessen eigene
-    Gesundheitsprüfung von der Ablage abhängt, meldet "krank", sobald genau die
-    Komponente ausfällt, über die man das eigentlich erfahren müsste.
+    Deliberately without database access: an overview service whose own health
+    check depends on storage reports "unhealthy" exactly when the component that
+    was supposed to explain that has failed.
     """
 
     return {"status": "ok"}
 
 
-@app.post("/v1/herzschlag", status_code=204)
-def herzschlag_empfangen(herzschlag: Herzschlag) -> None:
-    """Nimmt einen Herzschlag entgegen (Abschnitt 5).
+@app.post("/v1/heartbeat", status_code=204)
+def receive_heartbeat(heartbeat: Heartbeat) -> None:
+    """Accepts a heartbeat (section 5).
 
-    Fehlt: Anmeldungsprüfung des Melder-Tokens (Abschnitt 4), Ablage des
-    Herzschlags samt Lückenerkennung bei nachgeholten Herzschlägen (Abschnitt 5,
-    "Die Cloud erkennt Lücken am Zeitstempel"), Auswertung der Alarmregeln
-    (Abschnitt 8).
+    Missing: checking the agent's token (section 4), storing the heartbeat
+    including gap detection for caught-up heartbeats (section 5, "The cloud
+    detects gaps by the timestamp"), evaluation of the alarm rules (section 8).
     """
 
     raise NotImplementedError(
-        "Anmeldungsprüfung, Ablage und Alarmauswertung fehlen -- siehe "
-        "docs/spezifikation.md Abschnitt 4, 5 und 8."
+        "Registration check, storage and alarm evaluation are missing -- see "
+        "docs/specification.md sections 4, 5 and 8."
     )
 
 
-@app.post("/v1/ereignisse/{wohnung}", status_code=204)
-def ereignis_empfangen(wohnung: str, ereignis: Ereignis) -> None:
-    """Nimmt eine Ereignismeldung entgegen (Abschnitt 11, Schritt 1; Abschnitt 18.1).
+@app.post("/v1/events/{apartment}", status_code=204)
+def receive_event(apartment: str, event: Event) -> None:
+    """Accepts an event report (section 11, step 1; section 18.1).
 
-    Die Wohnung steckt in der Adresse, nicht in der Nutzlast -- thermoctls
-    Störungs-Webhook sendet unverändert nur `schluessel`/`schwere`/`titel`/`text`
-    (siehe `protokoll/ereignisse.py`). Fehlt: Prüfung des
-    `Authorization: Bearer …`-Tokens dieser Wohnung (Abschnitt 4, 18.1), Ablage,
-    Zuordnung des `schluessel`-Präfixes über
-    `protokoll.stoerungsart_aus_schluessel` zur Alarmauswertung (Abschnitt 8).
+    The apartment is embedded in the address, not in the payload -- thermoctl's
+    fault webhook sends only `schluessel`/`schwere`/`titel`/`text` unchanged (see
+    `protocol/events.py`). Missing: checking this apartment's
+    `Authorization: Bearer …` token (sections 4, 18.1), storage, mapping the
+    `schluessel` prefix via `protocol.fault_kind_from_key` for alarm evaluation
+    (section 8).
     """
 
     raise NotImplementedError(
-        f"Anmeldungsprüfung, Ablage und Alarmauswertung für Wohnung {wohnung!r} "
-        "fehlen -- siehe docs/spezifikation.md Abschnitt 4, 8, 11 und 18.1."
+        f"Registration check, storage and alarm evaluation for apartment "
+        f"{apartment!r} are missing -- see docs/specification.md sections 4, 8, "
+        "11 and 18.1."
     )
 
 
-@app.get("/v1/befehle")
-def befehle_stream(warten: int = 1) -> StreamingResponse:
-    """SSE-Strom für Befehle an eine Wohnung (Abschnitt 3 und 7).
+@app.get("/v1/commands")
+def commands_stream(wait: int = 1) -> StreamingResponse:
+    """SSE stream for commands to an apartment (sections 3 and 7).
 
-    `warten=0` ist die im Abschnitt 3 vorgesehene Rückfallebene (einmaliges
-    Abfragen statt offener Verbindung) -- welche Wohnung fragt, ergibt sich erst
-    aus der noch fehlenden Anmeldungsprüfung.
+    `wait=0` is the fallback provided for in section 3 (a single poll instead of
+    an open connection) -- which apartment is asking only follows from the
+    registration check that is still missing.
 
-    Fehlt vollständig: Anmeldungsprüfung, `Last-Event-ID`-Behandlung für die
-    Wiederverbindung, das tatsächliche Schreiben von `Befehl`-Ereignissen in den
-    Strom, und die Verfallsprüfung beim Zustellen (Abschnitt 7: ein Befehl, der
-    seine Verfallszeit überschritten hat, wird nicht mehr ausgeliefert).
+    Entirely missing: registration check, `Last-Event-ID` handling for
+    reconnection, actually writing `Command` events into the stream, and the
+    expiry check on delivery (section 7: a command that has passed its expiry is
+    no longer delivered).
     """
 
     raise NotImplementedError(
-        "SSE-Auslieferung von Befehlen fehlt -- siehe docs/spezifikation.md "
-        "Abschnitt 3 und 7."
+        "SSE delivery of commands is missing -- see docs/specification.md "
+        "sections 3 and 7."
     )
 
 
-@app.post("/v1/befehle/{kennung}/ergebnis", status_code=204)
-def befehlsergebnis_empfangen(kennung: str, ergebnis: BefehlErgebnis) -> None:
-    """Nimmt das Ergebnis eines ausgeführten Befehls entgegen (Abschnitt 7).
+@app.post("/v1/commands/{id}/result", status_code=204)
+def receive_command_result(id: str, result: CommandResult) -> None:
+    """Accepts the result of an executed command (section 7).
 
-    Fehlt: Anmeldungsprüfung, Zuordnung zur ausstehenden Befehlskennung, Ablage.
-    `kennung` aus dem Pfad und `ergebnis.kennung` müssen künftig auch noch
-    gegeneinander geprüft werden.
+    Missing: registration check, matching against the pending command id,
+    storage. `id` from the path and `result.id` will also still need to be
+    checked against each other.
     """
 
     raise NotImplementedError(
-        f"Ablage des Ergebnisses für Befehl {kennung!r} fehlt -- siehe "
-        "docs/spezifikation.md Abschnitt 7."
+        f"Storing the result for command {id!r} is missing -- see "
+        "docs/specification.md section 7."
     )
 
 
 # -----------------------------------------------------------------------------
-# Bestand: Liegenschaften, Wohnungen, Geräte, Zuordnungen (Abschnitt 20).
-# "Ohne dieses Verzeichnis gibt es keine Zuordnung, und ohne Zuordnung wird
-# keine Konfiguration freigegeben (Abschnitt 15.5)." Die beiden Abläufe aus
-# Abschnitt 20.2 (Erstinbetriebnahme, Gerätetausch) sind auf die Endpunkte
-# unten verteilt; keiner davon prüft oder erzwingt bislang etwas -- die drei
-# Regeln aus Abschnitt 20.3 (höchstens ein aktives Gerät je Wohnung, ein
-# Gerät gehört zu höchstens einer Wohnung, keine Freigabe ohne bestätigte
-# Prüfziffer) fehlen an jeder Stelle, an der sie zuträfen.
+# Inventory: properties, apartments, devices, assignments (section 20).
+# "Without this directory there is no assignment, and without an assignment no
+# configuration is released (section 15.5)." The two workflows from section 20.2
+# (initial setup, device swap) are spread across the endpoints below; none of
+# them yet checks or enforces anything -- the three rules from section 20.3 (at
+# most one active device per apartment, a device belongs to at most one
+# apartment, no release without a confirmed verification code) are missing at
+# every place they would apply.
 # -----------------------------------------------------------------------------
 
 
-class GeraetErsetzenAnfrage(BaseModel):
-    ersatzgeraet_kennung: str
+class DeviceReplacementRequest(BaseModel):
+    replacement_device_id: str
 
 
-class GeraetZustandAnfrage(BaseModel):
-    zustand: GeraetLebenszyklus
+class DeviceStateRequest(BaseModel):
+    state: DeviceLifecycle
 
 
-@app.get("/v1/bestand")
-def bestand_lesen() -> None:
-    """Liegenschaften, Wohnungen, Geräte, mit Filter auf "in_storage"/"faulty"
-    (Abschnitt 20.4, die vierte Ansicht "Bestand").
+@app.get("/v1/inventory")
+def read_inventory() -> None:
+    """Properties, apartments, devices, with a filter on "in_storage"/"faulty"
+    (section 20.4, the fourth view "Inventory").
 
-    Fehlt: Anmeldungsprüfung der Fleet-Oberfläche (nicht des Melders -- ein
-    anderer Auth-Weg als Abschnitt 4), Ablage, Filterung.
+    Missing: registration check of the fleet UI (not of the agent -- a different
+    auth path than section 4), storage, filtering.
     """
 
     raise NotImplementedError(
-        "Lesen des Bestands fehlt -- siehe docs/spezifikation.md Abschnitt 20.1 und 20.4."
+        "Reading the inventory is missing -- see docs/specification.md "
+        "sections 20.1 and 20.4."
     )
 
 
-@app.post("/v1/geraete", status_code=201)
-def geraet_erfassen(geraet: Geraet) -> None:
-    """Ein Gerät im Verzeichnis anlegen, "physisch noch nicht vorbereitet"
-    (Abschnitt 20.1, Zustand `registered`; Abschnitt 20.2, Erstinbetriebnahme
-    Schritt 1).
+@app.post("/v1/devices", status_code=201)
+def register_device(device: Device) -> None:
+    """Adds a device to the directory, "not yet physically prepared" (section
+    20.1, state `registered`; section 20.2, initial setup step 1).
 
-    Fehlt: Anmeldungsprüfung, Ablage, Erzwingen des Anfangszustands `registered`
-    unabhängig davon, was `geraet.zustand` im Anfragekörper trägt -- ein
-    Aufrufer darf ein Gerät nicht in einem anderen Zustand als `registered`
-    erfassen.
+    Missing: registration check, storage, enforcing the initial state
+    `registered` regardless of what `device.state` carries in the request body --
+    a caller must not be able to register a device in any state other than
+    `registered`.
     """
 
     raise NotImplementedError(
-        f"Erfassen von Gerät {geraet.kennung!r} fehlt -- siehe "
-        "docs/spezifikation.md Abschnitt 20.1 und 20.2."
+        f"Registering device {device.id!r} is missing -- see "
+        "docs/specification.md sections 20.1 and 20.2."
     )
 
 
-@app.post("/v1/geraete/{geraet_kennung}/vorbereiten", status_code=200)
-def geraet_vorbereiten(geraet_kennung: str) -> None:
-    """Anmeldecode erzeugen (Abschnitt 20.2, Erstinbetriebnahme Schritt 2;
-    Abschnitt 15.3, 19.5).
+@app.post("/v1/devices/{device_id}/prepare", status_code=200)
+def prepare_device(device_id: str) -> None:
+    """Generates a registration code (section 20.2, initial setup step 2;
+    sections 15.3, 19.5).
 
-    Das Abbild selbst schreibt weiterhin der Raspberry-Pi-Imager oder `dd` --
-    dieser Endpunkt liefert nur den einmaligen, zeitlich begrenzten Code für
-    `melder-anmeldung.json` (Abschnitt 4). Fehlt vollständig:
-    Anmeldungsprüfung, Erzeugen und Speichern des Codes, Zustandswechsel auf
-    `prepared`.
+    Writing the image itself is still done by the Raspberry Pi Imager or `dd` --
+    this endpoint only supplies the one-time, time-limited code for
+    `agent-registration.json` (section 4). Entirely missing: registration check,
+    generating and storing the code, state transition to `prepared`.
     """
 
     raise NotImplementedError(
-        f"Vorbereiten von Gerät {geraet_kennung!r} (Anmeldecode erzeugen) fehlt -- "
-        "siehe docs/spezifikation.md Abschnitt 15.3, 19.5 und 20.2."
+        f"Preparing device {device_id!r} (generating registration code) is "
+        "missing -- see docs/specification.md sections 15.3, 19.5 and 20.2."
     )
 
 
-@app.post("/v1/geraete/{geraet_kennung}/bestaetigen", status_code=200)
-def geraet_meldung_bestaetigen(
-    geraet_kennung: str, bestaetigung: Anmeldebestaetigung
+@app.post("/v1/devices/{device_id}/confirm", status_code=200)
+def confirm_device_registration(
+    device_id: str, confirmation: RegistrationConfirmation
 ) -> None:
-    """Meldung bestätigen und zuordnen (Abschnitt 20.2, Erstinbetriebnahme
-    Schritt 3-4; Abschnitt 15.3, Schritt 3).
+    """Confirms the registration and assigns the device (section 20.2, initial
+    setup steps 3-4; section 15.3, step 3).
 
-    "Erst diese Bestätigung gibt die Konfiguration frei" (15.3) -- Abschnitt
-    20.3: "Keine Freigabe ohne bestätigte Prüfziffer. Die Kennung allein
-    genügt nie." Fehlt vollständig: Anmeldungsprüfung, Prüfzifferabgleich,
-    Anlegen der `Zuordnung`, Zustandswechsel auf `in_service`, Freigabe der
-    Konfiguration.
+    "Only this confirmation releases the configuration" (15.3) -- section 20.3:
+    "No release without a confirmed verification code. The id alone is never
+    enough." Entirely missing: registration check, matching the verification
+    code, creating the `Assignment`, state transition to `in_service`, releasing
+    the configuration.
     """
 
     raise NotImplementedError(
-        f"Bestätigen und Zuordnen von Gerät {geraet_kennung!r} zu Wohnung "
-        f"{bestaetigung.wohnung!r} fehlt -- siehe docs/spezifikation.md "
-        "Abschnitt 15.3, 20.2 und 20.3."
+        f"Confirming and assigning device {device_id!r} to apartment "
+        f"{confirmation.apartment!r} is missing -- see docs/specification.md "
+        "sections 15.3, 20.2 and 20.3."
     )
 
 
-@app.post("/v1/wohnungen/{wohnung_kennung}/geraet-ersetzen", status_code=200)
-def geraet_ersetzen(wohnung_kennung: str, anfrage: GeraetErsetzenAnfrage) -> None:
-    """Gerät ersetzen (Abschnitt 20.2, Gerätetausch).
+@app.post("/v1/apartments/{apartment_id}/replace-device", status_code=200)
+def replace_device(apartment_id: str, request: DeviceReplacementRequest) -> None:
+    """Replaces a device (section 20.2, device swap).
 
-    Fehlt vollständig: Anmeldungsprüfung, ausdrückliche Bestätigung (Abschnitt
-    20.2 Schritt 2, Abschnitt 20.3 Regel 2 -- "muss vorher zurückgesetzt
-    worden sein"), Widerruf des Tokens des alten Geräts, Schließen der alten
-    `Zuordnung` mit `bis`, Anlegen der neuen `Zuordnung`, Übergabe der letzten
-    verschlüsselten Sicherung an das Ersatzgerät (Abschnitt 15.1).
+    Entirely missing: registration check, explicit confirmation (section 20.2
+    step 2, section 20.3 rule 2 -- "must have been reset beforehand"), revoking
+    the old device's token, closing the old `Assignment` with `until`, creating
+    the new `Assignment`, handing the last encrypted backup over to the
+    replacement device (section 15.1).
     """
 
     raise NotImplementedError(
-        f"Ersetzen des Geräts in Wohnung {wohnung_kennung!r} durch "
-        f"{anfrage.ersatzgeraet_kennung!r} fehlt -- siehe docs/spezifikation.md "
-        "Abschnitt 15.1 und 20.2."
+        f"Replacing the device in apartment {apartment_id!r} with "
+        f"{request.replacement_device_id!r} is missing -- see "
+        "docs/specification.md sections 15.1 and 20.2."
     )
 
 
-@app.post("/v1/geraete/{geraet_kennung}/zustand", status_code=200)
-def geraet_zustand_aendern(geraet_kennung: str, anfrage: GeraetZustandAnfrage) -> None:
-    """Zustand ändern (Abschnitt 20.1, Zustandsautomat `registered` → `prepared`
-    → `reported` → `in_service`, daneben `in_storage`, `faulty`, `decommissioned`).
+@app.post("/v1/devices/{device_id}/state", status_code=200)
+def change_device_state(device_id: str, request: DeviceStateRequest) -> None:
+    """Changes the state (section 20.1, state machine `registered` → `prepared`
+    → `reported` → `in_service`, alongside `in_storage`, `faulty`,
+    `decommissioned`).
 
-    Fehlt vollständig: Anmeldungsprüfung, Prüfung auf erlaubte Übergänge (die
-    Aufzählung `GeraetLebenszyklus` erlaubt jeden Wert an jeder Stelle -- ein
-    Sprung von `registered` direkt auf `in_service` ist strukturell nicht
-    ausgeschlossen und muss hier verhindert werden), Protokollierung
-    (Abschnitt 20.3: "Jede Änderung an Zuordnung, Zustand oder Token wird
-    protokolliert").
+    Entirely missing: registration check, checking for allowed transitions (the
+    `DeviceLifecycle` enum permits every value at every point -- a jump from
+    `registered` straight to `in_service` is not structurally excluded and must
+    be prevented here), logging (section 20.3: "Every change to assignment,
+    state, or token is logged").
     """
 
     raise NotImplementedError(
-        f"Zustandswechsel von Gerät {geraet_kennung!r} nach {anfrage.zustand!r} "
-        "fehlt -- siehe docs/spezifikation.md Abschnitt 20.1 und 20.3."
+        f"Changing the state of device {device_id!r} to {request.state!r} is "
+        "missing -- see docs/specification.md sections 20.1 and 20.3."
     )
-

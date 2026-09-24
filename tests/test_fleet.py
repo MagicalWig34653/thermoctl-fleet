@@ -1,10 +1,10 @@
-"""Prüft das Endpunktgerüst des Fleet-Diensts.
+"""Tests the endpoint scaffold of the fleet service.
 
-`GET /healthz` muss antworten (CLAUDE.md verlangt das für jeden Endpunkt). Die
-übrigen Endpunkte sind absichtlich unfertig -- hier wird geprüft, dass sie
-tatsächlich mit `NotImplementedError` und einem Verweis auf die Spezifikation
-abbrechen, statt stillschweigend etwas vorzutäuschen, das nicht passiert (z. B.
-ein 204 ohne jede Wirkung).
+`GET /healthz` must respond (CLAUDE.md requires this for every endpoint). The
+remaining endpoints are deliberately unfinished -- this checks that they actually
+abort with `NotImplementedError` and a reference to the specification, instead of
+silently pretending something happened that did not (e.g. a 204 with no effect at
+all).
 """
 
 from __future__ import annotations
@@ -13,151 +13,155 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fleet.app import app
-from protokoll.version import PROTOKOLLVERSION
+from protocol.version import PROTOCOL_VERSION
 
 client = TestClient(app, raise_server_exceptions=True)
 
-HERZSCHLAG_BEISPIEL = {
-    "wohnung": "haus7-w03",
-    "gesendet": "2026-09-22T14:03:11Z",
-    "melder": "0.1.0",
-    "protokollversion": PROTOKOLLVERSION,
-    "thermoctl": {"version": "0.9.5", "erreichbar": True, "betriebsart": "scharf"},
-    "regelung": {
-        "letzte_entscheidung": "2026-09-22T14:02:47Z",
-        "zonen": 6,
-        "zonen_mit_waermeanforderung": 2,
-        "zonen_ohne_messwert": 0,
+HEARTBEAT_EXAMPLE = {
+    "apartment": "house7-a03",
+    "sent_at": "2026-09-22T14:03:11Z",
+    "agent": "0.1.0",
+    "protocol_version": PROTOCOL_VERSION,
+    "thermoctl": {"version": "0.9.5", "reachable": True, "mode": "armed"},
+    "control": {
+        "last_decision": "2026-09-22T14:02:47Z",
+        "zones": 6,
+        "zones_with_heat_demand": 2,
+        "zones_without_reading": 0,
     },
-    "geraete": {
-        "zigbee_bruecke": "verbunden",
-        "schwaechste_batterie_prozent": 62,
-        "schlechteste_funkqualitaet": 47,
-        "stumme_geraete": 0,
+    "devices": {
+        "zigbee_bridge": "connected",
+        "weakest_battery_percent": 62,
+        "worst_signal_quality": 47,
+        "silent_devices": 0,
     },
     "system": {
-        "laufzeit_s": 962114,
-        "speicher_frei_prozent": 41,
-        "datentraeger_frei_prozent": 68,
-        "zeitversatz_s": 0.4,
+        "uptime_s": 962114,
+        "memory_free_percent": 41,
+        "disk_free_percent": 68,
+        "clock_drift_s": 0.4,
     },
-    "offene_stoerungen": [],
+    "open_faults": [],
 }
 
 
-def test_healthz_antwortet() -> None:
-    antwort = client.get("/healthz")
+def test_healthz_responds() -> None:
+    response = client.get("/healthz")
 
-    assert antwort.status_code == 200
-    assert antwort.json() == {"status": "ok"}
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
-def test_herzschlag_endpunkt_nimmt_das_modell_an_und_meldet_fehlende_umsetzung() -> None:
+def test_heartbeat_endpoint_accepts_the_model_and_reports_missing_implementation() -> (
+    None
+):
     with pytest.raises(NotImplementedError):
-        client.post("/v1/herzschlag", json=HERZSCHLAG_BEISPIEL)
+        client.post("/v1/heartbeat", json=HEARTBEAT_EXAMPLE)
 
 
-def test_herzschlag_endpunkt_lehnt_fehlerhaften_koerper_strukturell_ab() -> None:
-    fehlerhaft = {k: v for k, v in HERZSCHLAG_BEISPIEL.items() if k != "system"}
+def test_heartbeat_endpoint_rejects_a_malformed_body_structurally() -> None:
+    malformed = {k: v for k, v in HEARTBEAT_EXAMPLE.items() if k != "system"}
 
-    antwort = client.post("/v1/herzschlag", json=fehlerhaft)
+    response = client.post("/v1/heartbeat", json=malformed)
 
-    assert antwort.status_code == 422
+    assert response.status_code == 422
 
 
-def test_ereignis_endpunkt_nimmt_die_echte_webhook_nutzlast_an() -> None:
-    """Abschnitt 18.1: die Wohnung steckt in der Adresse, nicht im Körper."""
+def test_event_endpoint_accepts_the_real_webhook_payload() -> None:
+    """Section 18.1: the apartment is embedded in the address, not in the body."""
 
     with pytest.raises(NotImplementedError):
         client.post(
-            "/v1/ereignisse/haus7-w03",
+            "/v1/events/house7-a03",
             json={
-                "schluessel": "zigbee2mqtt:brücke",
+                "schluessel": "zigbee2mqtt:bridge",
                 "schwere": "stoerung",
-                "titel": "Zigbee2MQTT nicht erreichbar",
-                "text": "Die Bridge antwortet seit 5 Minuten nicht mehr.",
+                "titel": "Zigbee2MQTT unreachable",
+                "text": "The bridge has not responded for 5 minutes.",
             },
         )
 
 
-def test_ereignis_endpunkt_lehnt_fehlerhaften_koerper_strukturell_ab() -> None:
-    antwort = client.post(
-        "/v1/ereignisse/haus7-w03",
-        json={"schwere": "stoerung", "titel": "…", "text": "…"},
+def test_event_endpoint_rejects_a_malformed_body_structurally() -> None:
+    response = client.post(
+        "/v1/events/house7-a03",
+        json={"schwere": "stoerung", "titel": "...", "text": "..."},
     )
 
-    assert antwort.status_code == 422
+    assert response.status_code == 422
 
 
-def test_befehle_stream_meldet_fehlende_umsetzung() -> None:
+def test_commands_stream_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        client.get("/v1/befehle")
+        client.get("/v1/commands")
 
 
-def test_befehlsergebnis_endpunkt_meldet_fehlende_umsetzung() -> None:
+def test_command_result_endpoint_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
         client.post(
-            "/v1/befehle/abc123/ergebnis",
-            json={"kennung": "abc123", "erfolgreich": True, "dauer_s": 1.2},
+            "/v1/commands/abc123/result",
+            json={"id": "abc123", "successful": True, "duration_s": 1.2},
         )
 
 
-GERAET_BEISPIEL = {
-    "kennung": "sn-12345",
-    "bauart": "Pi 5",
-    "anschaffungsdatum": "2026-01-15",
-    "oeffentlicher_schluessel_fingerabdruck": "ab:cd:ef",
-    "abbild_fassung": "2026.1",
-    "waechter_fassung": "0.1.0",
-    "zustand": "registered",
+DEVICE_EXAMPLE = {
+    "id": "sn-12345",
+    "model": "Pi 5",
+    "acquisition_date": "2026-01-15",
+    "public_key_fingerprint": "ab:cd:ef",
+    "image_version": "2026.1",
+    "watchdog_version": "0.1.0",
+    "state": "registered",
 }
 
 
-def test_bestand_lesen_meldet_fehlende_umsetzung() -> None:
+def test_read_inventory_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        client.get("/v1/bestand")
+        client.get("/v1/inventory")
 
 
-def test_geraet_erfassen_nimmt_das_modell_an_und_meldet_fehlende_umsetzung() -> None:
+def test_register_device_accepts_the_model_and_reports_missing_implementation() -> (
+    None
+):
     with pytest.raises(NotImplementedError):
-        client.post("/v1/geraete", json=GERAET_BEISPIEL)
+        client.post("/v1/devices", json=DEVICE_EXAMPLE)
 
 
-def test_geraet_erfassen_lehnt_fehlerhaften_koerper_strukturell_ab() -> None:
-    fehlerhaft = {k: v for k, v in GERAET_BEISPIEL.items() if k != "bauart"}
+def test_register_device_rejects_a_malformed_body_structurally() -> None:
+    malformed = {k: v for k, v in DEVICE_EXAMPLE.items() if k != "model"}
 
-    antwort = client.post("/v1/geraete", json=fehlerhaft)
+    response = client.post("/v1/devices", json=malformed)
 
-    assert antwort.status_code == 422
+    assert response.status_code == 422
 
 
-def test_geraet_vorbereiten_meldet_fehlende_umsetzung() -> None:
+def test_prepare_device_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        client.post("/v1/geraete/sn-12345/vorbereiten")
+        client.post("/v1/devices/sn-12345/prepare")
 
 
-def test_geraet_bestaetigen_meldet_fehlende_umsetzung() -> None:
+def test_confirm_device_registration_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
         client.post(
-            "/v1/geraete/sn-12345/bestaetigen",
-            json={"pruefziffer": "4711", "wohnung": "haus7-w03"},
+            "/v1/devices/sn-12345/confirm",
+            json={"verification_code": "4711", "apartment": "house7-a03"},
         )
 
 
-def test_geraet_ersetzen_meldet_fehlende_umsetzung() -> None:
+def test_replace_device_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
         client.post(
-            "/v1/wohnungen/haus7-w03/geraet-ersetzen",
-            json={"ersatzgeraet_kennung": "sn-67890"},
+            "/v1/apartments/house7-a03/replace-device",
+            json={"replacement_device_id": "sn-67890"},
         )
 
 
-def test_geraet_zustand_aendern_meldet_fehlende_umsetzung() -> None:
+def test_change_device_state_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
-        client.post("/v1/geraete/sn-12345/zustand", json={"zustand": "in_storage"})
+        client.post("/v1/devices/sn-12345/state", json={"state": "in_storage"})
 
 
-def test_geraet_zustand_aendern_lehnt_unbekannten_zustand_strukturell_ab() -> None:
-    antwort = client.post("/v1/geraete/sn-12345/zustand", json={"zustand": "verschollen"})
+def test_change_device_state_rejects_an_unknown_state_structurally() -> None:
+    response = client.post("/v1/devices/sn-12345/state", json={"state": "missing"})
 
-    assert antwort.status_code == 422
+    assert response.status_code == 422

@@ -4,22 +4,21 @@ version = "0.1.0"
 requires-python = ">=3.13"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-# Der gemeinsame Vertrag (protokoll/) braucht nur Pydantic und ist damit in
-# beiden Abbildern (fleet, agent) enthalten, ohne dass eines das jeweils andere
-# Extra mitzieht.
+# The shared contract (protocol/) only needs Pydantic and is therefore included
+# in both images (fleet, agent) without either pulling in the other's extra.
 dependencies = [
     "pydantic>=2.9",
 ]
 
 [project.optional-dependencies]
-# Cloud-Seite: FastAPI-Anwendung, SSE-Ausgabe.
+# Cloud side: FastAPI application, SSE output.
 fleet = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "sse-starlette>=2.1",
 ]
-# Geräte-Seite: HTTP-Client für Herzschlag/Ereignisse, SSE-Client für den
-# Befehlskanal.
+# Device side: HTTP client for heartbeat/events, SSE client for the
+# command channel.
 agent = [
     "httpx>=0.27",
     "httpx-sse>=0.4",
@@ -27,8 +26,8 @@ agent = [
 dev = [
     "pytest>=8.3",
     "pytest-cov>=5.0",
-    # Für FastAPIs TestClient -- nicht "httpx": Für Python 3.14 ist httpx2 der
-    # empfohlene Ersatz, siehe die Warnung von starlette.testclient bei httpx.
+    # For FastAPI's TestClient -- not "httpx": for Python 3.14, httpx2 is the
+    # recommended replacement, see starlette.testclient's warning about httpx.
     "httpx2>=2.12",
     "ruff>=0.16",
     "mypy>=1.18",
@@ -39,18 +38,18 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-# waechter/ ist bewusst NICHT hier gelistet: Es ist seit Abschnitt 18.3 ein
-# eigenständiges Go-Modul (waechter/go.mod), kein Python-Paket -- siehe
-# waechter/README.md. tools* ist reines Bau-/CI-Werkzeug
-# (abbild/-Konfigurationsprüfung) und geht in kein Docker-Abbild ein.
-include = ["protokoll*", "fleet*", "agent*", "tools*"]
+# watchdog/ is deliberately NOT listed here: since section 18.3 it is a
+# standalone Go module (watchdog/go.mod), not a Python package -- see
+# watchdog/README.md. tools* is pure build/CI tooling (image/ configuration
+# check) and does not go into any Docker image.
+include = ["protocol*", "fleet*", "agent*", "tools*"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py313"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "S"]
-ignore = ["S101"]  # assert ist in Tests erwünscht
+ignore = ["S101"]  # assert is welcome in tests
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106"]
@@ -62,4 +61,4 @@ plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --cov=protokoll --cov=fleet --cov=agent --cov=tools --cov-report=term-missing"
+addopts = "-q --cov=protocol --cov=fleet --cov=agent --cov=tools --cov-report=term-missing"

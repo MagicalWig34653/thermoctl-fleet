@@ -1,0 +1,42 @@
+# Example unit for the watchdog (section 17, 18.3). Shipped as part of the
+# prepared system image (section 15.3) and updated via the operating
+# system's package management -- explicitly NOT via the fleet service and
+# NOT as a Docker container: the watchdog must run precisely when the
+# containers are not.
+#
+# Installation (example, not an automated tool -- deliberately, see
+# docs/STATUS.md). Assumes the binary built for the target architecture
+# (CI, see .github/workflows/go.yml) is already at
+# /usr/local/bin/thermoctl-watchdog -- nothing is compiled on the device
+# (section 18.3):
+#   install -m 755 thermoctl-watchdog-<arch> /usr/local/bin/thermoctl-watchdog
+#   install -m 644 watchdog/thermoctl-watchdog.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now thermoctl-watchdog.service
+
+[Unit]
+Description=thermoctl watchdog (swaps the agent container, no network, no registry)
+# Deliberately no "After=docker.service"/"Requires=docker.service": the
+# watchdog must be able to start independently of the container runtime, to
+# be able to notice its failure at all.
+After=network.target
+
+[Service]
+Type=simple
+# Statically built binary (CGO_ENABLED=0, section 18.3) -- no runtime
+# environment, no venv, no interpreter that could itself break.
+ExecStart=/usr/local/bin/thermoctl-watchdog
+Restart=always
+RestartSec=5
+# No network, as required by section 18.3: the watchdog needs no network
+# access to start or stop containers locally, or to read a state file.
+PrivateNetwork=true
+# Runs with the rights needed to address the container runtime (e.g.
+# membership in the "docker" group) -- not as root. Which concrete
+# group/runtime that is depends on the prepared system image (section 15.3)
+# and is not fixed here.
+User=thermoctl-watchdog
+Group=docker
+
+[Install]
+WantedBy=multi-user.target

@@ -1,7 +1,7 @@
-"""Fleet-Dienst: Cloud-Seite (docs/spezifikation.md, Abschnitt 2).
+"""Fleet service: the cloud side (docs/specification.md, section 2).
 
-Empfängt Herzschläge und Ereignisse, gibt Befehle über einen SSE-Strom aus, hält
-Sollzustände vor. Sieht **keine** Raumtemperaturen, Sollwerte oder Mieterdaten
-(Abschnitt 6) und kann die Heizung nicht regeln (Abschnitt 1) -- das ist kein
-Implementierungsdetail, sondern der Zuschnitt, den dieses Repository umsetzt.
+Receives heartbeats and events, hands out commands over an SSE stream, holds
+desired states. Sees **no** room temperatures, setpoints, or tenant data (section
+6) and cannot control the heating (section 1) -- that is not an implementation
+detail, it is the scope this repository implements.
 """

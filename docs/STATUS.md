@@ -1,263 +1,289 @@
-# Stand
+# Status
 
-Letzte Aktualisierung: 2026-09-24.
+Last updated: 2026-09-24.
 
-## Sechs bisher offene Punkte vom Projektinhaber entschieden
+**English migration (this update):** the repository's directories, files,
+identifiers, comments, and documentation were translated to English end to
+end (see the commit that carries this note for the full list). Everything
+below that names a file or identifier uses the current, English name; where
+a translated commit message quotes a past state verbatim, the name at that
+point in time is kept as it was. The original German specification stays
+authoritative as a source document under `thermoctl/lokal/`; the English
+`docs/specification.md` in this repository is authoritative for this
+repository from 2026-09-24 onward -- see its own note at the top.
 
-Sechs Lücken, zu denen die Spezifikation bisher schwieg, sind jetzt entschieden
-und in `docs/spezifikation.md` nachgezogen (Abschnitt 17, 19, 20, 22.1-22.4,
-24.4):
+**300-line rule redefined (section 18.3).** The watchdog's line limit now
+counts only executable statements -- comments and blank lines no longer
+count. Reason: the point of the limit was "small enough to read in full",
+and that is a statement about logic, not about explanations; the previous
+counting method had forced trimming comments to stay under 300, and the
+comments are exactly where the reasoning lives. Under the new rule, the six
+production files (`main.go`, `watch.go`, `state.go`, `health.go`, `leds.go`,
+`linefile.go`) total **300 raw lines** (the old counting method) and
+**195 statement lines** (the new counting method) -- both well under the
+limit, `go vet` and `go test ./...` still green (25 tests).
 
-1. **Rückfall ohne bewährten Stand.** Beim Bau des Systemabbilds wird der
-   Digest der mitgelieferten Fassung fest in die Zustandsdatei eingetragen und
-   gilt ab dem ersten Start als `bewaehrt` (neuer Abschnitt „Rückfall ohne
-   bewährten Stand" in Abschnitt 17, Bullet in 19.3). `waechter/wache.go::
-   AufBewaehrtZuruecksetzen` meldet ein leeres `Bewaehrt` jetzt als Zeichen
-   einer **fehlerhaften Auslieferung**, nicht mehr als ungeklärten Sonderfall.
-2. **Bedeutung von `seit`:** der Zeitpunkt, seit dem `gewuenscht` gilt --
-   bereits in Abschnitt 22.2 dokumentiert, jetzt ausdrücklich als
-   nachträgliche Festlegung markiert (einzige Lesart, mit der das Feld den
-   Rückfall überhaupt steuern kann), in `waechter/zustand.go` und
-   `agent/schleife.py` nachgezogen.
-3. **Zustandsnamen englisch.** `WohnungZustand` und `GeraetLebenszyklus` in
-   `protokoll/bestand.py` tragen jetzt englische Werte (`occupied`,
-   `in_service`, ...), Tabelle dazu in Abschnitt 20.1. Nur die Werte, nicht
-   Klassen- oder Feldnamen. `fleet/app.py`-Docstrings und Tests nachgezogen.
-4. **Einheitlicher Umschlag der Störungsereignisse.** `protokoll/ereignisse.py`
-   hat jetzt `Stoerungsereignis` (Art, Schlüssel, Zeitpunkt, Klartext) und
-   `stoerungsereignis_aus_ereignis`; die Präfixtabelle deckt jetzt vier der
-   sechs Störungsarten ab (`zigbee2mqtt:`, `tenant-report:`, `fenster:`,
-   `schaltbefehl:`) -- `sensor:` bleibt absichtlich ohne Zuordnung (Abschnitt
-   22.1, Sonderfall Sensorstörung/festhängender Messwert).
-5. **Format der Gesundmeldung.** Zeilenbasiert wie die Zustandsdatei, nicht
-   ein einzelner Zeitstempel: `zeitpunkt=`, `digest=` (der **laufende**
-   Digest), `fassung=` (Abschnitt 22.3, neu geschrieben). Umgesetzt in
-   `waechter/gesundmeldung.go`, `agent/schleife.py::gesundmeldung_melden`
-   (neu), Vertragstest `waechter/pruefe_vertrag.sh` deckt jetzt auch diesen
-   Dateityp ab.
-6. **eSIM-Rückfall.** `esim_vorheriges_profil=`/`esim_frist=` sind zwei
-   weitere Zeilen in der **bestehenden** Zustandsdatei, keine eigene Datei
-   (Abschnitt 24.4). `waechter/zustand.go` überliest unbekannte Zeilen
-   ohnehin, das Format ist dadurch erweiterbar. `agent/schleife.py::
-   waechter_zustand_melden` nimmt dafür zwei neue Schlüsselwortargumente an.
+## Six previously open points decided by the project owner
 
-Das gemeinsame Zeilenformat von Zustandsdatei und Gesundmeldung wurde beim
-Umsetzen von Punkt 5 in ein neues, geteiltes Modul `waechter/zeilendatei.go`
-gezogen (`liesSchluesselWertZeilen`, `parseOptionalerZeitstempel`) -- ohne das
-wäre `waechter/` deutlich über die 300-Zeilen-Grenze gewachsen (Gesundmeldung
-brauchte durch das neue Format ebenso viel Parsing-Code wie die
-Zustandsdatei). Produktionscode liegt jetzt bei **299 Zeilen** (sechs Dateien:
-`main.go`, `wache.go`, `zustand.go`, `gesundmeldung.go`, `statusanzeige.go`,
-`zeilendatei.go`) -- **knapp unter** der Grenze von 300, weiterhin **kein**
-Eintrag in `go.mod`. `go vet` und `go test ./...` laufen grün (25 Tests,
-vorher 19). Python-Testsuite: 60 Tests (vorher 53), Abdeckung unverändert
-**94 %** (die 6 % Lücke ist ausschließlich in den bereits vor diesem Auftrag
-unbedeckten `NotImplementedError`-Stummeln, nicht in neuem Code).
+Six gaps the specification had so far been silent on are now decided and
+carried into `docs/specification.md` (sections 17, 19, 20, 22.1-22.4, 24.4):
 
-**Kein Widerspruch zur Spezifikation gefunden.** Alle sechs Entscheidungen
-gingen glatt in Rezept, Zustandsdatei-Vertrag und Bestandsmodelle auf.
+1. **Fallback without a proven revision.** When the system image is built,
+   the digest of the shipped version is written into the state file and
+   counts as `proven` from the first boot on (new section "Fallback without
+   a proven revision" in section 17, bullet in 19.3). `watchdog/watch.go::
+   RollBackToProven` now reports an empty `Proven` as a sign of a **faulty
+   delivery**, no longer as an unresolved special case.
+2. **Meaning of `since`:** the point in time since which `desired` applies --
+   already documented in section 22.2, now explicitly marked as a decision
+   made afterward (the only reading with which the field can steer the
+   fallback at all), carried into `watchdog/state.go` and `agent/loop.py`.
+3. **State names in English.** `ApartmentState` and `DeviceLifecycle` in
+   `protocol/inventory.py` now carry English values (`occupied`,
+   `in_service`, ...), with a table in section 20.1. Only the values, not
+   class or field names. `fleet/app.py` docstrings and tests updated to
+   match.
+4. **Unified envelope for fault events.** `protocol/events.py` now has
+   `FaultEvent` (kind, key, timestamp, plain text) and
+   `fault_event_from_event`; the prefix table now covers four of the six
+   fault kinds (`zigbee2mqtt:`, `tenant-report:`, `fenster:`,
+   `schaltbefehl:`) -- `sensor:` deliberately stays without a mapping
+   (section 22.1, special case sensor fault/stuck reading).
+5. **Health report format.** Line-based like the state file, not a single
+   timestamp: `timestamp=`, `digest=` (the **currently running** digest),
+   `version=` (section 22.3, newly written). Implemented in
+   `watchdog/health.go`, `agent/loop.py::report_health` (new), the contract
+   test `watchdog/check_contract.sh` now covers this file type too.
+6. **eSIM fallback.** `esim_previous_profile=`/`esim_deadline=` are two
+   further lines in the **existing** state file, not a separate file
+   (section 24.4). `watchdog/state.go` skips unknown lines anyway, so the
+   format is extensible by this. `agent/loop.py::report_watchdog_state`
+   accepts two new keyword arguments for this.
 
-## Spezifikation nachgezogen, Gerüst für Abschnitt 23/24, Implementierungsplan angelegt
+The shared line format of the state file and the health report was pulled
+out into a new, shared module while implementing point 5 (now
+`watchdog/linefile.go`: `readKeyValueLines`, `parseOptionalTimestamp`) --
+without that, `watchdog/` would have grown well past the 300-line limit
+(the health report needed just as much parsing code through the new format
+as the state file did). Production code was then at **299 lines** under the
+old counting method (six files: `main.go`, `watch.go`, `state.go`,
+`health.go`, `leds.go`, `linefile.go`) -- **just under** the 300 limit, still
+**no** entry in `go.mod`. `go vet` and `go test ./...` ran green (25 tests,
+up from 19). Python test suite: 60 tests (up from 53), coverage unchanged at
+**94%** (the 6% gap is exclusively in the `NotImplementedError` stubs
+already uncovered before this task, not in new code).
 
-`docs/spezifikation.md` war veraltet (1001 von inzwischen 1235 Zeilen der lokalen
-Quelle) und ist jetzt wieder eine **wortgleiche** Kopie. Neu darin: Abschnitt 22
-(„Nachträge aus dem Bau des Gerüsts" — vier Lesarten, die das Gerüst wählen
-musste, siehe deren jeweilige Fundstellen unten), Abschnitt 23 (Statusanzeige am
-Gerät) und Abschnitt 24 (eSIM-Profile aus der Ferne), dazu in 19.1 die Regel
-**„mainline oder gar nicht"** für ein drittes Abbild außerhalb der
-Raspberry-Familie und in 19 eine Zeile zu ModemManager/LTE-Firmware in der
-Paketliste. Die Spezifikation zählt jetzt **24 Abschnitte**.
+**No contradiction with the specification found.** All six decisions folded
+cleanly into the recipe, the state file contract, and the inventory models.
 
-**Bekannter toter Verweis in der Spezifikation:** Abschnitt 19.1 verweist auf
-`lokal/recherche/basisstationen-alternativen.md` — ein Pfad, den es nur im lokalen,
-nicht veröffentlichten Dokumentenbestand gibt, nicht in diesem Repository. Die
-Kopie bleibt wortgleich (siehe `CLAUDE.md`, „Maßgeblich ist docs/spezifikation.md"),
-der Verweis wird deshalb hier vermerkt statt im Dokument korrigiert.
+## Specification brought up to date, scaffold for sections 23/24, implementation plan created
 
-**Gerüst für Abschnitt 23 (Statusanzeige, zwei LEDs am 40-poligen Anschluss):**
-`waechter/statusanzeige.go`, neu. `LedVorhanden` ist **echt umgesetzt** (reiner
-`os.Stat`-Aufruf) und dadurch bereits testbar für den zentralen Punkt aus
-23.3: Fehlen die beiden sysfs-Dateien, ist das **kein Fehler**, der Wächter läuft
-unverändert weiter. `LedMusterSetzen` ist Stummel wie die übrigen Funktionen in
-`wache.go` — welches Wächter-Ereignis welches Blinkmuster auslöst, entsteht mit
-`wache.go` selbst (siehe `docs/implementierungsplan.md`, P5.7). Produktionscode
-lag danach bei 273 Zeilen (vorher 226, Grenze 300) -- siehe oben für den
-aktuellen Stand (299 Zeilen, sechs Dateien) nach den sechs Nachträgen.
+`docs/specification.md` was outdated (1001 of what are now 1235 lines of the
+local source) and is now a **verbatim** copy again. New in it: section 22
+("Addenda from building the scaffold" -- four readings the scaffold had to
+choose, see their respective locations below), section 23 (status display on
+the device), and section 24 (remote eSIM profiles), plus in 19.1 the
+**"mainline or not at all"** rule for a third image outside the Raspberry
+family, and in 19 a line about ModemManager/LTE firmware in the package
+list. The specification now has **24 sections**.
 
-**Gerüst für Abschnitt 24 (eSIM):** Vier neue Stummel in `agent/schleife.py`
-(`esim_profile_auflisten`, `esim_profil_laden`, `esim_profil_aktivieren`,
-`esim_profil_loeschen`), dokumentierter Ablauf je Funktion. Alle vier sind **Stufe
-2** und deshalb — wie `zuruecksetzen` und `zugang_oeffnen` — **nicht** in
-`protokoll.befehle.BefehlTyp` aufgenommen. Der sicherheitsrelevante Punkt aus
-Abschnitt 24.4 steht im Docstring von `esim_profil_aktivieren`: Ein Profilwechsel
-kappt die Verbindung, über die der Befehl kam, der Rückfall liegt deshalb beim
-**Wächter**, nicht beim Melder — dieselbe Aufteilung wie beim
-Sollzustandsabgleich, nur mit einem SIM-Profil statt einem Container-Digest.
+**Known dead reference in the specification:** section 19.1 refers to
+`lokal/recherche/basisstationen-alternativen.md` -- a path that only exists
+in the local, unpublished document collection, not in this repository. The
+copy stays verbatim (see `CLAUDE.md`, "docs/specification.md is
+authoritative"), the reference is therefore noted here instead of corrected
+in the document.
 
-**Rückfalluhr entschieden** (siehe „Sechs bisher offene Punkte" oben, Punkt 6):
-`esim_vorheriges_profil=`/`esim_frist=` als zwei weitere Zeilen in der
-bestehenden Zustandsdatei, keine eigene Datei.
+**Scaffold for section 23 (status display, two LEDs on the 40-pin header):**
+`watchdog/leds.go`, new. `LedPresent` is **actually implemented** (a plain
+`os.Stat` call) and is thereby already testable for the central point from
+23.3: if the two sysfs files are missing, that is **not an error**, the
+watchdog keeps running unchanged. `LedSetPattern` is a stub like the other
+functions in `watch.go` -- which watchdog event triggers which blink pattern
+is decided together with `watch.go` itself (see
+`docs/implementation_plan.md`, P5.7). Production code was then at 273 lines
+(up from 226, limit 300) -- see above for the current state (299 lines, six
+files) after the six addenda.
 
-**Neu:** `docs/implementierungsplan.md` — Arbeitspakete in der Reihenfolge aus
-Abschnitt 11, je Paket einen Auftrag mit eigenem Worktree groß, mit
-Abnahmekriterium und Checkbox. Ersetzt die Schritt-für-Schritt-Liste, die vorher
-hier stand.
+**Scaffold for section 24 (eSIM):** four new stubs in `agent/loop.py`
+(`esim_profiles_list`, `esim_profile_load`, `esim_profile_activate`,
+`esim_profile_delete`), a documented flow for each function. All four are
+**stage 2** and are therefore -- like `factory_reset` and `open_access` --
+**not** included in `protocol.commands.CommandType`. The security-relevant
+point from section 24.4 is in the docstring of `esim_profile_activate`: a
+profile switch cuts the connection the command arrived on, so the fallback
+lies with the **watchdog**, not the agent -- the same split as for
+desired-state reconciliation, just with a SIM profile instead of a
+container digest.
 
-## Nur ein Gerüst
+**Fallback clock decided** (see "Six previously open points" above, point
+6): `esim_previous_profile=`/`esim_deadline=` as two further lines in the
+existing state file, no separate file.
 
-Dieses Repository enthält **keine** funktionierende Anwendung. `protokoll/` ist
-vollständig (Pydantic-Modelle für Herzschlag, Befehl/Befehlsergebnis, Sollzustand,
-Anmeldung, Ereignis, Bestand). `fleet/` und `agent/` haben je ein Endpunkt- bzw.
-Schleifengerüst mit `NotImplementedError` an jeder Stelle, an der Umsetzung fehlt.
-`waechter/` ist seit Abschnitt 18.3 ein eigenständiges **Go-Modul** (nicht mehr
-Python) mit derselben Idee, in Go-Idiom: Funktionen geben einen Fehler mit
-Abschnittsverweis zurück, mit einer Ausnahme -- der Dateivertrag mit dem Agenten
-(`waechter/zustand.go`, `waechter/gesundmeldung.go`) ist **echt umgesetzt**, nicht
-nur ein Platzhalter, siehe „Der Wächter" unten -- `waechter/statusanzeige.go`
-(Abschnitt 23) folgt demselben Muster mit einer Ausnahme (`LedVorhanden`, siehe
-oben). `abbild/` (Abschnitt 19) ist ein Rezept-Gerüst ohne echten Bildbau,
-`tools/` prüft dessen Konfiguration. Jede Fundstelle trägt einen Verweis auf den
-Abschnitt in `docs/spezifikation.md` (jetzt 24 Abschnitte).
+**New:** `docs/implementation_plan.md` -- work packages in the order from
+section 11, one task per package sized to its own worktree, with an
+acceptance criterion and a checkbox. Replaces the step-by-step list that
+used to be here.
 
-Was als Nächstes ansteht, steht jetzt ausschließlich in
-`docs/implementierungsplan.md` (Arbeitspakete P1.1 ff., aus Abschnitt 11
-abgeleitet) -- nicht mehr redundant hier aufgeführt, um genau die Art von
-veraltetem Nebeneinander zu vermeiden, die diese Datei laut `CLAUDE.md` klein
-halten soll.
+## Just a scaffold
 
-## Der Wächter ist jetzt in Go, nicht mehr in Python (Abschnitt 18.3, 18.4)
+This repository contains **no** working application. `protocol/` is
+complete (Pydantic models for heartbeat, command/command result, desired
+state, registration, event, inventory). `fleet/` and `agent/` each have an
+endpoint or loop scaffold with `NotImplementedError` at every point where
+implementation is missing. `watchdog/` has been a standalone **Go module**
+since section 18.3 (no longer Python) with the same idea, in Go idiom:
+functions return an error referencing the section, with one exception -- the
+file contract with the agent (`watchdog/state.go`, `watchdog/health.go`) is
+**actually implemented**, not just a placeholder, see "The watchdog" below --
+`watchdog/leds.go` (section 23) follows the same pattern with one exception
+(`LedPresent`, see above). `image/` (section 19) is a recipe scaffold
+without a real image build, `tools/` checks its configuration. Every
+location carries a reference to the section in `docs/specification.md`
+(now 24 sections).
 
-Geändert, nachdem das Gerüst zunächst mit einem Python-`waechter`-Paket gebaut
-worden war -- der Projektinhaber hat vor dessen Fertigstellung entschieden, dass
-der Wächter in Go geschrieben wird, weil er "das Einzige sein muss, was
-funktioniert, wenn alles andere kaputt ist" und ein Python-Interpreter genau
-diese Garantie nicht geben kann (beschädigtes `apt`, zerschossener
-`python3`-Symlink, kaputte `.pyc`). Die **Sprachregel** dazu (Abschnitt 18.4):
-**auf dem Blech Go, im Container Python** -- der Agent bleibt Python, weil er
-seine Laufzeit im eigenen Abbild mitbringt und das gemeinsame Protokollpaket mit
-`fleet/` sonst doppelt gepflegt werden müsste.
+What comes next is now exclusively in `docs/implementation_plan.md` (work
+packages P1.1 ff., derived from section 11) -- no longer listed redundantly
+here, to avoid exactly the kind of stale duplication this file is meant to
+stay free of, per `CLAUDE.md`.
 
-`waechter/` liegt außerhalb der Containerlaufzeit, mit eigener systemd-Einheit
-(`waechter/thermoctl-waechter.service`) und eigener CI-Spur
-(`.github/workflows/go.yml`) -- **die Python-Spur (`ci.yml`) blieb dabei
-unverändert**, wie in Abschnitt 18.3 gefordert.
+## The watchdog is now in Go, no longer in Python (sections 18.3, 18.4)
 
-**Bedingungen, alle eingehalten:**
+Changed after the scaffold had initially been built with a Python `watchdog`
+package -- the project owner decided, before it was finished, that the
+watchdog would be written in Go, because it "has to be the one thing that
+works when everything else is broken", and a Python interpreter cannot give
+exactly that guarantee (a broken `apt`, a shot `python3` symlink, corrupted
+`.pyc` files). The **language rule** that follows from this (section 18.4):
+**Go on the bare metal, Python in the container** -- the agent stays Python,
+because it brings its own runtime in its own image, and the protocol
+package it shares with `fleet/` would otherwise have to be maintained twice.
 
-- `waechter/go.mod` hat **keine** Abhängigkeit.
-- Statisch gebaut (`CGO_ENABLED=0`), geprüft für `linux/arm64` und
-  `linux/amd64` (lokal cross-kompiliert und mit `file` bestätigt).
-- Produktionscode (`main.go`, `zustand.go`, `gesundmeldung.go`, `wache.go`,
-  `statusanzeige.go`, `zeilendatei.go`, ohne Tests) liegt bei **299 Zeilen**
-  -- knapp unter der Grenze von 300 (226 vor Abschnitt 23, 273 danach, siehe
-  „Sechs bisher offene Punkte" oben für den Sprung auf 299).
-- `go vet` und `go test ./...` laufen grün (25 Tests, siehe Testergebnisse
-  unten).
+`watchdog/` sits outside the container runtime, with its own systemd unit
+(`watchdog/thermoctl-watchdog.service`) and its own CI track
+(`.github/workflows/go.yml`) -- **the Python track (`ci.yml`) stayed
+unchanged** in doing so, as required by section 18.3.
 
-**Der sprachübergreifende Vertragstest** (`waechter/pruefe_vertrag.sh`, Abschnitt
-18.3): Python schreibt die Zustandsdatei mit demselben Code, der später auf dem
-Gerät läuft (`agent.schleife.waechter_zustand_melden`), das gebaute
-Go-Binärprogramm liest sie im Prüfmodus (`-pruefmodus`), das Skript vergleicht
-beide Werte. Lokal ausgeführt und bestanden; läuft als eigener Job
-(`vertragstest`) in `.github/workflows/go.yml`.
+**Conditions, all met:**
 
-**Das Dateiformat ist zeilenbasiert, kein JSON** (`gewuenscht=`, `bewaehrt=`,
-`seit=`, wie eine systemd-Umgebungsdatei) -- die Begründung dafür steht doppelt
-im Quelltext (`waechter/zustand.go` und `agent/schleife.py`, bei
-`waechter_zustand_melden`), absichtlich nicht nur an einer Stelle, damit sie
-nicht verloren geht, wenn jemand nur eine der beiden Dateien vor sich hat.
+- `watchdog/go.mod` has **no** dependency.
+- Statically built (`CGO_ENABLED=0`), checked for `linux/arm64` and
+  `linux/amd64` (cross-compiled locally and confirmed with `file`).
+- Production code (`main.go`, `state.go`, `health.go`, `watch.go`,
+  `leds.go`, `linefile.go`, without tests) is at **299 lines** under the old
+  counting method -- just under the 300 limit (226 before section 23, 273
+  after, see "Six previously open points" above for the jump to 299; see the
+  top of this document for the current numbers under the new,
+  statements-only counting method).
+- `go vet` and `go test ./...` run green (25 tests, see the test results
+  below).
 
-Was in `waechter/wache.go` noch fehlt (alles gibt einen Fehler mit
-Abschnittsverweis zurück): Agent-Ende erkennen, Container mit dem gewünschten
-Digest starten, auf die Gesundmeldung warten (10-Minuten-Frist), bei Ausbleiben
-auf `bewaehrt` zurücksetzen.
+**The cross-language contract test** (`watchdog/check_contract.sh`, section
+18.3): Python writes the state file with the same code that later runs on
+the device (`agent.loop.report_watchdog_state`), the built Go binary reads
+it in check mode (`-check-mode`), the script compares both values. Run
+locally and passed; runs as its own job (`contract-test`) in
+`.github/workflows/go.yml`.
 
-## Bestand: Liegenschaft, Wohnung, Gerät, Zuordnung (Abschnitt 20)
+**The file format is line-based, not JSON** (`desired=`, `proven=`,
+`since=`, like a systemd environment file) -- the reasoning for this is
+stated twice in the source (`watchdog/state.go` and `agent/loop.py`, at
+`report_watchdog_state`), deliberately not only in one place, so it is not
+lost if someone only has one of the two files in front of them.
 
-`protokoll/bestand.py` modelliert alle vier Wesenheiten, mit den drei Punkten,
-auf die der Projektinhaber ausdrücklich bestand: die Zuordnung ist ein eigener
-Eintrag (`von`/`bis`/`grund`), nicht ein Feld an `Geraet`; der Gerätezustand ist
-eine abschließende Aufzählung (`GeraetLebenszyklus`, sieben Werte) statt freien
-Texts; `Wohnung` trägt keinen Mieternamen, mit Kommentar an der Stelle, warum
-nicht. `Wohnung.pilotbetrieb: bool` (Vorgabe `False`) ist ebenfalls dort, für
-Abschnitt 21.4.
+What is still missing in `watchdog/watch.go` (everything returns an error
+referencing the section): detecting the agent's end, starting a container
+with the desired digest, waiting for the health report (10-minute deadline),
+falling back to `proven` if it fails to arrive.
 
-`fleet/app.py` hat dazu sechs Stummel-Endpunkte (Bestand lesen, Gerät erfassen,
-vorbereiten, Meldung bestätigen und zuordnen, Gerät ersetzen, Zustand ändern) --
-jeder nimmt sein Modell strukturell an und meldet sonst `NotImplementedError`.
-Die drei Regeln aus Abschnitt 20.3 (höchstens ein aktives Gerät je Wohnung, ein
-Gerät gehört zu höchstens einer Wohnung, keine Freigabe ohne bestätigte
-Prüfziffer) sind **nirgends erzwungen** -- das ist Anwendungslogik, die bei der
-echten Umsetzung in jeden betroffenen Endpunkt muss, nicht nur in einen.
+## Inventory: property, apartment, device, assignment (section 20)
 
-**Zustandsnamen entschieden** (siehe „Sechs bisher offene Punkte" oben, Punkt
-3): `WohnungZustand` und `GeraetLebenszyklus` tragen jetzt englische Werte,
-mit Tabelle in Abschnitt 20.1 -- wie bei `Stoerungsart` (Abschnitt 5).
+`protocol/inventory.py` models all four entities, with the three points the
+project owner explicitly insisted on: the assignment is its own entry
+(`from_`/`until`/`reason`), not a field on `Device`; the device state is a
+closed enumeration (`DeviceLifecycle`, seven values) instead of free text;
+`Apartment` carries no tenant name, with a comment at that point explaining
+why not. `Apartment.pilot_mode: bool` (default `False`) is also there, for
+section 21.4.
 
-## Aus der Ferne zurücksetzen, neu bespielen, hineinsehen (Abschnitt 21)
+`fleet/app.py` has six stub endpoints for this (read inventory, register
+device, prepare, confirm registration and assign, replace device, change
+state) -- each accepts its model structurally and otherwise reports
+`NotImplementedError`. The three rules from section 20.3 (at most one
+active device per apartment, a device belongs to at most one apartment, no
+release without a confirmed verification code) are **enforced nowhere** --
+that is application logic that must go into every affected endpoint at the
+real implementation, not just one.
 
-Drei Befehle neu beschrieben, zwei davon als Stummel in `agent/schleife.py`
-angelegt:
+**State names decided** (see "Six previously open points" above, point 3):
+`ApartmentState` and `DeviceLifecycle` now carry English values, with a
+table in section 20.1 -- as with `FaultKind` (section 5).
 
-- **`zurueck_setzen`** (Befehl `zuruecksetzen`, Stufe 2, Abschnitt 21.2): Stummel
-  mit vollständig dokumentiertem Ablauf, inklusive der sicherheitsrelevanten
-  Reihenfolge -- **erst die letzte verschlüsselte Sicherung hochladen, dann
-  löschen**, auch beim Mieterwechsel, weil die Aufbewahrungsfrist (Abschnitt 12)
-  über das Löschen entscheidet, nicht der Knopfdruck. `zuruecksetzen` ist
-  **nicht** Teil von `BefehlTyp` (Stufe 2, wie die anderen dort ausgeschlossenen
-  Befehle).
-- **`diagnose_paket_erstellen`** (Befehl `diagnose_paket`, **Stufe 1**, Abschnitt
-  21.5): Stummel, dazu **ist `diagnose_paket` jetzt Teil von `BefehlTyp`** --
-  einziger Neuzugang aus Abschnitt 21 in der abschließenden Liste.
-- **`zugang_oeffnen`** (Befehl `zugang_oeffnen`, Stufe 2, Erprobungsphase,
-  Abschnitt 21.4): **Die einzige Funktion in diesem Modul, die eine Stufe-2-Sache
-  betrifft und trotzdem teilweise echt umgesetzt ist.** Die `pilotbetrieb`-Prüfung
-  ("lehnt der Agent den Befehl ab -- die Prüfung liegt lokal, nicht in der
-  Oberfläche") ist scharf: ohne `pilotbetrieb=True` wirft die Funktion
-  `PermissionError`, nicht `NotImplementedError`. Der Rest (SSH-Zertifikat,
-  Rückkanal, 60-Minuten-Frist) bleibt Platzhalter. `zugang_oeffnen` ist ebenfalls
-  **nicht** Teil von `BefehlTyp`.
+## Remote factory reset, re-provisioning, and diagnostics (section 21)
 
-**A/B-Systempartitionen (Abschnitt 21.3) werden nicht gebaut.** Der Projektinhaber
-hat das ausdrücklich zurückgestellt: Abschnitt 21.2 (Zurücksetzen aus der Ferne)
-deckt fast alles ab, was im Alltag vorkommt; A/B lohnt sich erst, wenn eine
-Heizperiode Betrieb zeigt, dass Vor-Ort-Termine tatsächlich wegen des
-Betriebssystems anfallen -- nicht wegen defekter Hardware, wo ohnehin jemand
-hinmuss. **Die Entscheidung ist umkehrbar, solange das Abbild-Rezept (`abbild/`)
-in eigener Hand bleibt** -- kein Schritt in diesem Gerüst verbaut den Weg zu RAUC,
-Mender oder swupdate, falls sich das später doch lohnt.
+Three commands newly described, two of them laid out as stubs in
+`agent/loop.py`:
 
-## Weitere offene Punkte aus dem Zuschnitt des Gerüsts
+- **`factory_reset`** (command `factory_reset`, stage 2, section 21.2):
+  stub with a fully documented flow, including the security-relevant order
+  -- **upload the last encrypted backup first, delete only after**, even on
+  a tenant change, because the retention period (section 12) decides the
+  deletion, not the button press. `factory_reset` is **not** part of
+  `CommandType` (stage 2, like the other commands excluded there).
+- **`create_diagnostic_bundle`** (command `diagnostic_bundle`, **stage 1**,
+  section 21.5): stub, and **`diagnostic_bundle` is now part of
+  `CommandType`** -- the only section-21 newcomer in the closed list.
+- **`open_access`** (command `open_access`, stage 2, pilot phase, section
+  21.4): **the only function in this module that touches a stage-2 matter
+  and is nonetheless partly actually implemented.** The `pilot_mode` check
+  ("the agent rejects the command -- the check is local, not in the UI") is
+  real: without `pilot_mode=True` the function raises `PermissionError`,
+  not `NotImplementedError`. The rest (SSH certificate, back-channel,
+  60-minute deadline) stays a placeholder. `open_access` is likewise **not**
+  part of `CommandType`.
 
-- **Token-Format nicht als Modell.** `melder_<wohnung>_<zufall>` (Abschnitt 4) ist
-  bewusst kein Pydantic-Modell mit Beispielwert — ein Repository-taugliches Beispiel
-  sähe wie ein echtes Geheimnis aus. Wer das Format prüfen will, tut das über eine
-  eigene, secret-freie Validierungsfunktion, nicht über ein Modell mit Default.
-- **`.venv/bin/pytest` schlägt unter macOS bei dieser editierbaren Installation
-  fehl** (`ModuleNotFoundError` für die eigenen Pakete), obwohl `import protokoll`
-  im selben Interpreter funktioniert — dieselbe Ursache wie bei thermoctls
-  Konsolenbefehl (siehe dessen README): die versteckte Markerdatei unter
-  `.venv/bin` wird beim Start übersprungen. `python -m pytest` funktioniert
-  zuverlässig und ist deshalb überall hier so dokumentiert.
-- **`abbild/`-Paketliste und udev-Regel sind Platzhalter.** Insbesondere die
-  USB-IDs in `abbild/gemeinsam/udev/99-zigbee-stick.rules` müssen vor dem
-  echten Bau durch die IDs des tatsächlich beschafften Funksticks ersetzt
-  werden (siehe Kommentar dort).
+**A/B system partitions (section 21.3) are not being built.** The project
+owner explicitly deferred this: section 21.2 (remote factory reset) covers
+almost everything that comes up day to day; A/B only pays off once a
+heating season of operation shows that on-site visits actually happen
+because of the operating system -- not because of defective hardware, where
+someone has to go on site anyway. **The decision is reversible as long as
+the image recipe (`image/`) stays in our own hands** -- no step in this
+scaffold builds in a wall against RAUC, Mender, or swupdate, should that pay
+off later after all.
+
+## Further open points from scoping the scaffold
+
+- **Token format not as a model.** `agent_<apartment>_<random>` (section 4)
+  is deliberately not a Pydantic model with an example value -- a
+  repository-safe example would look like a real secret. Whoever wants to
+  check the format does so via a separate, secret-free validation function,
+  not via a model with a default.
+- **`.venv/bin/pytest` fails on macOS with this editable install**
+  (`ModuleNotFoundError` for the project's own packages), even though
+  `import protocol` works in the same interpreter -- the same cause as with
+  thermoctl's console command (see its README): the hidden marker file
+  under `.venv/bin` is skipped at startup. `python -m pytest` works
+  reliably and is therefore documented that way everywhere here.
+- **`image/` package list and udev rule are placeholders.** In particular
+  the USB ids in `image/common/udev/99-zigbee-stick.rules` must be replaced
+  with the ids of the actually procured radio stick before the real build
+  (see the comment there).
 
 ## CI
 
-Zwei unabhängige Spuren, wie in Abschnitt 18.3 gefordert:
+Two independent tracks, as required by section 18.3:
 
-- **`ci.yml`** (Python): ruff, mypy, pytest gegen Python 3.13 und 3.14, ohne
-  Datenbankdienst — das Gerüst legt nichts ab.
-- **`go.yml`** (Go, neu): `go vet` und `go test` für `waechter/`, Bau je eines
-  statischen Binärprogramms für `amd64`/`arm64` mit Prüfsumme, dazu der
-  sprachübergreifende Vertragstest (siehe oben). Läuft nur bei Änderungen an
-  `waechter/`, `agent/schleife.py` oder `protokoll/`.
-- **`abbild.yml`** (neu): liest `abbild/`-Konfiguration ein und validiert die
-  Paketliste (`tools/pruefe_abbild_konfiguration.py`) — **kein** echter
-  pi-gen-/mkosi-/debos-Lauf, der gehört an die Freigabe, nicht in jeden Commit.
-- **`docker.yml`** baut bei `v*`-Tags zwei Abbilder (`thermoctl-fleet`,
-  `thermoctl-agent`) für `linux/amd64` und `linux/arm64` nach ghcr.io, und bei
-  jedem Pull Request zur Bauprobe ohne Veröffentlichung. `waechter/` geht in
-  **keines** der beiden Abbilder ein (kein Docker-Abbild, siehe oben).
+- **`ci.yml`** (Python): ruff, mypy, pytest against Python 3.13 and 3.14,
+  without a database service -- the scaffold stores nothing.
+- **`go.yml`** (Go, new): `go vet` and `go test` for `watchdog/`, building
+  one static binary each for `amd64`/`arm64` with a checksum, plus the
+  cross-language contract test (see above). Runs only on changes to
+  `watchdog/`, `agent/loop.py`, or `protocol/`.
+- **`image.yml`** (new): reads the `image/` configuration and validates the
+  package list (`tools/check_image_config.py`) -- **no** real pi-gen/mkosi/
+  debos run, that belongs at the release, not in every commit.
+- **`docker.yml`** builds two images (`thermoctl-fleet`, `thermoctl-agent`)
+  for `linux/amd64` and `linux/arm64` to ghcr.io on `v*` tags, and on every
+  pull request as a build check without publishing. `watchdog/` goes into
+  **neither** of the two images (no Docker image, see above).

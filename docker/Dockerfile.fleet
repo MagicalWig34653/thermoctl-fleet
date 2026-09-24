@@ -1,9 +1,9 @@
-# Abbild des Cloud-Diensts. Getrennt von Dockerfile.agent, weil beide Seiten
-# unabhängig voneinander aktualisiert werden -- nie mit einem gemeinsamen Tag.
+# Image of the cloud service. Separate from Dockerfile.agent, because both
+# sides are updated independently of each other -- never with a shared tag.
 FROM python:3.13-slim AS build
 WORKDIR /build
 COPY pyproject.toml LICENSE ./
-COPY protokoll ./protokoll
+COPY protocol ./protocol
 COPY fleet ./fleet
 RUN pip install --no-cache-dir --prefix=/install ".[fleet]"
 
