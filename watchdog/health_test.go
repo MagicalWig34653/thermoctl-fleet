@@ -7,64 +7,64 @@ import (
 	"testing"
 )
 
-func TestLiesGesundmeldungVollstaendig(t *testing.T) {
-	pfad := filepath.Join(t.TempDir(), "gesundmeldung")
-	inhalt := "zeitpunkt=1790000123\ndigest=sha256:9f2c\nfassung=0.4.0\n"
-	if err := os.WriteFile(pfad, []byte(inhalt), 0o600); err != nil {
-		t.Fatalf("Vorbereitung fehlgeschlagen: %v", err)
+func TestReadHealthComplete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "health")
+	content := "timestamp=1790000123\ndigest=sha256:9f2c\nversion=0.4.0\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("setup failed: %v", err)
 	}
 
-	g, err := LiesGesundmeldung(pfad)
+	h, err := ReadHealth(path)
 	if err != nil {
-		t.Fatalf("unerwarteter Fehler: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if g.Zeitpunkt != 1790000123 {
-		t.Errorf("Zeitpunkt = %d, erwartet 1790000123", g.Zeitpunkt)
+	if h.Timestamp != 1790000123 {
+		t.Errorf("Timestamp = %d, expected 1790000123", h.Timestamp)
 	}
-	if g.Digest != "sha256:9f2c" {
-		t.Errorf("Digest = %q, erwartet sha256:9f2c", g.Digest)
+	if h.Digest != "sha256:9f2c" {
+		t.Errorf("Digest = %q, expected sha256:9f2c", h.Digest)
 	}
-	if g.Fassung != "0.4.0" {
-		t.Errorf("Fassung = %q, erwartet 0.4.0", g.Fassung)
+	if h.Version != "0.4.0" {
+		t.Errorf("Version = %q, expected 0.4.0", h.Version)
 	}
 }
 
-func TestParseGesundmeldungLehntUngueltigenZeitstempelAb(t *testing.T) {
-	_, err := ParseGesundmeldung(strings.NewReader("zeitpunkt=kein-zeitstempel\n"))
+func TestParseHealthRejectsInvalidTimestamp(t *testing.T) {
+	_, err := ParseHealth(strings.NewReader("timestamp=not-a-timestamp\n"))
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestParseGesundmeldungLehntFehlendenZeitpunktAb(t *testing.T) {
-	_, err := ParseGesundmeldung(strings.NewReader("digest=sha256:9f2c\nfassung=0.4.0\n"))
+func TestParseHealthRejectsMissingTimestamp(t *testing.T) {
+	_, err := ParseHealth(strings.NewReader("digest=sha256:9f2c\nversion=0.4.0\n"))
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestParseGesundmeldungLehntZeileOhneGleichheitszeichenAb(t *testing.T) {
-	_, err := ParseGesundmeldung(strings.NewReader("zeitpunkt=1790000123\netwas ohne Gleichheitszeichen\n"))
+func TestParseHealthRejectsLineWithoutEqualsSign(t *testing.T) {
+	_, err := ParseHealth(strings.NewReader("timestamp=1790000123\nsomething without an equals sign\n"))
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestParseGesundmeldungIgnoriertUnbekannteSchluessel(t *testing.T) {
-	// Wie bei der Zustandsdatei: ein künftiges Feld darf das Lesen der
-	// bekannten Felder nicht verhindern.
-	g, err := ParseGesundmeldung(strings.NewReader("zeitpunkt=1790000123\nkuenftiges_feld=irgendwas\n"))
+func TestParseHealthIgnoresUnknownKeys(t *testing.T) {
+	// As with the state file: a future field must not prevent reading the
+	// known fields.
+	h, err := ParseHealth(strings.NewReader("timestamp=1790000123\nfuture_field=something\n"))
 	if err != nil {
-		t.Fatalf("unerwarteter Fehler: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if g.Zeitpunkt != 1790000123 {
-		t.Errorf("Zeitpunkt = %d, erwartet 1790000123", g.Zeitpunkt)
+	if h.Timestamp != 1790000123 {
+		t.Errorf("Timestamp = %d, expected 1790000123", h.Timestamp)
 	}
 }
 
-func TestLiesGesundmeldungFehltDatei(t *testing.T) {
-	_, err := LiesGesundmeldung(filepath.Join(t.TempDir(), "fehlt"))
+func TestReadHealthMissingFile(t *testing.T) {
+	_, err := ReadHealth(filepath.Join(t.TempDir(), "missing"))
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }

@@ -1,8 +1,8 @@
-// Die Gesundmeldung (Abschnitt 17, Schritt 5). Zeilenbasiert wie die
-// Zustandsdatei, nicht ein einzelner Zeitstempel (Abschnitt 22.3,
-// nachträglich festgelegt): `zeitpunkt=`, `digest=`, `fassung=`. Der Gewinn
-// ist `digest`, der **laufende** Digest des schreibenden Container-Standes
-// -- der Wächter sieht damit, dass das Richtige lebt, nicht nur irgendetwas.
+// The health report (section 17, step 5). Line-based like the state file,
+// not a single timestamp (section 22.3, decided afterward): `timestamp=`,
+// `digest=`, `version=`. The gain is `digest`, the **currently running**
+// digest of the writing container revision -- this way the watchdog sees
+// that the right thing is alive, not just something.
 package main
 
 import (
@@ -12,36 +12,36 @@ import (
 	"strconv"
 )
 
-// Gesundmeldung ist der geparste Inhalt der Gesundmeldungsdatei.
-type Gesundmeldung struct {
-	Zeitpunkt int64
+// Health is the parsed content of the health report file.
+type Health struct {
+	Timestamp int64
 	Digest    string
-	Fassung   string
+	Version   string
 }
 
-// ParseGesundmeldung liest eine Gesundmeldungsdatei aus r. Unbekannte
-// Schlüssel werden ignoriert, nicht abgelehnt (wie bei der Zustandsdatei).
-func ParseGesundmeldung(r io.Reader) (Gesundmeldung, error) {
-	werte, err := liesSchluesselWertZeilen(r, "gesundmeldung")
+// ParseHealth reads a health report file from r. Unknown keys are ignored,
+// not rejected (as with the state file).
+func ParseHealth(r io.Reader) (Health, error) {
+	values, err := readKeyValueLines(r, "health report")
 	if err != nil {
-		return Gesundmeldung{}, err
+		return Health{}, err
 	}
-	if werte["zeitpunkt"] == "" {
-		return Gesundmeldung{}, fmt.Errorf("gesundmeldung: 'zeitpunkt' fehlt oder ist leer")
+	if values["timestamp"] == "" {
+		return Health{}, fmt.Errorf("health report: 'timestamp' is missing or empty")
 	}
-	zeitpunkt, err := strconv.ParseInt(werte["zeitpunkt"], 10, 64)
+	timestamp, err := strconv.ParseInt(values["timestamp"], 10, 64)
 	if err != nil {
-		return Gesundmeldung{}, fmt.Errorf("gesundmeldung: 'zeitpunkt' ist kein Unix-Zeitstempel: %w", err)
+		return Health{}, fmt.Errorf("health report: 'timestamp' is not a Unix timestamp: %w", err)
 	}
-	return Gesundmeldung{Zeitpunkt: zeitpunkt, Digest: werte["digest"], Fassung: werte["fassung"]}, nil
+	return Health{Timestamp: timestamp, Digest: values["digest"], Version: values["version"]}, nil
 }
 
-// LiesGesundmeldung öffnet pfad und parst ihn.
-func LiesGesundmeldung(pfad string) (Gesundmeldung, error) {
-	datei, err := os.Open(pfad)
+// ReadHealth opens path and parses it.
+func ReadHealth(path string) (Health, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return Gesundmeldung{}, err
+		return Health{}, err
 	}
-	defer datei.Close()
-	return ParseGesundmeldung(datei)
+	defer file.Close()
+	return ParseHealth(file)
 }

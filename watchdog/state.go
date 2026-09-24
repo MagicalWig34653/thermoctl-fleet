@@ -1,10 +1,10 @@
-// Der Vertrag zwischen Agent und Wächter: die Zustandsdatei (Abschnitt 17,
-// Schritt 2; Abschnitt 18.3). Zeilenbasiert, KEIN JSON -- Absicht, nicht
-// Vereinfachung: so ist der Vertrag in jeder Sprache mit Bordmitteln lesbar.
-// Ein frisch ausgeliefertes Gerät startet nie mit leerem Bewaehrt: Das
-// Abbild-Rezept trägt beim Bau den Digest der mitgelieferten Fassung als
-// Gewuenscht und Bewaehrt ein (Abschnitt 22.5) -- ein leeres Bewaehrt ist
-// damit ein Zeichen für eine fehlerhafte Auslieferung, kein Normalzustand.
+// The contract between agent and watchdog: the state file (section 17,
+// step 2; section 18.3). Line-based, NOT JSON -- intentional, not a
+// simplification: this way the contract is readable in every language with
+// built-in tools. A freshly shipped device never starts with an empty
+// Proven: the image recipe enters the digest of the shipped version as both
+// Desired and Proven at build time (section 22.5) -- an empty Proven is
+// thus a sign of a faulty delivery, not the normal state.
 package main
 
 import (
@@ -13,56 +13,56 @@ import (
 	"os"
 )
 
-// Zustand ist der geparste Inhalt der Zustandsdatei. Gewuenscht: vom Agenten
-// bereits geprüfter Digest (Abschnitt 13). Bewaehrt: Digest nach einer Stunde
-// störungsfrei, beim Bau vorbelegt (Abschnitt 22.5). Seit: seit wann
-// Gewuenscht gilt (Abschnitt 22.2, nachträglich festgelegt -- die einzige
-// Lesart, mit der dieses Feld die Fristen aus Abschnitt 17 berechnen kann).
-// EsimVorherigesProfil/EsimFrist: Rückfalluhr für eSIM-Profilwechsel
-// (Abschnitt 24.4, nachträglich als zwei weitere Zeilen hier, keine eigene
-// Datei). Leer/0, solange kein Wechsel aussteht.
-type Zustand struct {
-	Gewuenscht           string
-	Bewaehrt             string
-	Seit                 int64
-	EsimVorherigesProfil string
-	EsimFrist            int64
+// State is the parsed content of the state file. Desired: the digest already
+// checked by the agent (section 13). Proven: digest after one fault-free
+// hour, pre-set at build time (section 22.5). Since: since when Desired has
+// applied (section 22.2, decided afterward -- the only reading with which
+// this field can compute the deadlines from section 17). EsimPreviousProfile
+// /EsimDeadline: fallback clock for an eSIM profile switch (section 24.4,
+// decided afterward as two further lines here, no separate file). Empty/0
+// as long as no switch is pending.
+type State struct {
+	Desired             string
+	Proven              string
+	Since               int64
+	EsimPreviousProfile string
+	EsimDeadline        int64
 }
 
-// ParseZustand liest eine Zustandsdatei aus r. Unbekannte Schlüssel werden
-// ignoriert, nicht abgelehnt -- eine künftige, dem Wächter unbekannte Zeile
-// darf ihn nicht am Lesen der bekannten hindern (Abschnitt 18.2, sinngemäß).
-func ParseZustand(r io.Reader) (Zustand, error) {
-	werte, err := liesSchluesselWertZeilen(r, "zustandsdatei")
+// ParseState reads a state file from r. Unknown keys are ignored, not
+// rejected -- a future line unknown to the watchdog must not keep it from
+// reading the known ones (section 18.2, applied analogously).
+func ParseState(r io.Reader) (State, error) {
+	values, err := readKeyValueLines(r, "state file")
 	if err != nil {
-		return Zustand{}, err
+		return State{}, err
 	}
-	if werte["gewuenscht"] == "" {
-		return Zustand{}, fmt.Errorf("zustandsdatei: 'gewuenscht' fehlt oder ist leer")
+	if values["desired"] == "" {
+		return State{}, fmt.Errorf("state file: 'desired' is missing or empty")
 	}
-	seit, err := parseOptionalerZeitstempel(werte["seit"], "seit", "zustandsdatei")
+	since, err := parseOptionalTimestamp(values["since"], "since", "state file")
 	if err != nil {
-		return Zustand{}, err
+		return State{}, err
 	}
-	esimFrist, err := parseOptionalerZeitstempel(werte["esim_frist"], "esim_frist", "zustandsdatei")
+	esimDeadline, err := parseOptionalTimestamp(values["esim_deadline"], "esim_deadline", "state file")
 	if err != nil {
-		return Zustand{}, err
+		return State{}, err
 	}
-	return Zustand{
-		Gewuenscht:           werte["gewuenscht"],
-		Bewaehrt:             werte["bewaehrt"],
-		Seit:                 seit,
-		EsimVorherigesProfil: werte["esim_vorheriges_profil"],
-		EsimFrist:            esimFrist,
+	return State{
+		Desired:             values["desired"],
+		Proven:              values["proven"],
+		Since:               since,
+		EsimPreviousProfile: values["esim_previous_profile"],
+		EsimDeadline:        esimDeadline,
 	}, nil
 }
 
-// LadeZustand öffnet pfad und parst ihn. Kein Netz, keine Registry.
-func LadeZustand(pfad string) (Zustand, error) {
-	datei, err := os.Open(pfad)
+// LoadState opens path and parses it. No network, no registry.
+func LoadState(path string) (State, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return Zustand{}, err
+		return State{}, err
 	}
-	defer datei.Close()
-	return ParseZustand(datei)
+	defer file.Close()
+	return ParseState(file)
 }

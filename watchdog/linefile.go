@@ -1,5 +1,5 @@
-// Gemeinsames Zeilenformat für Zustandsdatei und Gesundmeldung (Abschnitt 17,
-// 18.3, 22.3): "Schluessel=Wert" je Zeile, "#" leitet einen Kommentar ein.
+// Shared line format for the state file and the health report (section 17,
+// 18.3, 22.3): "key=value" per line, "#" starts a comment.
 package main
 
 import (
@@ -10,37 +10,37 @@ import (
 	"strings"
 )
 
-// liesSchluesselWertZeilen liest r zeilenweise "Schluessel=Wert" in eine Map.
-// Leere Zeilen und Kommentare werden übersprungen; eine Zeile ohne "=" ist
-// ein Fehler. datei dient nur der Fehlermeldung.
-func liesSchluesselWertZeilen(r io.Reader, datei string) (map[string]string, error) {
-	werte := map[string]string{}
+// readKeyValueLines reads r line by line as "key=value" into a map. Empty
+// lines and comments are skipped; a line without "=" is an error. file is
+// only used for the error message.
+func readKeyValueLines(r io.Reader, file string) (map[string]string, error) {
+	values := map[string]string{}
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		zeile := strings.TrimSpace(scanner.Text())
-		if zeile == "" || strings.HasPrefix(zeile, "#") {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		schluessel, wert, gefunden := strings.Cut(zeile, "=")
-		if !gefunden {
-			return nil, fmt.Errorf("%s: Zeile ohne '=': %q", datei, zeile)
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			return nil, fmt.Errorf("%s: line without '=': %q", file, line)
 		}
-		werte[strings.TrimSpace(schluessel)] = strings.TrimSpace(wert)
+		values[strings.TrimSpace(key)] = strings.TrimSpace(value)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	return werte, nil
+	return values, nil
 }
 
-// parseOptionalerZeitstempel liest ein Unix-Sekunden-Feld, leer -> 0.
-func parseOptionalerZeitstempel(wert, feldname, datei string) (int64, error) {
-	if wert == "" {
+// parseOptionalTimestamp reads a Unix-seconds field, empty -> 0.
+func parseOptionalTimestamp(value, fieldName, file string) (int64, error) {
+	if value == "" {
 		return 0, nil
 	}
-	zeitstempel, err := strconv.ParseInt(wert, 10, 64)
+	timestamp, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("%s: %q ist kein Unix-Zeitstempel: %w", datei, feldname, err)
+		return 0, fmt.Errorf("%s: %q is not a Unix timestamp: %w", file, fieldName, err)
 	}
-	return zeitstempel, nil
+	return timestamp, nil
 }

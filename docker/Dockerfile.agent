@@ -1,16 +1,16 @@
-# Abbild des Melders (Basisstation einer Wohnung). Getrennt von Dockerfile.fleet,
-# weil eine Wohnung eine ältere Fassung fahren kann, während die Cloud längst
-# aktualisiert ist -- siehe Abschnitt 13 und 17 der Spezifikation
-# (Sollzustandsabgleich, Rollback bei ausbleibendem Herzschlag).
+# Image of the agent (base station of an apartment). Separate from
+# Dockerfile.fleet, because an apartment can run an older version while the
+# cloud has long since been updated -- see sections 13 and 17 of the
+# specification (desired-state reconciliation, rollback on missing heartbeat).
 FROM python:3.13-slim AS build
 WORKDIR /build
 COPY pyproject.toml LICENSE ./
-COPY protokoll ./protokoll
+COPY protocol ./protocol
 COPY agent ./agent
-# waechter/ ist seit Abschnitt 18.3 ein eigenständiges Go-Modul, kein
-# Python-Paket -- nichts davon wird in dieses Abbild kopiert. Den geteilten
-# Vertrag (Zustandsdatei) schreibt agent/schleife.py selbst, ohne einen
-# Import aus waechter/.
+# watchdog/ has been a standalone Go module since section 18.3, not a
+# Python package -- none of it is copied into this image. agent/loop.py
+# writes the shared contract (state file) itself, without an import from
+# watchdog/.
 RUN pip install --no-cache-dir --prefix=/install ".[agent]"
 
 FROM python:3.13-slim

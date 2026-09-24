@@ -7,10 +7,10 @@ permissions:
   contents: read
 
 jobs:
-  # Kein Datenbankdienst: Das Gerüst legt nichts ab (siehe docs/STATUS.md). Sobald
-  # eine Ablage entsteht, hier ergänzen -- nach demselben Muster wie thermoctls
-  # ci.yml (Matrix sqlite/mariadb, THERMOCTL_TEST_DATABASE_URL-Äquivalent).
-  pruefen:
+  # No database service: the scaffold stores nothing (see docs/STATUS.md). Once
+  # storage exists, add it here -- following the same pattern as thermoctl's
+  # ci.yml (sqlite/mariadb matrix, THERMOCTL_TEST_DATABASE_URL equivalent).
+  check:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -24,12 +24,12 @@ jobs:
           cache: pip
       - run: pip install -e ".[dev,fleet,agent]"
       - run: ruff check .
-      # waechter/ ist seit Abschnitt 18.3 ein Go-Modul, nicht Teil dieser
-      # Python-Prüfung -- eigene CI-Spur in go.yml (Abschnitt 18.3,
-      # "Die bestehende Python-Spur bleibt, wie sie ist").
-      - run: mypy protokoll fleet agent tools
-      # Enthält tests/test_waechter_vertrag.py (die Python-Seite des Vertrags,
-      # Abschnitt 18.3) und tests/test_abbild_konfiguration.py (Abschnitt 19).
+      # watchdog/ has been a Go module since section 18.3, not part of this
+      # Python check -- its own CI track in go.yml (section 18.3, "the
+      # existing Python track stays as it is").
+      - run: mypy protocol fleet agent tools
+      # Includes tests/test_watchdog_contract.py (the Python side of the
+      # contract, section 18.3) and tests/test_image_config.py (section 19).
       - run: pytest -v
 
   docker-build:

@@ -6,39 +6,39 @@ import (
 	"testing"
 )
 
-func TestLedVorhandenFehlend(t *testing.T) {
-	pfad := filepath.Join(t.TempDir(), "brightness")
-	if LedVorhanden(pfad) {
-		t.Fatal("LedVorhanden meldet true fuer eine nicht existierende Datei")
+func TestLedPresentMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "brightness")
+	if LedPresent(path) {
+		t.Fatal("LedPresent reports true for a non-existent file")
 	}
 }
 
-func TestLedVorhandenVorhanden(t *testing.T) {
-	pfad := filepath.Join(t.TempDir(), "brightness")
-	if err := os.WriteFile(pfad, []byte("0"), 0o644); err != nil {
-		t.Fatalf("Testdatei anlegen fehlgeschlagen: %v", err)
+func TestLedPresentPresent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "brightness")
+	if err := os.WriteFile(path, []byte("0"), 0o644); err != nil {
+		t.Fatalf("creating test file failed: %v", err)
 	}
-	if !LedVorhanden(pfad) {
-		t.Fatal("LedVorhanden meldet false fuer eine vorhandene Datei")
-	}
-}
-
-// TestLedMusterSetzenOhneDateiKeinFehler prueft den zentralen Punkt aus
-// Abschnitt 23.3: eine fehlende LED-Datei ist kein Fehler, der Waechter
-// laeuft unveraendert weiter.
-func TestLedMusterSetzenOhneDateiKeinFehler(t *testing.T) {
-	pfad := filepath.Join(t.TempDir(), "brightness")
-	if err := LedMusterSetzen(pfad, "langsames-blinken"); err != nil {
-		t.Fatalf("erwartete keinen Fehler bei fehlender LED-Datei, bekam: %v", err)
+	if !LedPresent(path) {
+		t.Fatal("LedPresent reports false for an existing file")
 	}
 }
 
-func TestLedMusterSetzenNichtUmgesetzt(t *testing.T) {
-	pfad := filepath.Join(t.TempDir(), "brightness")
-	if err := os.WriteFile(pfad, []byte("0"), 0o644); err != nil {
-		t.Fatalf("Testdatei anlegen fehlgeschlagen: %v", err)
+// TestLedSetPatternWithoutFileNoError checks the central point from
+// section 23.3: a missing LED file is not an error, the watchdog keeps
+// running unchanged.
+func TestLedSetPatternWithoutFileNoError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "brightness")
+	if err := LedSetPattern(path, "slow-blink"); err != nil {
+		t.Fatalf("expected no error for a missing LED file, got: %v", err)
 	}
-	if err := LedMusterSetzen(pfad, "dauerhaft-an"); err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+}
+
+func TestLedSetPatternNotImplemented(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "brightness")
+	if err := os.WriteFile(path, []byte("0"), 0o644); err != nil {
+		t.Fatalf("creating test file failed: %v", err)
+	}
+	if err := LedSetPattern(path, "steady-on"); err == nil {
+		t.Fatal("expected error did not occur")
 	}
 }

@@ -1,0 +1,55 @@
+name: Image
+on:
+  push:
+    paths:
+      - "image/**"
+      - "watchdog/thermoctl-watchdog.service"
+      - "protocol/registration.py"
+      - "tools/check_image_config.py"
+      - ".github/workflows/image.yml"
+  pull_request:
+    paths:
+      - "image/**"
+      - "watchdog/thermoctl-watchdog.service"
+      - "protocol/registration.py"
+      - "tools/check_image_config.py"
+      - ".github/workflows/image.yml"
+
+# For now ONLY a buildability check: read the configuration, validate the
+# package list (image/README.md, "State of this scaffold"). No real pi-gen
+# or mkosi/debos run -- that takes 30-60 minutes and, per the task, does not
+# belong in every commit but in the release (see comment below).
+jobs:
+  check-configuration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      # Only the base dependency (pydantic) needed -- the check needs
+      # neither the fleet nor the agent extras.
+      - run: pip install -e .
+      - run: python -m tools.check_image_config
+
+# -----------------------------------------------------------------------------
+# Planned for later (section 19.4), not yet implemented:
+#
+#   build:
+#     if: startsWith(github.ref, 'refs/tags/v')
+#     runs-on: ubuntu-latest
+#     strategy:
+#       matrix:
+#         target: [pi, x86]
+#     steps:
+#       - uses: actions/checkout@v4
+#       - Target "pi": run pi-gen with image/pi/ + image/common/
+#       - Target "x86": run mkosi/debos with image/x86/ + image/common/
+#       - Compress the result (.img.xz), compute a checksum
+#       - Attach both files plus checksums to this tag's GitHub release
+#
+# The image version should carry the same number as the watchdog version
+# shipped inside it (section 19.4) -- this coupling does not exist yet,
+# because `watchdog/` itself does not yet have its own version number.
+# -----------------------------------------------------------------------------

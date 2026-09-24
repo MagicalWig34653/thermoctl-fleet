@@ -1,10 +1,10 @@
-# Beispiel-Zusammenspiel beider Abbilder. Kein einziger Zugangswert steht in dieser
-# Datei -- Anmeldedaten kommen aus .env, die nicht ins Repository gehört (siehe
-# docs/spezifikation.md Abschnitt 4).
+# Example interplay of both images. Not a single credential is in this
+# file -- credentials come from .env, which does not belong in the
+# repository (see docs/specification.md section 4).
 #
-# Dieses Beispiel zeigt nur die grobe Topologie und ist kein Rollout-Rezept fuer
-# mehrere Wohnungen: Der Melder laeuft in Wirklichkeit auf der Basisstation jeder
-# Wohnung, nicht neben dem Fleet-Dienst.
+# This example shows only the rough topology and is not a rollout recipe
+# for multiple apartments: the agent actually runs on each apartment's base
+# station, not next to the fleet service.
 
 services:
   fleet:
@@ -22,8 +22,8 @@ services:
       timeout: 5s
       start_period: 10s
 
-  # Nur zur Veranschaulichung -- läuft in Wirklichkeit auf der Basisstation der
-  # Wohnung, nicht hier neben dem Fleet-Dienst.
+  # Illustration only -- actually runs on the apartment's base station,
+  # not here next to the fleet service.
   agent:
     build:
       context: ..

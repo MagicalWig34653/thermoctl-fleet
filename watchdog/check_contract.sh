@@ -1,71 +1,71 @@
 #!/usr/bin/env bash
-# Der sprachübergreifende Vertragstest aus Abschnitt 18.3: "Python schreibt
-# die Zustandsdatei, Go liest sie. Zwei Sprachen, die sich kein Modell teilen
-# können, prüfen denselben Vertrag härter als zwei Python-Module, die
-# womöglich gemeinsam falsch liegen."
+# The cross-language contract test from section 18.3: "Python writes the
+# state file, Go reads it. Two languages that cannot share a model check
+# the same contract harder than two Python modules that might be wrong
+# together."
 #
-# Genau das führt dieses Skript aus, nicht als Behauptung, sondern als
-# echter Ablauf: (1) den Wächter bauen, (2) Python die Zustandsdatei mit
-# `agent.schleife.waechter_zustand_melden` schreiben lassen -- derselbe Code,
-# der später auf dem echten Gerät läuft, keine Testattrappe --, (3) den
-# gebauten Wächter im Prüfmodus (`-pruefmodus`) lesen lassen, (4) das
-# Ergebnis mit den ursprünglichen Werten vergleichen.
+# This is exactly what this script runs, not as a claim, but as a real
+# sequence: (1) build the watchdog, (2) have Python write the state file
+# with `agent.loop.report_watchdog_state` -- the same code that later runs
+# on the real device, no test double --, (3) have the built watchdog read
+# it in check mode (`-check-mode`), (4) compare the result against the
+# original values.
 #
-# Läuft in .github/workflows/go.yml, nicht in ci.yml: Die Python-Spur bleibt
-# unverändert (Abschnitt 18.3, Bedingungen), und dieser Test braucht sowohl
-# Go als auch Python -- er gehört zur Go-Spur, weil sie ihn zusätzlich zur
-# reinen Python-Installation braucht, nicht umgekehrt.
+# Runs in .github/workflows/go.yml, not in ci.yml: the Python track stays
+# unchanged (section 18.3, conditions), and this test needs both Go and
+# Python -- it belongs to the Go track, because it needs that track in
+# addition to a plain Python install, not the other way around.
 set -euo pipefail
 
-hier="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-wurzel="$(cd "$hier/.." && pwd)"
-arbeitsverzeichnis="$(mktemp -d)"
-trap 'rm -rf "$arbeitsverzeichnis"' EXIT
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+work_dir="$(mktemp -d)"
+trap 'rm -rf "$work_dir"' EXIT
 
-zustandsdatei="$arbeitsverzeichnis/zustand.env"
-gesundmeldungsdatei="$arbeitsverzeichnis/gesundmeldung.env"
-erwartet_gewuenscht="sha256:$(printf 'a%.0s' {1..64})"
-erwartet_bewaehrt="sha256:$(printf 'b%.0s' {1..64})"
-erwartet_esim_profil="profil-1"
-erwartet_digest="sha256:$(printf 'c%.0s' {1..64})"
-erwartet_fassung="0.4.0"
+state_file="$work_dir/state.env"
+health_file="$work_dir/health.env"
+expected_desired="sha256:$(printf 'a%.0s' {1..64})"
+expected_proven="sha256:$(printf 'b%.0s' {1..64})"
+expected_esim_profile="profile-1"
+expected_digest="sha256:$(printf 'c%.0s' {1..64})"
+expected_version="0.4.0"
 
-echo "1. Wächter bauen ..."
-binaerprogramm="$arbeitsverzeichnis/thermoctl-waechter"
-(cd "$hier" && go build -o "$binaerprogramm" .)
+echo "1. Building the watchdog ..."
+binary="$work_dir/thermoctl-watchdog"
+(cd "$here" && go build -o "$binary" .)
 
-echo "2. Python schreibt Zustands- und Gesundmeldungsdatei (agent.schleife) ..."
-PYTHONPATH="$wurzel" python3 -c "
+echo "2. Python writes the state and health report files (agent.loop) ..."
+PYTHONPATH="$root" python3 -c "
 from pathlib import Path
-from agent.schleife import gesundmeldung_melden, waechter_zustand_melden
+from agent.loop import report_health, report_watchdog_state
 
-waechter_zustand_melden(
-    Path('$zustandsdatei'),
-    gewuenscht='$erwartet_gewuenscht',
-    bewaehrt='$erwartet_bewaehrt',
-    esim_vorheriges_profil='$erwartet_esim_profil',
-    esim_frist=1790000723,
+report_watchdog_state(
+    Path('$state_file'),
+    desired='$expected_desired',
+    proven='$expected_proven',
+    esim_previous_profile='$expected_esim_profile',
+    esim_deadline=1790000723,
 )
-gesundmeldung_melden(
-    Path('$gesundmeldungsdatei'), digest='$erwartet_digest', fassung='$erwartet_fassung'
+report_health(
+    Path('$health_file'), digest='$expected_digest', version='$expected_version'
 )
 "
 
-echo "3. Wächter liest im Prüfmodus ..."
-ausgabe="$("$binaerprogramm" -pruefmodus -datei "$zustandsdatei" -gesundmeldungsdatei "$gesundmeldungsdatei")"
-echo "$ausgabe"
+echo "3. Watchdog reads in check mode ..."
+output="$("$binary" -check-mode -file "$state_file" -health-file "$health_file")"
+echo "$output"
 
-echo "4. Vergleichen ..."
-pruefe() {
-    if ! grep -qx "$1" <<<"$ausgabe"; then
-        echo "FEHLER: $1 fehlt oder stimmt nicht überein." >&2
+echo "4. Comparing ..."
+check() {
+    if ! grep -qx "$1" <<<"$output"; then
+        echo "ERROR: $1 missing or does not match." >&2
         exit 1
     fi
 }
-pruefe "GEWUENSCHT=$erwartet_gewuenscht"
-pruefe "BEWAEHRT=$erwartet_bewaehrt"
-pruefe "ESIM_VORHERIGES_PROFIL=$erwartet_esim_profil"
-pruefe "ZM_DIGEST=$erwartet_digest"
-pruefe "ZM_FASSUNG=$erwartet_fassung"
+check "DESIRED=$expected_desired"
+check "PROVEN=$expected_proven"
+check "ESIM_PREVIOUS_PROFILE=$expected_esim_profile"
+check "HEALTH_DIGEST=$expected_digest"
+check "HEALTH_VERSION=$expected_version"
 
-echo "Vertragstest bestanden: Python geschrieben, Go gelesen, Werte identisch."
+echo "Contract test passed: written by Python, read by Go, values identical."

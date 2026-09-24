@@ -1,41 +1,41 @@
-// Gerüst der eigentlichen Wächter-Entscheidungen (Abschnitt 17). Anders als
-// zustand.go und gesundmeldung.go (reines, echtes Dateiparsen) braucht jede
-// Funktion hier echten Zugriff auf die Containerlaufzeit oder systemd, den
-// dieses Gerüst nicht vorwegnimmt -- jede gibt deshalb einen Fehler mit
-// Verweis auf den zuständigen Schritt zurück statt etwas vorzutäuschen.
-// Arbeitsteilung (Abschnitt 17, "Wer lädt, und wer tauscht"): Keine Funktion
-// hier ruft eine Registry auf oder prüft einen Digest -- das hat der Agent
-// bereits erledigt. Der Wächter kennt nur zwei lokal vorhandene Digests.
+// Scaffold of the actual watchdog decisions (section 17). Unlike state.go
+// and health.go (pure, real file parsing), every function here needs real
+// access to the container runtime or systemd, which this scaffold does not
+// anticipate -- each one therefore returns an error referencing the
+// responsible step instead of pretending something happened. Division of
+// labor (section 17, "who loads, and who swaps"): no function here calls a
+// registry or checks a digest -- the agent has already done that. The
+// watchdog only knows two locally present digests.
 package main
 
 import "fmt"
 
-// AgentGestoppt erkennt, dass der Agent sich selbst gestoppt hat (Schritt 3).
-// Der Agent tauscht sich nicht selbst aus -- er stoppt sich nur. Der Wächter
-// muss das Ende bemerken, bevor er irgendetwas tut.
-func AgentGestoppt() (bool, error) {
-	return false, fmt.Errorf("Erkennen des Agent-Endes nicht umgesetzt -- siehe docs/spezifikation.md Abschnitt 17")
+// AgentStopped detects that the agent has stopped itself (step 3). The
+// agent does not swap itself -- it only stops. The watchdog must notice the
+// end before it does anything.
+func AgentStopped() (bool, error) {
+	return false, fmt.Errorf("detecting the agent's end not implemented -- see docs/specification.md section 17")
 }
 
-// DigestStarten startet den in z.Gewuenscht genannten Stand (Schritt 4).
-// Kein Digest-Abgleich gegen eine Quellenliste hier -- siehe Modul-Docstring.
-func DigestStarten(z Zustand) error {
-	return fmt.Errorf("Starten des Digests %q nicht umgesetzt -- siehe docs/spezifikation.md Abschnitt 17", z.Gewuenscht)
+// StartDigest starts the revision named in s.Desired (step 4). No digest
+// check against a source list here -- see the module docstring.
+func StartDigest(s State) error {
+	return fmt.Errorf("starting digest %q not implemented -- see docs/specification.md section 17", s.Desired)
 }
 
-// GesundmeldungAbwarten wartet auf die Gesundmeldung, höchstens 10 Minuten
-// (Schritt 5), oder erkennt einen dreimaligen Neustart des Containers.
-func GesundmeldungAbwarten() (bool, error) {
-	return false, fmt.Errorf("Warten auf die Gesundmeldung nicht umgesetzt -- siehe docs/spezifikation.md Abschnitt 17")
+// AwaitHealthReport waits for the health report, at most 10 minutes
+// (step 5), or detects a container restarting three times.
+func AwaitHealthReport() (bool, error) {
+	return false, fmt.Errorf("waiting for the health report not implemented -- see docs/specification.md section 17")
 }
 
-// AufBewaehrtZuruecksetzen setzt bei Ausbleiben der Gesundmeldung oder nach
-// drei Neustarts auf z.Bewaehrt zurück (Schritt 5). Ein leeres z.Bewaehrt ist
-// seit Abschnitt 22.5 kein Normalzustand mehr: das Abbild-Rezept trägt es
-// beim Bau vor, jedes ausgelieferte Gerät hat also ein Rückfallziel.
-func AufBewaehrtZuruecksetzen(z Zustand) error {
-	if z.Bewaehrt == "" {
-		return fmt.Errorf("kein bewährter Digest vorhanden -- Anzeichen einer fehlerhaften Auslieferung, siehe docs/spezifikation.md Abschnitt 22.5")
+// RollBackToProven falls back to s.Proven when the health report fails to
+// arrive or after three restarts (step 5). An empty s.Proven has not been
+// the normal state since section 22.5: the image recipe pre-sets it at
+// build time, so every shipped device has a fallback target.
+func RollBackToProven(s State) error {
+	if s.Proven == "" {
+		return fmt.Errorf("no proven digest present -- sign of a faulty delivery, see docs/specification.md section 22.5")
 	}
-	return fmt.Errorf("Rückrollen auf %q nicht umgesetzt -- siehe docs/spezifikation.md Abschnitt 17", z.Bewaehrt)
+	return fmt.Errorf("rolling back to %q not implemented -- see docs/specification.md section 17", s.Proven)
 }

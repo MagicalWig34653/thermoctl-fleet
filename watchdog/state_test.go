@@ -5,121 +5,121 @@ import (
 	"testing"
 )
 
-func TestParseZustandVollstaendig(t *testing.T) {
-	eingabe := "gewuenscht=sha256:9f2c\nbewaehrt=sha256:1a7b\nseit=1790000123\n"
+func TestParseStateComplete(t *testing.T) {
+	input := "desired=sha256:9f2c\nproven=sha256:1a7b\nsince=1790000123\n"
 
-	z, err := ParseZustand(strings.NewReader(eingabe))
+	s, err := ParseState(strings.NewReader(input))
 	if err != nil {
-		t.Fatalf("unerwarteter Fehler: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if z.Gewuenscht != "sha256:9f2c" {
-		t.Errorf("Gewuenscht = %q, erwartet sha256:9f2c", z.Gewuenscht)
+	if s.Desired != "sha256:9f2c" {
+		t.Errorf("Desired = %q, expected sha256:9f2c", s.Desired)
 	}
-	if z.Bewaehrt != "sha256:1a7b" {
-		t.Errorf("Bewaehrt = %q, erwartet sha256:1a7b", z.Bewaehrt)
+	if s.Proven != "sha256:1a7b" {
+		t.Errorf("Proven = %q, expected sha256:1a7b", s.Proven)
 	}
-	if z.Seit != 1790000123 {
-		t.Errorf("Seit = %d, erwartet 1790000123", z.Seit)
+	if s.Since != 1790000123 {
+		t.Errorf("Since = %d, expected 1790000123", s.Since)
 	}
 }
 
-func TestParseZustandOhneBewaehrt(t *testing.T) {
-	// Ein frisch eingerichtetes Gerät hat noch keinen bewährten Stand
-	// (siehe docs/STATUS.md) -- die Zeile fehlt hier ganz.
-	eingabe := "gewuenscht=sha256:9f2c\nseit=1790000123\n"
+func TestParseStateWithoutProven(t *testing.T) {
+	// A freshly set-up device has no proven revision yet (see
+	// docs/STATUS.md) -- the line is entirely missing here.
+	input := "desired=sha256:9f2c\nsince=1790000123\n"
 
-	z, err := ParseZustand(strings.NewReader(eingabe))
+	s, err := ParseState(strings.NewReader(input))
 	if err != nil {
-		t.Fatalf("unerwarteter Fehler: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if z.Bewaehrt != "" {
-		t.Errorf("Bewaehrt = %q, erwartet leer", z.Bewaehrt)
+	if s.Proven != "" {
+		t.Errorf("Proven = %q, expected empty", s.Proven)
 	}
 }
 
-func TestParseZustandOhneGewuenschtWirdAbgelehnt(t *testing.T) {
-	eingabe := "bewaehrt=sha256:1a7b\nseit=1790000123\n"
+func TestParseStateWithoutDesiredIsRejected(t *testing.T) {
+	input := "proven=sha256:1a7b\nsince=1790000123\n"
 
-	_, err := ParseZustand(strings.NewReader(eingabe))
+	_, err := ParseState(strings.NewReader(input))
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestParseZustandLehntZeileOhneGleichheitszeichenAb(t *testing.T) {
-	eingabe := "gewuenscht=sha256:9f2c\netwas ohne Gleichheitszeichen\n"
+func TestParseStateRejectsLineWithoutEqualsSign(t *testing.T) {
+	input := "desired=sha256:9f2c\nsomething without an equals sign\n"
 
-	_, err := ParseZustand(strings.NewReader(eingabe))
+	_, err := ParseState(strings.NewReader(input))
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestParseZustandLehntUngueltigenZeitstempelAb(t *testing.T) {
-	eingabe := "gewuenscht=sha256:9f2c\nseit=nicht-eine-zahl\n"
+func TestParseStateRejectsInvalidTimestamp(t *testing.T) {
+	input := "desired=sha256:9f2c\nsince=not-a-number\n"
 
-	_, err := ParseZustand(strings.NewReader(eingabe))
+	_, err := ParseState(strings.NewReader(input))
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestParseZustandIgnoriertKommentareUndUnbekannteSchluessel(t *testing.T) {
-	// Abschnitt 18.2, sinngemäß übernommen: ein neues Feld darf den Wächter
-	// nicht am Lesen der bekannten Felder hindern.
-	eingabe := "# Kommentar\ngewuenscht=sha256:9f2c\nkuenftiges_feld=irgendwas\n"
+func TestParseStateIgnoresCommentsAndUnknownKeys(t *testing.T) {
+	// Section 18.2, applied analogously: a new field must not keep the
+	// watchdog from reading the known fields.
+	input := "# comment\ndesired=sha256:9f2c\nfuture_field=something\n"
 
-	z, err := ParseZustand(strings.NewReader(eingabe))
+	s, err := ParseState(strings.NewReader(input))
 	if err != nil {
-		t.Fatalf("unerwarteter Fehler: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if z.Gewuenscht != "sha256:9f2c" {
-		t.Errorf("Gewuenscht = %q, erwartet sha256:9f2c", z.Gewuenscht)
+	if s.Desired != "sha256:9f2c" {
+		t.Errorf("Desired = %q, expected sha256:9f2c", s.Desired)
 	}
 }
 
-func TestLadeZustandFehltDatei(t *testing.T) {
-	_, err := LadeZustand("/pfad/der/nicht/existiert.env")
+func TestLoadStateMissingFile(t *testing.T) {
+	_, err := LoadState("/path/that/does/not/exist.env")
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestParseZustandLiestEsimRueckfallzeilen(t *testing.T) {
-	// Abschnitt 24.4, nachträglich festgelegt: die Rückfalluhr für einen
-	// eSIM-Profilwechsel steht als zwei weitere Zeilen in derselben Datei.
-	eingabe := "gewuenscht=sha256:9f2c\nesim_vorheriges_profil=profil-1\nesim_frist=1790000723\n"
+func TestParseStateReadsEsimFallbackLines(t *testing.T) {
+	// Section 24.4, decided afterward: the fallback clock for an eSIM
+	// profile switch is two further lines in the same file.
+	input := "desired=sha256:9f2c\nesim_previous_profile=profile-1\nesim_deadline=1790000723\n"
 
-	z, err := ParseZustand(strings.NewReader(eingabe))
+	s, err := ParseState(strings.NewReader(input))
 	if err != nil {
-		t.Fatalf("unerwarteter Fehler: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if z.EsimVorherigesProfil != "profil-1" {
-		t.Errorf("EsimVorherigesProfil = %q, erwartet profil-1", z.EsimVorherigesProfil)
+	if s.EsimPreviousProfile != "profile-1" {
+		t.Errorf("EsimPreviousProfile = %q, expected profile-1", s.EsimPreviousProfile)
 	}
-	if z.EsimFrist != 1790000723 {
-		t.Errorf("EsimFrist = %d, erwartet 1790000723", z.EsimFrist)
+	if s.EsimDeadline != 1790000723 {
+		t.Errorf("EsimDeadline = %d, expected 1790000723", s.EsimDeadline)
 	}
 }
 
-func TestParseZustandOhneEsimZeilenBleibtLeer(t *testing.T) {
-	// Kein Profilwechsel aussteht -- keine der beiden Zeilen vorhanden.
-	eingabe := "gewuenscht=sha256:9f2c\n"
+func TestParseStateWithoutEsimLinesStaysEmpty(t *testing.T) {
+	// No profile switch pending -- neither of the two lines present.
+	input := "desired=sha256:9f2c\n"
 
-	z, err := ParseZustand(strings.NewReader(eingabe))
+	s, err := ParseState(strings.NewReader(input))
 	if err != nil {
-		t.Fatalf("unerwarteter Fehler: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if z.EsimVorherigesProfil != "" || z.EsimFrist != 0 {
-		t.Errorf("Esim-Felder = %q/%d, erwartet leer/0", z.EsimVorherigesProfil, z.EsimFrist)
+	if s.EsimPreviousProfile != "" || s.EsimDeadline != 0 {
+		t.Errorf("esim fields = %q/%d, expected empty/0", s.EsimPreviousProfile, s.EsimDeadline)
 	}
 }
 
-func TestParseZustandLehntUngueltigeEsimFristAb(t *testing.T) {
-	eingabe := "gewuenscht=sha256:9f2c\nesim_frist=nicht-eine-zahl\n"
+func TestParseStateRejectsInvalidEsimDeadline(t *testing.T) {
+	input := "desired=sha256:9f2c\nesim_deadline=not-a-number\n"
 
-	_, err := ParseZustand(strings.NewReader(eingabe))
+	_, err := ParseState(strings.NewReader(input))
 	if err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+		t.Fatal("expected error did not occur")
 	}
 }

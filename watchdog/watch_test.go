@@ -2,37 +2,37 @@ package main
 
 import "testing"
 
-// Diese Tests bestätigen nur, dass jede Gerüst-Funktion tatsächlich
-// fehlschlägt, statt etwas vorzutäuschen -- keine bestätigt eine bereits
-// vorhandene Fähigkeit (die gibt es hier noch nicht).
+// These tests only confirm that every scaffold function actually fails
+// instead of pretending something -- none confirms an already-present
+// capability (there is none here yet).
 
-func TestAgentGestopptNichtUmgesetzt(t *testing.T) {
-	if _, err := AgentGestoppt(); err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+func TestAgentStoppedNotImplemented(t *testing.T) {
+	if _, err := AgentStopped(); err == nil {
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestDigestStartenNichtUmgesetzt(t *testing.T) {
-	if err := DigestStarten(Zustand{Gewuenscht: "sha256:9f2c"}); err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+func TestStartDigestNotImplemented(t *testing.T) {
+	if err := StartDigest(State{Desired: "sha256:9f2c"}); err == nil {
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestGesundmeldungAbwartenNichtUmgesetzt(t *testing.T) {
-	if _, err := GesundmeldungAbwarten(); err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+func TestAwaitHealthReportNotImplemented(t *testing.T) {
+	if _, err := AwaitHealthReport(); err == nil {
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestAufBewaehrtZuruecksetzenOhneBewaehrtenStand(t *testing.T) {
-	if err := AufBewaehrtZuruecksetzen(Zustand{Gewuenscht: "sha256:9f2c"}); err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+func TestRollBackToProvenWithoutProvenState(t *testing.T) {
+	if err := RollBackToProven(State{Desired: "sha256:9f2c"}); err == nil {
+		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestAufBewaehrtZuruecksetzenNichtUmgesetzt(t *testing.T) {
-	z := Zustand{Gewuenscht: "sha256:9f2c", Bewaehrt: "sha256:1a7b"}
-	if err := AufBewaehrtZuruecksetzen(z); err == nil {
-		t.Fatal("erwarteter Fehler blieb aus")
+func TestRollBackToProvenNotImplemented(t *testing.T) {
+	s := State{Desired: "sha256:9f2c", Proven: "sha256:1a7b"}
+	if err := RollBackToProven(s); err == nil {
+		t.Fatal("expected error did not occur")
 	}
 }
