@@ -1,11 +1,9 @@
 // Die Statusanzeige am Gerät: zwei LEDs am 40-poligen Anschluss, nur am
-// Raspberry Pi vorhanden (Abschnitt 23). Angesteuert vom Wächter, nicht vom
-// Agenten -- er läuft auch dann noch, wenn Container stehen oder das Netz
-// weg ist, und genau dann will jemand vor Ort sehen, woran er ist.
-//
+// Raspberry Pi (Abschnitt 23), angesteuert vom Wächter, nicht vom Agenten --
+// er läuft auch dann noch, wenn Container stehen oder das Netz weg ist.
 // Ohne eine einzige Abhängigkeit (Abschnitt 23.1): kein GPIO-Paket, kein
-// ioctl. Das Abbild-Rezept (Abschnitt 19) lädt die Kernel-Overlays
-// `gpio-led`, danach schreibt der Wächter nur noch in zwei sysfs-Dateien.
+// ioctl. Das Abbild-Rezept lädt die Kernel-Overlays `gpio-led`, danach
+// schreibt der Wächter nur noch in zwei sysfs-Dateien.
 package main
 
 import (

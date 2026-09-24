@@ -1,32 +1,47 @@
-// Die Gesundmeldung: der zweite Teil des Vertrags mit dem Agenten (Abschnitt
-// 17, Schritt 5): "Der neue Agent muss binnen 10 Minuten seinen Selbsttest
-// bestehen und regelmäßig eine Gesundmeldung in eine lokale Datei schreiben."
-//
-// Dieselbe Formbegründung wie bei der Zustandsdatei (siehe zustand.go): eine
-// einzelne Zeile mit einem Unix-Zeitstempel statt JSON, damit ein künftiger
-// Wächter in einer anderen Sprache sie ohne Zusatzpaket lesen kann. Die
-// Spezifikation legt dieses Dateiformat nicht wörtlich fest (anders als bei
-// der Zustandsdatei) -- diese Wahl ist eine Annahme des Gerüsts in
-// Konsistenz mit ihr, keine belegte Festlegung.
+// Die Gesundmeldung (Abschnitt 17, Schritt 5). Zeilenbasiert wie die
+// Zustandsdatei, nicht ein einzelner Zeitstempel (Abschnitt 22.3,
+// nachträglich festgelegt): `zeitpunkt=`, `digest=`, `fassung=`. Der Gewinn
+// ist `digest`, der **laufende** Digest des schreibenden Container-Standes
+// -- der Wächter sieht damit, dass das Richtige lebt, nicht nur irgendetwas.
 package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
-	"strings"
 )
 
-// LiesGesundmeldung liest den zuletzt gemeldeten Unix-Zeitstempel.
-func LiesGesundmeldung(pfad string) (int64, error) {
-	inhalt, err := os.ReadFile(pfad)
+// Gesundmeldung ist der geparste Inhalt der Gesundmeldungsdatei.
+type Gesundmeldung struct {
+	Zeitpunkt int64
+	Digest    string
+	Fassung   string
+}
+
+// ParseGesundmeldung liest eine Gesundmeldungsdatei aus r. Unbekannte
+// Schlüssel werden ignoriert, nicht abgelehnt (wie bei der Zustandsdatei).
+func ParseGesundmeldung(r io.Reader) (Gesundmeldung, error) {
+	werte, err := liesSchluesselWertZeilen(r, "gesundmeldung")
 	if err != nil {
-		return 0, err
+		return Gesundmeldung{}, err
 	}
-	zeile := strings.TrimSpace(string(inhalt))
-	zeitpunkt, err := strconv.ParseInt(zeile, 10, 64)
+	if werte["zeitpunkt"] == "" {
+		return Gesundmeldung{}, fmt.Errorf("gesundmeldung: 'zeitpunkt' fehlt oder ist leer")
+	}
+	zeitpunkt, err := strconv.ParseInt(werte["zeitpunkt"], 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("gesundmeldung: kein Unix-Zeitstempel: %w", err)
+		return Gesundmeldung{}, fmt.Errorf("gesundmeldung: 'zeitpunkt' ist kein Unix-Zeitstempel: %w", err)
 	}
-	return zeitpunkt, nil
+	return Gesundmeldung{Zeitpunkt: zeitpunkt, Digest: werte["digest"], Fassung: werte["fassung"]}, nil
+}
+
+// LiesGesundmeldung öffnet pfad und parst ihn.
+func LiesGesundmeldung(pfad string) (Gesundmeldung, error) {
+	datei, err := os.Open(pfad)
+	if err != nil {
+		return Gesundmeldung{}, err
+	}
+	defer datei.Close()
+	return ParseGesundmeldung(datei)
 }

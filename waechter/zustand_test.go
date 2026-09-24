@@ -84,3 +84,42 @@ func TestLadeZustandFehltDatei(t *testing.T) {
 		t.Fatal("erwarteter Fehler blieb aus")
 	}
 }
+
+func TestParseZustandLiestEsimRueckfallzeilen(t *testing.T) {
+	// Abschnitt 24.4, nachträglich festgelegt: die Rückfalluhr für einen
+	// eSIM-Profilwechsel steht als zwei weitere Zeilen in derselben Datei.
+	eingabe := "gewuenscht=sha256:9f2c\nesim_vorheriges_profil=profil-1\nesim_frist=1790000723\n"
+
+	z, err := ParseZustand(strings.NewReader(eingabe))
+	if err != nil {
+		t.Fatalf("unerwarteter Fehler: %v", err)
+	}
+	if z.EsimVorherigesProfil != "profil-1" {
+		t.Errorf("EsimVorherigesProfil = %q, erwartet profil-1", z.EsimVorherigesProfil)
+	}
+	if z.EsimFrist != 1790000723 {
+		t.Errorf("EsimFrist = %d, erwartet 1790000723", z.EsimFrist)
+	}
+}
+
+func TestParseZustandOhneEsimZeilenBleibtLeer(t *testing.T) {
+	// Kein Profilwechsel aussteht -- keine der beiden Zeilen vorhanden.
+	eingabe := "gewuenscht=sha256:9f2c\n"
+
+	z, err := ParseZustand(strings.NewReader(eingabe))
+	if err != nil {
+		t.Fatalf("unerwarteter Fehler: %v", err)
+	}
+	if z.EsimVorherigesProfil != "" || z.EsimFrist != 0 {
+		t.Errorf("Esim-Felder = %q/%d, erwartet leer/0", z.EsimVorherigesProfil, z.EsimFrist)
+	}
+}
+
+func TestParseZustandLehntUngueltigeEsimFristAb(t *testing.T) {
+	eingabe := "gewuenscht=sha256:9f2c\nesim_frist=nicht-eine-zahl\n"
+
+	_, err := ParseZustand(strings.NewReader(eingabe))
+	if err == nil {
+		t.Fatal("erwarteter Fehler blieb aus")
+	}
+}

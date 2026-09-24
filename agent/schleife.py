@@ -135,7 +135,12 @@ def sollzustand_abgleichen(soll: Sollzustand) -> None:
 
 
 def waechter_zustand_melden(
-    pfad: Path, gewuenscht: str, bewaehrt: str | None = None
+    pfad: Path,
+    gewuenscht: str,
+    bewaehrt: str | None = None,
+    *,
+    esim_vorheriges_profil: str | None = None,
+    esim_frist: int | None = None,
 ) -> None:
     """Legt den gewünschten (und, falls vorhanden, den bewährten) Digest für den
     Wächter ab (Abschnitt 17, Schritt 2).
@@ -161,12 +166,67 @@ def waechter_zustand_melden(
     Datei plus `Path.replace`), aus demselben Grund wie in der Spezifikation
     für den Wächter selbst gefordert: Er darf nie eine halb geschriebene
     Zustandsdatei lesen.
+
+    `seit` (Abschnitt 22.2, nachträglich festgelegt): der Zeitpunkt, seit dem
+    `gewuenscht` gilt -- die Spezifikation zeigte dieses Feld ursprünglich nur
+    an einem Beispiel, ohne seine Bedeutung im Text zu nennen. Das ist keine
+    von mehreren gleichwertigen Lesarten, sondern die einzige, mit der das
+    Feld den Rückfall überhaupt steuern kann: Nur an den *aktuellen* Sollstand
+    gebunden lässt sich daraus die 10-Minuten- und die Stunden-Frist aus
+    Abschnitt 17 berechnen. Deshalb wird hier bei **jedem** Aufruf neu
+    gesetzt, nicht nur, wenn sich `gewuenscht` tatsächlich ändert -- das
+    entscheidet der Aufrufer, nicht diese Funktion.
+
+    `esim_vorheriges_profil`/`esim_frist` (Abschnitt 24.4, nachträglich
+    festgelegt): die Rückfalluhr für einen eSIM-Profilwechsel, als zwei
+    weitere Zeilen in **dieser** Zustandsdatei, keine eigene Datei. Beide
+    zusammen oder keine von beiden -- ein Profilwechsel ohne Rückfallziel
+    ergibt keinen Sinn. `waechter/zustand.go` überliest diese Zeilen wie jeden
+    anderen unbekannten Schlüssel, solange ein Wächter sie noch nicht kennt;
+    das Format ist dadurch erweiterbar, ohne dass es sich vorher als solches
+    ankündigen musste.
     """
 
     zeilen = [f"gewuenscht={gewuenscht}"]
     if bewaehrt is not None:
         zeilen.append(f"bewaehrt={bewaehrt}")
     zeilen.append(f"seit={int(time.time())}")
+    if esim_vorheriges_profil is not None:
+        zeilen.append(f"esim_vorheriges_profil={esim_vorheriges_profil}")
+        if esim_frist is not None:
+            zeilen.append(f"esim_frist={esim_frist}")
+
+    temp = pfad.with_suffix(pfad.suffix + ".tmp")
+    temp.write_text("\n".join(zeilen) + "\n", encoding="utf-8")
+    temp.replace(pfad)
+
+
+def gesundmeldung_melden(pfad: Path, digest: str, fassung: str) -> None:
+    """Schreibt die Gesundmeldung für den Wächter (Abschnitt 17, Schritt 5;
+    Abschnitt 22.3, nachträglich festgelegt).
+
+    **Zeilenbasiert wie die Zustandsdatei, nicht ein einzelner Zeitstempel**
+    -- ersetzt die vorherige Annahme eines einzelnen Unix-Zeitstempels. Der
+    eigentliche Gewinn ist `digest`: der **laufende** Digest, also der des
+    Container-Standes, der diese Gesundmeldung gerade schreibt. Der Wächter
+    sieht damit nicht nur, dass etwas lebt, sondern dass **das Richtige**
+    lebt -- eine nach einem Tausch liegen gebliebene Gesundmeldung vom alten
+    Stand täuscht damit keine gesunde neue Fassung vor. `fassung` trägt die
+    Agent-Fassung im Klartext, für die Diagnose vor Ort ohne Rückgriff auf
+    den Digest.
+
+    Wie `waechter_zustand_melden`: atomar geschrieben (temporäre Datei plus
+    `Path.replace`), damit der Wächter nie eine halb geschriebene Datei
+    liest. Der Aufrufer legt `pfad` typischerweise unter `/run/` an (Abschnitt
+    22.3) -- diese Funktion selbst kennt keinen festen Pfad, aus demselben
+    Grund wie überall sonst in diesem Modul: nichts hart verdrahtet.
+    """
+
+    zeilen = [
+        f"zeitpunkt={int(time.time())}",
+        f"digest={digest}",
+        f"fassung={fassung}",
+    ]
 
     temp = pfad.with_suffix(pfad.suffix + ".tmp")
     temp.write_text("\n".join(zeilen) + "\n", encoding="utf-8")
@@ -347,13 +407,16 @@ def esim_profil_aktivieren(profil_kennung: str) -> None:
     4. Läuft die Frist ab, schaltet der **Wächter** auf das zuvor gemerkte
        Profil zurück, nicht der Melder (Abschnitt 24.4).
 
-    **Offener Punkt, absichtlich nicht hier entschieden:** Ob
-    `waechter/zustand.go` (`gewuenscht`/`bewaehrt`/`seit`, Abschnitt 17/18.3)
-    für diese Rückfalluhr ein zusätzliches Feld braucht oder ob eine eigene
-    Datei entsteht, legt dieser Stummel **nicht** fest -- das Format ist ein
-    sprachübergreifender Vertrag mit eigenem Test
-    (`waechter/pruefe_vertrag.sh`) und wird nicht nebenbei erweitert. Siehe
-    docs/STATUS.md, offener Punkt „Rückfalluhr für eSIM-Profilwechsel".
+    **Entschieden (Abschnitt 24.4, nachträglich):** Die Rückfalluhr liegt in
+    der **bestehenden** Zustandsdatei des Wächters (`gewuenscht`/`bewaehrt`/
+    `seit`, Abschnitt 17/18.3), als zwei weitere Zeilen
+    (`esim_vorheriges_profil=`, `esim_frist=`) -- keine eigene Datei. Die
+    Umsetzung ruft dafür `agent.schleife.waechter_zustand_melden` mit den
+    Schlüsselwortargumenten `esim_vorheriges_profil` und `esim_frist` auf,
+    dieselbe Funktion wie beim Sollzustandsabgleich. `waechter/zustand.go`
+    überliest diese beiden Zeilen wie jeden anderen unbekannten Schlüssel,
+    solange ein Wächter sie noch nicht kennt -- das Format ist dadurch
+    erweiterbar, ohne dass es sich vorher als solches ankündigen musste.
     """
 
     raise NotImplementedError(

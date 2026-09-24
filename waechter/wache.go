@@ -1,15 +1,11 @@
 // Gerüst der eigentlichen Wächter-Entscheidungen (Abschnitt 17). Anders als
 // zustand.go und gesundmeldung.go (reines, echtes Dateiparsen) braucht jede
-// Funktion hier einen echten Zugriff auf die Containerlaufzeit oder
-// systemd, den dieses Gerüst nicht vorwegnimmt. Jede gibt deshalb einen
-// Fehler mit Verweis auf den zuständigen Schritt zurück statt etwas
-// vorzutäuschen.
-//
+// Funktion hier echten Zugriff auf die Containerlaufzeit oder systemd, den
+// dieses Gerüst nicht vorwegnimmt -- jede gibt deshalb einen Fehler mit
+// Verweis auf den zuständigen Schritt zurück statt etwas vorzutäuschen.
 // Arbeitsteilung (Abschnitt 17, "Wer lädt, und wer tauscht"): Keine Funktion
-// hier ruft eine Registry auf oder prüft einen Digest gegen eine
-// Quellenliste -- das hat der Agent bereits erledigt, bevor er die
-// Zustandsdatei geschrieben hat. Der Wächter kennt ausschließlich zwei
-// lokal vorhandene Digests.
+// hier ruft eine Registry auf oder prüft einen Digest -- das hat der Agent
+// bereits erledigt. Der Wächter kennt nur zwei lokal vorhandene Digests.
 package main
 
 import "fmt"
@@ -34,12 +30,12 @@ func GesundmeldungAbwarten() (bool, error) {
 }
 
 // AufBewaehrtZuruecksetzen setzt bei Ausbleiben der Gesundmeldung oder nach
-// drei Neustarts auf z.Bewaehrt zurück (Schritt 5). Ist z.Bewaehrt leer
-// (noch nie ein bewährter Stand), behandelt die Spezifikation diesen Fall
-// nicht -- siehe docs/STATUS.md.
+// drei Neustarts auf z.Bewaehrt zurück (Schritt 5). Ein leeres z.Bewaehrt ist
+// seit Abschnitt 22.5 kein Normalzustand mehr: das Abbild-Rezept trägt es
+// beim Bau vor, jedes ausgelieferte Gerät hat also ein Rückfallziel.
 func AufBewaehrtZuruecksetzen(z Zustand) error {
 	if z.Bewaehrt == "" {
-		return fmt.Errorf("kein bewährter Digest vorhanden, Rückrollen unmöglich -- siehe docs/STATUS.md")
+		return fmt.Errorf("kein bewährter Digest vorhanden -- Anzeichen einer fehlerhaften Auslieferung, siehe docs/spezifikation.md Abschnitt 22.5")
 	}
 	return fmt.Errorf("Rückrollen auf %q nicht umgesetzt -- siehe docs/spezifikation.md Abschnitt 17", z.Bewaehrt)
 }

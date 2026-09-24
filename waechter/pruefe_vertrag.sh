@@ -23,37 +23,49 @@ arbeitsverzeichnis="$(mktemp -d)"
 trap 'rm -rf "$arbeitsverzeichnis"' EXIT
 
 zustandsdatei="$arbeitsverzeichnis/zustand.env"
+gesundmeldungsdatei="$arbeitsverzeichnis/gesundmeldung.env"
 erwartet_gewuenscht="sha256:$(printf 'a%.0s' {1..64})"
 erwartet_bewaehrt="sha256:$(printf 'b%.0s' {1..64})"
+erwartet_esim_profil="profil-1"
+erwartet_digest="sha256:$(printf 'c%.0s' {1..64})"
+erwartet_fassung="0.4.0"
 
 echo "1. Wächter bauen ..."
 binaerprogramm="$arbeitsverzeichnis/thermoctl-waechter"
 (cd "$hier" && go build -o "$binaerprogramm" .)
 
-echo "2. Python schreibt die Zustandsdatei (agent.schleife.waechter_zustand_melden) ..."
+echo "2. Python schreibt Zustands- und Gesundmeldungsdatei (agent.schleife) ..."
 PYTHONPATH="$wurzel" python3 -c "
 from pathlib import Path
-from agent.schleife import waechter_zustand_melden
+from agent.schleife import gesundmeldung_melden, waechter_zustand_melden
 
 waechter_zustand_melden(
     Path('$zustandsdatei'),
     gewuenscht='$erwartet_gewuenscht',
     bewaehrt='$erwartet_bewaehrt',
+    esim_vorheriges_profil='$erwartet_esim_profil',
+    esim_frist=1790000723,
+)
+gesundmeldung_melden(
+    Path('$gesundmeldungsdatei'), digest='$erwartet_digest', fassung='$erwartet_fassung'
 )
 "
 
 echo "3. Wächter liest im Prüfmodus ..."
-ausgabe="$("$binaerprogramm" -pruefmodus -datei "$zustandsdatei")"
+ausgabe="$("$binaerprogramm" -pruefmodus -datei "$zustandsdatei" -gesundmeldungsdatei "$gesundmeldungsdatei")"
 echo "$ausgabe"
 
 echo "4. Vergleichen ..."
-if ! grep -qx "GEWUENSCHT=$erwartet_gewuenscht" <<<"$ausgabe"; then
-    echo "FEHLER: GEWUENSCHT stimmt nicht überein." >&2
-    exit 1
-fi
-if ! grep -qx "BEWAEHRT=$erwartet_bewaehrt" <<<"$ausgabe"; then
-    echo "FEHLER: BEWAEHRT stimmt nicht überein." >&2
-    exit 1
-fi
+pruefe() {
+    if ! grep -qx "$1" <<<"$ausgabe"; then
+        echo "FEHLER: $1 fehlt oder stimmt nicht überein." >&2
+        exit 1
+    fi
+}
+pruefe "GEWUENSCHT=$erwartet_gewuenscht"
+pruefe "BEWAEHRT=$erwartet_bewaehrt"
+pruefe "ESIM_VORHERIGES_PROFIL=$erwartet_esim_profil"
+pruefe "ZM_DIGEST=$erwartet_digest"
+pruefe "ZM_FASSUNG=$erwartet_fassung"
 
 echo "Vertragstest bestanden: Python geschrieben, Go gelesen, Werte identisch."
