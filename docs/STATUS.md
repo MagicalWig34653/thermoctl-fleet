@@ -360,7 +360,7 @@ missed -- `fleet/alarms.py`, `fleet/app.py`, `fleet/storage.py`,
 `fleet/auth.py`, and all four migrations at 100%) -- `ruff check .` and
 `mypy .` / `mypy protocol fleet agent tools` all clean. Verified stable:
 the full suite 3 times and `tests/test_alarms.py` 10 times, all green.
-Follow-up fix commit for this round noted in this package's git history.
+Follow-up fix commit for this round: `64a7d31`.
 
 ## Token check per apartment (P1.1, sections 4, 18.1)
 
