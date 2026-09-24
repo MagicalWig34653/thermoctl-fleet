@@ -15,12 +15,18 @@ have been implemented.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
+import os
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from fleet.alarms import check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from fleet.storage import Storage, get_storage
 from protocol import (
@@ -33,7 +39,54 @@ from protocol import (
 from protocol.inventory import Device
 from protocol.version import PROTOCOL_VERSION
 
-app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION))
+logger = logging.getLogger(__name__)
+
+# P2.2, section 8: how often the absence-alarm check runs. Configurable, not
+# hard-coded, per CLAUDE.md -- default matches the work package's own
+# suggestion (60s).
+_ALARM_CHECK_INTERVAL_ENV = "FLEET_ALARM_CHECK_INTERVAL_S"
+_DEFAULT_ALARM_CHECK_INTERVAL_S = 60.0
+
+
+async def _alarm_check_loop(interval_s: float) -> None:  # pragma: no cover
+    # Thin scheduling wrapper, deliberately untested here (an infinite loop
+    # with a real `asyncio.sleep` would either need a real wait in the test
+    # suite or an artificial construction that tests the wrapper instead of
+    # anything real) -- the logic it calls, `check_absence_alarms`, is fully
+    # covered with an injected clock in `tests/test_alarms.py`, per the work
+    # package's own instruction that only the loop wrapper may carry this
+    # pragma. `get_storage()`/`load_notifiers_from_env` failures are caught
+    # so a misconfiguration (e.g. a missing `FLEET_DATABASE_URL`) logs
+    # instead of silently killing the background task forever.
+    notifiers = load_notifiers_from_env(os.environ)
+    while True:
+        try:
+            check_absence_alarms(get_storage(), datetime.now(UTC), notifiers)
+        except Exception:
+            logger.exception("Absence alarm check failed")
+        await asyncio.sleep(interval_s)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Starts the absence-alarm background task (P2.2) for the lifetime of
+    the application; cancelled cleanly on shutdown. The endpoints
+    themselves do not depend on this task in any way -- a test that only
+    exercises an endpoint via `TestClient` and never enters this lifespan
+    (as most of `tests/test_fleet.py` does not) is unaffected by it.
+    """
+
+    interval_s = float(os.environ.get(_ALARM_CHECK_INTERVAL_ENV, _DEFAULT_ALARM_CHECK_INTERVAL_S))
+    task = asyncio.create_task(_alarm_check_loop(interval_s))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION), lifespan=lifespan)
 
 
 @app.get("/healthz")

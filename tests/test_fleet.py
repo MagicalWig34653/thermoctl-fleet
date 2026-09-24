@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 
+import fleet.storage as storage_module
 from fleet.app import app
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from protocol import Heartbeat
@@ -121,6 +122,32 @@ def test_healthz_responds(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_lifespan_starts_and_cancels_the_alarm_background_task(
+    monkeypatch: pytest.MonkeyPatch, db_path: str
+) -> None:
+    """P2.2 (section 8): `fleet.app.lifespan` starts the periodic
+    absence-alarm background task on startup and cancels it cleanly on
+    shutdown. The check logic itself (`check_absence_alarms`) is fully
+    covered with an injected clock in `tests/test_alarms.py`; this only
+    confirms the scheduling wrapper wires up and tears down without error
+    -- see `fleet.app._alarm_check_loop`'s own `# pragma: no cover` for why
+    its infinite loop body is deliberately not exercised here (it would
+    otherwise need either a real wait or an artificial construction that
+    tests the wrapper rather than anything real)."""
+
+    monkeypatch.setenv("FLEET_DATABASE_URL", f"sqlite:///{db_path}")
+    # Large on purpose -- the loop's single `asyncio.sleep` call must not
+    # actually fire while this test's `with` block is open.
+    monkeypatch.setenv("FLEET_ALARM_CHECK_INTERVAL_S", "3600")
+    storage_module._storage_singleton = None
+    try:
+        with TestClient(app) as lifespan_client:
+            response = lifespan_client.get("/healthz")
+            assert response.status_code == 200
+    finally:
+        storage_module._storage_singleton = None
 
 
 # -----------------------------------------------------------------------------

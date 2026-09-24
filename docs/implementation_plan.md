@@ -83,6 +83,10 @@ parallel with all other packages of the same stage.
 - **Acceptance:** test simulates absence over time (no real waiting),
   checks that exactly one alarm fires, not again on every check run.
 - **Depends on:** P2.1.
+- [x] done -- `fleet/alarms.py` (check function + `WebhookNotifier`/
+  `SmtpNotifier`/`LogNotifier`), migration `0004_alarms`, background task
+  in `fleet/app.py`'s lifespan. See `docs/STATUS.md` for channels, env
+  variables, and open points.
 
 ### P2.3 -- Agent: collect and send heartbeat
 - **Goal:** implement `agent/loop.py::collect_heartbeat` (thermoctl REST
