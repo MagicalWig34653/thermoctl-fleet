@@ -2,6 +2,100 @@
 
 Last updated: 2026-09-24.
 
+## Storage layer (P1.3, section 12)
+
+`fleet/storage.py` (SQLAlchemy 2.x typed ORM) plus Alembic migrations shipped
+inside the package at `fleet/migrations/` (`env.py`, `versions/`) -- not a
+repository-root `alembic.ini`, which `docker/Dockerfile.fleet` would not
+carry into the image (it only `COPY`s `fleet/`). `fleet/storage.py::upgrade`
+builds the Alembic `Config` entirely in code for exactly this reason; a
+sibling `downgrade` exists too, used by the tests, not by the running
+service. Both `sqlalchemy` and `alembic` were added to the `fleet` extra in
+`pyproject.toml` (not the base dependencies), so `agent`'s image does not
+pull them in. `fleet.migrations` and `fleet.migrations.versions` are proper
+Python packages (own `__init__.py`) so `[tool.setuptools.packages.find]`'s
+existing `"fleet*"` pattern already installs them -- no separate
+`package-data` entry was needed.
+
+Three tables, deliberately minimal, all in `fleet/migrations/versions/
+0001_initial_schema.py`:
+
+- **`apartments`** (`id`, `token_hash`): **only the SHA-256 hash** of the
+  agent token is stored (section 4: "the cloud stores only its hash").
+  Unsalted, fast SHA-256 is the right call here, not the shortcut it would
+  be for a human-chosen password -- the token carries >=32 bytes of
+  server-generated entropy by construction (`agent_<apartment>_<random>`),
+  so there is no low-entropy search space for a slow KDF
+  (bcrypt/argon2/scrypt) to defend against. `Storage.set_apartment_token`
+  hashes internally; there is no sibling function that could be called by
+  mistake to store the raw token.
+- **`heartbeats`** (`apartment_id`, `received_at`, `sent_at`,
+  `protocol_version`, `payload_json`): the heartbeat as validated JSON
+  (`Heartbeat.model_dump_json()`), not split into columns -- read back via
+  `Heartbeat.model_validate_json`, so an additive protocol change (section
+  18.2) needs no migration to stay readable. **Checked against
+  `protocol/heartbeat.py` as part of this task, per its instructions:** the
+  claim "`Heartbeat` already excludes everything section 6 forbids" holds --
+  none of its fields (`ThermoctlState`, `ControlState`, `DeviceState`,
+  `SystemState`, `OpenFault`) carry a room temperature, a setpoint, a
+  schedule, an absence period, or tenant data. No correction needed.
+- **`events`** (`apartment_id`, `schluessel`, `schwere`, `fault_kind`
+  nullable, `received_at`): **deliberately no column for `titel`/`text`**.
+  thermoctl's tenant-report text carries the tenant's name, room
+  temperature, setpoint, mode, and a free-text note; sensor-fault text
+  carries the frost-protection setpoint -- both forbidden by section 6.
+  `fault_kind` is derived on write via `protocol.events.fault_kind_from_key`
+  (`None` = "other report", section 18.1/22.1, including the deliberate
+  `sensor:` special case) -- storing only the derived, closed-vocabulary
+  kind plus the (thermoctl-internal) key keeps the promise that no free text
+  from the webhook payload is ever persisted.
+
+`Storage` wraps one SQLAlchemy engine with write/read-back methods for all
+three tables (`set_apartment_token`/`get_apartment_token_hash`,
+`save_heartbeat`/`list_heartbeats`, `save_event`/`list_events`) and a
+`session()` context manager (commit on success, rollback and re-raise on
+error). Datetimes are stored as naive UTC (`_naive_utc`, mirroring
+thermoctl's own `utcnow()` convention in `thermoctl/db/base.py`) -- SQLite
+(and a future MariaDB) has no timezone-aware column type.
+
+`get_storage()` is a FastAPI dependency provider reading `FLEET_DATABASE_URL`
+lazily on first use (never at import time, and never a hard-coded default,
+per `CLAUDE.md`) and caching one `Storage` singleton. **Deliberately not
+wired into any endpoint** -- `fleet/app.py` is otherwise untouched by this
+task; every endpoint still raises `NotImplementedError` exactly as before.
+P1.1/P1.2 will call it via `Depends(get_storage)`.
+
+**Retention (section 12) is still not implemented**, as decided by the
+project owner for this task -- the specification's own numbers (90 days for
+heartbeats, 365 for faults) are marked "proposal", not a decision, and no
+deletion job exists. Still open, tracked here, not invented.
+
+**Tests** (`tests/test_storage.py`, 20 tests, all against a **real SQLite
+file in `tmp_path`**, migrated via `fleet.storage.upgrade` -- no
+`Base.metadata.create_all()` shortcut): migrations create all three tables
+on an empty database and are idempotent when re-run; a downgrade-then-
+upgrade round trip (exercises `0001_initial_schema.py::downgrade`, which
+would otherwise never run); heartbeat and event write/read-back, including
+per-apartment isolation and oldest-first ordering; the six-kinds-from-a-key
+mapping including the `sensor:` special case and an unknown prefix; that
+`titel`/`text` have no column at all (asserted via `inspect(engine)
+.get_columns("events")`, not just by reading the model); token hash
+set/lookup/replace (a replace changes the hash), unknown-apartment lookup
+returns `None`; that no raw token is ever stored (inspects the actual row
+via raw SQL, not through `Storage`'s own accessor, so a bug in the accessor
+could not hide a stored raw token); `get_storage`'s missing-env-var error and
+its singleton caching; the `session()` context manager's rollback-and-
+re-raise path. Full suite: **80 tests** (up from 60), coverage **96%** (up
+from 94%; `fleet/storage.py` itself at 100%) -- `ruff check .` and `mypy .` /
+`mypy protocol fleet agent tools` both clean. `fleet/app.py` is unchanged by
+this task (no endpoint was touched, per scope).
+
+`.github/workflows/ci.yml`'s stale "the scaffold stores nothing" comment on
+the `check` job was updated: SQLite needs no service container (a writable
+filesystem, which the runner already has, is enough), a mariadb/postgres
+matrix following thermoctl's own `ci.yml` pattern is explicitly out of scope
+for this package. No trigger or job was changed.
+
 **English migration (this update):** the repository's directories, files,
 identifiers, comments, and documentation were translated to English end to
 end (see the commit that carries this note for the full list). Everything

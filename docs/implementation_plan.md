@@ -55,6 +55,7 @@ parallel with all other packages of the same stage.
 - **Acceptance:** an event and a heartbeat can be written and read back;
   the test runs against a real, even if lightweight, database (no mock).
 - **Parallel to:** P1.1.
+- [x] done
 
 ---
 
