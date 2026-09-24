@@ -22,9 +22,23 @@ Weder Wohnung noch Art noch Zeitstempel sind darin enthalten. Daraus folgt
 - **Die Art steckt im `schluessel`**, nicht in einem eigenen Feld. Der
   Fleet-Dienst ordnet über ein Präfix zu und behandelt Unbekanntes als
   "sonstige Meldung", statt abzulehnen -- siehe `stoerungsart_aus_schluessel`.
+
+**Nachträglich entschieden (Abschnitt 5, 21, 22.1):** Intern -- also ab dem
+Punkt, an dem der Fleet-Dienst ein `Ereignis` entgegengenommen hat -- benutzen
+alle sechs Störungsarten denselben Umschlag: Art, Schlüssel, Zeitpunkt,
+Klartext (`Stoerungsereignis` unten). Die Präfixe wie `zigbee2mqtt:` und
+`tenant-report:` bleiben dabei eine Konvention *innerhalb* des Schlüssels,
+keine eigenen Typen -- eine neue Störungsart kostet damit keine
+Protokolländerung auf beiden Seiten, nur einen neuen Eintrag in
+`_PRAEFIX_STOERUNGSART`. `art` bleibt bewusst `None`, wo der Schlüssel keine
+eindeutige Zuordnung erlaubt (siehe der Sonderfall `sensor:` unten) -- das ist
+kein Rateversuch, sondern die in Abschnitt 22.1 ausdrücklich verlangte
+Zurückhaltung.
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 
@@ -40,19 +54,40 @@ class Ereignis(BaseModel):
     text: str = Field(min_length=1)
 
 
-# Nur die beiden in Abschnitt 18.1 ausdrücklich belegten Präfixe
-# ("zigbee2mqtt:brücke", "tenant-report:<zone>:<kategorie>"). Die vier übrigen
-# Störungsarten aus Abschnitt 5 (sensor_fault, command_failure, stuck_sensor,
-# window_alarm) haben in thermoctls Quelltext (thermoctl/domain/fault_notice.py)
-# je einen eigenen `key`-Aufbau, der sich nicht ohne Weiteres auf ein einzelnes,
-# eindeutiges Präfix reduzieren lässt -- `sensor_fault` und `stuck_sensor`
-# teilen sich dort laut Docstring sogar denselben Präfix `sensor:{zone.id}`, um
-# dieselbe Home-Assistant-Entität zu treffen. Vor der echten Umsetzung mit
-# thermoctl klären statt hier zu raten; bis dahin fallen alle vier unter
-# "sonstige Meldung" (`None`), was Abschnitt 18.1 als gültiges Verhalten nennt.
+class Stoerungsereignis(BaseModel):
+    """Der einheitliche Umschlag für alle sechs Störungsarten (Abschnitt 22.1,
+    nachträglich entschieden).
+
+    Entsteht aus einem entgegengenommenen `Ereignis` plus dem
+    Empfangszeitpunkt (`stoerungsereignis_aus_ereignis` unten) -- kein
+    eigener Endpunkt, kein eigenes Feldschema, das thermoctl senden müsste.
+    """
+
+    art: Stoerungsart | None = Field(
+        default=None,
+        description=(
+            "None = 'sonstige Meldung' oder mehrdeutiger Schlüssel (Abschnitt "
+            "18.1/22.1), kein Fehlerfall."
+        ),
+    )
+    schluessel: str = Field(min_length=1)
+    zeitpunkt: datetime
+    klartext: str = Field(min_length=1)
+
+
+# Abschnitt 22.1, am Quelltext belegt (`thermoctl/app.py`, `services/publishing.py`,
+# `domain/fault_notice.py`, `domain/problem_report.py`). Bewusst **ohne** `sensor:`:
+# Sensorstörung (`sensor_fault`) und festhängender Messwert (`stuck_sensor`) teilen
+# sich dort absichtlich denselben Schlüssel `sensor:<zonen-id>`, weil thermoctl beide
+# auf dieselbe Home-Assistant-Entität abbildet -- "der Fleet-Dienst darf daraus also
+# nicht auf die Art schließen" (Abschnitt 22.1). Ein `sensor:`-Schlüssel bleibt daher
+# absichtlich unter "sonstige Meldung" (`None`), keine Lücke, die noch zu schließen
+# wäre.
 _PRAEFIX_STOERUNGSART: dict[str, Stoerungsart] = {
     "zigbee2mqtt:": Stoerungsart.BRIDGE_FAULT,
     "tenant-report:": Stoerungsart.TENANT_REPORT,
+    "fenster:": Stoerungsart.WINDOW_ALARM,
+    "schaltbefehl:": Stoerungsart.COMMAND_FAILURE,
 }
 
 
@@ -60,10 +95,29 @@ def stoerungsart_aus_schluessel(schluessel: str) -> Stoerungsart | None:
     """Ordnet einen Ereignis-`schluessel` über ein Präfix einer Störungsart zu.
 
     `None` bedeutet "sonstige Meldung" (Abschnitt 18.1) -- kein Fehlerfall,
-    keine Ablehnung.
+    keine Ablehnung. Gilt auch für den `sensor:`-Schlüssel, siehe die
+    Begründung bei `_PRAEFIX_STOERUNGSART` oben.
     """
 
     for praefix, art in _PRAEFIX_STOERUNGSART.items():
         if schluessel.startswith(praefix):
             return art
     return None
+
+
+def stoerungsereignis_aus_ereignis(
+    ereignis: Ereignis, empfangen: datetime
+) -> Stoerungsereignis:
+    """Baut den einheitlichen Umschlag aus der rohen Webhook-Nutzlast.
+
+    `empfangen` kommt vom Aufrufer (Abschnitt 18.1: "der Zeitstempel ist der
+    Empfangszeitpunkt"), nicht aus `ereignis` selbst -- die Nutzlast trägt
+    keinen eigenen Zeitstempel.
+    """
+
+    return Stoerungsereignis(
+        art=stoerungsart_aus_schluessel(ereignis.schluessel),
+        schluessel=ereignis.schluessel,
+        zeitpunkt=empfangen,
+        klartext=f"{ereignis.titel}: {ereignis.text}",
+    )

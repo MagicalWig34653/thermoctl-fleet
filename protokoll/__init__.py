@@ -20,7 +20,12 @@ from protokoll.bestand import (
     WohnungZustand,
     Zuordnung,
 )
-from protokoll.ereignisse import Ereignis, stoerungsart_aus_schluessel
+from protokoll.ereignisse import (
+    Ereignis,
+    Stoerungsereignis,
+    stoerungsart_aus_schluessel,
+    stoerungsereignis_aus_ereignis,
+)
 from protokoll.herzschlag import (
     GeraeteZustand,
     Herzschlag,
@@ -54,10 +59,12 @@ __all__ = [
     "RegelungsZustand",
     "Sollzustand",
     "Stoerungsart",
+    "Stoerungsereignis",
     "SystemZustand",
     "ThermoctlZustand",
     "Wohnung",
     "WohnungZustand",
     "Zuordnung",
     "stoerungsart_aus_schluessel",
+    "stoerungsereignis_aus_ereignis",
 ]

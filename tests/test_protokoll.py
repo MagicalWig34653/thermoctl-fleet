@@ -9,11 +9,17 @@ die Verträglichkeit älterer Fassungen (18.2).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pydantic
 import pytest
 
 from protokoll.befehle import Befehl
-from protokoll.ereignisse import Ereignis, stoerungsart_aus_schluessel
+from protokoll.ereignisse import (
+    Ereignis,
+    stoerungsart_aus_schluessel,
+    stoerungsereignis_aus_ereignis,
+)
 from protokoll.herzschlag import Herzschlag, Stoerungsart
 from protokoll.version import PROTOKOLLVERSION
 
@@ -181,6 +187,8 @@ def test_ereignis_ohne_pflichtfeld_wird_abgelehnt() -> None:
     [
         ("zigbee2mqtt:brücke", Stoerungsart.BRIDGE_FAULT),
         ("tenant-report:3:heizung_kalt", Stoerungsart.TENANT_REPORT),
+        ("fenster:3", Stoerungsart.WINDOW_ALARM),
+        ("schaltbefehl:heizkoerper-3", Stoerungsart.COMMAND_FAILURE),
     ],
 )
 def test_stoerungsart_aus_schluessel_ordnet_belegte_praefixe_zu(
@@ -196,3 +204,57 @@ def test_stoerungsart_aus_schluessel_gibt_none_fuer_unbekanntes_praefix() -> Non
     """
 
     assert stoerungsart_aus_schluessel("etwas_unbekanntes:42") is None
+
+
+def test_stoerungsart_aus_schluessel_bleibt_bei_sensor_praefix_absichtlich_none() -> None:
+    """Abschnitt 22.1, Sonderfall: 'sensor_fault' und 'stuck_sensor' teilen sich
+
+    denselben Schlüssel `sensor:<zonen-id>` -- daraus darf der Fleet-Dienst nicht
+    auf eine der beiden Arten schließen, deshalb bleibt `sensor:` absichtlich
+    ohne Eintrag in der Präfixtabelle.
+    """
+
+    assert stoerungsart_aus_schluessel("sensor:3") is None
+
+
+def test_stoerungsereignis_aus_ereignis_baut_den_einheitlichen_umschlag() -> None:
+    """Abschnitt 22.1, nachträglich entschieden: Art, Schlüssel, Zeitpunkt,
+
+    Klartext -- derselbe Umschlag für alle sechs Störungsarten.
+    """
+
+    ereignis = Ereignis.model_validate(
+        {
+            "schluessel": "fenster:3",
+            "schwere": "stoerung",
+            "titel": "Fenster offen",
+            "text": "Zone 3 meldet ein offenes Fenster seit 20 Minuten.",
+        }
+    )
+    empfangen = datetime(2026, 9, 22, 14, 3, 11, tzinfo=UTC)
+
+    stoerungsereignis = stoerungsereignis_aus_ereignis(ereignis, empfangen)
+
+    assert stoerungsereignis.art == Stoerungsart.WINDOW_ALARM
+    assert stoerungsereignis.schluessel == "fenster:3"
+    assert stoerungsereignis.zeitpunkt == empfangen
+    assert stoerungsereignis.klartext == (
+        "Fenster offen: Zone 3 meldet ein offenes Fenster seit 20 Minuten."
+    )
+
+
+def test_stoerungsereignis_aus_ereignis_laesst_art_offen_bei_mehrdeutigem_schluessel() -> None:
+    ereignis = Ereignis.model_validate(
+        {
+            "schluessel": "sensor:3",
+            "schwere": "stoerung",
+            "titel": "Sensor gestört",
+            "text": "Zone 3 liefert seit 10 Minuten keinen Messwert.",
+        }
+    )
+
+    stoerungsereignis = stoerungsereignis_aus_ereignis(
+        ereignis, datetime(2026, 9, 22, 14, 3, 11, tzinfo=UTC)
+    )
+
+    assert stoerungsereignis.art is None
