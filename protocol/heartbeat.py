@@ -15,6 +15,14 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+# Section 5: "the agent sends the buffered heartbeats (at most the last 240,
+# i.e. eight hours) on next contact, in one batch". A module constant, not a
+# model field -- the catch-up limit is not part of the wire contract of a
+# single `Heartbeat`, it is a property of the buffer that produces a batch of
+# them (`POST /v1/heartbeats`, P2.1b) and of the agent-side buffer that will
+# fill it (P2.3, deferred).
+MAX_CATCH_UP_HEARTBEATS = 240
+
 
 class FaultKind(StrEnum):
     """The six fault kinds thermoctl already knows today (section 5)."""
@@ -71,8 +79,8 @@ class Heartbeat(BaseModel):
     """A single heartbeat, as the agent sends it every 120 s.
 
     When catching up (section 5, "at most the last 240"), the agent sends several
-    of these in one batch -- the batch format for that is not yet defined (see
-    docs/STATUS.md, open points for the scaffold).
+    of these in one batch via `POST /v1/heartbeats` (P2.1b) -- a plain JSON list
+    of this model, at least one and at most `MAX_CATCH_UP_HEARTBEATS` entries.
 
     `protocol_version` (section 18.2): the agent sends it with every heartbeat.
     Structurally, this model checks nothing against `PROTOCOL_VERSION` -- whether a
