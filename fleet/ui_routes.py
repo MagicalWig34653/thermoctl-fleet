@@ -24,7 +24,7 @@ from fastapi.templating import Jinja2Templates
 
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
 from fleet.storage import Storage, get_storage
-from fleet.ui_apartment import DEFAULT_HISTORY_DAYS, build_apartment_detail
+from fleet.ui_apartment import build_apartment_detail
 from fleet.ui_auth import (
     PRE_SESSION_CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
@@ -41,6 +41,7 @@ from fleet.ui_auth import (
     session_absolute_lifetime_s,
 )
 from fleet.ui_house import build_house_overview
+from fleet.ui_tasks import build_task_overview
 
 logger = logging.getLogger(__name__)
 
@@ -277,11 +278,44 @@ def index(
     return response
 
 
+@router.get("/tasks", response_class=HTMLResponse)
+def tasks(
+    request: Request,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """"Aufgaben" (P3.4, section 9's third view) -- what is due: battery
+    rounds, updates, unconfirmed faults. All derivation/German rendering
+    happens in `fleet.ui_tasks.build_task_overview`; this route only wires
+    the authenticated request to it and renders the template, exactly the
+    same shape as `index` above for "Das Haus"."""
+
+    overview = build_task_overview(storage, datetime.now(UTC))
+    response = templates.TemplateResponse(
+        request,
+        "tasks.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "overview": overview,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# P3.2 review: any future `/ui/apartments/...` sub-route (a fixed suffix,
+# not a `{apartment_id}`) **must** be registered above this one -- FastAPI/
+# Starlette matches routes in registration order, and `{apartment_id:path}`
+# below greedily matches everything after the prefix, including a literal
+# segment like `/ui/apartments/export` that was meant for a different,
+# more specific route. `/tasks` above is unaffected (a different top-level
+# `/ui/...` path, not a `/ui/apartments/...` suffix).
 @router.get("/apartments/{apartment_id:path}", response_class=HTMLResponse)
 def apartment_detail(
     request: Request,
     apartment_id: str,
-    days: int = DEFAULT_HISTORY_DAYS,
+    days: str | None = None,
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
@@ -300,14 +334,23 @@ def apartment_detail(
     space/`<`/every other quoted character correctly -- verified for all of
     `/`, space, and `<` by this package's own tests.
 
+    **`days` is `str | None`, not `int`, deliberately (cross-review round
+    1 fix):** an `int`-typed FastAPI query parameter makes FastAPI/Pydantic
+    itself reject a non-integer value (`?days=abc`, `?days=3.5`,
+    `?days=1e400`) with a 422 *before* this function body ever runs --
+    contradicting both this docstring's own earlier claim and
+    `docs/STATUS.md`'s "never a 422" for this parameter. Accepting the raw
+    string and handing it to `fleet.ui_apartment.clamp_history_days` lets
+    *that* function be the single place that decides what counts as a
+    valid `days` value; any value it cannot parse as a positive int
+    degrades to the default (3), same as an out-of-range one.
+
     Unknown apartment -> 404, same layout (`base.html`'s nav/header still
     render), no data (`build_apartment_detail` returns `None`,
     `apartment.html` branches on that itself). All derivation/German
     rendering happens in `fleet.ui_apartment.build_apartment_detail`; this
     route only wires the authenticated request (plus the `days` query
-    parameter, capped by that function via `clamp_history_days` -- an
-    out-of-range or malformed value is clamped, never a 422) to it and
-    renders the template.
+    parameter) to it and renders the template.
     """
 
     detail = build_apartment_detail(storage, apartment_id, datetime.now(UTC), days)

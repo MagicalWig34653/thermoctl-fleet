@@ -27,13 +27,8 @@ header nav {
     border-bottom: 1px solid #8888;
 }
 
-header nav a,
-header nav span.inactive {
+header nav a {
     text-decoration: none;
-}
-
-header nav span.inactive {
-    opacity: 0.6;
 }
 
 header nav form {
@@ -187,11 +182,48 @@ ol.timeline {
     font-weight: bold;
 }
 
-.timeline__duration {
+.timeline__duration,
+.timeline__count {
     opacity: 0.8;
 }
 
 .apartment-detail__note {
     font-size: 0.9em;
     opacity: 0.8;
+}
+
+/* "Aufgaben" (P3.4) -- three task groups, each a plain list, "Nichts
+ * fällig." for an empty one (same "quiet surface" idea as P3.1's tiles,
+ * here without any colour coding -- a task list is already ordered by
+ * what needs doing, it does not also need a red/green split).
+ */
+.task-group {
+    margin: 2rem 0 0;
+}
+
+.task-group:first-of-type {
+    margin-top: 1rem;
+}
+
+.task-group h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1.1rem;
+}
+
+.task-group__empty {
+    opacity: 0.7;
+}
+
+ul.task-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+}
+
+.task-list li {
+    border: 1px solid #8888;
+    border-radius: 0.25rem;
+    padding: 0.5rem 0.75rem;
 }

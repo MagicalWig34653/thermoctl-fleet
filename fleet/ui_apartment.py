@@ -22,6 +22,17 @@ definition of "absent" (section 8's own headline alarm). `_build_timeline`
 below is the pure function this reasoning lives in; it takes already-loaded
 rows and `now`, so it is unit-testable without a database at all.
 
+**Reachable runs are aggregated, gaps never are (cross-review round 1).**
+A 14-day window can mean up to ~10,000 stored heartbeats; rendering one
+`<li>` per heartbeat was found to not scale. `_build_timeline` now
+collapses each *contiguous* run of reachable heartbeats (no gap between
+any two consecutive ones) into a single `TimelineEntry`
+(`_close_run` -- "erreichbar von ... bis ..., N Herzschläge", plus how
+many were caught up), while a gap keeps its own row with its own start,
+end, and duration -- unchanged from the original derivation above.
+Section 5 forbids smoothing over gaps; it says nothing about summarising a
+reachable period, which is exactly what a run collapses without losing.
+
 **Caught-up heartbeats (section 5: "the agent sends the buffered
 heartbeats ... on next contact, in one batch", P2.1b).** A heartbeat whose
 `received_at` is more than `ABSENCE_THRESHOLD` after its own `sent_at` was
@@ -88,14 +99,35 @@ ALARM_KIND_LABELS: dict[str, str] = {
 _OTHER_REPORT_LABEL = "sonstige Meldung"
 
 
-def clamp_history_days(days: int | None) -> int:
+def clamp_history_days(days: int | str | None) -> int:
     """`None`/non-positive -> `DEFAULT_HISTORY_DAYS`; anything above
     `MAX_HISTORY_DAYS` -> capped there. A malformed or hostile `?days=`
     query value therefore never produces an unbounded storage read -- see
     `Storage.get_heartbeat_history`'s own bound for the second half of
-    "keep queries bounded"."""
+    "keep queries bounded".
 
-    if days is None or days < 1:
+    **Accepts `str` as well as `int` (cross-review round 1 fix).**
+    `fleet/ui_routes.py::apartment_detail` deliberately types its `days`
+    query parameter as `str | None`, not `int | None` -- an `int`-typed
+    FastAPI query parameter makes FastAPI/Pydantic itself reject a
+    non-integer value (`?days=abc`, `?days=3.5`, `?days=1e400`) with a 422
+    *before* this function, or the route body, ever runs, which
+    contradicts the "never a 422" behaviour this whole function exists to
+    provide. Any string that does not parse as a plain base-10 integer
+    (`int(days)`, which itself already rejects `"3.5"`/`"1e400"`/`"abc"`
+    with a `ValueError`) degrades to `DEFAULT_HISTORY_DAYS`, exactly like
+    an out-of-range value -- malformed input is never a hard error here,
+    only ever a silent fallback to the default.
+    """
+
+    if days is None:
+        return DEFAULT_HISTORY_DAYS
+    if isinstance(days, str):
+        try:
+            days = int(days)
+        except ValueError:
+            return DEFAULT_HISTORY_DAYS
+    if days < 1:
         return DEFAULT_HISTORY_DAYS
     return min(days, MAX_HISTORY_DAYS)
 
@@ -146,16 +178,27 @@ def _relative_duration(now: datetime, moment: datetime) -> str:
 @dataclass(frozen=True)
 class TimelineEntry:
     """One row of the heartbeat-history timeline (section 5). Either a
-    received heartbeat (`is_gap=False`) or a detected silence between two
-    consecutive heartbeats (`is_gap=True`, `duration_text` set) --
-    reachability only, see this module's docstring for why nothing from
-    section 6 is or could be derived here."""
+    **contiguous run of reachable heartbeats**, aggregated into one row
+    (`is_gap=False`, `heartbeat_count`/`caught_up_count` set,
+    `duration_text=None`), or a detected silence between two runs
+    (`is_gap=True`, `duration_text` set, `heartbeat_count`/
+    `caught_up_count=None`) -- reachability only, see this module's
+    docstring for why nothing from section 6 is or could be derived here.
+
+    **Runs are summarised, gaps never are (cross-review round 1, review's
+    own wording): "section 5 forbids smoothing over gaps, not summarising
+    reachable periods."** A single row per run keeps a 14-day, ~10,000
+    heartbeat window renderable without one `<li>` per heartbeat; every gap
+    still gets its own row with its own start, end, and duration -- exactly
+    the data section 5 says must never be smoothed over.
+    """
 
     is_gap: bool
     label: str
     when_text: str
     duration_text: str | None
-    caught_up: bool
+    heartbeat_count: int | None
+    caught_up_count: int | None
 
 
 @dataclass(frozen=True)
@@ -222,43 +265,71 @@ class ApartmentDetail:
     alarms: list[AlarmDisplay]
 
 
+def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> TimelineEntry:
+    """Collapses one contiguous run of reachable heartbeats (`run_rows`,
+    ascending by `sent_at`, never empty) into a single `TimelineEntry` --
+    "erreichbar von ... bis ..., N Herzschläge", plus how many of them were
+    delivered late via a catch-up batch (P2.1b). A run of exactly one
+    heartbeat renders as a single point in time ("vor X"), not a
+    zero-length range, since "von X bis X" would only restate the same
+    moment twice."""
+
+    start = run_rows[0].sent_at
+    end = run_rows[-1].sent_at
+    caught_up_count = sum(
+        1 for row in run_rows if (row.received_at - row.sent_at) > ABSENCE_THRESHOLD
+    )
+    when_text = (
+        f"vor {_relative_duration(now, start)}"
+        if len(run_rows) == 1
+        else f"von {_relative_duration(now, start)} bis {_relative_duration(now, end)}"
+    )
+    return TimelineEntry(
+        is_gap=False,
+        label="Erreichbar",
+        when_text=when_text,
+        duration_text=None,
+        heartbeat_count=len(run_rows),
+        caught_up_count=caught_up_count,
+    )
+
+
 def _build_timeline(rows: list[HeartbeatHistoryEntry], now: datetime) -> list[TimelineEntry]:
     """Pure function, no storage access -- `rows` must already be ordered
     ascending by `sent_at` (as `Storage.get_heartbeat_history` returns
-    them). See the module docstring for the gap/caught-up reasoning; this
-    function only assembles the resulting list, newest first (a landlord
-    checking "is everything fine right now" reads top to bottom, most
-    recent activity first)."""
+    them). See the module docstring for the gap/caught-up/run-aggregation
+    reasoning; this function only assembles the resulting list, newest
+    first (a landlord checking "is everything fine right now" reads top to
+    bottom, most recent activity first) -- **every gap keeps its own row,
+    only contiguous reachable runs are collapsed into one** (cross-review
+    round 1: section 5 forbids smoothing over gaps, not summarising
+    reachable periods, and a 14-day window can otherwise mean one `<li>`
+    per heartbeat, up to ~10,000 of them)."""
 
     entries: list[TimelineEntry] = []
+    current_run: list[HeartbeatHistoryEntry] = []
     previous_sent_at: datetime | None = None
     for row in rows:
-        if previous_sent_at is not None:
-            gap = row.sent_at - previous_sent_at
-            if gap > ABSENCE_THRESHOLD:
-                entries.append(
-                    TimelineEntry(
-                        is_gap=True,
-                        label="Lücke",
-                        when_text=(
-                            f"{_relative_duration(now, previous_sent_at)} bis "
-                            f"{_relative_duration(now, row.sent_at)}"
-                        ),
-                        duration_text=_relative_duration(row.sent_at, previous_sent_at),
-                        caught_up=False,
-                    )
+        if previous_sent_at is not None and (row.sent_at - previous_sent_at) > ABSENCE_THRESHOLD:
+            entries.append(_close_run(current_run, now))
+            entries.append(
+                TimelineEntry(
+                    is_gap=True,
+                    label="Lücke",
+                    when_text=(
+                        f"{_relative_duration(now, previous_sent_at)} bis "
+                        f"{_relative_duration(now, row.sent_at)}"
+                    ),
+                    duration_text=_relative_duration(row.sent_at, previous_sent_at),
+                    heartbeat_count=None,
+                    caught_up_count=None,
                 )
-        caught_up = (row.received_at - row.sent_at) > ABSENCE_THRESHOLD
-        entries.append(
-            TimelineEntry(
-                is_gap=False,
-                label="Gemeldet",
-                when_text=f"vor {_relative_duration(now, row.sent_at)}",
-                duration_text=None,
-                caught_up=caught_up,
             )
-        )
+            current_run = []
+        current_run.append(row)
         previous_sent_at = row.sent_at
+    if current_run:
+        entries.append(_close_run(current_run, now))
     entries.reverse()
     return entries
 
@@ -287,7 +358,7 @@ def _build_alarm_display(alarm: AlarmRecord, now: datetime) -> AlarmDisplay:
 
 
 def build_apartment_detail(
-    storage: Storage, apartment_id: str, now: datetime, days: int | None
+    storage: Storage, apartment_id: str, now: datetime, days: int | str | None
 ) -> ApartmentDetail | None:
     """`None` for an apartment unknown to storage (`fleet/ui_routes.py`
     turns that into a 404) -- existence is checked via
@@ -295,6 +366,10 @@ def build_apartment_detail(
     already performs for a different purpose (every registered apartment
     has exactly one token-hash row, `Storage.set_apartment_token`), so no
     separate "does this apartment exist" storage method was needed.
+
+    `days` accepts `int | str | None` -- see `clamp_history_days` for why
+    `str` is accepted (the HTTP route passes the raw, unvalidated query
+    value straight through, deliberately never as `int`).
 
     `now` is always injected by the caller (same pattern as
     `fleet/alarms.py`/`fleet/ui_auth.py`/`fleet/ui_house.py`), so tests

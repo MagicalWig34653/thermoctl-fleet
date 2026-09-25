@@ -29,7 +29,12 @@
             <span class="timeline__label">{{ entry.label }}</span>
             <span class="timeline__when">{{ entry.when_text }}</span>
             {% if entry.duration_text %}<span class="timeline__duration">({{ entry.duration_text }})</span>{% endif %}
-            {% if entry.caught_up %}<span class="apartment-tile__tag">nachgeliefert</span>{% endif %}
+            {% if entry.heartbeat_count is not none %}
+            <span class="timeline__count">{{ entry.heartbeat_count }} Herzschläge</span>
+            {% endif %}
+            {% if entry.caught_up_count %}
+            <span class="apartment-tile__tag">{{ entry.caught_up_count }} nachgeliefert</span>
+            {% endif %}
         </li>
         {% endfor %}
     </ol>

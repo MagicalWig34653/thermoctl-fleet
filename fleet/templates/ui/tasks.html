@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}Aufgaben – thermoctl-fleet{% endblock %}
+
+{% block content %}
+{# "Aufgaben" (P3.4, section 9's third view) -- three task groups, already
+   filtered, sorted, and rendered into German text by
+   fleet/ui_tasks.py::build_task_overview. This template only iterates and
+   prints; it makes no filtering, sorting, or wording decisions of its own. #}
+<h1>Aufgaben</h1>
+
+<section class="task-group" aria-labelledby="task-group-battery">
+    <h2 id="task-group-battery">Batterierunde</h2>
+    {% if overview.battery_rounds %}
+    <ul class="task-list">
+        {% for task in overview.battery_rounds %}
+        <li>
+            <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
+            {{ task.battery_percent }}&nbsp;% (Stand {{ task.last_contact_text }})
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="task-group__empty">Nichts fällig.</p>
+    {% endif %}
+</section>
+
+<section class="task-group" aria-labelledby="task-group-updates">
+    <h2 id="task-group-updates">Updates</h2>
+    {% if overview.updates %}
+    <ul class="task-list">
+        {% for task in overview.updates %}
+        <li>
+            <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
+            veraltete Protokollversion (Agent {{ task.agent_version }}, thermoctl {{ task.thermoctl_version }})
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="task-group__empty">Nichts fällig.</p>
+    {% endif %}
+</section>
+
+<section class="task-group" aria-labelledby="task-group-faults">
+    <h2 id="task-group-faults">Unbestätigte Störungen</h2>
+    {% if overview.unconfirmed_faults %}
+    <ul class="task-list">
+        {% for task in overview.unconfirmed_faults %}
+        <li>
+            <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
+            {{ task.kind_label }} ({{ task.zone }}), {{ task.since_text }}
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="task-group__empty">Nichts fällig.</p>
+    {% endif %}
+</section>
+{% endblock %}
