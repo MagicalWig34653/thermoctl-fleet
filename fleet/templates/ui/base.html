@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}thermoctl-fleet{% endblock %}</title>
+    {#
+    An external, same-origin stylesheet, not an inline style block
+    (cross-review round 2: `default-src 'self'` without `'unsafe-inline'`
+    blocks inline CSS too, not only inline scripts -- see
+    fleet/static/ui/fleet-ui.css's own header comment). Still no script of
+    any kind (P3.0 requirement: "no JS needed") -- the CSP sent by
+    fleet/ui_routes.py's security-headers middleware would block an inline
+    one regardless, and no script is mounted under /ui/static either.
+    #}
+    <link rel="stylesheet" href="/ui/static/fleet-ui.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Zum Inhalt springen</a>
+{% if ui_session %}
+<header>
+    <nav aria-label="Hauptnavigation">
+        <a href="/ui/">Das Haus</a>
+        {#
+        "Aufgaben" is section 9's third view (P3.4, not built yet -- see
+        docs/implementation_plan.md). Shown as inactive text, not a link to
+        a route that does not exist: a landlord clicking a broken link is a
+        worse first impression than an entry that visibly does nothing yet.
+        #}
+        <span class="inactive" aria-disabled="true">Aufgaben</span>
+        <form method="post" action="/ui/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Abmelden</button>
+        </form>
+    </nav>
+</header>
+{% endif %}
+<main id="main">
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

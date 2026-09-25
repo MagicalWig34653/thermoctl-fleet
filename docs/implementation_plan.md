@@ -136,6 +136,45 @@ parallel with all other packages of the same stage.
 
 ## Step 3 -- UI
 
+### P3.0 -- Login for the fleet UI **SR**
+- **Goal:** the landlord can log in to the fleet UI before any of the three
+  views (section 9) exist to protect. The specification itself is silent on
+  how this login works -- decided by the project owner, 2026-09-24: own user
+  accounts in the fleet database, password hashed with Argon2
+  (`argon2-cffi`), TOTP as a mandatory second factor (`pyotp`), server-side
+  sessions via a cookie; the first account is created via a CLI command,
+  never via the web; no external identity provider; passkeys/WebAuthn noted
+  as a possible later extension, not built here.
+- **Files:** `fleet/ui_auth.py` (auth/session/CSRF logic, the
+  `require_ui_user` dependency later UI packages depend on),
+  `fleet/ui_routes.py` (`/ui/login`, `/ui/logout`, the protected `/ui/`
+  placeholder, the `/ui`-scoped security-header middleware),
+  `fleet/admin.py` (`python -m fleet.admin create-user/reset-totp/unlock/
+  delete-user`), `fleet/storage.py` (`UiUserRecord`/`UiSessionRecord` plus
+  their `Storage` methods), migration `0005_ui_accounts`,
+  `fleet/templates/ui/{base,login,index}.html`.
+- **Section:** 9 (this login sits in front of all three views); no
+  specification section defines it directly, see the decision above.
+- **Acceptance:** see `docs/STATUS.md`'s P3.0 section and
+  `tests/test_ui_auth.py`/`tests/test_admin.py`/`tests/test_packaging.py`
+  for the full list -- successful login sets a correctly flagged session
+  cookie and reaches the protected page; unknown user/wrong password/wrong
+  or replayed TOTP code all produce the same generic response; lockout
+  after 5 consecutive failures, unlocking again after the configured
+  duration; session absolute and idle expiry; logout deletes the session
+  server-side (the old cookie value stops working); login rotates
+  (never reuses) the session token; CSRF is required and checked on every
+  state-changing `/ui` POST; an unauthenticated protected-page request
+  redirects (303) to `/ui/login` without ever rendering protected content;
+  the security headers are present on every `/ui` response; the stored
+  session value is a hash, never the raw cookie value; an agent token
+  cannot reach `/ui/` and a UI session cookie cannot reach `/v1/...`; the
+  wheel actually contains the templates.
+- **Depends on:** P1.3 (storage layer, migrations).
+- [x] done -- see `docs/STATUS.md` for the decision, the configuration
+  environment variables, and the open points (passkeys; TOTP secrets
+  stored in plain text).
+
 ### P3.1 -- "The house" view
 - **Goal:** overview of all apartments with status.
 - **Files:** `fleet/` templates/views (directory not yet created),
@@ -163,6 +202,29 @@ parallel with all other packages of the same stage.
   pattern from thermoctl).
 - **Depends on:** P4.1 (at least a reading inventory endpoint).
 - **Parallel to:** P3.1, P3.2 once their templates exist.
+
+### P3.4 -- "Tasks" view
+- **Goal:** section 9's third view, "what is due": battery rounds, updates,
+  unconfirmed faults -- "the list people actually work from." Noted here
+  explicitly because this plan's step 3 had so far only ever listed two of
+  section 9's three views (P3.1 "the house", P3.2 "one apartment") --
+  spotted while writing up P3.0, not a change of scope, section 9 always
+  named three.
+- **Files:** as P3.1, plus whatever P2.2/P4.x endpoints or storage queries
+  a task actually needs (battery-round data from heartbeats already stored,
+  update availability, unconfirmed/open faults from `fleet/storage.py`'s
+  `events`/`alarms` tables) -- most likely new read-only aggregation
+  helpers on `Storage`, not new tables.
+- **Section:** 9.
+- **Acceptance:** page lists the three task kinds; test checks that a
+  battery round, a pending update, and an unconfirmed fault each actually
+  show up when the underlying data says they should, and that the page is
+  empty when none do (mirroring "whoever has nothing to do sees a quiet
+  surface" from P3.1's own goal).
+- **Depends on:** P3.1 (shared templates/navigation -- the "Aufgaben" nav
+  entry already exists as an inactive placeholder since P3.0, see
+  `fleet/templates/ui/base.html`).
+- **Not done yet.**
 
 ---
 

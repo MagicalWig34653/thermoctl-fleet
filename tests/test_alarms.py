@@ -20,7 +20,7 @@ import secrets
 import socket
 import ssl
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -113,9 +113,13 @@ class _RecordingNotifier:
 
     def __init__(self) -> None:
         self.notifications: list[AlarmNotification] = []
+        self.raw_notifications: list[tuple[str, dict[str, str]]] = []
 
     def notify(self, notification: AlarmNotification) -> None:
         self.notifications.append(notification)
+
+    def notify_raw(self, subject: str, payload: Mapping[str, str]) -> None:
+        self.raw_notifications.append((subject, dict(payload)))
 
 
 class _FailingNotifier:
@@ -123,6 +127,11 @@ class _FailingNotifier:
         self.calls = 0
 
     def notify(self, notification: AlarmNotification) -> None:
+        self.calls += 1
+        raise RuntimeError("simulated notifier failure")
+
+    def notify_raw(self, subject: str, payload: Mapping[str, str]) -> None:
+        del subject, payload
         self.calls += 1
         raise RuntimeError("simulated notifier failure")
 
@@ -520,6 +529,33 @@ def test_webhook_notifier_posts_the_payload_to_a_real_local_server(webhook_serve
     assert body["cleared_at"] is None
 
 
+def test_webhook_notifier_notify_raw_posts_the_given_payload_verbatim(
+    webhook_server: str,
+) -> None:
+    """P3.0 round 3: `notify_raw` is the entry point
+    `notify_ui_account_locked` uses (no `AlarmNotification` involved, since
+    a UI account lock has no apartment) -- posts exactly the payload it is
+    given, through the same transport `notify` uses."""
+
+    notifier = WebhookNotifier([webhook_server])
+
+    notifier.notify_raw(
+        "[thermoctl-fleet] UI account locked: landlord",
+        {
+            "alarm_kind": "ui_account_locked",
+            "username": "landlord",
+            "locked_at": "2026-09-25T00:00:00+00:00",
+        },
+    )
+
+    assert len(_CapturingWebhookHandler.received) == 1
+    assert _CapturingWebhookHandler.received[0] == {
+        "alarm_kind": "ui_account_locked",
+        "username": "landlord",
+        "locked_at": "2026-09-25T00:00:00+00:00",
+    }
+
+
 def test_webhook_notifier_raises_when_the_server_errors() -> None:
     class _FailingHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
@@ -791,6 +827,32 @@ def test_smtp_notifier_sends_a_message_over_plaintext_to_a_real_local_server(
     assert "schluessel" not in content
 
 
+def test_smtp_notifier_notify_raw_sends_the_given_subject_and_payload(
+    smtp_server: tuple[str, int, _CapturingSmtpHandler],
+) -> None:
+    host, port, handler = smtp_server
+    notifier = SmtpNotifier(
+        SmtpConfig(
+            host=host,
+            port=port,
+            from_addr="fleet@example.invalid",
+            to_addrs=("landlord@example.invalid",),
+            tls_mode=SmtpTlsMode.PLAINTEXT,
+        )
+    )
+
+    notifier.notify_raw(
+        "[thermoctl-fleet] UI account locked: landlord",
+        {"alarm_kind": "ui_account_locked", "username": "landlord"},
+    )
+
+    assert len(handler.envelopes) == 1
+    content = handler.envelopes[0].content.decode("utf-8")  # type: ignore[attr-defined]
+    assert "UI account locked: landlord" in content
+    assert "ui_account_locked" in content
+    assert "username: landlord" in content
+
+
 def test_smtp_notifier_starttls_calls_starttls_with_a_verifying_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -970,6 +1032,20 @@ def test_log_notifier_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
         notifier.notify(notification)
 
     assert any(APARTMENT in record.message for record in caplog.records)
+
+
+def test_log_notifier_notify_raw_logs_the_subject_and_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    notifier = LogNotifier()
+
+    with caplog.at_level("WARNING"):
+        notifier.notify_raw(
+            "[thermoctl-fleet] UI account locked: landlord",
+            {"alarm_kind": "ui_account_locked", "username": "landlord"},
+        )
+
+    assert any("landlord" in record.message for record in caplog.records)
 
 
 # -- configuration parsing --------------------------------------------------------

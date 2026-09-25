@@ -91,9 +91,21 @@ class AlarmKind(StrEnum):
     separate future work -- adding a value here without also building its
     check function would be exactly the kind of silent gap this project's
     tests are meant to catch, so none are added ahead of their own package.
+
+    `UI_ACCOUNT_LOCKED` is the one deliberate exception to "section 8's
+    table only" (P3.0 round 3, project owner decision 2026-09-25): it is
+    not one of section 8's nine apartment alarm rules at all -- there is no
+    apartment involved -- but "when an account gets locked, raise a
+    notification through the existing P2.2 notifier channels" is exactly
+    the same job this enum and `load_notifiers_from_env` already do, so a
+    second, parallel notification system was not built just to keep this
+    enum's membership literally restricted to section 8. See
+    `notify_ui_account_locked` below for the (much smaller, apartment-free)
+    payload this kind actually carries.
     """
 
     NOT_REPORTING = "not_reporting"
+    UI_ACCOUNT_LOCKED = "ui_account_locked"
 
 
 class Urgency(StrEnum):
@@ -122,6 +134,19 @@ class AlarmNotification:
 
 class Notifier(Protocol):
     def notify(self, notification: AlarmNotification) -> None: ...  # pragma: no cover
+
+    # Sends an arbitrary `subject`/`payload` pair through the same
+    # transport as `notify`, without going through `AlarmNotification`'s
+    # apartment-shaped fields (P3.0 round 3: the UI-account-lock
+    # notification has no apartment, no urgency, no raise/clear event --
+    # forcing it into `AlarmNotification`'s shape would mean inventing
+    # meaningless values for fields that do not apply, which is worse than
+    # a second, smaller entry point on the same three notifier
+    # implementations). `subject` is the email subject line for
+    # `SmtpNotifier`; `WebhookNotifier` and `LogNotifier` accept but do not
+    # use it as a header of any kind (a webhook POST body simply *is* the
+    # payload, and a log line has no separate subject/body split).
+    def notify_raw(self, subject: str, payload: Mapping[str, str]) -> None: ...  # pragma: no cover
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -191,7 +216,17 @@ class WebhookNotifier:
         self._timeout_s = timeout_s
 
     def notify(self, notification: AlarmNotification) -> None:
-        payload = _payload_dict(notification)
+        self._post(_payload_dict(notification))
+
+    def notify_raw(self, subject: str, payload: Mapping[str, str]) -> None:
+        # No header in a JSON POST body for a "subject" to go into -- a
+        # webhook recipient reads `alarm_kind` (or whatever else the
+        # payload carries) to tell notifications apart, the same way it
+        # already does for `notify`'s apartment-alarm payloads.
+        del subject
+        self._post(dict(payload))
+
+    def _post(self, payload: dict[str, str | None]) -> None:
         failures: list[str] = []
         with httpx.Client(timeout=self._timeout_s) as client:
             for index, url in enumerate(self._urls):
@@ -260,7 +295,17 @@ class SmtpNotifier:
         self._config = config
 
     def notify(self, notification: AlarmNotification) -> None:
-        message = self._build_message(notification)
+        subject_event = "ALARM" if notification.event == "raised" else "ALL-CLEAR"
+        subject = (
+            f"[thermoctl-fleet] {subject_event}: {notification.kind.value} "
+            f"for {notification.apartment_id}"
+        )
+        self._send(self._build_message(subject, _payload_dict(notification)))
+
+    def notify_raw(self, subject: str, payload: Mapping[str, str]) -> None:
+        self._send(self._build_message(subject, payload))
+
+    def _send(self, message: EmailMessage) -> None:
         cfg = self._config
         context = ssl.create_default_context()
         if cfg.tls_mode is SmtpTlsMode.IMPLICIT:
@@ -281,16 +326,11 @@ class SmtpNotifier:
             smtp.login(self._config.user, self._config.password or "")
         smtp.send_message(message)
 
-    def _build_message(self, notification: AlarmNotification) -> EmailMessage:
+    def _build_message(self, subject: str, payload: Mapping[str, str | None]) -> EmailMessage:
         message = EmailMessage()
         message["From"] = self._config.from_addr
         message["To"] = ", ".join(self._config.to_addrs)
-        subject_event = "ALARM" if notification.event == "raised" else "ALL-CLEAR"
-        message["Subject"] = (
-            f"[thermoctl-fleet] {subject_event}: {notification.kind.value} "
-            f"for {notification.apartment_id}"
-        )
-        payload = _payload_dict(notification)
+        message["Subject"] = subject
         body = "\n".join(f"{key}: {value}" for key, value in payload.items())
         message.set_content(body)
         return message
@@ -315,6 +355,9 @@ class LogNotifier:
             _as_utc(notification.raised_at).isoformat(),
             _as_utc(notification.cleared_at).isoformat() if notification.cleared_at else None,
         )
+
+    def notify_raw(self, subject: str, payload: Mapping[str, str]) -> None:
+        logger.warning("%s: %s", subject, dict(payload))
 
 
 # -- configuration from the environment ----------------------------------------
@@ -468,6 +511,51 @@ def _try_notify(
             )
     if all_succeeded:
         mark_sent()
+
+
+# -- UI account lock notification (P3.0 round 3) -------------------------------
+
+
+def notify_ui_account_locked(
+    notifiers: Sequence[Notifier], username: str, locked_at: datetime
+) -> None:
+    """Notifies every configured channel that a fleet UI account was just
+    locked (P3.0 round 3, project owner decision 2026-09-25: "when an
+    account gets locked, raise a notification through the existing P2.2
+    notifier channels"). **Called at most once per lock**, by construction
+    of the caller: `fleet.ui_auth.authenticate` only calls this when
+    `Storage.record_ui_login_failure` reports that *this specific call* was
+    the one that atomically transitioned the account from unlocked to
+    locked (see that method's docstring) -- concurrent callers that lost
+    that race never call this function at all, so there is no
+    "all_succeeded, mark it sent, retry later" bookkeeping to do here the
+    way `_try_notify`/`AlarmRecord.raise_notified` do for apartment alarms:
+    a failed send is only ever logged, once, not retried on a later login
+    attempt (there is no natural "later check run" for an account lock the
+    way there is for an absent apartment).
+
+    **Payload is deliberately minimal** (round 3 decision, stated
+    explicitly: "payload = alarm kind, username, time -- no IP list, no
+    password material"): `notify_raw`'s `payload` carries exactly
+    `alarm_kind`, `username`, and `locked_at`, nothing about which IP
+    addresses were involved (those live only in `ui_login_throttle`, a
+    completely separate table this function never reads) and nothing
+    password- or TOTP-related.
+    """
+
+    subject = f"[thermoctl-fleet] UI account locked: {username}"
+    payload = {
+        "alarm_kind": AlarmKind.UI_ACCOUNT_LOCKED.value,
+        "username": username,
+        "locked_at": _as_utc(locked_at).isoformat(),
+    }
+    for notifier in notifiers:
+        try:
+            notifier.notify_raw(subject, payload)
+        except Exception:
+            logger.exception(
+                "Notifier %r failed for UI account lock (%s)", notifier, username
+            )
 
 
 def check_absence_alarms(

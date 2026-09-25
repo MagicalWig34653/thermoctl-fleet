@@ -30,6 +30,8 @@ from pydantic import BaseModel
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from fleet.storage import Storage, get_storage
+from fleet.ui_routes import install_security_headers
+from fleet.ui_routes import router as ui_router
 from protocol import (
     CommandResult,
     DeviceLifecycle,
@@ -118,6 +120,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION), lifespan=lifespan)
+
+# Fleet UI login (P3.0) -- entirely separate auth path from the `/v1/...`
+# agent API above: `ui_router`'s routes use `fleet.ui_auth`
+# (session cookie + CSRF), never `fleet.auth` (bearer token), and vice
+# versa no `/v1/...` endpoint here ever reads the `/ui` session cookie. See
+# `fleet/ui_auth.py`'s module docstring for the reasoning.
+app.include_router(ui_router)
+install_security_headers(app)
 
 
 @app.get("/healthz")
