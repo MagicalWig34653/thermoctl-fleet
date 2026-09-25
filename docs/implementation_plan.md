@@ -228,7 +228,11 @@ parallel with all other packages of the same stage.
 - **Depends on:** P3.1 (shared templates/navigation -- the "Aufgaben" nav
   entry already exists as an inactive placeholder since P3.0, see
   `fleet/templates/ui/base.html`).
-- **Not done yet.**
+- [x] done -- see `docs/STATUS.md` for the three named thresholds (citing
+  their own row of section 8's alarm table), the "already on Das Haus"
+  exclusion, and the open points (the version-gap reference needs a "current
+  release" concept this service does not have yet; no fault-acknowledgement
+  mechanism is built).
 
 ---
 

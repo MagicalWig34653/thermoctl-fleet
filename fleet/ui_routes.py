@@ -39,6 +39,7 @@ from fleet.ui_auth import (
     session_absolute_lifetime_s,
 )
 from fleet.ui_house import build_house_overview
+from fleet.ui_tasks import build_task_overview
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,32 @@ def index(
             "ui_session": authenticated,
             "csrf_token": authenticated.session.csrf_token,
             "tiles": tiles,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/tasks", response_class=HTMLResponse)
+def tasks(
+    request: Request,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """"Aufgaben" (P3.4, section 9's third view) -- what is due: battery
+    rounds, updates, unconfirmed faults. All derivation/German rendering
+    happens in `fleet.ui_tasks.build_task_overview`; this route only wires
+    the authenticated request to it and renders the template, exactly the
+    same shape as `index` above for "Das Haus"."""
+
+    overview = build_task_overview(storage, datetime.now(UTC))
+    response = templates.TemplateResponse(
+        request,
+        "tasks.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "overview": overview,
         },
     )
     response.headers["Cache-Control"] = "no-store"
