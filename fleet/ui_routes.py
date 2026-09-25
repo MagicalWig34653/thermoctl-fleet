@@ -16,7 +16,7 @@ import secrets
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Cookie, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -166,6 +166,7 @@ def _generic_login_failure_response(request: Request) -> Response:
 @router.post("/login")
 def login_submit(
     request: Request,
+    background_tasks: BackgroundTasks,
     username: str = Form(...),
     password: str = Form(...),
     totp_code: str = Form(...),
@@ -180,24 +181,35 @@ def login_submit(
     now = datetime.now(UTC)
     client_ip = resolve_client_ip(request)
 
-    # Per-IP throttle (P3.0 round 3, primary defence) -- checked **before**
-    # `authenticate`, so a blocked IP never causes any Argon2 work and its
-    # attempts are never counted against the account at all (P3.0 round 3
-    # requirement, verbatim).
-    if storage.is_ip_login_blocked(client_ip, now):
+    # Per-IP throttle (P3.0 round 4: **reserve-then-verify**, replacing
+    # round 3's check-then-act "is_ip_login_blocked, then record a failure
+    # afterward" -- that left a race a single IP with enough concurrent
+    # connections could exploit to force the account-level lock (30
+    # concurrent requests at threshold 5 all passed the read before any of
+    # them wrote anything, cross-review reproduced 30/30 reaching Argon2).
+    # `reserve_ip_login_attempt` atomically increments *before* any Argon2
+    # work and reports whether this specific request is still within the
+    # limit -- over the limit means the same generic failure, no Argon2,
+    # no account-counter credit, exactly as round 3 intended but now
+    # actually race-free.
+    if not storage.reserve_ip_login_attempt(
+        client_ip,
+        now,
+        ip_throttle_threshold(),
+        ip_throttle_window_s(),
+        ip_throttle_duration_s(),
+    ):
         return _generic_login_failure_response(request)
 
-    user = authenticate(storage, username, password, totp_code, now, notifiers)
+    user = authenticate(storage, username, password, totp_code, now, notifiers, background_tasks)
 
     if user is None:
-        storage.record_ip_login_failure(
-            client_ip,
-            now,
-            ip_throttle_threshold(),
-            ip_throttle_window_s(),
-            ip_throttle_duration_s(),
-        )
         return _generic_login_failure_response(request)
+
+    # Give this request's reservation back -- a legitimate, successful
+    # login must not spend down the IP's failure budget (P3.0 round 4:
+    # "a legitimate user is not penalised for their successful attempt").
+    storage.release_ip_login_attempt(client_ip, now)
 
     new_session = create_session(storage, user.id, now)
     response: Response = RedirectResponse(url="/ui/", status_code=303)

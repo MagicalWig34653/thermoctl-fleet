@@ -75,6 +75,7 @@ from sqlalchemy import (
     case,
     create_engine,
     delete,
+    func,
     or_,
     select,
     text,
@@ -1020,15 +1021,12 @@ class Storage:
     # -- per-IP login throttle (P3.0 round 3) -------------------------------------
 
     def is_ip_login_blocked(self, ip: str, now: datetime) -> bool:
-        """Read-only check for the per-client-IP throttle (P3.0 round 3,
-        project owner decision 2026-09-25) -- **must** be called, and must
-        return `True`, *before* `fleet.ui_auth.authenticate` (and therefore
-        any Argon2 work) ever runs for a blocked IP: "a blocked IP gets the
-        same generic login failure page, without doing any Argon2 work
-        (protects CPU), and its attempts are not counted against the
-        account." Deliberately a separate, non-writing method from
-        `record_ip_login_failure` below -- a blocked check that also wrote
-        would defeat the point of checking first."""
+        """Read-only status check for the per-client-IP throttle (P3.0
+        round 3) -- **not** part of the request path any more (round 4:
+        see `reserve_ip_login_attempt` for why a separate check-then-act
+        read was itself a race). Kept as a plain read for inspection/tests
+        and any future admin/status view; never call this to decide
+        whether a login attempt may proceed."""
 
         with self.session() as session:
             record = session.get(UiLoginThrottleRecord, ip)
@@ -1036,46 +1034,76 @@ class Storage:
                 return False
             return _naive_utc(now) < record.blocked_until
 
-    def record_ip_login_failure(
+    def reserve_ip_login_attempt(
         self,
         ip: str,
         now: datetime,
         throttle_threshold: int,
         throttle_window_s: float,
         throttle_duration_s: float,
-    ) -> None:
-        """Records one failed login attempt from `ip` (P3.0 round 3) --
-        the **primary** defence against locking the landlord's own account
-        out (see `record_ui_login_failure`'s docstring for why the account
-        lock alone cannot be: a distributed attacker controlling more
-        addresses than fit under this threshold can still force the
-        account-level backstop, which is exactly the residual risk
-        `docs/STATUS.md` states plainly, not silently).
+    ) -> bool:
+        """**Reserve-then-verify** (P3.0 round 4, fixing a check-then-act
+        race cross-review reproduced): atomically increments `ip`'s attempt
+        counter -- unconditionally, for *every* attempt, before
+        `fleet.ui_auth.authenticate` (and therefore any Argon2 work) ever
+        runs -- and returns whether the resulting count is still within
+        `throttle_threshold`, i.e. whether *this* request is allowed to
+        proceed at all.
 
-        Same windowed model as `record_ui_login_failure` (a failure while
-        already blocked changes nothing; a failure after the window has
-        lapsed starts a fresh one) and the same single-statement atomicity
-        technique -- see that method's docstring for the full reasoning,
-        not repeated here. The one structural difference: `ip` is this
-        table's own primary key (there is no separate id to look up by, and
-        no row exists until the first failure from a given address), so an
-        `INSERT ... ON CONFLICT (ip) DO NOTHING` guarantees a row to update
-        before the same atomic `UPDATE` runs -- safe under concurrency
-        regardless of ordering, since it never overwrites an existing row.
+        **The bug this replaces:** round 3's `is_ip_login_blocked` (a
+        read) followed by `record_ip_login_failure` (a write, only *after*
+        `authenticate` had already failed) left a wide-open check-then-act
+        window -- any number of concurrent requests could all read "not
+        blocked" before any of them had written anything. Reproduced with
+        30 concurrent `POST /ui/login` from one IP at threshold 5: 30/30
+        ran Argon2, and 30 failures landed on the *account's* counter, not
+        the IP's -- a single address with enough concurrent connections
+        could force the account-level lock on its own, defeating the
+        entire point of a per-IP throttle. Moving the atomic write to
+        *before* the decision (this method) removes the gap: the increment
+        and the "still within limit" decision are the same database
+        operation, so no two concurrent callers can both observe "still
+        allowed" for what turns out to be attempt number `threshold + 1`.
 
-        No return value: unlike the account lock, an IP being newly
-        blocked never raises a notification (round 3 decision) -- alerting
-        on every throttled IP would be exactly the kind of alarm-fatigue
-        noise section 8's "against alarm fatigue" reasoning warns about
-        elsewhere in this codebase, and an IP address alone identifies
-        nothing actionable for a landlord the way "your account got
-        locked" does.
+        **Allowed means `new_failures <= throttle_threshold`** -- the
+        `threshold`-th attempt itself is still allowed through (and is
+        typically the one that also sets `blocked_until` for every
+        request after it); only attempt `threshold + 1` onward is refused.
+        This is deliberately symmetric with `release_ip_login_attempt`
+        below: a successful login among the first `threshold` attempts
+        gives its reservation back, so genuine, eventually-successful
+        traffic does not consume the budget meant for failures.
+
+        Same windowed model as `record_ui_login_failure` (a further
+        attempt while already blocked changes nothing; one after the
+        window has lapsed starts a fresh window) and the same
+        `INSERT ... ON CONFLICT DO NOTHING` then atomic `UPDATE ...
+        RETURNING` technique used throughout this module -- see
+        `record_ui_login_failure`'s docstring for why `RETURNING` is safe
+        to use for the *post-update* `failures`/`blocked_until` values
+        specifically (unlike that method's own history: this decision
+        needs exactly the post-update state, not a derived "did this call
+        cause a transition" boolean, so the off-by-one trap documented
+        there does not apply here).
+
+        No return value beyond the boolean -- unlike the account lock, an
+        IP being newly blocked never raises a notification (round 3
+        decision, unchanged): alerting on every throttled IP would be
+        exactly the kind of alarm-fatigue noise section 8's "against alarm
+        fatigue" reasoning warns about elsewhere in this codebase, and an
+        IP address alone identifies nothing actionable for a landlord the
+        way "your account got locked" does.
         """
 
         normalized_now = _naive_utc(now)
         window_deadline = normalized_now - timedelta(seconds=throttle_window_s)
         new_blocked_until = normalized_now + timedelta(seconds=throttle_duration_s)
-        fresh_window_blocks = throttle_threshold <= 1
+        # A threshold of 0 (degenerate, "block everything") means even a
+        # fresh window's first attempt (failures=1) is already over it --
+        # a plain Python `bool`, not a SQL comparison, since `throttle_
+        # threshold` is a fixed argument to this call, never a column value
+        # that could itself be raced.
+        fresh_window_over_threshold = 1 > throttle_threshold
 
         with self.session() as session:
             dialect = session.get_bind().dialect.name
@@ -1110,6 +1138,9 @@ class Storage:
                 UiLoginThrottleRecord.blocked_until > normalized_now,
             )
             window_lapsed = UiLoginThrottleRecord.window_started_at < window_deadline
+            crosses_threshold_in_place = (
+                UiLoginThrottleRecord.failures + 1
+            ) > throttle_threshold
 
             new_failures = case(
                 (currently_blocked, UiLoginThrottleRecord.failures),
@@ -1121,25 +1152,15 @@ class Storage:
                 (window_lapsed, normalized_now),
                 else_=UiLoginThrottleRecord.window_started_at,
             )
-            # `fresh_window_blocks` is a plain Python `bool`, fixed for the
-            # whole call (derived only from `throttle_threshold`, never from
-            # a column value) -- branching on it in Python, rather than
-            # folding it into a SQL `and_()` alongside `window_lapsed`,
-            # keeps every operand of every SQL boolean expression an actual
-            # SQL expression (mypy's `and_()` stub does not accept a mix of
-            # `ColumnElement` and a bare `bool`).
-            window_lapsed_locks = new_blocked_until if fresh_window_blocks else None
+            window_lapsed_blocks = new_blocked_until if fresh_window_over_threshold else None
             new_blocked_until_expr = case(
                 (currently_blocked, UiLoginThrottleRecord.blocked_until),
-                (window_lapsed, window_lapsed_locks),
-                (
-                    (UiLoginThrottleRecord.failures + 1) >= throttle_threshold,
-                    new_blocked_until,
-                ),
+                (window_lapsed, window_lapsed_blocks),
+                (crosses_threshold_in_place, new_blocked_until),
                 else_=UiLoginThrottleRecord.blocked_until,
             )
 
-            session.execute(
+            statement = (
                 update(UiLoginThrottleRecord)
                 .where(UiLoginThrottleRecord.ip == ip)
                 .values(
@@ -1147,6 +1168,47 @@ class Storage:
                     window_started_at=new_window_started_at,
                     blocked_until=new_blocked_until_expr,
                 )
+                .returning(UiLoginThrottleRecord.failures)
+            )
+            row = session.execute(statement).first()
+            if row is None:  # pragma: no cover -- the insert above guarantees a row
+                return True
+            resulting_failures = row[0]
+            return bool(resulting_failures <= throttle_threshold)
+
+    def release_ip_login_attempt(self, ip: str, now: datetime) -> None:
+        """Gives back one reserved attempt slot after a request that went
+        on to log in **successfully** (P3.0 round 4, the other half of
+        `reserve_ip_login_attempt`'s "reserve-then-verify": "a legitimate
+        user is not penalised for their successful attempt"). Atomic
+        `UPDATE ... SET failures = MAX(failures - 1, 0)` -- floored at 0,
+        never negative, safe to call even if the row does not exist yet
+        (`WHERE ip = :ip` then simply matches nothing) or has already been
+        reset by a window lapse in between (decrementing a freshly-reset
+        low count is harmless, it only ever makes the count *more*
+        permissive for the next attempt, never less).
+
+        **Deliberately does not touch `window_started_at` or
+        `blocked_until`.** A block already in effect must run its full
+        `throttle_duration_s` regardless of one later request happening to
+        succeed -- and by construction, a request can only reach this
+        method if `reserve_ip_login_attempt` already allowed it through
+        (`failures <= threshold` at reservation time), so a call here
+        never has to reason about an active block it might otherwise be
+        tempted to lift early.
+
+        `now` is accepted for symmetry with every other `now`-taking method
+        in this module (and in case a future revision needs it, e.g. to
+        bound how far back a release may apply) but is not currently used
+        in the computation itself -- the decrement is unconditional.
+        """
+
+        del now
+        with self.session() as session:
+            session.execute(
+                update(UiLoginThrottleRecord)
+                .where(UiLoginThrottleRecord.ip == ip)
+                .values(failures=func.max(UiLoginThrottleRecord.failures - 1, 0))
             )
 
     # -- ui sessions (P3.0) -------------------------------------------------------

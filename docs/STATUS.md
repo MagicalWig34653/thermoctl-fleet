@@ -2,6 +2,135 @@
 
 Last updated: 2026-09-25.
 
+## Login for the fleet UI (P3.0), round-4: reserve-then-verify + XFF hardening + background notification
+
+Re-review of round 3 reproduced one real defect and asked for two cheap,
+agreed hardenings. All fixed:
+
+**1. IP-throttle check-then-act race (the real defect).** Round 3's
+`login_submit` read `Storage.is_ip_login_blocked` and only wrote
+`record_ip_login_failure` *after* `authenticate` had already run and
+failed -- a check-then-act gap, the exact same class of bug round 2's
+concurrency fixes closed elsewhere, just not yet closed here. Reproduced:
+30 concurrent `POST /ui/login` from one IP at throttle threshold 5 -- 30/30
+ran Argon2, and 30 failures landed on the *account's* counter, not the
+IP's. A single address with ~50 concurrent connections could force the
+account-level lock entirely on its own, which is precisely the attack the
+per-IP throttle exists to prevent. **Fixed with reserve-then-verify:**
+`Storage.reserve_ip_login_attempt` (replacing `record_ip_login_failure`)
+atomically increments the IP's attempt counter -- windowed, same model as
+the account lock -- *before* `authenticate` runs at all, and returns
+whether the resulting count is still within the configured threshold (the
+`threshold`-th attempt itself is still allowed through; only attempt
+`threshold + 1` onward is refused and skips `authenticate` entirely, no
+Argon2, no account-counter credit). `Storage.release_ip_login_attempt`
+gives the reservation back (atomic `failures = MAX(failures - 1, 0)`,
+never negative) after a request that went on to log in *successfully*, so
+a legitimate user is not penalised for their own successful attempt --
+deliberately does not touch `window_started_at`/`blocked_until`, since a
+release can only ever happen for a request `reserve_ip_login_attempt`
+already allowed through, so there is never an active block to reason
+about lifting early. `Storage.is_ip_login_blocked` remains as a read-only
+status check (useful for inspection/tests/a future status view) but is no
+longer part of the request-path decision at all -- `reserve_ip_login_attempt`
+is now the single gate.
+
+Regression test:
+`tests/test_ui_throttle.py::test_concurrent_login_requests_respect_the_ip_throttle`
+-- 30 **real concurrent `client.post("/ui/login")` calls** (not a direct
+`Storage` call) from one IP, each with its own `TestClient`/cookie jar (to
+avoid a shared-cookie-jar race in the *test* itself clobbering the
+pre-session CSRF cookie -- an artifact of the test harness, not the
+throttle) but all resolving to the same address (Starlette's fixed
+`TestClient` default peer). Spies on `PasswordHasher.verify`'s call count
+(same monkeypatch-the-class technique as the round-2 timing-oracle tests)
+and asserts it is called **at most `threshold` times**, and that the
+account's own `failed_attempts` rises by **at most `threshold`** too. Run
+10/10.
+
+**2. `X-Forwarded-For` robustness (cheap, agreed).** `fleet.ui_auth
+._strip_port` now strips a `:port` suffix (`203.0.113.9:51413` →
+`203.0.113.9`) and RFC 7239-style IPv6 bracket notation
+(`[2001:db8::1]:51413` → `2001:db8::1`, `[2001:db8::1]` with no port too)
+from each `X-Forwarded-For` entry before it is compared against the
+trusted-proxy set or considered as the resolved client address -- without
+this, a proxy that appends a port would never match a configured trusted
+entry (so its own hop would never be skipped when walking the chain), and
+would be used *as the throttle key itself* if chosen, needlessly splitting
+one real address across many meaningless throttle-table rows by port
+number. A bracket-less IPv6 address with no port (`2001:db8::1`, which has
+multiple colons of its own) is correctly left untouched -- the stripping
+logic requires *exactly* one colon plus a dot (IPv4) to treat something as
+`host:port`. Separately, `resolve_client_ip`'s final chosen candidate --
+from the header or the direct peer -- is now validated as a real IP
+address (`ipaddress.ip_address`) before being returned at all; an
+unparseable result (a malformed/garbage header entry that happens not to
+match the trusted set either, or a non-IP `request.client.host` such as a
+Unix-socket peer) falls back to the direct peer rather than handing an
+arbitrary string to the storage layer as a throttle key. Tests:
+`test_resolve_client_ip_strips_an_ipv4_port_suffix`,
+`::strips_a_bracketed_ipv6_port_suffix`,
+`::strips_a_bracketed_ipv6_with_no_port`,
+`::leaves_a_bare_ipv6_without_a_port_unchanged`,
+`::falls_back_to_the_direct_peer_for_an_unclosed_bracket`,
+`::falls_back_to_the_direct_peer_for_a_non_ip_xff_entry`.
+
+**3. "Account locked" notification moved off the request path (cheap,
+agreed).** `fleet.ui_auth.authenticate` gained an optional `background_tasks:
+fastapi.BackgroundTasks | None` parameter; when given (always, from
+`fleet/ui_routes.py::login_submit`), a just-triggered `notify_ui_account_locked`
+call is scheduled via `BackgroundTasks.add_task` instead of being called
+inline, so a slow or hanging notifier (a blocking SMTP connection, an
+unreachable webhook host) cannot delay the login response itself. `None`
+(the default) falls back to the synchronous call exactly as round 3 did --
+used by every test that calls `authenticate` directly, outside of any
+request/response cycle, where there is no response to avoid delaying.
+"Exactly once per lock" is unaffected either way: `Storage
+.record_ui_login_failure`'s atomic `just_locked` result still decides
+*whether* to notify at all; this parameter only changes *when*, and on
+what thread of control, an already-decided notification actually runs.
+
+**Why this needed a white-box test, not a wall-clock one:**
+`starlette.testclient.TestClient` drives the *entire* ASGI request cycle,
+background tasks included, to completion before `client.post(...)` itself
+returns -- confirmed empirically (a 1.0s `time.sleep` background task
+still added ~1.0s to `TestClient`'s own call). A timing assertion through
+`TestClient` would therefore pass or fail for the wrong reason regardless
+of whether the fix is present; it cannot distinguish "scheduled via
+`BackgroundTasks`" from "called inline" by wall-clock alone, since both
+still block the *test's* call to `.post()` for as long as the notifier
+takes. `tests/test_ui_throttle.py
+::test_login_submit_schedules_the_notification_via_background_tasks`
+instead calls `login_submit` directly as a plain Python function (bypassing
+FastAPI's request/dependency machinery, which is only needed when going
+through the ASGI app) with a real `BackgroundTasks()` instance, and
+inspects it *immediately after `login_submit` returns* -- confirming the
+notifier has not run yet (`notifier.raw_calls == []`) and is only queued
+(`background_tasks.tasks[0].func is notify_ui_account_locked`), then runs
+the queued task manually (`asyncio.run(background_tasks())`, exactly what
+Starlette does after sending the real response) and confirms it fires
+then. A second, end-to-end test,
+`::test_login_response_does_not_wait_on_the_notifier_even_when_it_is_slow`,
+drives the real ASGI app through `TestClient` with an injected notifier
+delay (0.05s, "no real sleeping longer than a fraction of a second" per
+the work package) purely to prove the wiring does not hang, error, or
+double-fire under the real app -- not to assert on timing, for the reason
+above.
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol
+fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+run three times (323 passed each time, 99% coverage, every P3.0 file at
+100% except `fleet/admin.py`'s untested `__main__` guard, unchanged from
+earlier rounds); every concurrency regression test in the P3.0 suite
+(`test_totp_replay_race_allows_exactly_one_concurrent_login`,
+`test_concurrent_failed_logins_do_not_lose_counter_updates`,
+`test_concurrent_failed_logins_lock_the_account_deterministically`,
+`test_concurrent_ip_failures_do_not_lose_updates`,
+`test_concurrent_ip_failures_block_deterministically`,
+`test_concurrent_lockout_notifies_exactly_once`, and the new
+`test_concurrent_login_requests_respect_the_ip_throttle`) run 10 times
+individually, 10/10 passes every time.
+
 ## Login for the fleet UI (P3.0), round-3: per-IP throttle + account-lock backstop
 
 Cross-review round 2's lockout model (5 failures / 15 min lock, always
@@ -16,24 +145,24 @@ the primary defence, and a much higher, windowed account-level lock as a
 backstop, with a notification the moment the backstop actually engages.**
 
 **1. Per-client-IP throttle (`ui_login_throttle`, migration
-`0005_ui_accounts`, `Storage.is_ip_login_blocked`/
-`record_ip_login_failure`).** One row per IP address that has ever failed a
-login: `failures`, `window_started_at`, `blocked_until`. Default 5 failures
-within 15 minutes blocks that one IP for 15 minutes; the window resets
-(fresh count) once it lapses with no failures. **Checked before
-`fleet.ui_auth.authenticate` is ever called** (`fleet/ui_routes.py
-::login_submit`) -- a blocked IP gets the exact same generic failure
-response as any other failed login, without a single Argon2 verify (CPU
-protection, not just a UX nicety) and without touching the *account's* own
-failure counter at all ("its attempts are not counted against the
-account", decided verbatim). A successful login does **not** unblock any
-IP, including its own -- an already-blocked window simply lapses on its
-own; there is no special-case reset path that could itself become a bug.
-Same atomic-`UPDATE`-per-failure technique as the account lock below (see
-`Storage.record_ip_login_failure`'s own docstring); regression tests:
-`tests/test_ui_throttle.py::test_concurrent_ip_failures_do_not_lose_updates`,
+`0005_ui_accounts`).** **Superseded by round 4's reserve-then-verify fix,
+see the section above this one for the current design and the race this
+paragraph's original design had** -- kept here only as history. One row
+per IP address that has ever failed a login: `failures`, `window_started_at`,
+`blocked_until`. Default 5 failures within 15 minutes blocks that one IP
+for 15 minutes; the window resets (fresh count) once it lapses with no
+failures. A successful login does **not** unblock any IP, including its
+own -- an already-blocked window simply lapses on its own; there is no
+special-case reset path that could itself become a bug (this part is
+still true after round 4). `Storage.reserve_ip_login_attempt`/
+`release_ip_login_attempt` are the current entry points (round 4);
+`is_ip_login_blocked` is now read-only, not part of the request-path
+decision. Regression tests (still passing, exercising the current
+methods): `tests/test_ui_throttle.py::test_concurrent_ip_failures_do_not_lose_updates`,
 `::test_concurrent_ip_failures_block_deterministically`,
-`::test_ip_throttle_concurrency_regression_runs_reliably` (10 rounds).
+`::test_ip_throttle_concurrency_regression_runs_reliably` (10 rounds) --
+plus round 4's own `test_concurrent_login_requests_respect_the_ip_throttle`
+for the check-then-act race specifically.
 
 **2. Client IP resolution (`fleet.ui_auth.resolve_client_ip`).**
 `request.client.host` by default. `X-Forwarded-For` is honoured **only**

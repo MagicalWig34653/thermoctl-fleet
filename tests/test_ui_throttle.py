@@ -19,9 +19,11 @@ from datetime import UTC, datetime, timedelta
 
 import pyotp
 import pytest
+from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+import fleet.ui_auth as ui_auth_module
 from fleet.alarms import AlarmKind, notify_ui_account_locked
 from fleet.app import app
 from fleet.storage import Storage, create_storage, get_storage, upgrade
@@ -173,6 +175,73 @@ def test_resolve_client_ip_ignores_a_malformed_trusted_proxies_entry(
     assert resolve_client_ip(request) == "198.51.100.1"
 
 
+def test_resolve_client_ip_strips_an_ipv4_port_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FLEET_UI_TRUSTED_PROXIES", "10.0.0.1")
+    request = _make_request("10.0.0.1", {"X-Forwarded-For": "198.51.100.1:51413"})
+
+    assert resolve_client_ip(request) == "198.51.100.1"
+
+
+def test_resolve_client_ip_strips_a_bracketed_ipv6_port_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FLEET_UI_TRUSTED_PROXIES", "10.0.0.1")
+    request = _make_request("10.0.0.1", {"X-Forwarded-For": "[2001:db8::1]:51413"})
+
+    assert resolve_client_ip(request) == "2001:db8::1"
+
+
+def test_resolve_client_ip_strips_a_bracketed_ipv6_with_no_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FLEET_UI_TRUSTED_PROXIES", "10.0.0.1")
+    request = _make_request("10.0.0.1", {"X-Forwarded-For": "[2001:db8::1]"})
+
+    assert resolve_client_ip(request) == "2001:db8::1"
+
+
+def test_resolve_client_ip_leaves_a_bare_ipv6_without_a_port_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bracket-less IPv6 address has multiple colons of its own -- the
+    port-stripping heuristic (exactly one colon, plus a dot for IPv4) must
+    not mistake any of them for a port separator."""
+
+    monkeypatch.setenv("FLEET_UI_TRUSTED_PROXIES", "10.0.0.1")
+    request = _make_request("10.0.0.1", {"X-Forwarded-For": "2001:db8::1"})
+
+    assert resolve_client_ip(request) == "2001:db8::1"
+
+
+def test_resolve_client_ip_falls_back_to_the_direct_peer_for_an_unclosed_bracket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed `[...`  entry with no closing `]` is left as-is by
+    `_strip_port` (nothing else it can safely do) and then fails the final
+    `ipaddress.ip_address` validation in `resolve_client_ip` -- falling
+    back to the direct peer rather than propagating a garbage string as
+    though it were a resolved client IP."""
+
+    monkeypatch.setenv("FLEET_UI_TRUSTED_PROXIES", "10.0.0.1")
+    request = _make_request("10.0.0.1", {"X-Forwarded-For": "[2001:db8::1:51413"})
+
+    assert resolve_client_ip(request) == "10.0.0.1"
+
+
+def test_resolve_client_ip_falls_back_to_the_direct_peer_for_a_non_ip_xff_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chosen candidate itself must be a real IP address, not merely
+    "not in the trusted set" -- a completely bogus header value is neither
+    trusted (so it would otherwise be selected) nor a parseable address,
+    and must not be handed to the storage layer as a throttle key."""
+
+    monkeypatch.setenv("FLEET_UI_TRUSTED_PROXIES", "10.0.0.1")
+    request = _make_request("10.0.0.1", {"X-Forwarded-For": "not-an-ip-at-all"})
+
+    assert resolve_client_ip(request) == "10.0.0.1"
+
+
 def test_resolve_client_ip_handles_a_non_ip_direct_peer_with_trusted_proxies_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -201,29 +270,47 @@ def test_resolve_client_ip_handles_an_empty_xff_header(monkeypatch: pytest.Monke
     assert resolve_client_ip(request) == "10.0.0.1"
 
 
-# -- Storage.is_ip_login_blocked / record_ip_login_failure ----------------------
+# -- Storage.is_ip_login_blocked / reserve_ip_login_attempt ---------------------
+#
+# `reserve_ip_login_attempt` is the atomic reserve-then-verify write (P3.0
+# round 4) -- it both counts *and* answers "is this attempt still within
+# the limit" in one atomic statement, replacing round 3's
+# `record_ip_login_failure` (a write that only ever ran *after*
+# `authenticate` had already failed, with `is_ip_login_blocked` as a
+# separate, racy check beforehand). The tests below call it directly in a
+# loop to drive the counter/window/block state exactly as round 3's tests
+# did; `test_concurrent_login_requests_respect_the_ip_throttle` further
+# below is the new, real-HTTP regression test for the race this replaced.
 
 
 def test_ip_not_blocked_before_any_failures(storage: Storage) -> None:
     assert storage.is_ip_login_blocked("203.0.113.9", datetime.now(UTC)) is False
 
 
-def test_ip_blocks_after_reaching_the_threshold(storage: Storage) -> None:
+def test_ip_blocks_only_once_the_threshold_is_exceeded(storage: Storage) -> None:
+    """Round 4's "at most `threshold` requests reach the password
+    verifier" means the `threshold`-th attempt itself is still *allowed*
+    (`reserve_ip_login_attempt` returns `True` for it) -- only attempt
+    `threshold + 1` is refused, and only *that* attempt's reservation call
+    is also the one that sets `blocked_until`."""
+
     ip = "203.0.113.9"
     now = datetime.now(UTC)
-    for _ in range(4):
-        storage.record_ip_login_failure(ip, now, 5, 900, 900)
+    for _ in range(5):
+        allowed = storage.reserve_ip_login_attempt(ip, now, 5, 900, 900)
+        assert allowed is True
         assert storage.is_ip_login_blocked(ip, now) is False
 
-    storage.record_ip_login_failure(ip, now, 5, 900, 900)
+    sixth_allowed = storage.reserve_ip_login_attempt(ip, now, 5, 900, 900)
+    assert sixth_allowed is False
     assert storage.is_ip_login_blocked(ip, now) is True
 
 
 def test_ip_block_lapses_after_the_configured_duration(storage: Storage) -> None:
     ip = "203.0.113.9"
     now = datetime.now(UTC)
-    for _ in range(5):
-        storage.record_ip_login_failure(ip, now, 5, 900, 900)
+    for _ in range(6):  # 5 allowed, the 6th is the one that blocks
+        storage.reserve_ip_login_attempt(ip, now, 5, 900, 900)
     assert storage.is_ip_login_blocked(ip, now) is True
 
     just_before = now + timedelta(seconds=899)
@@ -240,10 +327,10 @@ def test_ip_throttle_window_resets_after_it_lapses(storage: Storage) -> None:
     ip = "203.0.113.9"
     now = datetime.now(UTC)
     for _ in range(4):
-        storage.record_ip_login_failure(ip, now, 5, 900, 900)
+        storage.reserve_ip_login_attempt(ip, now, 5, 900, 900)
 
     later = now + timedelta(seconds=1000)  # past the 900s window
-    storage.record_ip_login_failure(ip, later, 5, 900, 900)
+    storage.reserve_ip_login_attempt(ip, later, 5, 900, 900)
 
     # A fresh window started at `later` with exactly one failure in it --
     # nowhere near the threshold of 5.
@@ -252,8 +339,8 @@ def test_ip_throttle_window_resets_after_it_lapses(storage: Storage) -> None:
 
 def test_ip_throttle_is_independent_per_address(storage: Storage) -> None:
     now = datetime.now(UTC)
-    for _ in range(5):
-        storage.record_ip_login_failure("203.0.113.9", now, 5, 900, 900)
+    for _ in range(6):  # 5 allowed, the 6th is the one that blocks
+        storage.reserve_ip_login_attempt("203.0.113.9", now, 5, 900, 900)
 
     assert storage.is_ip_login_blocked("203.0.113.9", now) is True
     assert storage.is_ip_login_blocked("198.51.100.1", now) is False
@@ -261,7 +348,7 @@ def test_ip_throttle_is_independent_per_address(storage: Storage) -> None:
 
 def test_concurrent_ip_failures_do_not_lose_updates(storage: Storage) -> None:
     """Same lost-update race as `Storage.record_ui_login_failure`'s own
-    regression tests, reproduced here for `record_ip_login_failure` -- 20
+    regression tests, reproduced here for `reserve_ip_login_attempt` -- 20
     concurrent failures from the same IP, threshold high enough that
     blocking does not interfere, must leave exactly 20 recorded failures."""
 
@@ -271,7 +358,7 @@ def test_concurrent_ip_failures_do_not_lose_updates(storage: Storage) -> None:
 
     def _attempt() -> None:
         barrier.wait()
-        storage.record_ip_login_failure(ip, now, 1000, 900, 900)
+        storage.reserve_ip_login_attempt(ip, now, 1000, 900, 900)
 
     threads = [threading.Thread(target=_attempt) for _ in range(20)]
     for thread in threads:
@@ -294,7 +381,7 @@ def test_concurrent_ip_failures_block_deterministically(storage: Storage) -> Non
 
     def _attempt() -> None:
         barrier.wait()
-        storage.record_ip_login_failure(ip, now, 5, 900, 900)
+        storage.reserve_ip_login_attempt(ip, now, 5, 900, 900)
 
     threads = [threading.Thread(target=_attempt) for _ in range(20)]
     for thread in threads:
@@ -315,7 +402,7 @@ def test_ip_throttle_concurrency_regression_runs_reliably(storage: Storage) -> N
             ip: str = ip, now: datetime = now, barrier: threading.Barrier = barrier
         ) -> None:
             barrier.wait()
-            storage.record_ip_login_failure(ip, now, 1000, 900, 900)
+            storage.reserve_ip_login_attempt(ip, now, 1000, 900, 900)
 
         threads = [threading.Thread(target=_attempt) for _ in range(20)]
         for thread in threads:
@@ -496,6 +583,121 @@ def test_concurrent_lockout_notification_regression_runs_reliably(
         assert len(notifier.raw_calls) == 1, f"round {i}: got {len(notifier.raw_calls)}"
 
 
+# -- background-task notification (P3.0 round 4) --------------------------------
+
+
+def test_login_submit_schedules_the_notification_via_background_tasks(
+    storage: Storage, password: str, totp_secret: str, user_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3.0 round 4 requirement: "move `notify_ui_account_locked` off the
+    request path ... so a slow/hanging notifier cannot delay the login
+    response." `starlette.testclient.TestClient` cannot demonstrate this by
+    wall-clock timing alone -- it drives the whole ASGI cycle, background
+    tasks included, to completion before `client.post(...)` itself
+    returns, exactly the same as a synchronous call, so any such timing
+    assertion would pass or fail for the wrong reason regardless of
+    whether the fix is present. What genuinely distinguishes "off the
+    request path" from "still inline" is *how* the notifier is invoked --
+    via `BackgroundTasks.add_task` (queued, run by Starlette after the
+    response is already on its way to the client) rather than called
+    directly inside `login_submit`'s/`authenticate`'s own synchronous
+    body. This calls `login_submit` directly as a plain function (bypassing
+    FastAPI's request/dependency machinery entirely, which is only needed
+    when going through the ASGI app) with a real `BackgroundTasks()`
+    instance, and inspects it immediately after `login_submit` returns --
+    before anything in it has actually been run."""
+
+    from fastapi import BackgroundTasks
+
+    from fleet.ui_routes import login_submit
+
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
+    now = datetime.now(UTC)
+    for _ in range(4):
+        authenticate(storage, USERNAME, "wrong", "000000", now)
+
+    csrf = secrets.token_urlsafe(32)
+    request = _make_request("203.0.113.9")
+    background_tasks = BackgroundTasks()
+    notifier = _RecordingNotifier()
+
+    response = login_submit(
+        request=request,
+        background_tasks=background_tasks,
+        username=USERNAME,
+        password="wrong",
+        totp_code="000000",
+        pre_csrf=csrf,
+        pre_csrf_cookie=csrf,
+        storage=storage,
+        notifiers=[notifier],
+    )
+
+    # `login_submit` has already returned its `Response` -- the notifier
+    # must not have run yet, only be queued to run.
+    assert response.status_code == 401
+    assert notifier.raw_calls == []
+    assert len(background_tasks.tasks) == 1
+    assert background_tasks.tasks[0].func is notify_ui_account_locked
+
+    # Running the queued task now (exactly what Starlette does after
+    # sending the response) is what finally invokes the notifier.
+    import asyncio
+
+    asyncio.run(background_tasks())
+    assert len(notifier.raw_calls) == 1
+
+
+def test_login_response_does_not_wait_on_the_notifier_even_when_it_is_slow(
+    client: TestClient,
+    storage: Storage,
+    password: str,
+    totp_secret: str,
+    user_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complements the white-box test above with an end-to-end run through
+    the real ASGI app: a deliberately slow notifier (an injected short
+    delay, well under a second -- not a stand-in for "instant", just proof
+    the request/response cycle completes and is not left hanging or
+    erroring because of it) must not break or meaningfully lengthen the
+    login flow, and the notification still fires exactly once."""
+
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
+    import time
+
+    class _SlowRecordingNotifier:
+        def __init__(self) -> None:
+            self.raw_calls: list[tuple[str, dict[str, str]]] = []
+
+        def notify(self, notification: object) -> None:  # pragma: no cover -- unused here
+            raise AssertionError("notify() should not be called for a UI account lock")
+
+        def notify_raw(self, subject: str, payload: dict[str, str]) -> None:
+            time.sleep(0.05)
+            self.raw_calls.append((subject, dict(payload)))
+
+    slow_notifier = _SlowRecordingNotifier()
+    app.dependency_overrides[get_ui_notifiers] = lambda: [slow_notifier]
+    try:
+        for _ in range(5):
+            pre_csrf = _get_pre_csrf(client)
+            response = client.post(
+                "/ui/login",
+                data={
+                    "username": USERNAME,
+                    "password": "wrong",
+                    "totp_code": "000000",
+                    "pre_csrf": pre_csrf,
+                },
+            )
+            assert response.status_code == 401
+    finally:
+        app.dependency_overrides.pop(get_ui_notifiers, None)
+
+    assert len(slow_notifier.raw_calls) == 1
+
+
 # -- get_ui_notifiers (P3.0 round 3) --------------------------------------------
 
 
@@ -540,6 +742,91 @@ def _get_pre_csrf(client: TestClient) -> str:
     match = re.search(r'name="pre_csrf" value="([^"]*)"', response.text)
     assert match is not None
     return match.group(1)
+
+
+def test_concurrent_login_requests_respect_the_ip_throttle(
+    client: TestClient,
+    storage: Storage,
+    password: str,
+    totp_secret: str,
+    user_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3.0 round 4 regression: reproduces the exact check-then-act race
+    cross-review found and drove through **real concurrent
+    `client.post("/ui/login")` calls**, not a direct `Storage` call -- 30
+    concurrent requests from one IP, throttle threshold 5, all with wrong
+    credentials. Before reserve-then-verify, `login_submit` read
+    `is_ip_login_blocked` and only wrote a failure *after* `authenticate`
+    had already run and failed -- any number of concurrent requests could
+    pass that read before any of them had written anything, so all 30 ran
+    Argon2 and all 30 landed on the *account's* counter (cross-review
+    reproduced exactly this: 30/30 through Argon2, a single IP with enough
+    concurrent connections able to force the account-level lock on its
+    own). With `reserve_ip_login_attempt` moved *before* `authenticate`,
+    at most `threshold` requests may ever reach the password verifier, and
+    the account's own failure counter rises by at most `threshold` too.
+
+    Each thread uses its **own** `TestClient` (own cookie jar) against the
+    same `app`/dependency-overridden `storage` -- a single shared
+    `TestClient` would race its own pre-session CSRF cookie across
+    concurrent `GET`/`POST` pairs, which is an artifact of sharing one
+    cookie jar, not the throttle behaviour under test. Every `TestClient`
+    still resolves to the same address as far as the server is concerned
+    (Starlette's fixed default test-client peer, `"testclient"`), so this
+    still genuinely exercises "one source IP, many concurrent connections".
+    """
+
+    threshold = 5
+    concurrency = 30
+    monkeypatch.setenv("FLEET_UI_IP_THROTTLE_THRESHOLD", str(threshold))
+
+    call_count = 0
+    call_count_lock = threading.Lock()
+    hasher_class = type(ui_auth_module._password_hasher)
+    real_verify = hasher_class.verify
+
+    def _counting_verify(self: PasswordHasher, hash: str | bytes, password: str | bytes) -> bool:
+        nonlocal call_count
+        with call_count_lock:
+            call_count += 1
+        return bool(real_verify(self, hash, password))
+
+    monkeypatch.setattr(hasher_class, "verify", _counting_verify)
+
+    barrier = threading.Barrier(concurrency)
+    statuses: list[int] = [0] * concurrency
+
+    def _attempt(index: int) -> None:
+        own_client = TestClient(app, base_url="https://testserver")
+        pre_csrf = _get_pre_csrf(own_client)
+        barrier.wait()
+        response = own_client.post(
+            "/ui/login",
+            data={
+                "username": USERNAME,
+                "password": "wrong",
+                "totp_code": "000000",
+                "pre_csrf": pre_csrf,
+            },
+        )
+        statuses[index] = response.status_code
+
+    threads = [threading.Thread(target=_attempt, args=(i,)) for i in range(concurrency)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert all(status == 401 for status in statuses)
+    assert call_count <= threshold, f"Argon2 ran {call_count} times, expected at most {threshold}"
+
+    final_user = storage.get_ui_user_by_username(USERNAME)
+    assert final_user is not None
+    assert final_user.failed_attempts <= threshold, (
+        f"account failed_attempts rose to {final_user.failed_attempts}, "
+        f"expected at most {threshold}"
+    )
 
 
 def test_login_records_an_ip_failure_on_wrong_credentials(
@@ -671,8 +958,8 @@ def test_login_success_does_not_unblock_a_different_ip(
 
     blocked_ip = "203.0.113.9"
     now = datetime.now(UTC)
-    for _ in range(5):
-        storage.record_ip_login_failure(blocked_ip, now, 5, 900, 900)
+    for _ in range(6):  # 5 allowed, the 6th is the one that blocks
+        storage.reserve_ip_login_attempt(blocked_ip, now, 5, 900, 900)
     assert storage.is_ip_login_blocked(blocked_ip, now) is True
 
     result = authenticate(storage, USERNAME, password, _totp_now(totp_secret, now), now)

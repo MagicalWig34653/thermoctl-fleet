@@ -90,7 +90,7 @@ from datetime import UTC, datetime, timedelta
 import pyotp
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, VerifyMismatchError
-from fastapi import Cookie, Depends, HTTPException, Request
+from fastapi import BackgroundTasks, Cookie, Depends, HTTPException, Request
 
 from fleet.alarms import Notifier, notify_ui_account_locked
 from fleet.storage import Storage, UiSessionRecord, UiUserRecord, get_storage, hash_token
@@ -212,6 +212,28 @@ def _ip_in_networks(
     return any(address in network for network in networks)
 
 
+def _strip_port(candidate: str) -> str:
+    """Strips a `:port` suffix from an `X-Forwarded-For` entry (P3.0 round
+    4 hardening) -- some proxies append one (`203.0.113.9:51413`), and
+    RFC 7239-style bracket notation is the unambiguous way to do the same
+    for IPv6 (`[2001:db8::1]:51413`). Left alone (and correctly so) for a
+    bare, bracket-less IPv6 address with no port, which itself contains
+    multiple colons and no port to strip (`2001:db8::1`) -- the one-colon
+    check below is what tells an IPv4 host:port apart from that case."""
+
+    candidate = candidate.strip()
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        if closing != -1:
+            return candidate[1:closing]
+        return candidate  # malformed ("[..." with no "]") -- left as-is,
+        # caught by the final `ipaddress.ip_address` validation below.
+    if candidate.count(":") == 1 and "." in candidate:
+        host, _, _port = candidate.rpartition(":")
+        return host
+    return candidate
+
+
 def resolve_client_ip(request: Request) -> str:
     """The address a login attempt is throttled by (P3.0 round 3): `request
     .client.host` by default. `X-Forwarded-For` is honoured **only** when
@@ -225,25 +247,46 @@ def resolve_client_ip(request: Request) -> str:
     that is not. A `X-Forwarded-For` presented by an untrusted direct peer
     is attacker-controlled and completely ignored: trusting it would let
     any client claim to be any IP address, defeating the throttle entirely.
+
+    **Round 4 hardening:** each `X-Forwarded-For` entry has a possible
+    `:port`/`[..]:port` suffix stripped before it is compared against the
+    trusted set or considered as the resolved address (`_strip_port` above)
+    -- without this, `"203.0.113.9:51413"` would never match a configured
+    `203.0.113.9` trusted-proxy entry (so a trusted proxy's own hop would
+    never be skipped), and would be used *as the throttle key itself* if it
+    were the chosen candidate, splitting one real address across many
+    distinct (and meaningless) throttle-table rows by port number. And
+    whatever address is finally chosen -- from the header or the direct
+    peer -- is validated as a real IP address before being returned; an
+    unparseable result (a malformed header entry, or a non-IP `request
+    .client.host` such as a Unix-socket peer) falls back to the direct
+    peer rather than handing an arbitrary string to the storage layer as a
+    throttle key.
     """
 
     direct_peer = request.client.host if request.client is not None else "unknown"
     networks = _parse_trusted_proxies(os.environ.get(_TRUSTED_PROXIES_ENV, ""))
-    if not networks or not _ip_in_networks(direct_peer, networks):
-        return direct_peer
 
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if not forwarded_for:
-        return direct_peer
+    resolved = direct_peer
+    if networks and _ip_in_networks(direct_peer, networks):
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            chain = [
+                _strip_port(entry) for entry in forwarded_for.split(",") if entry.strip()
+            ]
+            for candidate in reversed(chain):
+                if not _ip_in_networks(candidate, networks):
+                    resolved = candidate
+                    break
+            # else: every hop in the chain is itself a trusted proxy --
+            # `resolved` stays the direct peer, nothing else to treat as
+            # "the client".
 
-    chain = [entry.strip() for entry in forwarded_for.split(",") if entry.strip()]
-    for candidate in reversed(chain):
-        if not _ip_in_networks(candidate, networks):
-            return candidate
-    # Every hop in the chain is itself a trusted proxy -- nothing left to
-    # treat as "the client" other than the direct peer this request itself
-    # arrived from.
-    return direct_peer
+    try:
+        ipaddress.ip_address(resolved)
+    except ValueError:
+        return direct_peer
+    return resolved
 
 
 def session_absolute_lifetime_s() -> float:
@@ -329,6 +372,7 @@ def authenticate(
     totp_code: str,
     now: datetime,
     notifiers: Sequence[Notifier] | None = None,
+    background_tasks: BackgroundTasks | None = None,
 ) -> UiUserRecord | None:
     """The single entry point for a login attempt (P3.0). Returns the
     authenticated `UiUserRecord` on success, `None` on **any** failure --
@@ -361,6 +405,22 @@ def authenticate(
     (`fleet.alarms.notify_ui_account_locked`) -- `None` (the default) means
     "do not notify", used by tests that only care about the auth decision
     itself; `fleet/ui_routes.py` always passes the real, configured list.
+
+    **`background_tasks`, if given, defers that notification (P3.0 round
+    4: "move the notification off the request path, so a slow/hanging
+    notifier cannot delay the login response")** -- scheduled via
+    `BackgroundTasks.add_task` instead of being called inline, so this
+    function (and therefore the HTTP response `fleet/ui_routes.py` builds
+    right after it returns) never waits on a notifier's own network I/O.
+    `None` (the default) falls back to calling `notify_ui_account_locked`
+    synchronously, exactly as round 3 did -- used by tests that call
+    `authenticate` directly, outside of any request/response cycle, where
+    there is no response to avoid delaying and a synchronous call is the
+    simpler, still entirely correct thing to do. Either way, "exactly once
+    per lock" is unaffected: it is still `Storage.record_ui_login_failure`'s
+    atomic `just_locked` result that decides *whether* to notify at all --
+    this parameter only changes *when* (and on what thread of control) an
+    already-decided notification actually runs.
     """
 
     user = storage.get_ui_user_by_username(normalize_username(username))
@@ -386,25 +446,37 @@ def authenticate(
 
     if user is None or not password_ok or locked or matched_step is None:
         if user is not None:
-            _record_failure_and_maybe_notify(storage, user, now, notifiers)
+            _record_failure_and_maybe_notify(storage, user, now, notifiers, background_tasks)
         return None
 
     if not storage.record_ui_login_success(user.id, matched_step):
         # Lost the replay race to a concurrent request presenting the same
         # code -- same outcome as any other failure, including being
         # counted toward the lockout threshold.
-        _record_failure_and_maybe_notify(storage, user, now, notifiers)
+        _record_failure_and_maybe_notify(storage, user, now, notifiers, background_tasks)
         return None
     return user
 
 
 def _record_failure_and_maybe_notify(
-    storage: Storage, user: UiUserRecord, now: datetime, notifiers: Sequence[Notifier] | None
+    storage: Storage,
+    user: UiUserRecord,
+    now: datetime,
+    notifiers: Sequence[Notifier] | None,
+    background_tasks: BackgroundTasks | None,
 ) -> None:
     just_locked = storage.record_ui_login_failure(
         user.id, now, lockout_threshold(), lockout_window_s(), lockout_duration_s()
     )
-    if just_locked and notifiers is not None:
+    if not just_locked or notifiers is None:
+        return
+    if background_tasks is not None:
+        # Scheduled, not called -- `BackgroundTasks.add_task` only appends
+        # to an internal list here; the notifier itself runs after
+        # `fleet/ui_routes.py`'s response has already been handed back to
+        # Starlette, never blocking this function's caller.
+        background_tasks.add_task(notify_ui_account_locked, notifiers, user.username, now)
+    else:
         notify_ui_account_locked(notifiers, user.username, now)
 
 
