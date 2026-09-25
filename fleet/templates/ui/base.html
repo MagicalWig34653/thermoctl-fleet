@@ -5,31 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}thermoctl-fleet{% endblock %}</title>
     {#
-    No external stylesheet, no script (P3.0 requirement: "no JS needed").
-    Inline, minimal CSS only -- there is no static-asset pipeline in the
-    fleet Docker image (see docker/Dockerfile.fleet), and the CSP this
-    service sends (fleet/ui_routes.py's security-headers middleware,
-    `default-src 'self'`) forbids inline scripts anyway, so nothing here
-    would work as a <script> block even if one were added later without
-    also relaxing that policy.
+    An external, same-origin stylesheet, not an inline style block
+    (cross-review round 2: `default-src 'self'` without `'unsafe-inline'`
+    blocks inline CSS too, not only inline scripts -- see
+    fleet/static/ui/fleet-ui.css's own header comment). Still no script of
+    any kind (P3.0 requirement: "no JS needed") -- the CSP sent by
+    fleet/ui_routes.py's security-headers middleware would block an inline
+    one regardless, and no script is mounted under /ui/static either.
     #}
-    <style>
-        :root { color-scheme: light dark; }
-        body { font-family: system-ui, sans-serif; margin: 0; padding: 0; line-height: 1.5; }
-        header nav { display: flex; gap: 1rem; align-items: center; padding: 0.75rem 1rem;
-                     border-bottom: 1px solid #8888; }
-        header nav a, header nav span.inactive { text-decoration: none; }
-        header nav span.inactive { opacity: 0.6; }
-        header nav form { margin-inline-start: auto; }
-        main { padding: 1rem; max-width: 60rem; margin: 0 auto; }
-        .error { border: 1px solid #c00; padding: 0.75rem 1rem; border-radius: 0.25rem; }
-        label { display: block; margin-top: 0.75rem; }
-        input[type=text], input[type=password] { width: 100%; max-width: 20rem;
-            padding: 0.4rem; margin-top: 0.25rem; }
-        button { padding: 0.4rem 1rem; margin-top: 1rem; }
-        a.skip-link { position: absolute; left: -999px; }
-        a.skip-link:focus { left: 1rem; top: 1rem; }
-    </style>
+    <link rel="stylesheet" href="/ui/static/fleet-ui.css">
 </head>
 <body>
 <a class="skip-link" href="#main">Zum Inhalt springen</a>

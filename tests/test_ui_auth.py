@@ -18,15 +18,19 @@ from __future__ import annotations
 
 import re
 import secrets
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pyotp
 import pytest
+from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect
 
+import fleet.ui_auth as ui_auth_module
 from fleet.app import app
 from fleet.storage import (
     Storage,
@@ -151,6 +155,20 @@ def test_authenticate_succeeds_with_correct_password_and_totp(
 ) -> None:
     now = datetime.now(UTC)
     user = authenticate(storage, USERNAME, password, _totp_now(totp_secret, now), now)
+
+    assert user is not None
+    assert user.id == user_id
+
+
+def test_authenticate_normalizes_the_presented_username(
+    storage: Storage, user_id: int, password: str, totp_secret: str
+) -> None:
+    """Optional hardening, cross-review round 2 -- a case/Unicode-
+    normalization variant of the stored username (`USERNAME` is created
+    lower-case by the `user_id` fixture) must still authenticate."""
+
+    now = datetime.now(UTC)
+    user = authenticate(storage, USERNAME.upper(), password, _totp_now(totp_secret, now), now)
 
     assert user is not None
     assert user.id == user_id
@@ -411,6 +429,348 @@ def test_get_valid_session_rejects_when_the_user_was_deleted(
         db_session.query(UiUserRecord).filter_by(id=user_id).delete()
 
     assert get_valid_session(storage, new_session.token, now) is None
+
+
+# -- concurrency (cross-review round 2) -----------------------------------------
+
+
+def test_totp_replay_race_allows_exactly_one_concurrent_login(
+    storage: Storage, user_id: int, password: str, totp_secret: str
+) -> None:
+    """Reproduces the exact race cross-review found: 20 threads present the
+    *same* valid TOTP code at the *same* instant. Before
+    `Storage.record_ui_login_success`'s atomic conditional `UPDATE`, every
+    one of them read `last_totp_step` as "not yet used" before any had
+    written it back -- 20/20 logins succeeded for a code meant to work
+    once. With the fix, exactly one thread's `UPDATE` can ever match the
+    row (the others' `last_totp_step < totp_step` condition is already
+    false by the time they run), so exactly one `authenticate()` call
+    returns a user."""
+
+    now = datetime.now(UTC)
+    code = _totp_now(totp_secret, now)
+    barrier = threading.Barrier(20)
+    results: list[object] = [None] * 20
+
+    def _attempt(index: int) -> None:
+        barrier.wait()
+        results[index] = authenticate(storage, USERNAME, password, code, now)
+
+    threads = [threading.Thread(target=_attempt, args=(i,)) for i in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    successes = [result for result in results if result is not None]
+    assert len(successes) == 1, f"expected exactly one success, got {len(successes)}"
+
+    # And the replay watermark itself reflects exactly this one accepted
+    # step -- not left ambiguous by whichever thread happened to write last.
+    final_user = storage.get_ui_user_by_username(USERNAME)
+    assert final_user is not None
+    assert final_user.last_totp_step is not None
+
+
+def test_totp_replay_race_regression_runs_reliably(
+    storage: Storage,
+    user_id: int,
+    password: str,
+    totp_secret: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same race as above, run 10 times in a fresh transaction each
+    time (same account, successive TOTP steps) -- a flaky fix would show up
+    as occasional double-successes here, not just on the first run.
+
+    Lockout threshold raised well above the 9-losers-per-round this
+    produces: this test is about the replay race specifically, not about
+    the (separately tested) interaction between a concurrent success and
+    concurrent failures both landing near the default lockout threshold at
+    once -- without this, the 9 losers each round can occasionally trip a
+    lock that outlives that round's single winner's own reset, depending on
+    commit order, and fail the *next* round for an unrelated reason.
+    """
+
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "1000")
+    for i in range(10):
+        # 120s apart (4 time steps), comfortably outside the +/-1 step
+        # tolerance window -- close successive rounds (e.g. 30s apart, one
+        # step) can otherwise have round i+1's candidate window overlap
+        # round i's `last_totp_step` depending on wall-clock alignment to
+        # the 30s grid, causing a spurious 0-success round unrelated to the
+        # replay-race fix under test here.
+        now = datetime.now(UTC) + timedelta(seconds=120 * i)
+        code = _totp_now(totp_secret, now)
+        barrier = threading.Barrier(10)
+        results: list[object] = [None] * 10
+
+        def _attempt(
+            index: int,
+            now: datetime = now,
+            code: str = code,
+            barrier: threading.Barrier = barrier,
+            results: list[object] = results,
+        ) -> None:
+            barrier.wait()
+            results[index] = authenticate(storage, USERNAME, password, code, now)
+
+        threads = [threading.Thread(target=_attempt, args=(j,)) for j in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        successes = [result for result in results if result is not None]
+        assert len(successes) == 1, f"round {i}: expected exactly one success, got {len(successes)}"
+
+
+def test_concurrent_failed_logins_do_not_lose_counter_updates(
+    storage: Storage, user_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduces the exact race cross-review found: 20 threads each submit
+    a wrong password concurrently. Before the atomic `UPDATE ... SET
+    failed_attempts = failed_attempts + 1`, the Python-level
+    `record.failed_attempts += 1` read-modify-write lost updates under
+    concurrency -- 20 failures left `failed_attempts == 11`, not 20. A high
+    lockout threshold keeps this test focused purely on the counter itself
+    (not on lock-renewal behaviour, covered separately below)."""
+
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "1000")
+    now = datetime.now(UTC)
+    barrier = threading.Barrier(20)
+
+    def _attempt() -> None:
+        barrier.wait()
+        authenticate(storage, USERNAME, "definitely-wrong", "000000", now)
+
+    threads = [threading.Thread(target=_attempt) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    final_user = storage.get_ui_user_by_username(USERNAME)
+    assert final_user is not None
+    assert final_user.failed_attempts == 20
+
+
+def test_concurrent_failed_logins_lock_the_account_deterministically(
+    storage: Storage, user_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same race, but with the real default-sized threshold (5) -- checks
+    that concurrency does not let the account slip past the threshold
+    without ever locking (the failure-mode cross-review was originally
+    worried about, alongside the raw lost-update count)."""
+
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
+    now = datetime.now(UTC)
+    barrier = threading.Barrier(20)
+
+    def _attempt() -> None:
+        barrier.wait()
+        authenticate(storage, USERNAME, "definitely-wrong", "000000", now)
+
+    threads = [threading.Thread(target=_attempt) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    final_user = storage.get_ui_user_by_username(USERNAME)
+    assert final_user is not None
+    assert final_user.failed_attempts == 20
+    assert final_user.locked_until is not None
+
+
+def test_lockout_counter_regression_runs_reliably(
+    storage: Storage, user_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lost-update race, run 10 times against 10 fresh accounts -- a
+    flaky fix would show up as an occasional wrong count here, not just on
+    the first run."""
+
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "1000")
+
+    for i in range(10):
+        username = f"concurrency-user-{i}"
+        storage.create_ui_user(
+            username=username,
+            password_hash=hash_password(secrets.token_urlsafe(16)),
+            totp_secret=generate_totp_secret(),
+            created_at=datetime.now(UTC),
+        )
+        now = datetime.now(UTC)
+        barrier = threading.Barrier(20)
+
+        def _attempt(
+            username: str = username, now: datetime = now, barrier: threading.Barrier = barrier
+        ) -> None:
+            barrier.wait()
+            authenticate(storage, username, "definitely-wrong", "000000", now)
+
+        threads = [threading.Thread(target=_attempt) for _ in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        final_user = storage.get_ui_user_by_username(username)
+        assert final_user is not None
+        assert final_user.failed_attempts == 20, f"round {i}: got {final_user.failed_attempts}"
+
+
+def test_a_new_failure_after_the_lock_lapses_relocks_the_account(
+    storage: Storage, user_id: int, password: str, totp_secret: str
+) -> None:
+    """**Decision (cross-review round 2):** every failed attempt is always
+    counted, locked or not, and a failure recorded once the previous lock
+    has already lapsed **re-locks** the account from that failure's time --
+    it does not get a fresh five-strike allowance. Only a genuinely
+    successful login, or `fleet.admin unlock`, clears the counter. See
+    `Storage.record_ui_login_failure`'s docstring and `docs/STATUS.md`'s
+    P3.0 section for the same reasoning written out in full."""
+
+    now = datetime.now(UTC)
+    for _ in range(5):
+        authenticate(storage, USERNAME, "wrong", "000000", now)
+
+    locked_user = storage.get_ui_user_by_username(USERNAME)
+    assert locked_user is not None
+    assert locked_user.locked_until is not None
+    lock_expiry = locked_user.locked_until
+
+    # Past the original lock's expiry -- one more wrong attempt here must
+    # both count (failed_attempts keeps climbing) and re-lock (a fresh,
+    # later `locked_until`), not silently pass through as if the slate had
+    # been wiped clean.
+    after_lapse = now + timedelta(minutes=16)
+    assert authenticate(storage, USERNAME, "still-wrong", "000000", after_lapse) is None
+
+    relocked_user = storage.get_ui_user_by_username(USERNAME)
+    assert relocked_user is not None
+    assert relocked_user.failed_attempts == 6
+    assert relocked_user.locked_until is not None
+    assert relocked_user.locked_until > lock_expiry
+
+    # And the correct credentials, presented later still, are rejected
+    # while the renewed lock holds...
+    still_locked_check = after_lapse + timedelta(seconds=1)
+    still_locked_code = _totp_now(totp_secret, still_locked_check)
+    assert (
+        authenticate(storage, USERNAME, password, still_locked_code, still_locked_check) is None
+    )
+
+    # ...but succeed, and fully clear the counter and lock, once presented
+    # after the renewed lock has itself lapsed.
+    well_after_relock = relocked_user.locked_until + timedelta(minutes=1, seconds=1)
+    # `locked_until` is stored naive UTC (see `fleet/storage.py::_naive_utc`);
+    # compare/derive the TOTP code against an equivalent aware instant.
+    well_after_relock_aware = well_after_relock.replace(tzinfo=UTC)
+    final_result = authenticate(
+        storage,
+        USERNAME,
+        password,
+        _totp_now(totp_secret, well_after_relock_aware),
+        well_after_relock_aware,
+    )
+    assert final_result is not None
+
+    unlocked_user = storage.get_ui_user_by_username(USERNAME)
+    assert unlocked_user is not None
+    assert unlocked_user.failed_attempts == 0
+    assert unlocked_user.locked_until is None
+
+
+def test_locked_account_still_pays_the_full_argon2_cost(
+    storage: Storage,
+    user_id: int,
+    password: str,
+    totp_secret: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timing-oracle regression (main-session finding, cross-review round
+    2): an earlier version of `authenticate` returned `None` for a locked
+    account *before* ever calling into Argon2, which made a locked --
+    therefore existing -- account answer measurably faster than an unknown
+    username. The fix always runs the real verify first; this spies on the
+    call count to prove it, the same way the reviewer found the gap
+    (inspecting whether the hasher was invoked at all), not just on wall-clock
+    timing (which is noisy and not a reliable thing to assert on in a test)."""
+
+    now = datetime.now(UTC)
+    for _ in range(5):
+        authenticate(storage, USERNAME, "wrong", "000000", now)
+    locked_user = storage.get_ui_user_by_username(USERNAME)
+    assert locked_user is not None
+    assert locked_user.locked_until is not None
+
+    call_count = 0
+    hasher_class = type(ui_auth_module._password_hasher)
+    real_verify = hasher_class.verify
+
+    def _counting_verify(self: PasswordHasher, hash: str | bytes, password: str | bytes) -> bool:
+        nonlocal call_count
+        call_count += 1
+        return bool(real_verify(self, hash, password))
+
+    monkeypatch.setattr(hasher_class, "verify", _counting_verify)
+
+    result = authenticate(storage, USERNAME, password, _totp_now(totp_secret, now), now)
+
+    assert result is None  # still locked, regardless of correct credentials
+    assert call_count == 1, "Argon2 verify must run even for a locked/existing account"
+
+
+def test_unknown_user_and_locked_user_both_run_exactly_one_argon2_verify(
+    storage: Storage,
+    user_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same spy, comparing the *unknown-user* path against the
+    *locked-account* path directly -- both must call the verifier exactly
+    once, which is the actual timing-oracle-closing property (not merely
+    "locked calls it at all")."""
+
+    now = datetime.now(UTC)
+    for _ in range(5):
+        authenticate(storage, USERNAME, "wrong", "000000", now)
+    locked_user = storage.get_ui_user_by_username(USERNAME)
+    assert locked_user is not None
+    assert locked_user.locked_until is not None
+
+    call_count = 0
+    hasher_class = type(ui_auth_module._password_hasher)
+    real_verify = hasher_class.verify
+
+    def _counting_verify(self: PasswordHasher, hash: str | bytes, password: str | bytes) -> bool:
+        nonlocal call_count
+        call_count += 1
+        return bool(real_verify(self, hash, password))
+
+    monkeypatch.setattr(hasher_class, "verify", _counting_verify)
+
+    authenticate(storage, "no-such-user-at-all", "irrelevant", "000000", now)
+    assert call_count == 1
+
+    authenticate(storage, USERNAME, "irrelevant", "000000", now)
+    assert call_count == 2
+
+
+# -- template hygiene (cross-review round 2: CSP has no 'unsafe-inline') --------
+
+
+def test_templates_contain_no_inline_style_or_script() -> None:
+    templates_dir = Path(__file__).resolve().parent.parent / "fleet" / "templates" / "ui"
+    html_files = sorted(templates_dir.glob("*.html"))
+    assert html_files, "no templates found -- did the directory move?"
+
+    reason = "CSP has no 'unsafe-inline'"
+    for path in html_files:
+        text = path.read_text(encoding="utf-8")
+        assert "<style" not in text, f"{path}: inline <style> block ({reason})"
+        assert "<script" not in text, f"{path}: inline <script> ({reason})"
+        assert " style=" not in text, f"{path}: inline style= attribute ({reason})"
 
 
 # -- HTTP: login flow -----------------------------------------------------------

@@ -59,7 +59,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from alembic import command
 from alembic.config import Config
@@ -73,11 +73,14 @@ from sqlalchemy import (
     Text,
     create_engine,
     delete,
+    or_,
     select,
     text,
+    update,
 )
 from sqlalchemy.dialects import postgresql as _postgresql_dialect
 from sqlalchemy.dialects import sqlite as _sqlite_dialect
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from protocol import Event, Heartbeat, fault_kind_from_key
@@ -789,29 +792,98 @@ class Storage:
     def record_ui_login_failure(
         self, user_id: int, now: datetime, lockout_threshold: int, lockout_duration_s: float
     ) -> None:
-        """Increments the failed-attempt counter; locks the account for
-        `lockout_duration_s` once `lockout_threshold` consecutive failures
-        are reached (P3.0 lockout rule)."""
+        """Increments the failed-attempt counter; locks (or **re**-locks,
+        renewing `locked_until` from *this* failure's time) the account once
+        `lockout_threshold` consecutive failures are reached (P3.0 lockout
+        rule).
+
+        **Atomic increment, not read-modify-write (cross-review, reproduced
+        as a lost-update bug: 20 concurrent wrong-password attempts against
+        the Python-level `record.failed_attempts += 1` this replaced left
+        `failed_attempts == 11`, not 20).** The increment is a single
+        `UPDATE ... SET failed_attempts = failed_attempts + 1 ...
+        RETURNING failed_attempts` statement -- the database computes the
+        new value from whatever is currently stored, not from a value this
+        method read moments earlier and could already be stale by the time
+        it writes it back. The `RETURNING` value is what decides the lock,
+        in a second statement in the same transaction, so the decision is
+        always made from the *actual* post-increment count, never a value
+        that raced against another writer.
+
+        **Every failed attempt is counted, whether or not the account is
+        already locked** (decided on cross-review, documented in
+        `docs/STATUS.md`'s P3.0 section): there is no "skip counting while
+        locked" branch here. A consequence, deliberately: hammering an
+        already-locked account keeps recomputing `locked_until` forward
+        from the most recent failure, i.e. **the lock renews on continued
+        attempts** rather than expiring on a fixed schedule an attacker
+        could simply wait out. The only things that ever reset the counter
+        to 0 and clear a lock are a successful login
+        (`record_ui_login_success`) and the `fleet.admin unlock` CLI
+        command (`unlock_ui_user`).
+        """
 
         with self.session() as session:
-            record = session.get(UiUserRecord, user_id)
-            if record is None:
+            increment_statement = (
+                update(UiUserRecord)
+                .where(UiUserRecord.id == user_id)
+                .values(failed_attempts=UiUserRecord.failed_attempts + 1)
+                .returning(UiUserRecord.failed_attempts)
+            )
+            row = session.execute(increment_statement).first()
+            if row is None:
                 return
-            record.failed_attempts += 1
-            if record.failed_attempts >= lockout_threshold:
-                record.locked_until = _naive_utc(now) + timedelta(seconds=lockout_duration_s)
+            new_failed_attempts = row[0]
+            if new_failed_attempts >= lockout_threshold:
+                session.execute(
+                    update(UiUserRecord)
+                    .where(UiUserRecord.id == user_id)
+                    .values(locked_until=_naive_utc(now) + timedelta(seconds=lockout_duration_s))
+                )
 
-    def record_ui_login_success(self, user_id: int, totp_step: int) -> None:
-        """Resets the failure counter and any lock, and records the accepted
-        TOTP step for replay protection -- called only after every check
-        (password, TOTP, lock) has already passed."""
+    def record_ui_login_success(self, user_id: int, totp_step: int) -> bool:
+        """Atomically resets the failure counter and any lock, and records
+        `totp_step` as the new TOTP replay watermark -- but **only** if
+        `totp_step` is strictly newer than whatever is already stored
+        (`last_totp_step IS NULL OR last_totp_step < totp_step`), checked
+        and written in the same `UPDATE ... WHERE ...` statement. Returns
+        whether the write actually happened.
+
+        **Closes a TOTP replay race (cross-review, reproduced: the same
+        valid code submitted by 20 concurrent requests produced 20/20
+        successful logins).** The previous version read `last_totp_step`,
+        decided in Python whether the presented step was new, and only then
+        wrote it back -- 20 concurrent requests could all read the same
+        "not yet used" value before any of them had written their update,
+        so all 20 passed the check. Folding the check into the `WHERE`
+        clause of the write itself removes that gap: only the request whose
+        `UPDATE` actually matches a row (i.e. is still the first to advance
+        `last_totp_step` past this step) changes anything; every other
+        concurrent request for the same step affects zero rows and gets
+        `False` back. **The caller (`fleet.ui_auth.authenticate`) must
+        treat a `False` result as a failed login**, not as "already
+        succeeded elsewhere" -- the whole point is that at most one
+        concurrent request may ever turn a given TOTP code into a session.
+        """
 
         with self.session() as session:
-            record = session.get(UiUserRecord, user_id)
-            if record is not None:
-                record.failed_attempts = 0
-                record.locked_until = None
-                record.last_totp_step = totp_step
+            statement = (
+                update(UiUserRecord)
+                .where(
+                    UiUserRecord.id == user_id,
+                    or_(
+                        UiUserRecord.last_totp_step.is_(None),
+                        UiUserRecord.last_totp_step < totp_step,
+                    ),
+                )
+                .values(failed_attempts=0, locked_until=None, last_totp_step=totp_step)
+            )
+            # `Session.execute` is typed to return the generic `Result[Any]`
+            # (no `rowcount`) even for a Core UPDATE, which always actually
+            # returns a `CursorResult` at runtime -- narrowed explicitly
+            # rather than silencing the check.
+            result = cast(CursorResult[Any], session.execute(statement))
+            return bool(result.rowcount and result.rowcount > 0)
 
     def set_ui_user_totp_secret(self, user_id: int, totp_secret: str) -> None:
         """`fleet.admin reset-totp` -- also clears `last_totp_step` (a step

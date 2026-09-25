@@ -1,6 +1,122 @@
 # Status
 
-Last updated: 2026-09-24.
+Last updated: 2026-09-25.
+
+## Login for the fleet UI (P3.0), round-2 fixes
+
+Cross-review round 2 (main session plus a second cross-review pass) found
+two real concurrency bugs and a timing oracle in the first version of P3.0,
+plus a CSP/CSS mismatch and a missing password floor. All five are fixed;
+the reasoning for each lives primarily as a docstring next to its fix (so it
+stays next to the code it explains), summarized here:
+
+- **TOTP replay race (reproduced: the same valid code from 20 concurrent
+  threads → 20/20 successful logins).** `Storage.record_ui_login_success`
+  used to read `last_totp_step`, decide in Python whether the presented
+  step was new, and only then write it back -- 20 concurrent requests could
+  all read "not yet used" before any of them had written anything. Fixed by
+  folding the check into the `UPDATE`'s own `WHERE` clause (`last_totp_step
+  IS NULL OR last_totp_step < :step`), so the database decides atomically,
+  per request, whether it is still the first to advance the watermark past
+  this step. The method now returns whether its write actually happened;
+  `fleet.ui_auth.authenticate` treats `False` as an ordinary failed login
+  (counted toward lockout like any other), not as "someone else already
+  succeeded". Regression tests: `tests/test_ui_auth.py
+  ::test_totp_replay_race_allows_exactly_one_concurrent_login` (20 threads,
+  one `threading.Barrier`, same code, real migrated SQLite -- exactly one
+  success) and `::test_totp_replay_race_regression_runs_reliably` (10
+  repeated rounds against fresh TOTP steps, to catch an occasionally-flaky
+  fix, not just a first-run pass).
+- **Lockout counter lost updates (reproduced: 20 concurrent wrong
+  passwords → `failed_attempts == 11`, not 20).** `Storage
+  .record_ui_login_failure` used to do a Python-level `record
+  .failed_attempts += 1` read-modify-write -- classic lost-update race under
+  concurrency. Fixed with a single atomic `UPDATE ... SET failed_attempts =
+  failed_attempts + 1 ... RETURNING failed_attempts`; the returned,
+  guaranteed-correct post-increment count is what decides (in a second
+  statement in the same transaction) whether `locked_until` gets set.
+  Regression tests: `::test_concurrent_failed_logins_do_not_lose_counter_
+  updates` (20 threads, high threshold so locking doesn't interfere,
+  `failed_attempts == 20` afterward), `::test_concurrent_failed_logins_lock_
+  the_account_deterministically` (same race at the real default threshold
+  of 5 -- still `failed_attempts == 20` *and* the account ends up locked),
+  and `::test_lockout_counter_regression_runs_reliably` (10 rounds against
+  10 fresh accounts).
+- **Lockout-lapse behaviour, decided and documented (cross-review asked
+  explicitly):** every failed attempt is counted **whether or not the
+  account is already locked** -- there is no "skip counting while locked"
+  branch. One consequence, deliberate: a failed attempt presented after a
+  previous lock has already lapsed does **not** get a fresh five-strike
+  allowance -- it both counts (the counter keeps climbing) and **re-locks**
+  the account, with `locked_until` renewed from that failure's time. Only a
+  genuinely successful login, or `fleet.admin unlock`, ever clears the
+  counter and the lock. This means hammering an already-locked (or
+  just-unlocked) account keeps it locked for as long as the attempts
+  continue, rather than guaranteeing an attacker a fixed unlock time to
+  simply wait out. See `Storage.record_ui_login_failure`'s own docstring
+  for the full reasoning. Regression test: `::test_a_new_failure_after_the_
+  lock_lapses_relocks_the_account`.
+- **Timing oracle for locked accounts (main-session finding): `authenticate`
+  used to return `None` for a locked account *before* running any Argon2
+  work at all**, so a locked (i.e. existing) account answered measurably
+  faster than an unknown username -- the response body was identical, but
+  the timing leaked "this account exists" regardless. Fixed: the Argon2
+  verify (real hash or dummy, exactly as before for the unknown-user case)
+  now always runs first, unconditionally, before the lock (or password, or
+  TOTP) result is even inspected; being locked only changes *what happens
+  after* that verify, never *whether* it happens. Regression tests:
+  `::test_locked_account_still_pays_the_full_argon2_cost` and
+  `::test_unknown_user_and_locked_user_both_run_exactly_one_argon2_verify`,
+  both spying on the Argon2 hasher's call count (monkeypatching the
+  `PasswordHasher` class, since the C-backed instance's own `verify`
+  attribute is read-only) rather than asserting on noisy wall-clock timing.
+- **CSP blocked the page's own styling.** The security-headers middleware
+  sends `Content-Security-Policy: default-src 'self'` with no
+  `'unsafe-inline'` -- correct for the "no inline scripts" requirement, but
+  `base.html`'s inline `<style>` block was *also* inline content the same
+  policy blocked, so the pages rendered unstyled in a real browser (only
+  `TestClient`, which does not execute CSS/JS, ever exercised them). Fixed
+  by moving the CSS into `fleet/static/ui/fleet-ui.css`, served same-origin
+  under `/ui/static/...` (mounted via `StaticFiles` on the `/ui` router in
+  `fleet/ui_routes.py`, added to `[tool.setuptools.package-data]` alongside
+  the templates, covered by the same wheel-inspection test as the templates
+  in `tests/test_packaging.py`) -- `default-src 'self'` already allows a
+  same-origin stylesheet link with no policy relaxation needed. No template
+  contains an inline `<style>`, `<script>`, or `style=` attribute any more;
+  `tests/test_ui_auth.py::test_templates_contain_no_inline_style_or_script`
+  asserts this directly against the shipped template files, not just by
+  eyeballing them.
+- **Minimum password length (main-session decision): `MIN_PASSWORD_LENGTH =
+  12`**, enforced in `fleet/admin.py::_read_new_password` -- the only place
+  a UI account's password is ever set (there is no web-facing registration
+  endpoint for a floor to guard there instead). `fleet.ui_auth`'s
+  verification path itself enforces no minimum, deliberately: it must keep
+  accepting whatever password was actually set at creation time regardless
+  of later policy changes. Tests: `tests/test_admin.py
+  ::test_create_user_rejects_a_too_short_password` and
+  `::test_create_user_accepts_a_password_exactly_at_the_minimum_length`.
+- **Username normalization (optional, done -- cross-review round 2):**
+  `fleet.ui_auth.normalize_username` (NFKC + casefold) is applied at both
+  boundaries where a human types a username -- `fleet.admin`'s four
+  subcommands and `authenticate` -- so `"Landlord"` and `"landlord"` cannot
+  become two separate accounts by accident, and a later command naming the
+  same account by a different case/normalization variant still resolves to
+  it. `Storage.get_ui_user_by_username` itself stays a plain, un-normalizing
+  exact-match lookup -- normalization is an application-layer decision made
+  once at the boundary, not something a raw storage read should silently
+  apply. Tests: `tests/test_admin.py
+  ::test_create_user_normalizes_the_username`,
+  `::test_create_user_rejects_a_case_variant_of_an_existing_username`,
+  `::test_unlock_finds_the_account_by_a_differently_cased_username`;
+  `tests/test_ui_auth.py::test_authenticate_normalizes_the_presented_username`.
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning` run
+three times (276 passed each time, 98% coverage); the two headline
+concurrency regression tests
+(`test_totp_replay_race_allows_exactly_one_concurrent_login`,
+`test_concurrent_failed_logins_do_not_lose_counter_updates`) each run 10
+times individually, 10/10 passes both.
 
 ## Login for the fleet UI (P3.0)
 
@@ -26,10 +142,12 @@ lockout, session creation/lookup, CSRF, the `require_ui_user` dependency
 every later UI package depends on), `fleet/ui_routes.py` (`GET/POST
 /ui/login`, `POST /ui/logout`, the protected `GET /ui/` placeholder, the
 `/ui`-scoped security-header middleware), `fleet/admin.py` (the CLI),
-`fleet/templates/ui/{base,login,index}.html` (shipped inside the `fleet`
-package via `[tool.setuptools.package-data]` in `pyproject.toml` -- proven
-by `tests/test_packaging.py`, which builds a real wheel and inspects it,
-not just by reading the config).
+`fleet/templates/ui/{base,login,index}.html`, `fleet/static/ui/fleet-ui.css`
+(all shipped inside the `fleet` package via `[tool.setuptools.package-data]`
+in `pyproject.toml` -- proven by `tests/test_packaging.py`, which builds a
+real wheel and inspects it, not just by reading the config; the CSS file is
+served same-origin under `/ui/static/...`, see the round-2 fixes section
+above for why it is a separate file and not inline).
 
 **Environment variables (all optional, sensible defaults):**
 

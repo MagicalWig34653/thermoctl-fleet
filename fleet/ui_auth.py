@@ -56,6 +56,7 @@ import hmac
 import logging
 import os
 import secrets
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -87,6 +88,29 @@ PRE_SESSION_CSRF_COOKIE_NAME = "fleet_ui_pre_csrf"
 
 _TOTP_INTERVAL_S = 30
 _TOTP_WINDOW_STEPS = 1  # +/- one time step, per the P3.0 requirement
+
+# Minimum password length for a UI account (main-session decision,
+# cross-review round 2). Enforced only in `fleet.admin` (`create-user`
+# prompts interactively, never over HTTP -- there is no web-facing
+# registration endpoint for this to guard) -- see that module.
+MIN_PASSWORD_LENGTH = 12
+
+
+def normalize_username(username: str) -> str:
+    """NFKC-normalizes and casefolds a username (cheap hardening,
+    cross-review round 2's optional item): two visually- or
+    logically-identical usernames that differ only by Unicode
+    normalization form or letter case (`"Landlord"` vs `"landlord"`, or a
+    precomposed vs. decomposed accented character) must resolve to the
+    same account, both at creation (`fleet.admin create-user`/
+    `reset-totp`/`unlock`/`delete-user`) and at login (`authenticate`
+    below) -- applied at both boundaries, not stored differently than
+    typed, so `ui_users.username` itself stays exactly what a `create-user`
+    invocation normalized once, not re-derived per lookup from a raw,
+    unnormalized value that could drift from it.
+    """
+
+    return unicodedata.normalize("NFKC", username).casefold()
 
 
 def lockout_threshold() -> int:
@@ -181,32 +205,57 @@ def authenticate(
     unknown user, wrong password, wrong/replayed TOTP code, and a locked
     account are all indistinguishable from the caller's point of view, by
     design (see the module docstring).
+
+    **The Argon2 verify always runs, unconditionally, before any decision
+    is made** -- including for a locked account (cross-review: an earlier
+    version returned `None` for a locked account *before* touching Argon2
+    at all, which made a locked, i.e. existing, account answer measurably
+    faster than an unknown username; a timing oracle for "this account
+    exists" even though the response body was identical). The lock is
+    still enforced -- it just no longer changes the timing profile of the
+    response.
+
+    **A concurrent TOTP replay is also a failure here, not a crash or a
+    silent double-success:** `Storage.record_ui_login_success` is the
+    atomic, race-proof gate (see its own docstring) -- if it reports the
+    write did not happen (someone else's concurrent request already
+    consumed this exact step first), this function records an ordinary
+    login failure and returns `None`, the same as a wrong code.
     """
 
-    user = storage.get_ui_user_by_username(username)
+    user = storage.get_ui_user_by_username(normalize_username(username))
 
-    if user is not None and user.locked_until is not None:
-        if _naive_utc_now(now) < user.locked_until:
-            # Still locked: no Argon2/TOTP work needed, but no early return
-            # with a different code path either -- the caller only ever
-            # sees `None`, same as every other failure.
-            return None
+    # Read here only to decide the *return value* (locked -> failure) and
+    # whether TOTP is even worth checking -- never to skip the Argon2 verify
+    # below, and never itself the thing that decides whether a failure gets
+    # recorded (see `Storage.record_ui_login_failure`'s docstring: every
+    # failure is counted, locked or not).
+    locked = (
+        user is not None
+        and user.locked_until is not None
+        and _naive_utc_now(now) < user.locked_until
+    )
 
     password_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
     password_ok = _verify_password(password_hash, password)
 
     matched_step: int | None = None
-    if user is not None and password_ok:
+    if user is not None and password_ok and not locked:
         matched_step = verify_totp(user.totp_secret, totp_code, now, user.last_totp_step)
 
-    if user is None or not password_ok or matched_step is None:
+    if user is None or not password_ok or locked or matched_step is None:
         if user is not None:
             storage.record_ui_login_failure(
                 user.id, now, lockout_threshold(), lockout_duration_s()
             )
         return None
 
-    storage.record_ui_login_success(user.id, matched_step)
+    if not storage.record_ui_login_success(user.id, matched_step):
+        # Lost the replay race to a concurrent request presenting the same
+        # code -- same outcome as any other failure, including being
+        # counted toward the lockout threshold.
+        storage.record_ui_login_failure(user.id, now, lockout_threshold(), lockout_duration_s())
+        return None
     return user
 
 
@@ -319,6 +368,7 @@ def require_ui_user(
 
 __all__ = [
     "AuthenticatedUiSession",
+    "MIN_PASSWORD_LENGTH",
     "NewSession",
     "PRE_SESSION_CSRF_COOKIE_NAME",
     "SESSION_COOKIE_NAME",
@@ -331,6 +381,7 @@ __all__ = [
     "hash_password",
     "lockout_duration_s",
     "lockout_threshold",
+    "normalize_username",
     "require_ui_user",
     "session_absolute_lifetime_s",
     "session_idle_timeout_s",

@@ -1,0 +1,81 @@
+/* Fleet UI base styling (P3.0).
+ *
+ * A separate file, not an inline <style> block in base.html (cross-review
+ * round 2): the security-headers middleware in fleet/ui_routes.py sends
+ * `Content-Security-Policy: default-src 'self'` on every /ui response,
+ * with no `'unsafe-inline'` for style-src -- a strict CSP that also blocks
+ * the page's own inline CSS is not a defense, it is an unstyled page. This
+ * file is same-origin, served under /ui/static/ (see the StaticFiles
+ * mount in fleet/ui_routes.py), which `default-src 'self'` already allows
+ * without any policy relaxation.
+ */
+
+:root { color-scheme: light dark; }
+
+body {
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    padding: 0;
+    line-height: 1.5;
+}
+
+header nav {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid #8888;
+}
+
+header nav a,
+header nav span.inactive {
+    text-decoration: none;
+}
+
+header nav span.inactive {
+    opacity: 0.6;
+}
+
+header nav form {
+    margin-inline-start: auto;
+}
+
+main {
+    padding: 1rem;
+    max-width: 60rem;
+    margin: 0 auto;
+}
+
+.error {
+    border: 1px solid #c00;
+    padding: 0.75rem 1rem;
+    border-radius: 0.25rem;
+}
+
+label {
+    display: block;
+    margin-top: 0.75rem;
+}
+
+input[type=text],
+input[type=password] {
+    width: 100%;
+    max-width: 20rem;
+    padding: 0.4rem;
+    margin-top: 0.25rem;
+}
+
+button {
+    padding: 0.4rem 1rem;
+    margin-top: 1rem;
+}
+
+a.skip-link {
+    position: absolute;
+    left: -999px;
+}
+
+a.skip-link:focus {
+    left: 1rem;
+    top: 1rem;
+}

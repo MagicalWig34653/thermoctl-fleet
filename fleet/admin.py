@@ -26,7 +26,13 @@ import sys
 from datetime import UTC, datetime
 
 from fleet.storage import create_storage
-from fleet.ui_auth import generate_totp_secret, hash_password, totp_provisioning_uri
+from fleet.ui_auth import (
+    MIN_PASSWORD_LENGTH,
+    generate_totp_secret,
+    hash_password,
+    normalize_username,
+    totp_provisioning_uri,
+)
 
 _DATABASE_URL_ENV = "FLEET_DATABASE_URL"
 
@@ -40,30 +46,41 @@ def _require_database_url() -> str:
 
 
 def _read_new_password() -> str:
-    """Prompts twice, rejects a mismatch -- never prints or logs the value
-    itself, only ever a length-blind confirmation message."""
+    """Prompts twice, rejects a mismatch or a too-short password -- never
+    prints or logs the value itself, only ever a length-blind confirmation
+    message.
+
+    **Minimum length `MIN_PASSWORD_LENGTH` (main-session decision,
+    cross-review round 2):** the only account class this CLI creates is the
+    landlord's own; enforcing a floor here, not in `fleet.ui_auth`'s
+    verification path (which must accept whatever was set at creation time
+    regardless of policy changes since), is the only place a length policy
+    can be enforced at all -- there is no web-facing registration endpoint
+    for a floor to guard there instead.
+    """
 
     first = getpass.getpass("Password: ")
     second = getpass.getpass("Confirm password: ")
     if first != second:
         print("Passwords did not match.", file=sys.stderr)
         raise SystemExit(1)
-    if not first:
-        print("Password must not be empty.", file=sys.stderr)
+    if len(first) < MIN_PASSWORD_LENGTH:
+        print(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.", file=sys.stderr)
         raise SystemExit(1)
     return first
 
 
 def create_user(username: str) -> int:
+    normalized_username = normalize_username(username)
     storage = create_storage(_require_database_url())
-    if storage.get_ui_user_by_username(username) is not None:
+    if storage.get_ui_user_by_username(normalized_username) is not None:
         print(f"User {username!r} already exists.", file=sys.stderr)
         return 1
 
     password = _read_new_password()
     totp_secret = generate_totp_secret()
     storage.create_ui_user(
-        username=username,
+        username=normalized_username,
         password_hash=hash_password(password),
         totp_secret=totp_secret,
         created_at=datetime.now(UTC),
@@ -74,13 +91,13 @@ def create_user(username: str) -> int:
     # on that), not repeated in any log.
     print(f"User {username!r} created.")
     print("Add this account to an authenticator app (shown once):")
-    print(totp_provisioning_uri(username, totp_secret))
+    print(totp_provisioning_uri(normalized_username, totp_secret))
     return 0
 
 
 def reset_totp(username: str) -> int:
     storage = create_storage(_require_database_url())
-    user = storage.get_ui_user_by_username(username)
+    user = storage.get_ui_user_by_username(normalize_username(username))
     if user is None:
         print(f"User {username!r} not found.", file=sys.stderr)
         return 1
@@ -89,13 +106,13 @@ def reset_totp(username: str) -> int:
     storage.set_ui_user_totp_secret(user.id, totp_secret)
     print(f"TOTP secret for {username!r} reset.")
     print("Add this account to an authenticator app (shown once):")
-    print(totp_provisioning_uri(username, totp_secret))
+    print(totp_provisioning_uri(user.username, totp_secret))
     return 0
 
 
 def unlock(username: str) -> int:
     storage = create_storage(_require_database_url())
-    user = storage.get_ui_user_by_username(username)
+    user = storage.get_ui_user_by_username(normalize_username(username))
     if user is None:
         print(f"User {username!r} not found.", file=sys.stderr)
         return 1
@@ -106,7 +123,7 @@ def unlock(username: str) -> int:
 
 def delete_user(username: str) -> int:
     storage = create_storage(_require_database_url())
-    user = storage.get_ui_user_by_username(username)
+    user = storage.get_ui_user_by_username(normalize_username(username))
     if user is None:
         print(f"User {username!r} not found.", file=sys.stderr)
         return 1

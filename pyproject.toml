@@ -78,7 +78,7 @@ include = ["protocol*", "fleet*", "agent*", "tools*"]
 # listed explicitly -- `packages.find` above only picks up `.py` files.
 # `docker/Dockerfile.fleet` only `COPY`s `fleet/`, so anything the running
 # service needs must be inside this package, not alongside it.
-fleet = ["templates/ui/*.html"]
+fleet = ["templates/ui/*.html", "static/ui/*.css"]
 
 [tool.ruff]
 line-length = 100

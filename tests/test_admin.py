@@ -18,7 +18,7 @@ import pytest
 
 import fleet.admin as admin_module
 from fleet.storage import create_storage, upgrade
-from fleet.ui_auth import hash_password
+from fleet.ui_auth import MIN_PASSWORD_LENGTH, hash_password
 
 
 @pytest.fixture
@@ -89,6 +89,44 @@ def test_create_user_rejects_an_empty_password(
     assert excinfo.value.code == 1
     storage = create_storage(database_url)
     assert storage.get_ui_user_by_username("landlord") is None
+
+
+def test_create_user_rejects_a_too_short_password(
+    database_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Main-session decision, cross-review round 2: `MIN_PASSWORD_LENGTH`
+    (12) is enforced here, the only place a landlord's UI password is ever
+    set. A password one character short of the floor, still matching on
+    both prompts, must still be rejected -- this is a length check, not
+    just the mismatch check already covered above."""
+
+    short_password = "a" * (MIN_PASSWORD_LENGTH - 1)
+    _patch_password(monkeypatch, short_password)
+
+    with pytest.raises(SystemExit) as excinfo:
+        admin_module.main(["create-user", "landlord"])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert short_password not in captured.out
+    assert short_password not in captured.err
+    assert str(MIN_PASSWORD_LENGTH) in captured.err
+
+    storage = create_storage(database_url)
+    assert storage.get_ui_user_by_username("landlord") is None
+
+
+def test_create_user_accepts_a_password_exactly_at_the_minimum_length(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exact_password = "a" * MIN_PASSWORD_LENGTH
+    _patch_password(monkeypatch, exact_password)
+
+    exit_code = admin_module.main(["create-user", "landlord"])
+
+    assert exit_code == 0
+    storage = create_storage(database_url)
+    assert storage.get_ui_user_by_username("landlord") is not None
 
 
 def test_create_user_rejects_an_existing_username(
@@ -180,6 +218,60 @@ def test_delete_user_removes_the_account(database_url: str) -> None:
 
 def test_delete_user_unknown_user_fails(database_url: str) -> None:
     assert admin_module.main(["delete-user", "no-such-user"]) == 1
+
+
+def test_create_user_normalizes_the_username(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Optional hardening, cross-review round 2: NFKC + casefold at
+    creation, so `"Landlord"` and `"landlord"` cannot become two separate
+    accounts by accident. `Storage.get_ui_user_by_username` itself stays
+    dumb (an exact-match lookup, no normalization) -- normalization is an
+    application-layer decision made once, at the two boundaries where a
+    human types a username (`fleet.admin`, `fleet.ui_auth.authenticate`),
+    not a storage-layer behaviour a raw lookup should silently apply."""
+
+    _patch_password(monkeypatch, secrets.token_urlsafe(16))
+    admin_module.main(["create-user", "Landlord"])
+
+    storage = create_storage(database_url)
+    assert storage.get_ui_user_by_username("landlord") is not None
+
+    # A later command naming the same account by a different case variant
+    # resolves to it -- normalized at the CLI boundary, not by chance.
+    exit_code = admin_module.main(["unlock", "LANDLORD"])
+    assert exit_code == 0
+
+
+def test_create_user_rejects_a_case_variant_of_an_existing_username(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_password(monkeypatch, secrets.token_urlsafe(16))
+    admin_module.main(["create-user", "landlord"])
+
+    exit_code = admin_module.main(["create-user", "LANDLORD"])
+
+    assert exit_code == 1
+
+
+def test_unlock_finds_the_account_by_a_differently_cased_username(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_password(monkeypatch, secrets.token_urlsafe(16))
+    admin_module.main(["create-user", "landlord"])
+    storage = create_storage(database_url)
+    user = storage.get_ui_user_by_username("landlord")
+    assert user is not None
+    storage.record_ui_login_failure(
+        user.id, datetime.now(UTC), lockout_threshold=1, lockout_duration_s=900
+    )
+
+    exit_code = admin_module.main(["unlock", "LANDLORD"])
+
+    assert exit_code == 0
+    unlocked = create_storage(database_url).get_ui_user_by_username("landlord")
+    assert unlocked is not None
+    assert unlocked.locked_until is None
 
 
 def test_missing_database_url_exits_with_an_error(monkeypatch: pytest.MonkeyPatch) -> None:

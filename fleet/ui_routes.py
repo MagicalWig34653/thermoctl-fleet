@@ -16,6 +16,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Cookie, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from fleet.storage import Storage, get_storage
@@ -35,6 +36,15 @@ router = APIRouter(prefix="/ui")
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates" / "ui"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+
+_STATIC_DIR = Path(__file__).parent / "static" / "ui"
+# Serves `fleet/static/ui/fleet-ui.css` (and any future same-origin asset)
+# under `/ui/static/...` -- same-origin, so `default-src 'self'` (the CSP
+# the security-headers middleware below sends) already allows loading it,
+# no policy relaxation needed. Mounted on the router itself (not `app`
+# directly), so it only ever exists under the `/ui` prefix, consistent
+# with every other route in this module.
+router.mount("/ui/static", StaticFiles(directory=str(_STATIC_DIR)), name="ui-static")
 
 _GENERIC_LOGIN_ERROR = (
     "Anmeldung fehlgeschlagen. Bitte Benutzername, Passwort und Bestätigungscode prüfen."
