@@ -308,6 +308,22 @@ class LatestHeartbeat:
 
 
 @dataclass(frozen=True)
+class HeartbeatHistoryEntry:
+    """One stored heartbeat's `sent_at`/`received_at` pair, for P3.2's
+    heartbeat-history timeline (section 5: "the cloud detects gaps by the
+    timestamp"). Deliberately not the full `Heartbeat` payload -- the
+    history view only ever needs reachability timing (see
+    `fleet/ui_apartment.py`'s own module docstring for the gap/caught-up
+    reasoning built from just these two fields), never section-6 content,
+    and returning the full model per row would be needless work for what
+    can be thousands of rows over a 14-day window.
+    """
+
+    sent_at: datetime
+    received_at: datetime
+
+
+@dataclass(frozen=True)
 class ApartmentOverview:
     """Everything "Das Haus" (P3.1, section 9's first view) needs for one
     apartment's tile, fetched together by `Storage.get_house_overview` so
@@ -852,6 +868,92 @@ class Storage:
             )
             for apartment_id in apartment_ids
         ]
+
+    # -- apartment detail (P3.2, section 9's second view) -------------------------
+
+    # A defensive cap, not an expected truncation point: 14 days (P3.2's own
+    # `days` query-parameter ceiling, see `fleet/ui_apartment.py
+    # .MAX_HISTORY_DAYS`) at one heartbeat every 120 s is 14 * 24 * 60 // 2
+    # = 10,080 rows in the worst case; this leaves comfortable headroom
+    # while still bounding the query per CLAUDE.md/the work package
+    # ("keep queries bounded (window + limit)").
+    _MAX_HEARTBEAT_HISTORY_ROWS = 20_000
+    _MAX_EVENT_HISTORY_ROWS = 200
+    _MAX_APARTMENT_ALARM_ROWS = 50
+
+    def get_heartbeat_history(
+        self, apartment_id: str, since: datetime
+    ) -> list[HeartbeatHistoryEntry]:
+        """Every stored heartbeat for `apartment_id` with `sent_at >= since`,
+        ordered ascending by `sent_at` (P3.2: "the cloud detects gaps by the
+        timestamp", section 5) -- `fleet.ui_apartment` derives gaps and
+        caught-up markers from consecutive entries here; this method only
+        supplies the bounded, ordered raw data, the same "no business logic
+        in storage" split `get_house_overview`/`fleet.ui_house` already
+        follow. Bounded by `since` (the caller's `days` window) and
+        `_MAX_HEARTBEAT_HISTORY_ROWS` above.
+        """
+
+        with self.session() as session:
+            rows = session.scalars(
+                select(HeartbeatRecord)
+                .where(
+                    HeartbeatRecord.apartment_id == apartment_id,
+                    HeartbeatRecord.sent_at >= _naive_utc(since),
+                )
+                .order_by(HeartbeatRecord.sent_at)
+                .limit(self._MAX_HEARTBEAT_HISTORY_ROWS)
+            ).all()
+            return [
+                HeartbeatHistoryEntry(sent_at=row.sent_at, received_at=row.received_at)
+                for row in rows
+            ]
+
+    def list_events_for_apartment(self, apartment_id: str, since: datetime) -> list[EventRecord]:
+        """Recent fault-report events for `apartment_id` (P3.2's "past
+        faults" section) with `received_at >= since`, newest first, bounded
+        by `_MAX_EVENT_HISTORY_ROWS` above. Detached `EventRecord` rows,
+        mirroring `list_events` above -- `titel`/`text` are not columns on
+        this table at all (see the module docstring), so there is
+        structurally nothing to leak here, not merely "left out of this
+        query"."""
+
+        with self.session() as session:
+            rows = session.scalars(
+                select(EventRecord)
+                .where(
+                    EventRecord.apartment_id == apartment_id,
+                    EventRecord.received_at >= _naive_utc(since),
+                )
+                .order_by(EventRecord.received_at.desc())
+                .limit(self._MAX_EVENT_HISTORY_ROWS)
+            ).all()
+            result = list(rows)
+            session.expunge_all()
+            return result
+
+    def list_alarms_for_apartment(self, apartment_id: str) -> list[AlarmRecord]:
+        """Every alarm ever raised for `apartment_id` (open or already
+        cleared), newest first, bounded by `_MAX_APARTMENT_ALARM_ROWS`
+        above (P3.2's "open and recent alarms" section) -- not
+        date-windowed like the heartbeat/event history above, since an
+        apartment realistically accumulates far fewer alarm rows than
+        heartbeats. In practice this only ever returns `AlarmKind
+        .NOT_REPORTING` rows: `UI_ACCOUNT_LOCKED` (`fleet/alarms.py`)
+        carries no `apartment_id` and is never written to this table at
+        all (see `docs/STATUS.md`'s P3.0 round-3 section, "not tied to the
+        alarms table")."""
+
+        with self.session() as session:
+            rows = session.scalars(
+                select(AlarmRecord)
+                .where(AlarmRecord.apartment_id == apartment_id)
+                .order_by(AlarmRecord.raised_at.desc(), AlarmRecord.id.desc())
+                .limit(self._MAX_APARTMENT_ALARM_ROWS)
+            ).all()
+            result = list(rows)
+            session.expunge_all()
+            return result
 
     # -- ui accounts / sessions (P3.0) -------------------------------------------
 

@@ -195,6 +195,12 @@ parallel with all other packages of the same stage.
 - **Acceptance:** page shows an apartment's history, open faults, and last
   commands.
 - **Depends on:** P3.1 (shared templates/navigation).
+- [x] done -- see `docs/STATUS.md` for the gap-detection derivation (reuses
+  `fleet.alarms.ABSENCE_THRESHOLD`, closing the open point carried since
+  P2.1/P2.1b), the new `fleet/ui_apartment.py`/`Storage` read methods, and
+  the two open points this package leaves for later (per-device
+  battery/signal values -- not in the heartbeat protocol; commands -- a
+  later step).
 
 ### P3.3 -- "Inventory" view
 - **Goal:** fourth view for property/apartment/device/assignment.

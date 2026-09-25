@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+
+{% block title %}{{ apartment_id }} – thermoctl-fleet{% endblock %}
+
+{% block content %}
+{# "Eine Wohnung" (P3.2, section 9's second view) -- already German-rendered
+   and already derived by fleet/ui_apartment.py::build_apartment_detail.
+   This template only iterates and prints; it makes no ordering, wording, or
+   gap/caught-up decisions of its own. #}
+<p><a href="/ui/">&larr; Zurück zum Haus</a></p>
+<h1>{{ apartment_id }}</h1>
+
+{% if detail is none %}
+<p>Diese Wohnung ist nicht bekannt.</p>
+{% else %}
+
+<nav aria-label="Zeitraum der Erreichbarkeitshistorie">
+    <a href="?days=3">3 Tage</a>
+    <a href="?days=7">7 Tage</a>
+    <a href="?days=14">14 Tage</a>
+</nav>
+
+<section aria-labelledby="history-heading">
+    <h2 id="history-heading">Erreichbarkeit ({{ detail.history_days }} Tage)</h2>
+    {% if detail.timeline %}
+    <ol class="timeline">
+        {% for entry in detail.timeline %}
+        <li class="timeline__entry {{ 'timeline__entry--gap' if entry.is_gap else 'timeline__entry--contact' }}">
+            <span class="timeline__label">{{ entry.label }}</span>
+            <span class="timeline__when">{{ entry.when_text }}</span>
+            {% if entry.duration_text %}<span class="timeline__duration">({{ entry.duration_text }})</span>{% endif %}
+            {% if entry.caught_up %}<span class="apartment-tile__tag">nachgeliefert</span>{% endif %}
+        </li>
+        {% endfor %}
+    </ol>
+    {% else %}
+    <p>Keine Heartbeats im gewählten Zeitraum.</p>
+    {% endif %}
+</section>
+
+<section aria-labelledby="faults-heading">
+    <h2 id="faults-heading">Störungen</h2>
+    <h3>Offen</h3>
+    {% if detail.open_faults %}
+    <ul>
+        {% for fault in detail.open_faults %}
+        <li>{{ fault.kind_label }} ({{ fault.zone }}), {{ fault.since_text }}</li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>Keine offenen Störungen.</p>
+    {% endif %}
+
+    <h3>Vergangen</h3>
+    {% if detail.past_faults %}
+    <ul>
+        {% for fault in detail.past_faults %}
+        <li>{{ fault.kind_label }} – {{ fault.key }} ({{ fault.severity }}), {{ fault.received_text }}</li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>Keine vergangenen Meldungen im gewählten Zeitraum.</p>
+    {% endif %}
+</section>
+
+<section aria-labelledby="devices-heading">
+    <h2 id="devices-heading">Batterie und Signal</h2>
+    {% if detail.never_reported %}
+    <p>Noch keine Daten.</p>
+    {% else %}
+    <dl>
+        <dt>Schwächste Batterie</dt>
+        <dd>{{ detail.weakest_battery_percent }} %</dd>
+        <dt>Schlechteste Signalqualität</dt>
+        <dd>{{ detail.worst_signal_quality }} %</dd>
+        <dt>Stille Geräte</dt>
+        <dd>{{ detail.silent_devices }}</dd>
+        <dt>Zigbee-Bridge</dt>
+        <dd>{{ detail.zigbee_bridge }}</dd>
+    </dl>
+    <p class="apartment-detail__note">
+        Werte je einzelnem Gerät werden vom Heartbeat-Protokoll nicht übertragen,
+        nur diese Wohnung-weiten Kennzahlen.
+    </p>
+    {% endif %}
+</section>
+
+<section aria-labelledby="version-heading">
+    <h2 id="version-heading">Version und System</h2>
+    {% if detail.never_reported %}
+    <p>Noch keine Daten.</p>
+    {% else %}
+    <dl>
+        <dt>Agent</dt>
+        <dd>{{ detail.agent_version }}</dd>
+        <dt>thermoctl</dt>
+        <dd>{{ detail.thermoctl_version }}</dd>
+        <dt>Protokollversion</dt>
+        <dd>
+            {{ detail.protocol_version }}
+            {%- if detail.outdated %}
+            <span class="apartment-tile__tag">veraltete Protokollversion</span>
+            {%- endif %}
+        </dd>
+        <dt>Modus</dt>
+        <dd>{{ detail.mode }}</dd>
+        <dt>thermoctl erreichbar</dt>
+        <dd>{{ "Ja" if detail.thermoctl_reachable else "Nein" }}</dd>
+        <dt>Laufzeit</dt>
+        <dd>{{ detail.uptime_text }}</dd>
+        <dt>Freier Speicher</dt>
+        <dd>{{ detail.memory_free_percent }} %</dd>
+        <dt>Freier Plattenplatz</dt>
+        <dd>{{ detail.disk_free_percent }} %</dd>
+        <dt>Uhrabweichung</dt>
+        <dd>{{ detail.clock_drift_s }} s</dd>
+        <dt>Letzte Regelentscheidung</dt>
+        <dd>{{ detail.last_decision_text }}</dd>
+        <dt>Zonen</dt>
+        <dd>{{ detail.zones }}</dd>
+        <dt>Zonen ohne Messwert</dt>
+        <dd>{{ detail.zones_without_reading }}</dd>
+        <dt>Zonen mit Wärmebedarf</dt>
+        <dd>{{ detail.zones_with_heat_demand }}</dd>
+    </dl>
+    {% endif %}
+</section>
+
+<section aria-labelledby="alarms-heading">
+    <h2 id="alarms-heading">Alarme</h2>
+    {% if detail.alarms %}
+    <ul>
+        {% for alarm in detail.alarms %}
+        <li>
+            {{ alarm.kind_label }} –
+            {% if alarm.open %}
+            offen, ausgelöst {{ alarm.raised_text }}
+            {% else %}
+            behoben, ausgelöst {{ alarm.raised_text }}, beendet {{ alarm.cleared_text }}
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>Keine Alarme.</p>
+    {% endif %}
+</section>
+
+<section aria-labelledby="commands-heading">
+    <h2 id="commands-heading">Befehle</h2>
+    <p>Befehle für diese Wohnung sind in dieser Version der Oberfläche noch nicht verfügbar.</p>
+</section>
+
+{% endif %}
+{% endblock %}

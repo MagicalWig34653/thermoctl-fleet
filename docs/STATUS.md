@@ -2,6 +2,150 @@
 
 Last updated: 2026-09-25.
 
+## "Eine Wohnung" -- the fleet UI's apartment detail view (P3.2, section 9's second view)
+
+`GET /ui/apartments/{apartment_id}` (behind `require_ui_user`, same as P3.1)
+renders section 9's second view: heartbeat history, open/past faults,
+battery/signal aggregates, version, system/control state, and
+open/recent alarms for one apartment -- everything except stage-1/2
+commands, which are explicitly deferred to a later step. Sits directly on
+top of P3.1 (`fleet/ui_house.py`'s pattern is repeated, not reinvented) and
+P1.2/P2.1/P2.2 (events, heartbeats, alarms) -- no new migration, no change
+to `protocol/`, `fleet/auth.py`, `fleet/ui_auth.py`, or `CommandType`.
+
+**Where the pieces live.** `fleet/storage.py` gained `HeartbeatHistoryEntry`
+(a `sent_at`/`received_at` pair) and three new bounded `Storage` read
+methods: `get_heartbeat_history(apartment_id, since)` (ascending by
+`sent_at`, capped at `_MAX_HEARTBEAT_HISTORY_ROWS = 20_000` -- comfortably
+above the 14-day cap's worst case of 10,080 rows at one heartbeat per
+120 s), `list_events_for_apartment(apartment_id, since)` (newest first,
+capped at `_MAX_EVENT_HISTORY_ROWS = 200`), and
+`list_alarms_for_apartment(apartment_id)` (newest first, capped at
+`_MAX_APARTMENT_ALARM_ROWS = 50`, not date-windowed -- an apartment
+realistically accumulates far fewer alarm rows than heartbeats). Apartment
+existence (for the 404 case) is checked by reusing
+`Storage.get_apartment_token_hash` -- every registered apartment has
+exactly one token-hash row (`Storage.set_apartment_token`), so no separate
+"does this apartment exist" method was needed.
+
+`fleet/ui_apartment.py` (new) is the view-model module, the same split
+P3.1 established: `build_apartment_detail(storage, apartment_id, now,
+days)` returns `None` for an unknown apartment (`fleet/ui_routes.py` turns
+that into a 404, same layout, no data) or an `ApartmentDetail` with every
+field already derived and German-rendered -- the template
+(`fleet/templates/ui/apartment.html`) only iterates and prints, exactly
+like `index.html`. `days` (default 3, query-capped at 14 via
+`clamp_history_days`) is a plain query parameter with no `Query(...)`
+validation -- an out-of-range or malformed value is silently clamped, not a
+422, matching the work package's "a `days` query parameter capped at
+e.g. 14" wording rather than inventing a stricter contract.
+
+**Gap detection (section 5) -- the open point this package closes.**
+P2.1b's `docs/STATUS.md` entry explicitly deferred "gap detection for
+caught-up heartbeats ... displaying it is a UI concern that belongs with
+P3.2" -- closed here. `fleet.ui_apartment._build_timeline` treats any
+interval between two *consecutive* stored heartbeats (ordered by
+`sent_at`, matching section 5's own wording, not `received_at`) strictly
+longer than `fleet.alarms.ABSENCE_THRESHOLD` (six minutes) as a gap --
+**reusing that constant directly, not a second, independently-chosen
+number**, so this view's definition of "gap" can never silently drift
+from P2.2's definition of "absent" (section 8's own headline alarm), per
+the work package's explicit instruction. A heartbeat whose `received_at`
+is itself more than `ABSENCE_THRESHOLD` after its own `sent_at` is marked
+"nachgeliefert" (caught up) -- the same reused threshold, since the agent
+sends a live heartbeat every 120 s, so a receipt delay past six minutes
+can only happen for a heartbeat that was buffered and delivered later via
+a P2.1b catch-up batch. **Window edges are a hard cut, not smoothed
+over:** `Storage.get_heartbeat_history` only ever returns rows with
+`sent_at >= since`; a heartbeat sent before the requested window is never
+used to fabricate a gap against the first heartbeat that *is* in the
+window -- `tests/test_ui_apartment.py
+::test_gap_detection_ignores_data_outside_the_requested_window` builds
+exactly this scenario (an old heartbeat outside a 1-day window, then a
+real 22h gap fully inside it) and asserts exactly one gap, not two.
+
+**Battery/signal values -- section 9's wording vs. the actual protocol
+(open point, not built, not invented).** Section 9 says "battery and
+signal values ... per device"; `protocol.heartbeat.DeviceState` only ever
+carries the fleet-wide aggregates (`weakest_battery_percent`,
+`worst_signal_quality`, `silent_devices`, `zigbee_bridge`) -- there is no
+per-device breakdown anywhere in the heartbeat wire contract. This page
+shows the aggregates only, with an explanatory note in the template ("Werte
+je einzelnem Gerät werden vom Heartbeat-Protokoll nicht übertragen").
+Adding per-device values would need a `protocol/` extension, which
+CLAUDE.md's security principles require clearing with the project owner
+first (section 18.2: "a field may only ever be added", a *deliberate*
+addition, not incidental to a UI package) -- not invented here, left open.
+
+**Commands -- explicitly deferred (work package's own instruction, section
+9: "the four to seven allowed commands as buttons with confirmation").**
+Not built by this package (a later step, once `POST /v1/commands/...` and
+the SSE channel exist per `docs/implementation_plan.md`'s own ordering).
+The page shows a short static German note in place of any button/form; no
+new `POST` route exists on `fleet/ui_routes.py` for this page.
+
+**Section 6 stays out, same as P3.1.** No room temperature, setpoint,
+schedule, or tenant data is read, shown, or derivable -- `EventRecord` has
+no `titel`/`text` column at all (P1.2), so past faults can only ever show
+`schluessel`/`schwere`/derived kind/receipt time, structurally nothing else
+to leak; verified directly by
+`tests/test_ui_apartment.py::test_events_never_show_titel_or_text_even_with_no_prefix_match`,
+which posts a real event through `POST /v1/events/{apartment}` with marker
+`titel`/`text` values and asserts both are absent from the rendered page,
+and by `::test_no_section_6_data_anywhere_on_the_page` (same forbidden-marker
+list P3.1 uses: `"°C"`/`"Sollwert"`/`"Zeitplan"`/`"Mieter:"`/`"Kontakt:"`).
+
+**Hardened apartment links (P3.1 review, closed here for both views).**
+`fleet/ui_routes.py` registers a Jinja filter, `urlpath`
+(`urllib.parse.quote(value, safe="")`) -- **not** Jinja's own built-in
+`urlencode`, which deliberately leaves `/` unescaped (correct for a query
+string, wrong for a path *segment* that may itself contain a literal `/`).
+`index.html`'s tile link now reads
+`/ui/apartments/{{ tile.apartment_id | urlpath }}`. On the receiving end,
+`fleet/ui_routes.py::apartment_detail` uses Starlette's `{apartment_id:path}`
+converter, not the plain (default) `str` one -- **confirmed empirically
+before choosing it:** a `%2F` inside a URL is decoded by the ASGI
+server/client before Starlette's router splits the path into segments, so
+a plain `str` parameter (whose regex excludes `/`) 404s for an id that
+actually contained a `/`, even though the link encoded it correctly; the
+`:path` converter matches everything after the prefix and round-trips
+`/`, a space, and `<` correctly, covered by
+`tests/test_ui_apartment.py::test_encoded_id_link_from_the_house_view_resolves_to_this_page`
+(builds a real apartment id containing all three, follows the house
+view's own rendered `href`, asserts 200) and
+`::test_xss_escaping_of_id_zone_mode_and_key`.
+
+**Tests.** New `tests/test_ui_apartment.py` (30 tests) against a real,
+migrated SQLite database, no mocks, mirroring `tests/test_ui_house.py`'s
+structure: `clamp_history_days` unit-tested directly (`None`/zero/negative
+-> default, over-range -> capped, in-range passthrough);
+`build_apartment_detail` unit-tested for the unknown-apartment `None`
+case, the never-reported placeholder, gap detection at exactly the
+threshold (no gap) and just above it (a gap), the window-edge case above,
+caught-up vs. live heartbeat marking, `days` clamping, open faults from
+the latest heartbeat, every battery/signal/version/system/control field,
+the outdated-protocol flag (same `monkeypatch.setattr(storage_module,
+"PROTOCOL_VERSION", ...)` technique P3.1 uses), and both an open and a
+since-cleared alarm; the three new `Storage` methods unit-tested directly
+for ordering, the `since` bound, and per-apartment scoping; HTTP-level
+tests logging in via the real P3.0 flow for: unauthenticated access
+redirecting (303), an unknown apartment 404ing with the same base layout,
+every section rendering from real stored data in one combined test, the
+titel/text-leak test described above, `days` capping at the HTTP layer
+(`?days=9999` -> 14, `?days=0` -> 3), XSS escaping of an apartment id,
+zone, mode, and event key all containing `<script>`, the encoded-link
+round trip, the section-6 absence check, and the security headers
+(`Content-Security-Policy`, `X-Frame-Options`, `Referrer-Policy`,
+`Cache-Control: no-store`) -- plus a template-level inline-style/script
+check mirroring `tests/test_ui_auth.py`'s existing glob-based one (which
+already also covers `apartment.html` automatically, since it globs every
+template in the directory).
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol
+fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+(372 passed, 99% coverage overall, `fleet/ui_apartment.py` and every other
+P3.2 file at 100%).
+
 ## "Das Haus" -- the fleet UI's house overview (P3.1, section 9's first view)
 
 `GET /ui/` (P3.0's protected placeholder) now renders section 9's first
@@ -1326,11 +1470,13 @@ touched, only a new module constant and a docstring sentence added),
 
 **Batch format open point (P2.1's `STATUS.md` entry) is now closed** by
 this package -- `POST /v1/heartbeats`, a plain JSON list of `Heartbeat`,
-`MAX_CATCH_UP_HEARTBEATS = 240`. **Still open, explicitly out of scope
-here, not invented:** gap detection for caught-up heartbeats (section 5,
-"The cloud detects gaps by the timestamp and displays them as such") --
-this package stores the batch; *displaying* a detected gap is a UI concern
-that belongs with P3.2 (the apartment detail view), not this endpoint.
+`MAX_CATCH_UP_HEARTBEATS = 240`. **Gap detection for caught-up heartbeats
+(section 5, "The cloud detects gaps by the timestamp and displays them as
+such") was left open here on purpose** -- this package stores the batch;
+*displaying* a detected gap is a UI concern that belongs with P3.2 (the
+apartment detail view), not this endpoint. **Closed by P3.2**, see this
+file's own "Eine Wohnung" section at the top for
+`fleet.ui_apartment._build_timeline`'s gap/caught-up derivation.
 P2.3 (the agent side that would produce a batch to send here) stays
 deferred, see the note in `docs/implementation_plan.md` under P2.3 and the
 "Decisions by the project owner" note carried by this task.
