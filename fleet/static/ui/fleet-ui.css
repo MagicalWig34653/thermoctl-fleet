@@ -79,3 +79,70 @@ a.skip-link:focus {
     left: 1rem;
     top: 1rem;
 }
+
+/* "Das Haus" (P3.1) -- "whoever has nothing to do sees a quiet surface"
+ * (section 9): a fine apartment's tile (.apartment-tile--quiet) is visibly
+ * calmer -- lower contrast border, no accent -- than one with trouble
+ * (.apartment-tile--trouble), whose left border stands out. Status itself
+ * is always conveyed by text ("Meldet sich nicht", "veraltete
+ * Protokollversion", the fault list) as well, never by colour alone.
+ */
+ul.apartment-tiles {
+    list-style: none;
+    margin: 1rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+}
+
+.apartment-tile {
+    border: 1px solid #8888;
+    border-inline-start-width: 0.3rem;
+    border-radius: 0.25rem;
+    padding: 0.75rem 1rem;
+}
+
+.apartment-tile--quiet {
+    border-inline-start-color: #8888;
+}
+
+.apartment-tile--trouble {
+    border-inline-start-color: #c00;
+}
+
+.apartment-tile h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1.1rem;
+}
+
+.apartment-tile__alarm {
+    font-weight: bold;
+    margin: 0 0 0.5rem;
+}
+
+.apartment-tile__facts {
+    margin: 0;
+}
+
+.apartment-tile__facts dt {
+    font-weight: bold;
+    margin-top: 0.5rem;
+}
+
+.apartment-tile__facts dd {
+    margin-inline-start: 0;
+}
+
+.apartment-tile__faults {
+    margin: 0;
+    padding-inline-start: 1.25rem;
+}
+
+.apartment-tile__tag {
+    display: inline-block;
+    border: 1px solid currentColor;
+    border-radius: 0.25rem;
+    padding: 0 0.35rem;
+    font-size: 0.85em;
+}

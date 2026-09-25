@@ -3,8 +3,52 @@
 {% block title %}Das Haus – thermoctl-fleet{% endblock %}
 
 {% block content %}
-{# The house overview itself is P3.1's job (docs/implementation_plan.md) --
-   this placeholder only proves the protected page and navigation exist. #}
+{# "Das Haus" (P3.1, section 9's first view) -- one tile per apartment,
+   already sorted by trouble and already rendered into German text by
+   fleet/ui_house.py::build_house_overview. This template only iterates and
+   prints; it makes no ordering or wording decisions of its own. #}
 <h1>Das Haus</h1>
-<p>Die Übersicht über alle Wohnungen folgt.</p>
+{% if tiles %}
+<ul class="apartment-tiles">
+    {% for tile in tiles %}
+    <li class="apartment-tile {{ 'apartment-tile--quiet' if tile.quiet else 'apartment-tile--trouble' }}">
+        <h2><a href="/ui/apartments/{{ tile.apartment_id }}">{{ tile.apartment_id }}</a></h2>
+        {% if tile.alarm_since_text %}
+        <p class="apartment-tile__alarm" role="alert">Meldet sich nicht, {{ tile.alarm_since_text }}</p>
+        {% endif %}
+        <dl class="apartment-tile__facts">
+            <dt>Letzter Kontakt</dt>
+            <dd>{{ tile.last_contact_text }}</dd>
+            {% if not tile.never_reported %}
+            <dt>Modus</dt>
+            <dd>{{ tile.mode }}</dd>
+            <dt>thermoctl erreichbar</dt>
+            <dd>{{ "Ja" if tile.thermoctl_reachable else "Nein" }}</dd>
+            <dt>Version</dt>
+            <dd>
+                Agent {{ tile.agent_version }}, thermoctl {{ tile.thermoctl_version }}
+                {%- if tile.outdated %}
+                <span class="apartment-tile__tag">veraltete Protokollversion</span>
+                {%- endif %}
+            </dd>
+            <dt>Offene Störungen</dt>
+            <dd>
+                {% if tile.open_faults %}
+                <ul class="apartment-tile__faults">
+                    {% for fault in tile.open_faults %}
+                    <li>{{ fault.kind_label }} ({{ fault.zone }})</li>
+                    {% endfor %}
+                </ul>
+                {% else %}
+                Keine
+                {% endif %}
+            </dd>
+            {% endif %}
+        </dl>
+    </li>
+    {% endfor %}
+</ul>
+{% else %}
+<p>Keine Wohnungen registriert.</p>
+{% endif %}
 {% endblock %}
