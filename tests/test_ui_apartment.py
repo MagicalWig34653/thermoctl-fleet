@@ -115,6 +115,26 @@ def test_clamp_history_days_passes_through_an_in_range_value() -> None:
     assert clamp_history_days(7) == 7
 
 
+def test_clamp_history_days_parses_a_valid_numeric_string() -> None:
+    assert clamp_history_days("7") == 7
+
+
+def test_clamp_history_days_degrades_a_non_numeric_string_to_the_default() -> None:
+    assert clamp_history_days("abc") == DEFAULT_HISTORY_DAYS
+
+
+def test_clamp_history_days_degrades_a_float_string_to_the_default() -> None:
+    assert clamp_history_days("3.5") == DEFAULT_HISTORY_DAYS
+
+
+def test_clamp_history_days_degrades_scientific_notation_to_the_default() -> None:
+    assert clamp_history_days("1e400") == DEFAULT_HISTORY_DAYS
+
+
+def test_clamp_history_days_degrades_an_empty_string_to_the_default() -> None:
+    assert clamp_history_days("") == DEFAULT_HISTORY_DAYS
+
+
 # -- fleet.ui_apartment.build_apartment_detail (unit tests, no HTTP) ----------
 
 
@@ -146,7 +166,10 @@ def test_gap_detection_no_gap_at_exactly_the_absence_threshold(storage: Storage)
 
     assert detail is not None
     assert all(not entry.is_gap for entry in detail.timeline)
-    assert len(detail.timeline) == 2
+    # Both heartbeats belong to the same run (no gap between them) --
+    # collapsed into one aggregated row, not two.
+    assert len(detail.timeline) == 1
+    assert detail.timeline[0].heartbeat_count == 2
 
 
 def test_gap_detection_gap_just_above_the_absence_threshold(storage: Storage) -> None:
@@ -204,7 +227,7 @@ def test_caught_up_heartbeat_is_marked(storage: Storage) -> None:
 
     assert detail is not None
     assert len(detail.timeline) == 1
-    assert detail.timeline[0].caught_up is True
+    assert detail.timeline[0].caught_up_count == 1
 
 
 def test_a_live_heartbeat_is_not_marked_caught_up(storage: Storage) -> None:
@@ -216,7 +239,98 @@ def test_a_live_heartbeat_is_not_marked_caught_up(storage: Storage) -> None:
     detail = build_apartment_detail(storage, APARTMENT, received_at + timedelta(minutes=1), 1)
 
     assert detail is not None
-    assert detail.timeline[0].caught_up is False
+    assert detail.timeline[0].caught_up_count == 0
+
+
+def test_a_long_run_of_heartbeats_collapses_into_one_row(storage: Storage) -> None:
+    """Cross-review round 1 (main session): a run of many contiguous,
+    reachable heartbeats must render as exactly one timeline row, not one
+    `<li>` per heartbeat -- otherwise a 14-day window can mean ~10,000 rows."""
+
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    count = 25
+    for i in range(count):
+        sent_at = BASE_TIME + timedelta(minutes=2 * i)  # every 120s, no gaps
+        storage.save_heartbeat(APARTMENT, _make_heartbeat(APARTMENT, sent_at=sent_at), sent_at)
+
+    last_sent_at = BASE_TIME + timedelta(minutes=2 * (count - 1))
+    detail = build_apartment_detail(storage, APARTMENT, last_sent_at + timedelta(minutes=1), 1)
+
+    assert detail is not None
+    assert len(detail.timeline) == 1
+    assert detail.timeline[0].is_gap is False
+    assert detail.timeline[0].heartbeat_count == count
+    assert detail.timeline[0].caught_up_count == 0
+    assert "von" in detail.timeline[0].when_text
+
+
+def test_two_runs_separated_by_a_gap_produce_run_gap_run(storage: Storage) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+
+    first_run_start = BASE_TIME
+    for i in range(3):
+        sent_at = first_run_start + timedelta(minutes=2 * i)
+        storage.save_heartbeat(APARTMENT, _make_heartbeat(APARTMENT, sent_at=sent_at), sent_at)
+
+    second_run_start = first_run_start + timedelta(hours=1)
+    for i in range(4):
+        sent_at = second_run_start + timedelta(minutes=2 * i)
+        storage.save_heartbeat(APARTMENT, _make_heartbeat(APARTMENT, sent_at=sent_at), sent_at)
+
+    last_sent_at = second_run_start + timedelta(minutes=2 * 3)
+    detail = build_apartment_detail(storage, APARTMENT, last_sent_at + timedelta(minutes=1), 1)
+
+    assert detail is not None
+    assert len(detail.timeline) == 3
+    kinds = [entry.is_gap for entry in detail.timeline]
+    assert kinds.count(True) == 1
+    assert kinds.count(False) == 2
+    runs = [entry for entry in detail.timeline if not entry.is_gap]
+    assert {run.heartbeat_count for run in runs} == {3, 4}
+    gap = next(entry for entry in detail.timeline if entry.is_gap)
+    assert gap.heartbeat_count is None
+    assert gap.duration_text is not None
+
+
+def test_caught_up_count_is_per_run_not_global(storage: Storage) -> None:
+    """Two separate runs, each with a different number of caught-up
+    heartbeats -- `caught_up_count` must be scoped to the run it belongs
+    to, not a single running total across the whole timeline."""
+
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+
+    # First run: two heartbeats, one delivered late (caught up).
+    first_run_start = BASE_TIME
+    storage.save_heartbeat(
+        APARTMENT, _make_heartbeat(APARTMENT, sent_at=first_run_start), first_run_start
+    )
+    second_of_first_run = first_run_start + timedelta(minutes=2)
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(APARTMENT, sent_at=second_of_first_run),
+        second_of_first_run + ABSENCE_THRESHOLD + timedelta(minutes=1),  # caught up
+    )
+
+    # Second run (after a real gap): three heartbeats, none caught up.
+    second_run_start = first_run_start + timedelta(hours=2)
+    for i in range(3):
+        sent_at = second_run_start + timedelta(minutes=2 * i)
+        storage.save_heartbeat(APARTMENT, _make_heartbeat(APARTMENT, sent_at=sent_at), sent_at)
+
+    last_sent_at = second_run_start + timedelta(minutes=2 * 2)
+    detail = build_apartment_detail(storage, APARTMENT, last_sent_at + timedelta(minutes=1), 1)
+
+    assert detail is not None
+    runs = sorted(
+        (entry for entry in detail.timeline if not entry.is_gap),
+        key=lambda entry: entry.heartbeat_count or 0,
+    )
+    assert len(runs) == 2
+    two_heartbeat_run, three_heartbeat_run = runs
+    assert two_heartbeat_run.heartbeat_count == 2
+    assert two_heartbeat_run.caught_up_count == 1
+    assert three_heartbeat_run.heartbeat_count == 3
+    assert three_heartbeat_run.caught_up_count == 0
 
 
 def test_days_parameter_is_used_and_clamped_in_the_detail(storage: Storage) -> None:
@@ -516,7 +630,7 @@ def test_every_section_renders_from_real_stored_data(
     body = response.text
     # heartbeat history
     assert "Erreichbarkeit" in body
-    assert "Gemeldet" in body
+    assert "Erreichbar" in body
     # open faults
     assert "Fensteralarm" in body
     assert "kueche" in body
@@ -586,6 +700,49 @@ def test_days_query_parameter_is_capped(
     default_case = client.get(f"/ui/apartments/{APARTMENT}?days=0")
     assert default_case.status_code == 200
     assert f"({DEFAULT_HISTORY_DAYS} Tage)" in default_case.text
+
+
+def test_days_query_parameter_non_numeric_is_not_a_422(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Cross-review round 1 (required fix): `days` used to be typed `int`
+    at the route, so FastAPI/Pydantic itself rejected a non-numeric value
+    with a 422 before `clamp_history_days` ever ran -- contradicting the
+    docstring's/STATUS's own "never a 422" claim. `days` is now `str | None`
+    at the route; a malformed value degrades to the default (3), same as an
+    out-of-range one."""
+
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+
+    _login(client, password, totp_secret)
+    response = client.get(f"/ui/apartments/{APARTMENT}?days=abc")
+
+    assert response.status_code == 200
+    assert f"({DEFAULT_HISTORY_DAYS} Tage)" in response.text
+
+
+def test_days_query_parameter_a_float_string_is_not_a_422(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+
+    _login(client, password, totp_secret)
+    response = client.get(f"/ui/apartments/{APARTMENT}?days=3.5")
+
+    assert response.status_code == 200
+    assert f"({DEFAULT_HISTORY_DAYS} Tage)" in response.text
+
+
+def test_days_query_parameter_scientific_notation_is_not_a_422(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+
+    _login(client, password, totp_secret)
+    response = client.get(f"/ui/apartments/{APARTMENT}?days=1e400")
+
+    assert response.status_code == 200
+    assert f"({DEFAULT_HISTORY_DAYS} Tage)" in response.text
 
 
 def test_xss_escaping_of_id_zone_mode_and_key(

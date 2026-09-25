@@ -178,16 +178,22 @@ this for whoever adds the next one; `/ui/tasks` (P3.4) is unaffected, since
 it is a different top-level `/ui/...` path, not a `/ui/apartments/...`
 suffix.
 
-**Tests.** New `tests/test_ui_apartment.py` (30 tests) against a real,
-migrated SQLite database, no mocks, mirroring `tests/test_ui_house.py`'s
-structure: `clamp_history_days` unit-tested directly (`None`/zero/negative
--> default, over-range -> capped, in-range passthrough);
-`build_apartment_detail` unit-tested for the unknown-apartment `None`
-case, the never-reported placeholder, gap detection at exactly the
-threshold (no gap) and just above it (a gap), the window-edge case above,
-caught-up vs. live heartbeat marking, `days` clamping, open faults from
-the latest heartbeat, every battery/signal/version/system/control field,
-the outdated-protocol flag (same `monkeypatch.setattr(storage_module,
+**Tests.** New `tests/test_ui_apartment.py` (43 tests, up from 30 after
+cross-review round 1's fixes) against a real, migrated SQLite database, no
+mocks, mirroring `tests/test_ui_house.py`'s structure: `clamp_history_days`
+unit-tested directly (`None`/zero/negative -> default, over-range ->
+capped, in-range passthrough, plus a valid numeric string and three
+malformed strings -- non-numeric, a float, scientific notation -- all
+degrading to the default, not raising); `build_apartment_detail`
+unit-tested for the unknown-apartment `None` case, the never-reported
+placeholder, gap detection at exactly the threshold (no gap, one collapsed
+run) and just above it (a gap plus two runs), the window-edge case above,
+caught-up vs. live heartbeat marking (now `caught_up_count`, per run),
+run aggregation (a long contiguous run collapses to one row; two runs
+separated by a gap give run/gap/run; caught-up counts stay scoped to their
+own run, not a running total), `days` clamping, open faults from the
+latest heartbeat, every battery/signal/version/system/control field, the
+outdated-protocol flag (same `monkeypatch.setattr(storage_module,
 "PROTOCOL_VERSION", ...)` technique P3.1 uses), and both an open and a
 since-cleared alarm; the three new `Storage` methods unit-tested directly
 for ordering, the `since` bound, and per-apartment scoping; HTTP-level
@@ -195,7 +201,9 @@ tests logging in via the real P3.0 flow for: unauthenticated access
 redirecting (303), an unknown apartment 404ing with the same base layout,
 every section rendering from real stored data in one combined test, the
 titel/text-leak test described above, `days` capping at the HTTP layer
-(`?days=9999` -> 14, `?days=0` -> 3), XSS escaping of an apartment id,
+(`?days=9999` -> 14, `?days=0` -> 3) plus the three malformed-`days`
+regression tests (`?days=abc`, `?days=3.5`, `?days=1e400`, each asserting
+200 with the default heading, never 422), XSS escaping of an apartment id,
 zone, mode, and event key all containing `<script>`, the encoded-link
 round trip, the section-6 absence check, and the security headers
 (`Content-Security-Policy`, `X-Frame-Options`, `Referrer-Policy`,
@@ -204,10 +212,10 @@ check mirroring `tests/test_ui_auth.py`'s existing glob-based one (which
 already also covers `apartment.html` automatically, since it globs every
 template in the directory).
 
-Verification for this round: `ruff check .`, `mypy .`, `mypy protocol
-fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
-(372 passed, 99% coverage overall, `fleet/ui_apartment.py` and every other
-P3.2 file at 100%).
+Verification for this round (run against `main` merged in, P3.4 included):
+`ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all clean;
+`python -m pytest -W ignore::ResourceWarning` (401 passed, 99% coverage
+overall, `fleet/ui_apartment.py` and every other P3.2/P3.4 file at 100%).
 
 ## "Aufgaben" -- the fleet UI's tasks view (P3.4, section 9's third view)
 
