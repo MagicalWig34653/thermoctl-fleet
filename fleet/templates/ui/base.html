@@ -21,13 +21,8 @@
 <header>
     <nav aria-label="Hauptnavigation">
         <a href="/ui/">Das Haus</a>
-        {#
-        "Aufgaben" is section 9's third view (P3.4, not built yet -- see
-        docs/implementation_plan.md). Shown as inactive text, not a link to
-        a route that does not exist: a landlord clicking a broken link is a
-        worse first impression than an entry that visibly does nothing yet.
-        #}
-        <span class="inactive" aria-disabled="true">Aufgaben</span>
+        {# "Aufgaben" is section 9's third view, built in P3.4. #}
+        <a href="/ui/tasks">Aufgaben</a>
         <form method="post" action="/ui/logout">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button type="submit">Abmelden</button>

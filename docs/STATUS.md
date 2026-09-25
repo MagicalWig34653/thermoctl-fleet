@@ -2,6 +2,173 @@
 
 Last updated: 2026-09-25.
 
+## "Aufgaben" -- the fleet UI's tasks view (P3.4, section 9's third view)
+
+`GET /ui/tasks` (behind `require_ui_user`, same as every other `/ui` route)
+renders section 9's third view: "what is due: battery rounds, updates,
+unconfirmed faults -- the list people actually work from." The "Aufgaben"
+nav link in `fleet/templates/ui/base.html`, inert since P3.0, now points
+here. Sits on top of P3.1 (`Storage.get_house_overview`, reused unchanged --
+no new storage query was needed) and P2.2 (the "not reporting" alarm used to
+decide which apartments to skip, see below) -- no new migration, no change
+to `protocol/`, `fleet/ui_auth.py`, or `CommandType`.
+
+**Where the pieces live.** `fleet/ui_tasks.py` (new) is the view-model
+module, mirroring `fleet/ui_house.py`'s shape: `build_task_overview(storage,
+now)` calls `Storage.get_house_overview`, filters, groups, sorts, and
+renders every field into the German text `fleet/templates/ui/tasks.html`
+prints verbatim -- no business logic in the template. `now` is always
+injected by the caller (`fleet/ui_routes.py::tasks` passes
+`datetime.now(UTC)`), same pattern as every other `now`-injected module in
+this repository.
+
+**Three thresholds, each a named constant citing its own row of section 8's
+alarm table -- no threshold invented beyond what that table gives:**
+
+- `BATTERY_LOW_PERCENT = 20` (`fleet/ui_tasks.py`) -- section 8: "Battery
+  low: weakest cell under 20%, collected until the battery round." Strictly
+  under 20; tested at the boundary (19 included, 20 not).
+- `FAULT_OPEN_THRESHOLD = timedelta(hours=2)` -- section 8: "Fault open: one
+  of the six kinds, longer than 2 h." Strictly longer than 2 h; tested at
+  the boundary (1:59 excluded, 2:01 included).
+- **The "Updates" group uses `LatestHeartbeat.outdated` (P2.1, section
+  18.2) directly, not section 8's own "version gap" row.** Section 8's
+  wording ("more than two versions behind") needs a notion of the *current*
+  agent/thermoctl release this service has nowhere at all -- no "latest
+  known release" concept exists in `protocol/` or `fleet/storage.py`, and
+  building one (a hard-coded version string, a registry lookup, a manually
+  maintained "current release" table) was out of scope and not decided by
+  the project owner. Listing only the already-existing outdated-protocol-
+  version case is a narrower, already-supported signal, not the full
+  section-8 rule -- **open point, not invented:** whoever adds a "current
+  release" concept to this service (likely alongside stage-2's
+  `apply_update`, section 7) should revisit this group to also cover the
+  "more than two versions behind" case section 8 actually asks for.
+
+**`silent_devices > 0` is deliberately left out of "Batterierunde."**
+Considered and rejected: section 8 gives `silent_devices` no threshold or
+alarm row of its own at all (it is not one of the nine rows in the table),
+and a silent Zigbee device is a network/connectivity signal, not a battery
+one -- a device can go silent for reasons that have nothing to do with its
+battery (out of range, powered off, a dead unit needing replacement, not
+just "needs new batteries"). Folding it into the same round as a genuinely
+low battery would invent a grouping section 8 does not establish, and would
+make "why is this apartment on the battery round" ambiguous on the page
+itself (a landlord bringing batteries to a visit that actually needed a
+different fix). Left out; if a future package wants to surface it, it
+should get its own task group, not this one.
+
+**Apartments already flagged on "Das Haus" are skipped here entirely --
+decided while building this package, the work package's own "decide,
+document" instruction.** `fleet.ui_tasks._eligible` excludes:
+
+- apartments that have **never reported** (`ApartmentOverview.latest is
+  None`) -- there is no heartbeat to read a battery/fault/version value
+  from in the first place, so there is structurally nothing to compute a
+  task from, not merely nothing worth showing.
+- apartments with a currently **open "not reporting" alarm**
+  (`ApartmentOverview.open_alarm is not None`) -- already the single most
+  urgent line on "Das Haus" (P3.1's category 0, ranked above everything
+  else); a battery percentage, fault, or version read from a heartbeat that
+  stopped updating the moment the apartment went silent is stale by
+  definition and would duplicate an already-surfaced, more urgent problem
+  under a less urgent heading instead of adding a genuinely new piece of
+  work to schedule.
+
+Tested directly: `tests/test_ui_tasks.py::
+test_apartment_with_open_not_reporting_alarm_excluded_from_every_group`
+builds an apartment with a very low battery, an old open fault, *and* an
+open "not reporting" alarm, and asserts it appears in none of the three
+groups despite otherwise qualifying for all three.
+
+**No acknowledge/confirm mechanism exists, on purpose -- open point, not
+built here.** The work package's own instruction: an "acknowledge" action on
+a fault would be a state-changing `POST` (its own CSRF handling, its own
+authorization question, its own persistence -- does acknowledging a fault
+on the fault's *current* occurrence carry forward to a later re-occurrence
+of the same key, or not?) that needs its own design, not a checkbox added as
+a side effect of building the read-only list. `fleet/ui_tasks.py` therefore
+lists **every** open fault older than the threshold, unfiltered by any prior
+acknowledgement, every time the page is loaded -- "Bestätigen" (confirm) is
+named directly in the template's own group heading
+("Unbestätigte Störungen") as what the group currently lacks, not hidden
+behind a vaguer name. A future package adding this needs at minimum: a new
+table or column (which fault, which apartment, acknowledged by whom and
+when), a `POST /ui/tasks/faults/{id}/confirm`-shaped endpoint with CSRF like
+every other state-changing `/ui` route, and a decision on the re-occurrence
+question above -- none of that is decided here.
+
+**What a task entry shows, and what it deliberately does not (section
+6/9).** Battery round: apartment id (linked), the weakest battery
+percentage, and the heartbeat's age ("Stand vor X"). Updates: apartment id
+(linked), agent and thermoctl version, the fixed "veraltete
+Protokollversion" text (mirroring P3.1's tile tag). Unconfirmed faults:
+apartment id (linked), the fault's German kind label
+(`fleet.ui_house.FAULT_KIND_LABELS`, reused unchanged rather than
+duplicated), the zone, and "seit X" duration since the fault opened.
+**Nothing from section 6** is read or shown -- the same structural guarantee
+P3.1 already established (`protocol.heartbeat.OpenFault` only ever carries
+`kind`/`since`/`zone`) applies unchanged here; verified directly by
+`tests/test_ui_tasks.py::test_tasks_view_contains_no_section_6_data`
+(same technique as P3.1's equivalent test: a `tenant_report` fault, checked
+for the same five forbidden markers). Event `titel`/`text` are not stored at
+all (P1.3) and are not read here either.
+
+**Links use a URL-encoded apartment id, per the work package's explicit
+requirement** (`urllib.parse.quote(id, safe="")`, `fleet.ui_tasks
+._apartment_href`) -- unlike P3.1's `index.html`, which links with the raw,
+unencoded id (a pre-existing gap in that package, not this one's to fix
+without touching P3.1's own files, per this package's "keep changes to
+shared files small" instruction). `/ui/apartments/{id}` itself is P3.2's
+route, built in parallel, not built or tested for resolution here (the work
+package: "do not test that the link resolves").
+
+**Sorting, decided while building this package (section 8/9 give no
+explicit order among entries of one group):** battery round ascending by
+percentage (weakest first -- the whole point of "collected until the
+battery round" is knowing which one needs attention soonest); updates
+alphabetically by apartment id (no urgency dimension exists between two
+outdated apartments); unconfirmed faults oldest-`since`-first ("longest
+overdue" first), the same "worst first" reading `fleet/ui_house.py` already
+applies to open-fault ordering on "Das Haus", adapted from "most faults" to
+"longest open" since this group lists individual faults, not apartments.
+Sorted on the actual timestamp, not the rendered "seit X" text (a string
+sort of "3 Std." against "50 Min." would be wrong).
+
+**Empty groups.** Each of the three groups renders "Nichts fällig." when
+empty, independently of the other two (P3.1's "whoever has nothing to do
+sees a quiet surface", carried into this view) --
+`tests/test_ui_tasks.py::test_tasks_view_shows_the_empty_state_for_every_group`
+asserts the text appears exactly three times for an apartment with nothing
+due in any group.
+
+**CSS** (`fleet/static/ui/fleet-ui.css`, `.task-group`/`.task-list`/
+`.task-group__empty`) is plain, no colour-coded urgency the way P3.1's tiles
+have one -- a task list is already ordered by what needs doing, section 9
+does not ask for a second visual layer on top of that, and there is no
+per-entry "trouble level" analogous to P3.1's alarm/fault/outdated/never-
+reported categories to colour by (every entry in a given group is, by
+definition, already something to do). The now-unused `.inactive`/
+`span.inactive` nav rule (P3.0's "not built yet" placeholder styling) was
+removed along with the placeholder `<span>` it styled.
+
+**Tests.** New `tests/test_ui_tasks.py` (18 tests) against a real, migrated
+SQLite database, no mocks, same fixtures/`_login` helper as
+`tests/test_ui_house.py`: every threshold boundary named above; sorting
+within each group; the never-reported and open-alarm exclusions (unit- and
+implicitly HTTP-tested); the `_relative_duration` "< 1 Min." branch (the
+other branches are exercised incidentally by the boundary tests); the
+URL-encoded href (including a non-ASCII-unsafe id containing `/` and a
+space); HTTP-level: unauthenticated access redirecting (303), one entry
+rendered per group with its exact text, the empty state for all three
+groups at once, an apartment id containing `<script>...` HTML-escaped, the
+section-6 absence check, and the security headers including `Cache-Control:
+no-store`.
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+(360 passed, 99% coverage overall, `fleet/ui_tasks.py` at 100%).
+
 ## "Das Haus" -- the fleet UI's house overview (P3.1, section 9's first view)
 
 `GET /ui/` (P3.0's protected placeholder) now renders section 9's first
