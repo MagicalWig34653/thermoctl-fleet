@@ -304,7 +304,26 @@ def _build_timeline(rows: list[HeartbeatHistoryEntry], now: datetime) -> list[Ti
     only contiguous reachable runs are collapsed into one** (cross-review
     round 1: section 5 forbids smoothing over gaps, not summarising
     reachable periods, and a 14-day window can otherwise mean one `<li>`
-    per heartbeat, up to ~10,000 of them)."""
+    per heartbeat, up to ~10,000 of them).
+
+    **The interval from the last stored heartbeat up to `now` is
+    deliberately never turned into a trailing gap row here (cross-review
+    round 2, explicit call-out).** The loop below only ever compares two
+    *consecutive stored heartbeats* against each other -- there is no
+    final check of `now - rows[-1].sent_at` after the loop, on purpose: an
+    apartment that has simply gone silent and not reported since is
+    already surfaced, with its own since-when text, by the open "meldet
+    sich nicht" alarm in the "Alarme" section of this same page
+    (`ApartmentDetail.alarms`, `fleet.alarms.check_absence_alarms`/P2.2) --
+    adding a second, differently-worded representation of the exact same
+    ongoing silence at the bottom of the timeline would not add
+    information, only a second place for the two to (eventually) disagree.
+    A *closed* gap between two heartbeats that both did arrive is a
+    different, already-resolved fact about the past, which is why it still
+    gets its own row. Pinned by
+    `tests/test_ui_apartment.py::test_a_stale_last_heartbeat_is_not_rendered_as_a_trailing_gap`
+    (a last heartbeat two days old, well past `ABSENCE_THRESHOLD`, and
+    `now` -> no trailing gap entry, exactly one run)."""
 
     entries: list[TimelineEntry] = []
     current_run: list[HeartbeatHistoryEntry] = []

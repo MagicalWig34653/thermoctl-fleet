@@ -217,6 +217,31 @@ def test_gap_detection_ignores_data_outside_the_requested_window(storage: Storag
     assert len(contacts) == 2  # outside_window's heartbeat itself is excluded
 
 
+def test_a_stale_last_heartbeat_is_not_rendered_as_a_trailing_gap(storage: Storage) -> None:
+    """Cross-review round 2 (explicit call-out): an apartment that has gone
+    silent and not reported since must not get a second, trailing "Lücke"
+    row for the still-open interval between its last heartbeat and `now` --
+    that ongoing silence is already surfaced by the open "meldet sich
+    nicht" alarm in the alarms section (see `_build_timeline`'s own
+    docstring). Only a *closed* gap between two heartbeats that both
+    arrived gets its own row."""
+
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    last_heartbeat = BASE_TIME
+    storage.save_heartbeat(
+        APARTMENT, _make_heartbeat(APARTMENT, sent_at=last_heartbeat), last_heartbeat
+    )
+    now = last_heartbeat + timedelta(days=2)  # well past ABSENCE_THRESHOLD
+
+    detail = build_apartment_detail(storage, APARTMENT, now, 7)
+
+    assert detail is not None
+    assert len(detail.timeline) == 1
+    assert detail.timeline[0].is_gap is False
+    assert detail.timeline[0].heartbeat_count == 1
+    assert not any(entry.is_gap for entry in detail.timeline)
+
+
 def test_caught_up_heartbeat_is_marked(storage: Storage) -> None:
     storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
     sent_at = BASE_TIME

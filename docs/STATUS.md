@@ -103,6 +103,25 @@ gaps, not summarising reachable periods." Regression tests:
 exactly-at-threshold/just-above-threshold tests (unchanged assertions,
 now read against the aggregated entries).
 
+**The interval from the last stored heartbeat up to `now` is deliberately
+never rendered as a trailing gap row (cross-review round 2, explicit
+call-out).** `_build_timeline` only ever compares consecutive *stored*
+heartbeats against each other; there is no closing check of `now -
+last_heartbeat.sent_at` after the loop. An apartment that has simply gone
+silent and not reported since is already surfaced by the open "meldet
+sich nicht" alarm in this same page's "Alarme" section
+(`ApartmentDetail.alarms`, P2.2's `check_absence_alarms`) -- a second,
+differently-worded row for the exact same still-ongoing silence at the
+bottom of the timeline would add no information, only a second place for
+the two to eventually disagree (e.g. a `days` window that excludes the
+alarm's own `raised_at`, or independent wording drift between "Lücke" and
+"Meldet sich nicht"). A *closed* gap between two heartbeats that both
+arrived is a different, already-resolved fact about the past, and keeps
+its own row exactly as before. Pinned by
+`tests/test_ui_apartment.py::test_a_stale_last_heartbeat_is_not_rendered_as_a_trailing_gap`
+(a last heartbeat two days old, `now` two days later -> exactly one run,
+no trailing gap).
+
 **Battery/signal values -- section 9's wording vs. the actual protocol
 (open point, not built, not invented).** Section 9 says "battery and
 signal values ... per device"; `protocol.heartbeat.DeviceState` only ever
@@ -178,8 +197,8 @@ this for whoever adds the next one; `/ui/tasks` (P3.4) is unaffected, since
 it is a different top-level `/ui/...` path, not a `/ui/apartments/...`
 suffix.
 
-**Tests.** New `tests/test_ui_apartment.py` (43 tests, up from 30 after
-cross-review round 1's fixes) against a real, migrated SQLite database, no
+**Tests.** New `tests/test_ui_apartment.py` (42 tests, up from 30 after
+cross-review rounds 1 and 2's fixes) against a real, migrated SQLite database, no
 mocks, mirroring `tests/test_ui_house.py`'s structure: `clamp_history_days`
 unit-tested directly (`None`/zero/negative -> default, over-range ->
 capped, in-range passthrough, plus a valid numeric string and three
@@ -191,7 +210,9 @@ run) and just above it (a gap plus two runs), the window-edge case above,
 caught-up vs. live heartbeat marking (now `caught_up_count`, per run),
 run aggregation (a long contiguous run collapses to one row; two runs
 separated by a gap give run/gap/run; caught-up counts stay scoped to their
-own run, not a running total), `days` clamping, open faults from the
+own run, not a running total), a stale last heartbeat producing no
+trailing gap row (the still-open interval up to `now` is left to the
+alarms section, see above), `days` clamping, open faults from the
 latest heartbeat, every battery/signal/version/system/control field, the
 outdated-protocol flag (same `monkeypatch.setattr(storage_module,
 "PROTOCOL_VERSION", ...)` technique P3.1 uses), and both an open and a
@@ -214,7 +235,7 @@ template in the directory).
 
 Verification for this round (run against `main` merged in, P3.4 included):
 `ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all clean;
-`python -m pytest -W ignore::ResourceWarning` (401 passed, 99% coverage
+`python -m pytest -W ignore::ResourceWarning` (402 passed, 99% coverage
 overall, `fleet/ui_apartment.py` and every other P3.2/P3.4 file at 100%).
 
 ## "Aufgaben" -- the fleet UI's tasks view (P3.4, section 9's third view)
