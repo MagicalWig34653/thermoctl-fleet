@@ -71,6 +71,8 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    and_,
+    case,
     create_engine,
     delete,
     or_,
@@ -232,7 +234,36 @@ class UiUserRecord(Base):
     last_totp_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    # Account-level lockout, round 3 (project owner decision, 2026-09-25):
+    # when the current failure-counting window began. `failed_attempts`
+    # counts failures *within* this window; once `now` is more than
+    # `FLEET_UI_LOCKOUT_WINDOW_S` past this timestamp, the next failure
+    # starts a **fresh** window (failed_attempts reset to 1) rather than
+    # accumulating forever -- see `Storage.record_ui_login_failure`'s
+    # docstring for the full reasoning and `docs/STATUS.md`.
+    failure_window_started_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class UiLoginThrottleRecord(Base):
+    __tablename__ = "ui_login_throttle"
+
+    # Per-client-IP login throttle (P3.0 round 3, project owner decision
+    # 2026-09-25): the **primary** defence against a distributed attacker
+    # locking the landlord's own account out of the UI by deliberately
+    # failing logins against a known username from many IPs (the
+    # account-level lock above is only a backstop with a much higher
+    # threshold and window, see `Storage.record_ui_login_failure`). One row
+    # per IP address ever seen failing a login; `ip` is the primary key
+    # (an upsert target, not a surrogate autoincrement id -- there is
+    # nothing else to key this table by). Same window/threshold/block
+    # shape as the account lock above, evaluated by the same atomic,
+    # single-statement `UPDATE` technique -- see
+    # `Storage.record_ip_login_failure`.
+    ip: Mapped[str] = mapped_column(String(64), primary_key=True)
+    failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
 
 
 class UiSessionRecord(Base):
@@ -766,6 +797,7 @@ class Storage:
                 last_totp_step=None,
                 failed_attempts=0,
                 locked_until=None,
+                failure_window_started_at=None,
                 created_at=_naive_utc(created_at),
             )
             session.add(record)
@@ -790,56 +822,118 @@ class Storage:
             return record
 
     def record_ui_login_failure(
-        self, user_id: int, now: datetime, lockout_threshold: int, lockout_duration_s: float
-    ) -> None:
-        """Increments the failed-attempt counter; locks (or **re**-locks,
-        renewing `locked_until` from *this* failure's time) the account once
-        `lockout_threshold` consecutive failures are reached (P3.0 lockout
-        rule).
+        self,
+        user_id: int,
+        now: datetime,
+        lockout_threshold: int,
+        lockout_window_s: float,
+        lockout_duration_s: float,
+    ) -> bool:
+        """Records one failed login against the **account-level** lockout
+        (P3.0 round 3, project owner decision 2026-09-25 -- this is now the
+        *backstop*, not the primary defence; see `record_ip_login_failure`
+        for the per-IP throttle that is). Returns whether **this call** is
+        the one that just transitioned the account from unlocked to locked
+        -- the caller (`fleet.ui_auth.authenticate`) uses that to raise the
+        "account locked" notification exactly once per lock, never zero,
+        never twice, regardless of how many concurrent requests are racing.
 
-        **Atomic increment, not read-modify-write (cross-review, reproduced
-        as a lost-update bug: 20 concurrent wrong-password attempts against
-        the Python-level `record.failed_attempts += 1` this replaced left
-        `failed_attempts == 11`, not 20).** The increment is a single
-        `UPDATE ... SET failed_attempts = failed_attempts + 1 ...
-        RETURNING failed_attempts` statement -- the database computes the
-        new value from whatever is currently stored, not from a value this
-        method read moments earlier and could already be stale by the time
-        it writes it back. The `RETURNING` value is what decides the lock,
-        in a second statement in the same transaction, so the decision is
-        always made from the *actual* post-increment count, never a value
-        that raced against another writer.
+        **Windowed, with a hard reset on lapse (round 3 change from round 2's
+        "always count, re-lock on every attempt" model, replaced after
+        further review):** `failed_attempts` counts failures within a
+        `lockout_window_s`-wide window starting at
+        `failure_window_started_at`. Once `now` is more than
+        `lockout_window_s` past that timestamp, the *next* failure starts a
+        **fresh** window (`failed_attempts` reset to 1, not incremented
+        forever) -- with round 3's much higher defaults (50 failures / 24h
+        window / 1h lock, see `fleet/ui_auth.py`), "count forever" and "reset
+        after 24h of inactivity" converge in practice, but round 2's
+        "re-lock on every attempt while already locked, indefinitely" model
+        is deliberately **not** carried forward: once locked, a further
+        failure while still locked changes **nothing** -- the per-IP
+        throttle above is now what actually slows a continuing attacker
+        down, so the account lock no longer needs to keep re-arming itself
+        to do that job too. See `docs/STATUS.md` for the full trade-off
+        writeup.
 
-        **Every failed attempt is counted, whether or not the account is
-        already locked** (decided on cross-review, documented in
-        `docs/STATUS.md`'s P3.0 section): there is no "skip counting while
-        locked" branch here. A consequence, deliberately: hammering an
-        already-locked account keeps recomputing `locked_until` forward
-        from the most recent failure, i.e. **the lock renews on continued
-        attempts** rather than expiring on a fixed schedule an attacker
-        could simply wait out. The only things that ever reset the counter
-        to 0 and clear a lock are a successful login
-        (`record_ui_login_success`) and the `fleet.admin unlock` CLI
-        command (`unlock_ui_user`).
+        **Two atomic statements in one transaction, not one (a deliberate
+        change back from an intermediate single-statement design that had a
+        real bug: `RETURNING` in SQLite -- like the SQL standard generally
+        -- evaluates against the row's *post-update* state, even for a
+        column referenced only inside a derived boolean expression, not
+        just for the column being written directly. A single `UPDATE ...
+        RETURNING <case computed from failed_attempts>` therefore saw
+        `failed_attempts` *after* its own increment, not before, and
+        reported the lock as freshly engaged one failure too early --
+        caught by exercising the threshold boundary directly, not only
+        under concurrency).** Statement 1 atomically computes and writes
+        the new `failed_attempts`/`failure_window_started_at` from the
+        row's pre-update state (`SET` clauses, unlike `RETURNING`, are
+        evaluated against the row as it was *before* this statement, which
+        is exactly why the classic `UPDATE t SET a = b, b = a` swap trick
+        works) and returns the resulting `failed_attempts` (the actual,
+        correct post-increment count) together with `locked_until`, a
+        column this statement never writes, so `RETURNING` reflects its
+        accurate, unchanged value regardless of read-vs-write timing rules.
+        Statement 2 -- only reached if the account was not already locked
+        and the returned count has now reached `lockout_threshold` -- sets
+        `locked_until`. Both statements run inside the same `session()`
+        transaction as before; SQLite's write serialization is exactly what
+        already made round 2's two-statement version safe under the
+        concurrency tests, unchanged here.
         """
+
+        normalized_now = _naive_utc(now)
+        window_deadline = normalized_now - timedelta(seconds=lockout_window_s)
+        new_locked_until = normalized_now + timedelta(seconds=lockout_duration_s)
+
+        currently_locked = and_(
+            UiUserRecord.locked_until.is_not(None),
+            UiUserRecord.locked_until > normalized_now,
+        )
+        window_lapsed = or_(
+            UiUserRecord.failure_window_started_at.is_(None),
+            UiUserRecord.failure_window_started_at < window_deadline,
+        )
+
+        new_failed_attempts = case(
+            (currently_locked, UiUserRecord.failed_attempts),
+            (window_lapsed, 1),
+            else_=UiUserRecord.failed_attempts + 1,
+        )
+        new_window_started_at = case(
+            (currently_locked, UiUserRecord.failure_window_started_at),
+            (window_lapsed, normalized_now),
+            else_=UiUserRecord.failure_window_started_at,
+        )
 
         with self.session() as session:
             increment_statement = (
                 update(UiUserRecord)
                 .where(UiUserRecord.id == user_id)
-                .values(failed_attempts=UiUserRecord.failed_attempts + 1)
-                .returning(UiUserRecord.failed_attempts)
+                .values(
+                    failed_attempts=new_failed_attempts,
+                    failure_window_started_at=new_window_started_at,
+                )
+                .returning(UiUserRecord.failed_attempts, UiUserRecord.locked_until)
             )
             row = session.execute(increment_statement).first()
             if row is None:
-                return
-            new_failed_attempts = row[0]
-            if new_failed_attempts >= lockout_threshold:
-                session.execute(
-                    update(UiUserRecord)
-                    .where(UiUserRecord.id == user_id)
-                    .values(locked_until=_naive_utc(now) + timedelta(seconds=lockout_duration_s))
-                )
+                return False
+            updated_failed_attempts, existing_locked_until = row
+
+            already_locked = (
+                existing_locked_until is not None and existing_locked_until > normalized_now
+            )
+            if already_locked or updated_failed_attempts < lockout_threshold:
+                return False
+
+            session.execute(
+                update(UiUserRecord)
+                .where(UiUserRecord.id == user_id)
+                .values(locked_until=new_locked_until)
+            )
+            return True
 
     def record_ui_login_success(self, user_id: int, totp_step: int) -> bool:
         """Atomically resets the failure counter and any lock, and records
@@ -876,7 +970,12 @@ class Storage:
                         UiUserRecord.last_totp_step < totp_step,
                     ),
                 )
-                .values(failed_attempts=0, locked_until=None, last_totp_step=totp_step)
+                .values(
+                    failed_attempts=0,
+                    locked_until=None,
+                    failure_window_started_at=None,
+                    last_totp_step=totp_step,
+                )
             )
             # `Session.execute` is typed to return the generic `Result[Any]`
             # (no `rowcount`) even for a Core UPDATE, which always actually
@@ -897,17 +996,19 @@ class Storage:
                 record.last_totp_step = None
                 record.failed_attempts = 0
                 record.locked_until = None
+                record.failure_window_started_at = None
 
     def unlock_ui_user(self, user_id: int) -> None:
-        """`fleet.admin unlock` -- also resets the failure counter, not only
-        `locked_until`, so the account is not one more failure away from
-        being locked again immediately."""
+        """`fleet.admin unlock` -- also resets the failure counter and
+        window start, not only `locked_until`, so the account is not one
+        more failure away from being locked again immediately."""
 
         with self.session() as session:
             record = session.get(UiUserRecord, user_id)
             if record is not None:
                 record.locked_until = None
                 record.failed_attempts = 0
+                record.failure_window_started_at = None
 
     def delete_ui_user(self, user_id: int) -> None:
         with self.session() as session:
@@ -915,6 +1016,138 @@ class Storage:
             if record is not None:
                 session.delete(record)
             session.execute(delete(UiSessionRecord).where(UiSessionRecord.user_id == user_id))
+
+    # -- per-IP login throttle (P3.0 round 3) -------------------------------------
+
+    def is_ip_login_blocked(self, ip: str, now: datetime) -> bool:
+        """Read-only check for the per-client-IP throttle (P3.0 round 3,
+        project owner decision 2026-09-25) -- **must** be called, and must
+        return `True`, *before* `fleet.ui_auth.authenticate` (and therefore
+        any Argon2 work) ever runs for a blocked IP: "a blocked IP gets the
+        same generic login failure page, without doing any Argon2 work
+        (protects CPU), and its attempts are not counted against the
+        account." Deliberately a separate, non-writing method from
+        `record_ip_login_failure` below -- a blocked check that also wrote
+        would defeat the point of checking first."""
+
+        with self.session() as session:
+            record = session.get(UiLoginThrottleRecord, ip)
+            if record is None or record.blocked_until is None:
+                return False
+            return _naive_utc(now) < record.blocked_until
+
+    def record_ip_login_failure(
+        self,
+        ip: str,
+        now: datetime,
+        throttle_threshold: int,
+        throttle_window_s: float,
+        throttle_duration_s: float,
+    ) -> None:
+        """Records one failed login attempt from `ip` (P3.0 round 3) --
+        the **primary** defence against locking the landlord's own account
+        out (see `record_ui_login_failure`'s docstring for why the account
+        lock alone cannot be: a distributed attacker controlling more
+        addresses than fit under this threshold can still force the
+        account-level backstop, which is exactly the residual risk
+        `docs/STATUS.md` states plainly, not silently).
+
+        Same windowed model as `record_ui_login_failure` (a failure while
+        already blocked changes nothing; a failure after the window has
+        lapsed starts a fresh one) and the same single-statement atomicity
+        technique -- see that method's docstring for the full reasoning,
+        not repeated here. The one structural difference: `ip` is this
+        table's own primary key (there is no separate id to look up by, and
+        no row exists until the first failure from a given address), so an
+        `INSERT ... ON CONFLICT (ip) DO NOTHING` guarantees a row to update
+        before the same atomic `UPDATE` runs -- safe under concurrency
+        regardless of ordering, since it never overwrites an existing row.
+
+        No return value: unlike the account lock, an IP being newly
+        blocked never raises a notification (round 3 decision) -- alerting
+        on every throttled IP would be exactly the kind of alarm-fatigue
+        noise section 8's "against alarm fatigue" reasoning warns about
+        elsewhere in this codebase, and an IP address alone identifies
+        nothing actionable for a landlord the way "your account got
+        locked" does.
+        """
+
+        normalized_now = _naive_utc(now)
+        window_deadline = normalized_now - timedelta(seconds=throttle_window_s)
+        new_blocked_until = normalized_now + timedelta(seconds=throttle_duration_s)
+        fresh_window_blocks = throttle_threshold <= 1
+
+        with self.session() as session:
+            dialect = session.get_bind().dialect.name
+            insert_values: dict[str, object] = {
+                "ip": ip,
+                "failures": 0,
+                "window_started_at": normalized_now,
+                "blocked_until": None,
+            }
+            # See `_insert_heartbeats_ignoring_conflicts` above for why this
+            # branches on dialect name and why `postgresql`/`else` are
+            # excluded from coverage -- the same reasoning applies here
+            # unchanged.
+            insert_statement: Any
+            if dialect == "sqlite":
+                insert_statement = _sqlite_dialect.insert(UiLoginThrottleRecord).values(
+                    **insert_values
+                )
+            elif dialect == "postgresql":  # pragma: no cover -- see above
+                insert_statement = _postgresql_dialect.insert(UiLoginThrottleRecord).values(
+                    **insert_values
+                )
+            else:  # pragma: no cover -- see above
+                raise NotImplementedError(
+                    "Insert-or-ignore for the login throttle table is not implemented "
+                    f"for the {dialect!r} SQLAlchemy dialect."
+                )
+            session.execute(insert_statement.on_conflict_do_nothing(index_elements=["ip"]))
+
+            currently_blocked = and_(
+                UiLoginThrottleRecord.blocked_until.is_not(None),
+                UiLoginThrottleRecord.blocked_until > normalized_now,
+            )
+            window_lapsed = UiLoginThrottleRecord.window_started_at < window_deadline
+
+            new_failures = case(
+                (currently_blocked, UiLoginThrottleRecord.failures),
+                (window_lapsed, 1),
+                else_=UiLoginThrottleRecord.failures + 1,
+            )
+            new_window_started_at = case(
+                (currently_blocked, UiLoginThrottleRecord.window_started_at),
+                (window_lapsed, normalized_now),
+                else_=UiLoginThrottleRecord.window_started_at,
+            )
+            # `fresh_window_blocks` is a plain Python `bool`, fixed for the
+            # whole call (derived only from `throttle_threshold`, never from
+            # a column value) -- branching on it in Python, rather than
+            # folding it into a SQL `and_()` alongside `window_lapsed`,
+            # keeps every operand of every SQL boolean expression an actual
+            # SQL expression (mypy's `and_()` stub does not accept a mix of
+            # `ColumnElement` and a bare `bool`).
+            window_lapsed_locks = new_blocked_until if fresh_window_blocks else None
+            new_blocked_until_expr = case(
+                (currently_blocked, UiLoginThrottleRecord.blocked_until),
+                (window_lapsed, window_lapsed_locks),
+                (
+                    (UiLoginThrottleRecord.failures + 1) >= throttle_threshold,
+                    new_blocked_until,
+                ),
+                else_=UiLoginThrottleRecord.blocked_until,
+            )
+
+            session.execute(
+                update(UiLoginThrottleRecord)
+                .where(UiLoginThrottleRecord.ip == ip)
+                .values(
+                    failures=new_failures,
+                    window_started_at=new_window_started_at,
+                    blocked_until=new_blocked_until_expr,
+                )
+            )
 
     # -- ui sessions (P3.0) -------------------------------------------------------
 

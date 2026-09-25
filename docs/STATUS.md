@@ -2,6 +2,154 @@
 
 Last updated: 2026-09-25.
 
+## Login for the fleet UI (P3.0), round-3: per-IP throttle + account-lock backstop
+
+Cross-review round 2's lockout model (5 failures / 15 min lock, always
+counted, re-locked on every attempt while already locked) had a real gap,
+pointed out after round 2 landed: **it is keyed by account, not by
+source.** Anyone who knows the landlord's username can keep the account
+locked out indefinitely with one wrong request every 15 minutes, from a
+single address -- the lockout meant to protect the account becomes a denial
+-of-service tool against its own owner. **Decision (project owner,
+2026-09-25): two independent layers, not one -- a per-client-IP throttle as
+the primary defence, and a much higher, windowed account-level lock as a
+backstop, with a notification the moment the backstop actually engages.**
+
+**1. Per-client-IP throttle (`ui_login_throttle`, migration
+`0005_ui_accounts`, `Storage.is_ip_login_blocked`/
+`record_ip_login_failure`).** One row per IP address that has ever failed a
+login: `failures`, `window_started_at`, `blocked_until`. Default 5 failures
+within 15 minutes blocks that one IP for 15 minutes; the window resets
+(fresh count) once it lapses with no failures. **Checked before
+`fleet.ui_auth.authenticate` is ever called** (`fleet/ui_routes.py
+::login_submit`) -- a blocked IP gets the exact same generic failure
+response as any other failed login, without a single Argon2 verify (CPU
+protection, not just a UX nicety) and without touching the *account's* own
+failure counter at all ("its attempts are not counted against the
+account", decided verbatim). A successful login does **not** unblock any
+IP, including its own -- an already-blocked window simply lapses on its
+own; there is no special-case reset path that could itself become a bug.
+Same atomic-`UPDATE`-per-failure technique as the account lock below (see
+`Storage.record_ip_login_failure`'s own docstring); regression tests:
+`tests/test_ui_throttle.py::test_concurrent_ip_failures_do_not_lose_updates`,
+`::test_concurrent_ip_failures_block_deterministically`,
+`::test_ip_throttle_concurrency_regression_runs_reliably` (10 rounds).
+
+**2. Client IP resolution (`fleet.ui_auth.resolve_client_ip`).**
+`request.client.host` by default. `X-Forwarded-For` is honoured **only**
+when the direct TCP peer is inside `FLEET_UI_TRUSTED_PROXIES`
+(comma-separated IPs/CIDRs, default **empty** -- meaning the header is
+completely ignored unless a deployment explicitly opts in); when trusted,
+the right-most address in the header that is **not itself** in the trusted
+set is used, walking the proxy chain from the hop closest to us outward.
+**A deployment behind a reverse proxy that does not set
+`FLEET_UI_TRUSTED_PROXIES` throttles by the proxy's own address for every
+request** -- effectively one shared bucket for every real client behind
+it, worth flagging explicitly for anyone running the fleet service that
+way (see the trade-off note below). Tests:
+`tests/test_ui_throttle.py::test_resolve_client_ip_ignores_spoofed_xff_from_an_untrusted_peer`,
+`::test_resolve_client_ip_uses_xff_via_a_trusted_proxy`,
+`::test_resolve_client_ip_walks_a_chain_of_multiple_proxies`,
+`::test_resolve_client_ip_uses_cidr_trusted_proxies`,
+`::test_resolve_client_ip_falls_back_to_the_direct_peer_if_every_hop_is_trusted`.
+
+**3. Account-level lock, now a backstop, not the primary defence
+(`Storage.record_ui_login_failure`, same table/columns as round 2 plus a
+new `ui_users.failure_window_started_at`).** Defaults raised from 5/15min
+to **50 failures within a 24h window → 1h locked** -- high enough that a
+single source hammering the per-IP throttle above never reaches it, but
+still there to stop a *distributed* attacker (more addresses than the IP
+throttle alone absorbs) from brute-forcing the account indefinitely.
+**The counting model itself changed, not just the numbers:** the window
+starts at the first failure and resets to a fresh count only once **24h**
+of no failures have passed -- not on every failure, and not on the lock
+itself lapsing (a failure presented after the 1h lock has expired but
+still within the 24h window **re-locks** the account rather than getting a
+fresh 50-strike allowance, since the window hasn't reset). And, changed
+from round 2: **a failure while the account is already locked now counts
+for nothing** -- round 2's "re-lock on every attempt, indefinitely" is
+gone, because the per-IP throttle above is what actually has to slow a
+continuing attacker down now; the account lock no longer needs to
+re-arm itself on every attempt to do that job too. See
+`Storage.record_ui_login_failure`'s own docstring for the complete
+reasoning, including why this needed **two** atomic statements per call
+(not one): an intermediate single-statement `UPDATE ... RETURNING`
+design was tried and found to have a real off-by-one bug -- `RETURNING`
+in SQLite evaluates against the row's *post-update* state even for a
+column only used inside a derived boolean expression, not just the column
+being written, so a boundary check referencing `failed_attempts` inside
+`RETURNING` reported the lock one failure too early. Caught by exercising
+the exact threshold boundary directly (call 49 vs. 50), not only under
+concurrency -- worth remembering as a general trap, not just fixed once.
+
+**4. "Account locked" notification (`fleet.alarms.notify_ui_account_locked`,
+new `AlarmKind.UI_ACCOUNT_LOCKED`).** Fires through the same P2.2 alert
+channels absence alarms already use (`load_notifiers_from_env` --
+webhook/SMTP/log fallback), **exactly once per lock**, the moment
+`Storage.record_ui_login_failure` reports that a given call is the one
+that actually transitioned the account from unlocked to locked (not "every
+call while locked", not "zero because of a race"). Payload is
+**deliberately minimal, as decided**: `alarm_kind`, `username`, `locked_at`
+-- no IP address, nothing password- or TOTP-related. Not tied to the
+`alarms` table (`AlarmRecord`'s open/all-clear/`raise_notified` bookkeeping
+exists for a *recurring, clearable* per-apartment condition; a UI account
+lock is a one-shot event with no apartment and nothing to clear) -- instead
+`Notifier` gained a second entry point, `notify_raw(subject, payload)`,
+alongside the existing `notify(AlarmNotification)`, implemented by all
+three notifier classes and reusing their existing transport (TLS-verified
+webhook POST, TLS-required SMTP send, or a log line). A broken
+`FLEET_ALERT_*` configuration is logged and treated as "no notifier"
+(`fleet/ui_routes.py::get_ui_notifiers`) rather than turned into a login
+500 -- unlike `fleet/app.py`'s lifespan, which parses this once at process
+startup specifically so a bad config is loud immediately, this dependency
+runs on every login POST, and alerting being misconfigured must not also
+break the login feature itself. Regression tests:
+`tests/test_ui_throttle.py::test_authenticate_notifies_exactly_once_when_the_account_locks`,
+`::test_authenticate_does_not_notify_again_on_further_failures_while_locked`,
+`::test_concurrent_lockout_notifies_exactly_once` (20 concurrent threads,
+exactly one notification), `::test_concurrent_lockout_notification_regression_runs_reliably`
+(10 rounds).
+
+**The remaining trade-off, stated plainly, not hidden:** an attacker who
+controls at least `⌈lockout_threshold / ip_throttle_threshold⌉` distinct
+source addresses (50/5 = 10, at the defaults) can still force the
+account-level lock, for up to an hour at a time, by spreading failed
+attempts across enough of them to stay under each individual address's
+throttle. This is a materially higher bar than round 2's "one address,
+one request every 15 minutes, forever" gap, but it is not eliminated --
+distributed brute-forcing an account, as opposed to a single source doing
+it, is exactly what the account-level backstop exists to make expensive,
+not impossible. Recovery: wait out the 1h lock (or the 24h window, for the
+counter itself to reset), or `python -m fleet.admin unlock` immediately.
+The landlord is alerted (point 4 above) the moment it happens, so this is
+not a silent lockout the way round 2's un-alerted version was.
+
+**Updated environment variables (replacing round 1/2's lockout section of
+the table below):**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FLEET_UI_LOCKOUT_THRESHOLD` | `50` | consecutive failures within the window before an account locks |
+| `FLEET_UI_LOCKOUT_WINDOW_S` | `86400` (24 h) | the failure-counting window; resets to a fresh count once this much time passes with no failures |
+| `FLEET_UI_LOCKOUT_DURATION_S` | `3600` (1 h) | how long an account lock lasts |
+| `FLEET_UI_IP_THROTTLE_THRESHOLD` | `5` | consecutive failures from one IP within the window before that IP is blocked |
+| `FLEET_UI_IP_THROTTLE_WINDOW_S` | `900` (15 min) | the per-IP failure-counting window |
+| `FLEET_UI_IP_THROTTLE_DURATION_S` | `900` (15 min) | how long a per-IP block lasts |
+| `FLEET_UI_TRUSTED_PROXIES` | empty | comma-separated IPs/CIDRs allowed to set `X-Forwarded-For`; **must** be set to the reverse proxy's own address for a deployment behind one, or every request throttles as if it came from the proxy |
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning` run
+three times (314 passed each time, 99% coverage, every P3.0 file at 100%
+except `fleet/admin.py`'s untested `__main__` guard, the same pre-existing
+pattern as `agent/__main__.py`); the concurrency regression tests
+(`test_totp_replay_race_allows_exactly_one_concurrent_login`,
+`test_concurrent_failed_logins_do_not_lose_counter_updates`,
+`test_concurrent_failed_logins_lock_the_account_deterministically`,
+`test_concurrent_ip_failures_do_not_lose_updates`,
+`test_concurrent_ip_failures_block_deterministically`,
+`test_concurrent_lockout_notifies_exactly_once`) each run 10 times
+individually, 10/10 passes every time.
+
 ## Login for the fleet UI (P3.0), round-2 fixes
 
 Cross-review round 2 (main session plus a second cross-review pass) found
@@ -43,19 +191,21 @@ stays next to the code it explains), summarized here:
   and `::test_lockout_counter_regression_runs_reliably` (10 rounds against
   10 fresh accounts).
 - **Lockout-lapse behaviour, decided and documented (cross-review asked
-  explicitly):** every failed attempt is counted **whether or not the
-  account is already locked** -- there is no "skip counting while locked"
-  branch. One consequence, deliberate: a failed attempt presented after a
-  previous lock has already lapsed does **not** get a fresh five-strike
-  allowance -- it both counts (the counter keeps climbing) and **re-locks**
-  the account, with `locked_until` renewed from that failure's time. Only a
-  genuinely successful login, or `fleet.admin unlock`, ever clears the
-  counter and the lock. This means hammering an already-locked (or
-  just-unlocked) account keeps it locked for as long as the attempts
-  continue, rather than guaranteeing an attacker a fixed unlock time to
-  simply wait out. See `Storage.record_ui_login_failure`'s own docstring
-  for the full reasoning. Regression test: `::test_a_new_failure_after_the_
-  lock_lapses_relocks_the_account`.
+  explicitly) -- superseded by round 3, kept here only as history.** This
+  round's model was: every failed attempt counted whether or not the
+  account was already locked, and a failure after a lock lapsed re-locked
+  the account rather than resetting the counter. Round 3 (see the section
+  above this one) replaced the account lock with a much higher, windowed
+  threshold plus an independent per-IP throttle as the actual primary
+  defence, and changed "counts while already locked" to "does not" -- the
+  reasoning that follows in this bullet no longer describes the current
+  behaviour; `Storage.record_ui_login_failure`'s own docstring and the
+  round-3 section above are the current source of truth. (The regression
+  test this bullet originally pointed at,
+  `test_a_new_failure_after_the_lock_lapses_relocks_the_account`, still
+  exists and still passes -- it now exercises round 3's "the lock lapsing
+  is not the same as the window lapsing" behaviour instead, see its
+  updated docstring in `tests/test_ui_auth.py`.)
 - **Timing oracle for locked accounts (main-session finding): `authenticate`
   used to return `None` for a locked account *before* running any Argon2
   work at all**, so a locked (i.e. existing) account answered measurably
@@ -138,10 +288,14 @@ and `tests/test_ui_auth.py::test_agent_token_cannot_access_protected_ui_page`
 would fail if this separation broke.
 
 **Where the pieces live:** `fleet/ui_auth.py` (password/TOTP verification,
-lockout, session creation/lookup, CSRF, the `require_ui_user` dependency
-every later UI package depends on), `fleet/ui_routes.py` (`GET/POST
-/ui/login`, `POST /ui/logout`, the protected `GET /ui/` placeholder, the
-`/ui`-scoped security-header middleware), `fleet/admin.py` (the CLI),
+account lockout, client-IP resolution, session creation/lookup, CSRF, the
+`require_ui_user` dependency every later UI package depends on),
+`fleet/ui_routes.py` (`GET/POST /ui/login`, `POST /ui/logout`, the
+protected `GET /ui/` placeholder, the `/ui`-scoped security-header
+middleware, the per-IP throttle check, the `get_ui_notifiers` dependency),
+`fleet/admin.py` (the CLI), `fleet/alarms.py` (also owns
+`notify_ui_account_locked` and `AlarmKind.UI_ACCOUNT_LOCKED` since round 3
+-- the same P2.2 notifier channels, reused rather than duplicated),
 `fleet/templates/ui/{base,login,index}.html`, `fleet/static/ui/fleet-ui.css`
 (all shipped inside the `fleet` package via `[tool.setuptools.package-data]`
 in `pyproject.toml` -- proven by `tests/test_packaging.py`, which builds a
@@ -149,12 +303,12 @@ real wheel and inspects it, not just by reading the config; the CSS file is
 served same-origin under `/ui/static/...`, see the round-2 fixes section
 above for why it is a separate file and not inline).
 
-**Environment variables (all optional, sensible defaults):**
+**Environment variables (all optional, sensible defaults) -- see the
+round-3 section above for the lockout/throttle/trusted-proxy variables,
+which replaced this table's original lockout row:**
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FLEET_UI_LOCKOUT_THRESHOLD` | `5` | consecutive failures before an account locks |
-| `FLEET_UI_LOCKOUT_DURATION_S` | `900` (15 min) | how long a lock lasts |
 | `FLEET_UI_SESSION_ABSOLUTE_LIFETIME_S` | `43200` (12 h) | hard session ceiling regardless of activity |
 | `FLEET_UI_SESSION_IDLE_TIMEOUT_S` | `3600` (1 h) | session dies this long after the last authenticated request |
 
@@ -205,7 +359,15 @@ with `hmac.compare_digest`.
   from `ui_sessions` -- a stale row is harmless (it can never authenticate
   again) but does accumulate; a retention/cleanup job is future work,
   mirroring the same open point already recorded for `heartbeats`/`events`
-  retention below.
+  retention below. The same applies to `ui_login_throttle` (round 3) --
+  every distinct failing IP ever seen gets a row that is never deleted,
+  only ever updated in place; harmless (a lapsed block cannot reactivate
+  itself) but grows without bound over the life of a deployment under
+  sustained scanning/attack traffic. Same future retention job, not built
+  here.
+- The account-lock/IP-throttle trade-off itself (an attacker with enough
+  source addresses can still force the account-level lock) is stated in
+  full in the round-3 section above, not repeated here.
 
 ## Absence alarming (P2.2, section 8)
 

@@ -25,6 +25,8 @@ import os
 import sys
 from datetime import UTC, datetime
 
+from sqlalchemy.exc import IntegrityError
+
 from fleet.storage import create_storage
 from fleet.ui_auth import (
     MIN_PASSWORD_LENGTH,
@@ -71,6 +73,20 @@ def _read_new_password() -> str:
 
 
 def create_user(username: str) -> int:
+    """`create-user` -- checked, then created. The check-then-create
+    sequence is inherently racy (two concurrent `create-user` invocations
+    for the same username could both pass the "not exists" check before
+    either has inserted its row -- unlikely for a single-landlord CLI run
+    by hand, but not impossible, e.g. two terminals or a re-run after a
+    hung first attempt) -- `ui_users.username`'s unique index
+    (`fleet/migrations/versions/0005_ui_accounts.py`) is the real,
+    database-level guarantee against ending up with two rows for the same
+    username; this function's own `IntegrityError` handling around the
+    insert only turns *that* guarantee's failure mode into the same clean
+    "already exists" message the earlier read-only check gives for the
+    non-racy case, instead of a raw traceback (round 3, cross-review
+    cosmetic item)."""
+
     normalized_username = normalize_username(username)
     storage = create_storage(_require_database_url())
     if storage.get_ui_user_by_username(normalized_username) is not None:
@@ -79,12 +95,16 @@ def create_user(username: str) -> int:
 
     password = _read_new_password()
     totp_secret = generate_totp_secret()
-    storage.create_ui_user(
-        username=normalized_username,
-        password_hash=hash_password(password),
-        totp_secret=totp_secret,
-        created_at=datetime.now(UTC),
-    )
+    try:
+        storage.create_ui_user(
+            username=normalized_username,
+            password_hash=hash_password(password),
+            totp_secret=totp_secret,
+            created_at=datetime.now(UTC),
+        )
+    except IntegrityError:
+        print(f"User {username!r} already exists.", file=sys.stderr)
+        return 1
     # Printed exactly once, here, and never stored anywhere else -- the
     # operator scans this into an authenticator app now or it is gone; the
     # secret itself stays in the database (see docs/STATUS.md's open point

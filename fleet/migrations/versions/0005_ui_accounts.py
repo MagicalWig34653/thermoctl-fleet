@@ -1,4 +1,5 @@
-"""ui_users and ui_sessions tables (P3.0, login for the fleet UI)
+"""ui_users, ui_sessions, and ui_login_throttle tables (P3.0, login for the
+fleet UI)
 
 Own user accounts in the fleet database for the landlord's login to the UI --
 project owner decision, 2026-09-24: password hashed with Argon2, TOTP as
@@ -11,14 +12,28 @@ the UI must never become a side door into the agent API.
   plain text (a known, documented open point -- see docs/STATUS.md).
   `last_totp_step` is replay protection: a presented code resolving to a
   step at or before this one is rejected even if otherwise numerically
-  correct. `failed_attempts`/`locked_until` implement the lockout rule (5
-  consecutive failures -> 15 minutes locked, both configurable via env, see
-  `fleet/ui_auth.py`).
+  correct. `failed_attempts`/`failure_window_started_at`/`locked_until`
+  implement the account-level lockout backstop (round 3, project owner
+  decision 2026-09-25: 50 failures within a 24h window -> 1h locked, a fresh
+  window after 24h of no failures -- see `fleet/ui_auth.py` and
+  `fleet/storage.py::Storage.record_ui_login_failure`).
 - `ui_sessions`: **only the SHA-256 hash of the session token** is stored
   (`token_hash`, mirroring `apartments.token_hash`/`hash_token` for the
   agent token) -- the raw token lives only in the browser's cookie. Also
   carries a per-session CSRF token (P3.0 requirement) and the two timestamps
   needed for absolute and idle session expiry.
+- `ui_login_throttle` (round 3, project owner decision 2026-09-25): one row
+  per client IP that has ever failed a login, the **primary** defence
+  against a distributed attacker locking the landlord's account out by
+  deliberately failing logins from many addresses (which the account lock
+  alone cannot prevent, since it is keyed by account, not by source).
+  Default 5 failures within 15 minutes -> that IP blocked for 15 minutes,
+  fresh window after it lapses -- see `Storage.record_ip_login_failure`.
+
+**This migration is edited in place across three rounds of cross-review
+(2026-09-24/25), not superseded by 0006/0007/...:** it is not on `main` yet
+at any point during that review, so there is nothing external depending on
+an already-released shape for either table to preserve compatibility with.
 
 Revision ID: 0005
 Revises: 0004
@@ -50,6 +65,7 @@ def upgrade() -> None:
             "failed_attempts", sa.Integer(), nullable=False, server_default=sa.text("0")
         ),
         sa.Column("locked_until", sa.DateTime(), nullable=True),
+        sa.Column("failure_window_started_at", sa.DateTime(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
     )
     op.create_index(
@@ -71,8 +87,19 @@ def upgrade() -> None:
     )
     op.create_index("ix_ui_sessions_user_id", "ui_sessions", ["user_id"])
 
+    op.create_table(
+        "ui_login_throttle",
+        sa.Column("ip", sa.String(length=64), primary_key=True),
+        sa.Column(
+            "failures", sa.Integer(), nullable=False, server_default=sa.text("0")
+        ),
+        sa.Column("window_started_at", sa.DateTime(), nullable=False),
+        sa.Column("blocked_until", sa.DateTime(), nullable=True),
+    )
+
 
 def downgrade() -> None:
+    op.drop_table("ui_login_throttle")
     op.drop_index("ix_ui_sessions_user_id", table_name="ui_sessions")
     op.drop_index("ix_ui_sessions_token_hash", table_name="ui_sessions")
     op.drop_table("ui_sessions")

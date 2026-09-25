@@ -81,6 +81,24 @@ def test_wheel_contains_the_ui_templates(built_wheel: Path) -> None:
         assert expected in names, f"{expected} missing from wheel contents: {sorted(names)}"
 
 
+def test_wheel_contains_the_ui_stylesheet(built_wheel: Path) -> None:
+    """Cross-review cosmetic item (P3.0 round 3): the CSS moved out of an
+    inline `<style>` block (blocked by the strict CSP, see
+    `fleet/static/ui/fleet-ui.css`'s own header comment) into a real file
+    served under `/ui/static/...` -- if `[tool.setuptools.package-data]`
+    only listed the templates and not this file, the page would still
+    render (locally, from the checkout) but ship to the Docker image
+    completely unstyled, the exact same class of gap this test file's
+    other wheel-inspection tests exist to catch."""
+
+    with zipfile.ZipFile(built_wheel) as archive:
+        names = set(archive.namelist())
+
+    assert "fleet/static/ui/fleet-ui.css" in names, (
+        f"fleet/static/ui/fleet-ui.css missing from wheel contents: {sorted(names)}"
+    )
+
+
 def test_wheel_still_contains_the_migration_scripts(built_wheel: Path) -> None:
     """Not new behaviour (P1.3 already relies on this, see
     `fleet/storage.py`'s `_alembic_config` docstring) -- kept here as a

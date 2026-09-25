@@ -26,12 +26,37 @@ username still runs a real Argon2 verify against a fixed dummy hash
 a stored or reused password) so that "no such user" cannot be distinguished
 from "wrong password" by response time.
 
-**Lockout (P3.0 requirement):** `Storage.record_ui_login_failure` locks an
-account for `FLEET_UI_LOCKOUT_DURATION_S` seconds after
-`FLEET_UI_LOCKOUT_THRESHOLD` consecutive failures; success
-(`Storage.record_ui_login_success`) resets the counter. Both are
-configurable via environment variables, defaults documented on the constants
-below.
+**Lockout, round 3 model (project owner decision, 2026-09-25):** two
+independent layers, not one.
+
+1. **Per-client-IP throttle (primary defence).** `Storage
+   .record_ip_login_failure` blocks one IP address for
+   `FLEET_UI_IP_THROTTLE_DURATION_S` after `FLEET_UI_IP_THROTTLE_THRESHOLD`
+   failures within `FLEET_UI_IP_THROTTLE_WINDOW_S` -- checked (`Storage
+   .is_ip_login_blocked`) **before** `authenticate` (and therefore any
+   Argon2 work) ever runs, by the caller (`fleet/ui_routes.py`), not inside
+   this function. A blocked IP's attempts are never passed to `authenticate`
+   at all, so they are never counted against the account either.
+2. **Account-level lock (backstop, much higher threshold).** `Storage
+   .record_ui_login_failure` locks the account for
+   `FLEET_UI_LOCKOUT_DURATION_S` after `FLEET_UI_LOCKOUT_THRESHOLD` failures
+   within `FLEET_UI_LOCKOUT_WINDOW_S` -- unlike the IP throttle, this exists
+   because a *distributed* attacker (more source addresses than the IP
+   throttle alone can absorb) can still force it; see `docs/STATUS.md` for
+   that trade-off stated plainly, not hidden. `notify_ui_account_locked`
+   (`fleet/alarms.py`) fires exactly once, the moment this lock actually
+   engages.
+
+Both counters are windowed with a hard reset on lapse, not endlessly
+renewing (round 3 replaces round 2's "re-lock on every attempt while
+locked" model -- see `Storage.record_ui_login_failure`'s own docstring for
+the full reasoning). Success (`Storage.record_ui_login_success`) resets the
+account-level counter; the IP throttle is untouched by a successful login
+either way ("successful login does not unblock other IPs" -- round 3
+decision -- and, for simplicity, does not unblock *its own* IP's counter
+either; that lapses on its own via the window). All six thresholds/windows/
+durations are configurable via environment variables, defaults documented
+on the constants below.
 
 **TOTP replay (P3.0 requirement):** `verify_totp` checks a ±1 time-step
 window (pyotp's own `interval=30` default -- so ±30s) and additionally
@@ -53,10 +78,12 @@ module.
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -65,6 +92,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, VerifyMismatchError
 from fastapi import Cookie, Depends, HTTPException, Request
 
+from fleet.alarms import Notifier, notify_ui_account_locked
 from fleet.storage import Storage, UiSessionRecord, UiUserRecord, get_storage, hash_token
 
 logger = logging.getLogger(__name__)
@@ -72,10 +100,27 @@ logger = logging.getLogger(__name__)
 # -- configuration (env-driven, per CLAUDE.md "nothing hard-coded") ----------
 
 _LOCKOUT_THRESHOLD_ENV = "FLEET_UI_LOCKOUT_THRESHOLD"
-_DEFAULT_LOCKOUT_THRESHOLD = 5
+# Round 3 (project owner decision, 2026-09-25): raised from 5 to 50 -- this
+# is now the *backstop*, not the primary defence (the per-IP throttle
+# below is). See the module docstring and docs/STATUS.md.
+_DEFAULT_LOCKOUT_THRESHOLD = 50
+
+_LOCKOUT_WINDOW_S_ENV = "FLEET_UI_LOCKOUT_WINDOW_S"
+_DEFAULT_LOCKOUT_WINDOW_S = 24 * 60 * 60.0
 
 _LOCKOUT_DURATION_S_ENV = "FLEET_UI_LOCKOUT_DURATION_S"
-_DEFAULT_LOCKOUT_DURATION_S = 15 * 60.0
+_DEFAULT_LOCKOUT_DURATION_S = 60 * 60.0
+
+_IP_THROTTLE_THRESHOLD_ENV = "FLEET_UI_IP_THROTTLE_THRESHOLD"
+_DEFAULT_IP_THROTTLE_THRESHOLD = 5
+
+_IP_THROTTLE_WINDOW_S_ENV = "FLEET_UI_IP_THROTTLE_WINDOW_S"
+_DEFAULT_IP_THROTTLE_WINDOW_S = 15 * 60.0
+
+_IP_THROTTLE_DURATION_S_ENV = "FLEET_UI_IP_THROTTLE_DURATION_S"
+_DEFAULT_IP_THROTTLE_DURATION_S = 15 * 60.0
+
+_TRUSTED_PROXIES_ENV = "FLEET_UI_TRUSTED_PROXIES"
 
 _SESSION_ABSOLUTE_LIFETIME_S_ENV = "FLEET_UI_SESSION_ABSOLUTE_LIFETIME_S"
 _DEFAULT_SESSION_ABSOLUTE_LIFETIME_S = 12 * 60 * 60.0
@@ -117,8 +162,88 @@ def lockout_threshold() -> int:
     return int(os.environ.get(_LOCKOUT_THRESHOLD_ENV, _DEFAULT_LOCKOUT_THRESHOLD))
 
 
+def lockout_window_s() -> float:
+    return float(os.environ.get(_LOCKOUT_WINDOW_S_ENV, _DEFAULT_LOCKOUT_WINDOW_S))
+
+
 def lockout_duration_s() -> float:
     return float(os.environ.get(_LOCKOUT_DURATION_S_ENV, _DEFAULT_LOCKOUT_DURATION_S))
+
+
+def ip_throttle_threshold() -> int:
+    return int(os.environ.get(_IP_THROTTLE_THRESHOLD_ENV, _DEFAULT_IP_THROTTLE_THRESHOLD))
+
+
+def ip_throttle_window_s() -> float:
+    return float(os.environ.get(_IP_THROTTLE_WINDOW_S_ENV, _DEFAULT_IP_THROTTLE_WINDOW_S))
+
+
+def ip_throttle_duration_s() -> float:
+    return float(os.environ.get(_IP_THROTTLE_DURATION_S_ENV, _DEFAULT_IP_THROTTLE_DURATION_S))
+
+
+def _parse_trusted_proxies(
+    raw: str,
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Parses `FLEET_UI_TRUSTED_PROXIES` (comma-separated IPs/CIDRs) into
+    networks. A malformed entry is skipped, not fatal -- a typo in this
+    variable must not crash every login attempt; it only means that one
+    entry never matches anything, same as leaving it out."""
+
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for entry in raw.split(","):
+        candidate = entry.strip()
+        if not candidate:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(candidate, strict=False))
+        except ValueError:
+            logger.warning("Ignoring malformed entry in %s: %r", _TRUSTED_PROXIES_ENV, candidate)
+    return networks
+
+
+def _ip_in_networks(
+    ip_str: str, networks: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network]
+) -> bool:
+    try:
+        address = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(address in network for network in networks)
+
+
+def resolve_client_ip(request: Request) -> str:
+    """The address a login attempt is throttled by (P3.0 round 3): `request
+    .client.host` by default. `X-Forwarded-For` is honoured **only** when
+    the direct TCP peer itself is inside `FLEET_UI_TRUSTED_PROXIES`
+    (comma-separated IPs/CIDRs, default empty -- meaning the header is
+    never trusted unless a deployment behind a reverse proxy explicitly
+    configures this); in that case, the right-most address in the header
+    that is **not itself** inside the trusted set is used -- i.e. walk the
+    proxy chain from the hop closest to us outward, skipping over addresses
+    that are themselves known-trusted proxies, and stop at the first one
+    that is not. A `X-Forwarded-For` presented by an untrusted direct peer
+    is attacker-controlled and completely ignored: trusting it would let
+    any client claim to be any IP address, defeating the throttle entirely.
+    """
+
+    direct_peer = request.client.host if request.client is not None else "unknown"
+    networks = _parse_trusted_proxies(os.environ.get(_TRUSTED_PROXIES_ENV, ""))
+    if not networks or not _ip_in_networks(direct_peer, networks):
+        return direct_peer
+
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if not forwarded_for:
+        return direct_peer
+
+    chain = [entry.strip() for entry in forwarded_for.split(",") if entry.strip()]
+    for candidate in reversed(chain):
+        if not _ip_in_networks(candidate, networks):
+            return candidate
+    # Every hop in the chain is itself a trusted proxy -- nothing left to
+    # treat as "the client" other than the direct peer this request itself
+    # arrived from.
+    return direct_peer
 
 
 def session_absolute_lifetime_s() -> float:
@@ -198,7 +323,12 @@ def verify_totp(
 
 
 def authenticate(
-    storage: Storage, username: str, password: str, totp_code: str, now: datetime
+    storage: Storage,
+    username: str,
+    password: str,
+    totp_code: str,
+    now: datetime,
+    notifiers: Sequence[Notifier] | None = None,
 ) -> UiUserRecord | None:
     """The single entry point for a login attempt (P3.0). Returns the
     authenticated `UiUserRecord` on success, `None` on **any** failure --
@@ -213,7 +343,10 @@ def authenticate(
     faster than an unknown username; a timing oracle for "this account
     exists" even though the response body was identical). The lock is
     still enforced -- it just no longer changes the timing profile of the
-    response.
+    response. This is **not** where the per-IP throttle is checked -- see
+    the module docstring's "round 3 model": a *blocked* IP must never reach
+    this function at all, so that check happens in `fleet/ui_routes.py`,
+    before Argon2 work of any kind, not here.
 
     **A concurrent TOTP replay is also a failure here, not a crash or a
     silent double-success:** `Storage.record_ui_login_success` is the
@@ -221,15 +354,23 @@ def authenticate(
     write did not happen (someone else's concurrent request already
     consumed this exact step first), this function records an ordinary
     login failure and returns `None`, the same as a wrong code.
+
+    **`notifiers`, if given, is used to fire the "account locked"
+    notification exactly when `Storage.record_ui_login_failure` reports
+    that *this* call is the one that just crossed the lockout threshold**
+    (`fleet.alarms.notify_ui_account_locked`) -- `None` (the default) means
+    "do not notify", used by tests that only care about the auth decision
+    itself; `fleet/ui_routes.py` always passes the real, configured list.
     """
 
     user = storage.get_ui_user_by_username(normalize_username(username))
 
     # Read here only to decide the *return value* (locked -> failure) and
     # whether TOTP is even worth checking -- never to skip the Argon2 verify
-    # below, and never itself the thing that decides whether a failure gets
-    # recorded (see `Storage.record_ui_login_failure`'s docstring: every
-    # failure is counted, locked or not).
+    # below. Whether a failure gets recorded/counted at all while locked is
+    # entirely `Storage.record_ui_login_failure`'s own decision now (round
+    # 3: a failure while already locked changes nothing there), not
+    # something this function pre-empts.
     locked = (
         user is not None
         and user.locked_until is not None
@@ -245,18 +386,26 @@ def authenticate(
 
     if user is None or not password_ok or locked or matched_step is None:
         if user is not None:
-            storage.record_ui_login_failure(
-                user.id, now, lockout_threshold(), lockout_duration_s()
-            )
+            _record_failure_and_maybe_notify(storage, user, now, notifiers)
         return None
 
     if not storage.record_ui_login_success(user.id, matched_step):
         # Lost the replay race to a concurrent request presenting the same
         # code -- same outcome as any other failure, including being
         # counted toward the lockout threshold.
-        storage.record_ui_login_failure(user.id, now, lockout_threshold(), lockout_duration_s())
+        _record_failure_and_maybe_notify(storage, user, now, notifiers)
         return None
     return user
+
+
+def _record_failure_and_maybe_notify(
+    storage: Storage, user: UiUserRecord, now: datetime, notifiers: Sequence[Notifier] | None
+) -> None:
+    just_locked = storage.record_ui_login_failure(
+        user.id, now, lockout_threshold(), lockout_window_s(), lockout_duration_s()
+    )
+    if just_locked and notifiers is not None:
+        notify_ui_account_locked(notifiers, user.username, now)
 
 
 def _naive_utc_now(now: datetime) -> datetime:
@@ -379,10 +528,15 @@ __all__ = [
     "generate_totp_secret",
     "get_valid_session",
     "hash_password",
+    "ip_throttle_duration_s",
+    "ip_throttle_threshold",
+    "ip_throttle_window_s",
     "lockout_duration_s",
     "lockout_threshold",
+    "lockout_window_s",
     "normalize_username",
     "require_ui_user",
+    "resolve_client_ip",
     "session_absolute_lifetime_s",
     "session_idle_timeout_s",
     "totp_provisioning_uri",

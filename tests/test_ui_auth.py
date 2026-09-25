@@ -111,7 +111,7 @@ def test_migration_0005_creates_and_removes_ui_tables(tmp_path: object) -> None:
 
     engine = create_storage(url).engine
     table_names = set(inspect(engine).get_table_names())
-    assert {"ui_users", "ui_sessions"} <= table_names
+    assert {"ui_users", "ui_sessions", "ui_login_throttle"} <= table_names
 
     ui_user_columns = {col["name"] for col in inspect(engine).get_columns("ui_users")}
     assert ui_user_columns == {
@@ -122,6 +122,7 @@ def test_migration_0005_creates_and_removes_ui_tables(tmp_path: object) -> None:
         "last_totp_step",
         "failed_attempts",
         "locked_until",
+        "failure_window_started_at",
         "created_at",
     }
     ui_session_columns = {col["name"] for col in inspect(engine).get_columns("ui_sessions")}
@@ -134,15 +135,25 @@ def test_migration_0005_creates_and_removes_ui_tables(tmp_path: object) -> None:
         "expires_at",
         "last_seen_at",
     }
+    ui_login_throttle_columns = {
+        col["name"] for col in inspect(engine).get_columns("ui_login_throttle")
+    }
+    assert ui_login_throttle_columns == {
+        "ip",
+        "failures",
+        "window_started_at",
+        "blocked_until",
+    }
 
     downgrade(url, "0004")
     remaining = set(inspect(create_storage(url).engine).get_table_names())
     assert "ui_users" not in remaining
     assert "ui_sessions" not in remaining
+    assert "ui_login_throttle" not in remaining
 
-    # And upgrading again from "0004" must cleanly recreate both tables.
+    # And upgrading again from "0004" must cleanly recreate all three tables.
     upgrade(url)
-    assert {"ui_users", "ui_sessions"} <= set(
+    assert {"ui_users", "ui_sessions", "ui_login_throttle"} <= set(
         inspect(create_storage(url).engine).get_table_names()
     )
 
@@ -241,8 +252,15 @@ def test_verify_totp_rejects_two_steps_of_clock_drift(totp_secret: str) -> None:
 
 
 def test_authenticate_locks_the_account_after_five_consecutive_failures(
-    storage: Storage, user_id: int, password: str
+    storage: Storage, user_id: int, password: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Round 3 raised the real default threshold to 50 (a backstop behind
+    the per-IP throttle, see `fleet/ui_auth.py`'s module docstring) --
+    monkeypatched down to 5 here so this test stays about "does the
+    threshold mechanism work at all", not about waiting out the real
+    default."""
+
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
     now = datetime.now(UTC)
     for _ in range(5):
         assert authenticate(storage, USERNAME, "wrong", "000000", now) is None
@@ -253,8 +271,13 @@ def test_authenticate_locks_the_account_after_five_consecutive_failures(
 
 
 def test_authenticate_rejects_correct_credentials_while_locked(
-    storage: Storage, user_id: int, password: str, totp_secret: str
+    storage: Storage,
+    user_id: int,
+    password: str,
+    totp_secret: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
     now = datetime.now(UTC)
     for _ in range(5):
         authenticate(storage, USERNAME, "wrong", "000000", now)
@@ -264,13 +287,19 @@ def test_authenticate_rejects_correct_credentials_while_locked(
 
 
 def test_authenticate_succeeds_again_after_the_lockout_expires(
-    storage: Storage, user_id: int, password: str, totp_secret: str
+    storage: Storage,
+    user_id: int,
+    password: str,
+    totp_secret: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_DURATION_S", "900")  # 15 minutes
     now = datetime.now(UTC)
     for _ in range(5):
         authenticate(storage, USERNAME, "wrong", "000000", now)
 
-    later = now + timedelta(minutes=16)  # past the 15 minute default lockout
+    later = now + timedelta(minutes=16)  # past the 15 minute lockout duration
     result = authenticate(storage, USERNAME, password, _totp_now(totp_secret, later), later)
     assert result is not None
 
@@ -379,7 +408,11 @@ def test_record_ui_login_failure_on_a_nonexistent_user_is_a_no_op(storage: Stora
     call, not just existing unexercised)."""
 
     storage.record_ui_login_failure(
-        999999, datetime.now(UTC), lockout_threshold=5, lockout_duration_s=1.0
+        999999,
+        datetime.now(UTC),
+        lockout_threshold=5,
+        lockout_window_s=86400,
+        lockout_duration_s=1.0,
     )
 
 
@@ -558,10 +591,23 @@ def test_concurrent_failed_logins_do_not_lose_counter_updates(
 def test_concurrent_failed_logins_lock_the_account_deterministically(
     storage: Storage, user_id: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same race, but with the real default-sized threshold (5) -- checks
-    that concurrency does not let the account slip past the threshold
-    without ever locking (the failure-mode cross-review was originally
-    worried about, alongside the raw lost-update count)."""
+    """Same race, but with a small threshold (5) against 20 concurrent
+    attempts -- checks that concurrency does not let the account slip past
+    the threshold without ever locking (the failure-mode cross-review was
+    originally worried about, alongside the raw lost-update count).
+
+    **Round 3 changed the expected final count.** Round 2's account lock
+    kept counting (and re-locking) every attempt even while already locked;
+    round 3 deliberately stops counting once locked (see
+    `Storage.record_ui_login_failure`'s docstring -- the per-IP throttle is
+    now what continues to slow a persistent attacker down, not the account
+    lock). Since `record_ui_login_failure` runs as one atomic transaction
+    per call and SQLite serializes writers, exactly the first 5 of the 20
+    concurrent calls advance the counter and the 5th also sets the lock;
+    the remaining 15 each see the account already locked and change
+    nothing -- so the deterministic final count is exactly the threshold,
+    not the attempt count.
+    """
 
     monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
     now = datetime.now(UTC)
@@ -579,7 +625,7 @@ def test_concurrent_failed_logins_lock_the_account_deterministically(
 
     final_user = storage.get_ui_user_by_username(USERNAME)
     assert final_user is not None
-    assert final_user.failed_attempts == 20
+    assert final_user.failed_attempts == 5
     assert final_user.locked_until is not None
 
 
@@ -621,16 +667,26 @@ def test_lockout_counter_regression_runs_reliably(
 
 
 def test_a_new_failure_after_the_lock_lapses_relocks_the_account(
-    storage: Storage, user_id: int, password: str, totp_secret: str
+    storage: Storage,
+    user_id: int,
+    password: str,
+    totp_secret: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """**Decision (cross-review round 2):** every failed attempt is always
-    counted, locked or not, and a failure recorded once the previous lock
-    has already lapsed **re-locks** the account from that failure's time --
-    it does not get a fresh five-strike allowance. Only a genuinely
-    successful login, or `fleet.admin unlock`, clears the counter. See
+    """**Decision, restated for round 3 (the account lock is now windowed,
+    see `Storage.record_ui_login_failure`'s docstring):** once the *lock*
+    itself lapses, the failure counter is **not** reset -- only the 24h
+    *window* lapsing resets it (not exercised here; the lock duration below
+    is far shorter than the window). A failure presented after the lock has
+    lapsed but still within the window both counts (failed_attempts keeps
+    climbing) and **re-locks** the account from that failure's time -- it
+    does not get a fresh five-strike allowance. Only a genuinely successful
+    login, or `fleet.admin unlock`, clears the counter. See
     `Storage.record_ui_login_failure`'s docstring and `docs/STATUS.md`'s
     P3.0 section for the same reasoning written out in full."""
 
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_DURATION_S", "900")  # 15 minutes
     now = datetime.now(UTC)
     for _ in range(5):
         authenticate(storage, USERNAME, "wrong", "000000", now)
@@ -698,6 +754,7 @@ def test_locked_account_still_pays_the_full_argon2_cost(
     (inspecting whether the hasher was invoked at all), not just on wall-clock
     timing (which is noisy and not a reliable thing to assert on in a test)."""
 
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
     now = datetime.now(UTC)
     for _ in range(5):
         authenticate(storage, USERNAME, "wrong", "000000", now)
@@ -732,6 +789,7 @@ def test_unknown_user_and_locked_user_both_run_exactly_one_argon2_verify(
     once, which is the actual timing-oracle-closing property (not merely
     "locked calls it at all")."""
 
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "5")
     now = datetime.now(UTC)
     for _ in range(5):
         authenticate(storage, USERNAME, "wrong", "000000", now)

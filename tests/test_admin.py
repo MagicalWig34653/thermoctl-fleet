@@ -145,6 +145,47 @@ def test_create_user_rejects_an_existing_username(
     assert exit_code == 1
 
 
+def test_create_user_handles_a_concurrent_duplicate_insert_cleanly(
+    database_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Simulates the exact race cross-review round 3 flagged: two
+    concurrent `create-user` invocations for the same username can both
+    pass the "not exists" check before either has inserted its row --
+    forced here by monkeypatching `Storage.get_ui_user_by_username` to
+    report "not found" even though a row already exists, so `Storage
+    .create_ui_user` hits the real `ui_users.username` unique index
+    (`fleet/migrations/versions/0005_ui_accounts.py`) and raises
+    `IntegrityError`. `fleet.admin.create_user` must turn that into the
+    same clean "already exists" message a non-racy duplicate gets, not a
+    raw traceback."""
+
+    from fleet.storage import Storage
+
+    storage = create_storage(database_url)
+    storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password(secrets.token_urlsafe(16)),
+        totp_secret="AAAAAAAAAAAAAAAA",
+        created_at=datetime.now(UTC),
+    )
+
+    monkeypatch.setattr(Storage, "get_ui_user_by_username", lambda self, username: None)
+    _patch_password(monkeypatch, secrets.token_urlsafe(16))
+
+    exit_code = admin_module.create_user("landlord")
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "already exists" in captured.err
+
+    # And the pre-existing account itself is untouched -- the race did not
+    # partially overwrite anything.
+    monkeypatch.undo()
+    untouched = create_storage(database_url).get_ui_user_by_username("landlord")
+    assert untouched is not None
+    assert untouched.totp_secret == "AAAAAAAAAAAAAAAA"
+
+
 def test_reset_totp_replaces_the_secret(
     database_url: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -182,7 +223,11 @@ def test_unlock_clears_the_lock_and_failure_counter(database_url: str) -> None:
         created_at=datetime.now(UTC),
     )
     storage.record_ui_login_failure(
-        record.id, datetime.now(UTC), lockout_threshold=1, lockout_duration_s=900
+        record.id,
+        datetime.now(UTC),
+        lockout_threshold=1,
+        lockout_window_s=86400,
+        lockout_duration_s=900,
     )
     locked = storage.get_ui_user_by_username("landlord")
     assert locked is not None
@@ -263,7 +308,11 @@ def test_unlock_finds_the_account_by_a_differently_cased_username(
     user = storage.get_ui_user_by_username("landlord")
     assert user is not None
     storage.record_ui_login_failure(
-        user.id, datetime.now(UTC), lockout_threshold=1, lockout_duration_s=900
+        user.id,
+        datetime.now(UTC),
+        lockout_threshold=1,
+        lockout_window_s=86400,
+        lockout_duration_s=900,
     )
 
     exit_code = admin_module.main(["unlock", "LANDLORD"])

@@ -10,6 +10,8 @@ docstring for why this is a completely separate path from agent auth
 
 from __future__ import annotations
 
+import logging
+import os
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
 from fleet.storage import Storage, get_storage
 from fleet.ui_auth import (
     PRE_SESSION_CSRF_COOKIE_NAME,
@@ -28,9 +31,15 @@ from fleet.ui_auth import (
     check_csrf,
     create_session,
     delete_session,
+    ip_throttle_duration_s,
+    ip_throttle_threshold,
+    ip_throttle_window_s,
     require_ui_user,
+    resolve_client_ip,
     session_absolute_lifetime_s,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ui")
 
@@ -88,6 +97,38 @@ def _set_pre_csrf_cookie(response: Response, value: str) -> None:
     )
 
 
+def get_ui_notifiers() -> list[Notifier]:
+    """FastAPI dependency: the same P2.2 alert channels
+    (`fleet.alarms.load_notifiers_from_env`) used for absence alarms, now
+    also used to fire the "UI account locked" notification (P3.0 round 3).
+    Loaded fresh from `FLEET_ALERT_*` env vars on every call -- deliberately
+    **not** cached the way `fleet.storage.get_storage` caches its `Storage`
+    singleton: a login attempt is not a hot path the way heartbeat
+    ingestion is, and a test that monkeypatches these env vars per test
+    must see the change take effect immediately, not after resetting a
+    shared cache in between.
+
+    **A broken `FLEET_ALERT_*` configuration must not also break login
+    itself** -- unlike `fleet/app.py`'s lifespan (which parses this once,
+    loudly, at process startup, exactly so a bad config is caught before
+    anything else runs), this dependency runs on *every* login POST; a
+    `NotifierConfigError` here is logged and treated as "no notifier
+    configured" (an empty list -- `notify_ui_account_locked` then simply
+    has nothing to call) rather than turned into a 500 for a login attempt
+    that has nothing to do with alerting configuration.
+    """
+
+    try:
+        return load_notifiers_from_env(os.environ)
+    except NotifierConfigError:
+        logger.exception(
+            "FLEET_ALERT_* configuration is invalid -- UI account-lock "
+            "notifications are disabled until it is fixed (login itself is "
+            "unaffected)."
+        )
+        return []
+
+
 @router.get("/login", response_class=HTMLResponse)
 def login_form(request: Request) -> HTMLResponse:
     """Renders the login form with a fresh pre-session CSRF cookie/field
@@ -104,6 +145,24 @@ def login_form(request: Request) -> HTMLResponse:
     return response
 
 
+def _generic_login_failure_response(request: Request) -> Response:
+    # Same generic response for every failure reason (P3.0 requirement) --
+    # a fresh pre-session CSRF pair, same as the GET form, so the form the
+    # user is looking at keeps working for a retry. Shared between the
+    # "IP blocked" short-circuit and an ordinary `authenticate` failure
+    # below -- both must be indistinguishable from each other too, not
+    # just from each other's individual failure reasons.
+    new_pre_csrf = secrets.token_urlsafe(32)
+    response: Response = templates.TemplateResponse(
+        request,
+        "login.html",
+        {"pre_csrf": new_pre_csrf, "error": _GENERIC_LOGIN_ERROR},
+        status_code=401,
+    )
+    _set_pre_csrf_cookie(response, new_pre_csrf)
+    return response
+
+
 @router.post("/login")
 def login_submit(
     request: Request,
@@ -113,26 +172,32 @@ def login_submit(
     pre_csrf: str = Form(...),
     pre_csrf_cookie: str | None = Cookie(default=None, alias=PRE_SESSION_CSRF_COOKIE_NAME),
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    notifiers: list[Notifier] = Depends(get_ui_notifiers),  # noqa: B008
 ) -> Response:
     if not pre_csrf_cookie or not check_csrf(pre_csrf_cookie, pre_csrf):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
 
     now = datetime.now(UTC)
-    user = authenticate(storage, username, password, totp_code, now)
+    client_ip = resolve_client_ip(request)
+
+    # Per-IP throttle (P3.0 round 3, primary defence) -- checked **before**
+    # `authenticate`, so a blocked IP never causes any Argon2 work and its
+    # attempts are never counted against the account at all (P3.0 round 3
+    # requirement, verbatim).
+    if storage.is_ip_login_blocked(client_ip, now):
+        return _generic_login_failure_response(request)
+
+    user = authenticate(storage, username, password, totp_code, now, notifiers)
 
     if user is None:
-        # Same generic response for every failure reason (P3.0 requirement)
-        # -- a fresh pre-session CSRF pair, same as the GET form, so the
-        # form the user is looking at keeps working for a retry.
-        new_pre_csrf = secrets.token_urlsafe(32)
-        failure_response: Response = templates.TemplateResponse(
-            request,
-            "login.html",
-            {"pre_csrf": new_pre_csrf, "error": _GENERIC_LOGIN_ERROR},
-            status_code=401,
+        storage.record_ip_login_failure(
+            client_ip,
+            now,
+            ip_throttle_threshold(),
+            ip_throttle_window_s(),
+            ip_throttle_duration_s(),
         )
-        _set_pre_csrf_cookie(failure_response, new_pre_csrf)
-        return failure_response
+        return _generic_login_failure_response(request)
 
     new_session = create_session(storage, user.id, now)
     response: Response = RedirectResponse(url="/ui/", status_code=303)
