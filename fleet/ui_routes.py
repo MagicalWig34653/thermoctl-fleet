@@ -15,6 +15,7 @@ import os
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -23,6 +24,7 @@ from fastapi.templating import Jinja2Templates
 
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
 from fleet.storage import Storage, get_storage
+from fleet.ui_apartment import build_apartment_detail
 from fleet.ui_auth import (
     PRE_SESSION_CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
@@ -47,6 +49,14 @@ router = APIRouter(prefix="/ui")
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates" / "ui"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+# P3.2 review of P3.1's tile link: `urllib.parse.quote(value, safe="")`
+# as a Jinja filter, not Jinja's own built-in `urlencode` (which leaves "/"
+# unescaped -- fine for a query string, wrong for a path *segment* that may
+# itself legitimately contain "/", since an unescaped one would otherwise
+# split into two path segments at the routing layer). Used for every link
+# to `/ui/apartments/{id}` -- `index.html` (P3.1) and nowhere yet in
+# `apartment.html` itself, which only ever links relatively (`?days=...`).
+templates.env.filters["urlpath"] = lambda value: quote(str(value), safe="")
 
 _STATIC_DIR = Path(__file__).parent / "static" / "ui"
 # Serves `fleet/static/ui/fleet-ui.css` (and any future same-origin asset)
@@ -289,6 +299,71 @@ def tasks(
             "csrf_token": authenticated.session.csrf_token,
             "overview": overview,
         },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# P3.2 review: any future `/ui/apartments/...` sub-route (a fixed suffix,
+# not a `{apartment_id}`) **must** be registered above this one -- FastAPI/
+# Starlette matches routes in registration order, and `{apartment_id:path}`
+# below greedily matches everything after the prefix, including a literal
+# segment like `/ui/apartments/export` that was meant for a different,
+# more specific route. `/tasks` above is unaffected (a different top-level
+# `/ui/...` path, not a `/ui/apartments/...` suffix).
+@router.get("/apartments/{apartment_id:path}", response_class=HTMLResponse)
+def apartment_detail(
+    request: Request,
+    apartment_id: str,
+    days: str | None = None,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """"Eine Wohnung" (P3.2, section 9's second view). **`apartment_id` uses
+    Starlette's `:path` converter, not the plain (default) `str` one.**
+    `index.html`'s `urlpath` filter (`urllib.parse.quote(value, safe="")`)
+    percent-encodes even a `/` inside an apartment id, exactly so it stays
+    one path segment on the wire (a raw, unencoded `/` would otherwise be
+    ambiguous with the route's own `/ui/apartments/` separator) -- but a
+    `%2F` inside a URL is decoded by the ASGI server/client *before*
+    Starlette's router ever splits the path into segments, so a plain
+    `str` parameter (whose regex excludes `/`) never actually matches an id
+    that contained one (**confirmed empirically**: a plain `{apartment_id}`
+    route 404s for exactly this case). `:path` matches everything after the
+    prefix, encoded slash included once decoded, and still round-trips a
+    space/`<`/every other quoted character correctly -- verified for all of
+    `/`, space, and `<` by this package's own tests.
+
+    **`days` is `str | None`, not `int`, deliberately (cross-review round
+    1 fix):** an `int`-typed FastAPI query parameter makes FastAPI/Pydantic
+    itself reject a non-integer value (`?days=abc`, `?days=3.5`,
+    `?days=1e400`) with a 422 *before* this function body ever runs --
+    contradicting both this docstring's own earlier claim and
+    `docs/STATUS.md`'s "never a 422" for this parameter. Accepting the raw
+    string and handing it to `fleet.ui_apartment.clamp_history_days` lets
+    *that* function be the single place that decides what counts as a
+    valid `days` value; any value it cannot parse as a positive int
+    degrades to the default (3), same as an out-of-range one.
+
+    Unknown apartment -> 404, same layout (`base.html`'s nav/header still
+    render), no data (`build_apartment_detail` returns `None`,
+    `apartment.html` branches on that itself). All derivation/German
+    rendering happens in `fleet.ui_apartment.build_apartment_detail`; this
+    route only wires the authenticated request (plus the `days` query
+    parameter) to it and renders the template.
+    """
+
+    detail = build_apartment_detail(storage, apartment_id, datetime.now(UTC), days)
+    response = templates.TemplateResponse(
+        request,
+        "apartment.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "apartment_id": apartment_id,
+            "detail": detail,
+        },
+        status_code=200 if detail is not None else 404,
     )
     response.headers["Cache-Control"] = "no-store"
     return response

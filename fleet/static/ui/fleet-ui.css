@@ -142,6 +142,56 @@ ul.apartment-tiles {
     font-size: 0.85em;
 }
 
+/* "Eine Wohnung" (P3.2) -- the heartbeat-history timeline
+ * (.timeline / .timeline__entry) and its sections. Same "never colour
+ * alone" rule as P3.1's tiles: a gap entry is distinguished by its own
+ * "Lücke" label and border accent together, not by colour by itself.
+ */
+main section + section {
+    margin-top: 1.5rem;
+}
+
+main section h2 {
+    font-size: 1.05rem;
+    margin-bottom: 0.5rem;
+}
+
+ol.timeline {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.timeline__entry {
+    border-inline-start: 0.25rem solid #8888;
+    padding: 0.25rem 0.75rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: baseline;
+}
+
+.timeline__entry--gap {
+    border-inline-start-color: #c00;
+}
+
+.timeline__label {
+    font-weight: bold;
+}
+
+.timeline__duration,
+.timeline__count {
+    opacity: 0.8;
+}
+
+.apartment-detail__note {
+    font-size: 0.9em;
+    opacity: 0.8;
+}
+
 /* "Aufgaben" (P3.4) -- three task groups, each a plain list, "Nichts
  * fällig." for an empty one (same "quiet surface" idea as P3.1's tiles,
  * here without any colour coding -- a task list is already ordered by

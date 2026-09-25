@@ -2,6 +2,242 @@
 
 Last updated: 2026-09-25.
 
+## "Eine Wohnung" -- the fleet UI's apartment detail view (P3.2, section 9's second view)
+
+`GET /ui/apartments/{apartment_id}` (behind `require_ui_user`, same as P3.1)
+renders section 9's second view: heartbeat history, open/past faults,
+battery/signal aggregates, version, system/control state, and
+open/recent alarms for one apartment -- everything except stage-1/2
+commands, which are explicitly deferred to a later step. Sits directly on
+top of P3.1 (`fleet/ui_house.py`'s pattern is repeated, not reinvented) and
+P1.2/P2.1/P2.2 (events, heartbeats, alarms) -- no new migration, no change
+to `protocol/`, `fleet/auth.py`, `fleet/ui_auth.py`, or `CommandType`.
+
+**Where the pieces live.** `fleet/storage.py` gained `HeartbeatHistoryEntry`
+(a `sent_at`/`received_at` pair) and three new bounded `Storage` read
+methods: `get_heartbeat_history(apartment_id, since)` (ascending by
+`sent_at`, capped at `_MAX_HEARTBEAT_HISTORY_ROWS = 20_000` -- comfortably
+above the 14-day cap's worst case of 10,080 rows at one heartbeat per
+120 s), `list_events_for_apartment(apartment_id, since)` (newest first,
+capped at `_MAX_EVENT_HISTORY_ROWS = 200`), and
+`list_alarms_for_apartment(apartment_id)` (newest first, capped at
+`_MAX_APARTMENT_ALARM_ROWS = 50`, not date-windowed -- an apartment
+realistically accumulates far fewer alarm rows than heartbeats). Apartment
+existence (for the 404 case) is checked by reusing
+`Storage.get_apartment_token_hash` -- every registered apartment has
+exactly one token-hash row (`Storage.set_apartment_token`), so no separate
+"does this apartment exist" method was needed.
+
+`fleet/ui_apartment.py` (new) is the view-model module, the same split
+P3.1 established: `build_apartment_detail(storage, apartment_id, now,
+days)` returns `None` for an unknown apartment (`fleet/ui_routes.py` turns
+that into a 404, same layout, no data) or an `ApartmentDetail` with every
+field already derived and German-rendered -- the template
+(`fleet/templates/ui/apartment.html`) only iterates and prints, exactly
+like `index.html`.
+
+**`days` is `str | None` at the route, not `int | None` (cross-review
+round 1 fix).** The first version of this package typed
+`apartment_detail`'s `days` query parameter as `int`, relying on
+FastAPI/Pydantic's own coercion plus `clamp_history_days` to handle
+out-of-range values -- cross-review found this did not actually deliver
+"never a 422" as the docstring/this file claimed: an `int`-typed query
+parameter makes FastAPI reject `?days=abc`, `?days=3.5`, and
+`?days=1e400` with a 422 *before* the route body (and therefore
+`clamp_history_days`) ever runs, for exactly the malformed-input case the
+work package asked to be tolerant of. Fixed by typing `days: str | None`
+at the route and moving all parsing into `clamp_history_days` itself,
+which now accepts `int | str | None`: a `str` that does not parse as a
+plain base-10 integer (`int(days)`, which itself already rejects
+`"3.5"`/`"1e400"`/`"abc"` with `ValueError`) degrades to
+`DEFAULT_HISTORY_DAYS` (3), the same fallback an out-of-range value
+already got. Regression tests, all at the HTTP level:
+`tests/test_ui_apartment.py::test_days_query_parameter_non_numeric_is_not_a_422`,
+`::test_days_query_parameter_a_float_string_is_not_a_422`,
+`::test_days_query_parameter_scientific_notation_is_not_a_422` (each posts
+one of the three inputs cross-review named, asserts 200 with the default
+3-day heading, not 422).
+
+**Gap detection (section 5) -- the open point this package closes.**
+P2.1b's `docs/STATUS.md` entry explicitly deferred "gap detection for
+caught-up heartbeats ... displaying it is a UI concern that belongs with
+P3.2" -- closed here. `fleet.ui_apartment._build_timeline` treats any
+interval between two *consecutive* stored heartbeats (ordered by
+`sent_at`, matching section 5's own wording, not `received_at`) strictly
+longer than `fleet.alarms.ABSENCE_THRESHOLD` (six minutes) as a gap --
+**reusing that constant directly, not a second, independently-chosen
+number**, so this view's definition of "gap" can never silently drift
+from P2.2's definition of "absent" (section 8's own headline alarm), per
+the work package's explicit instruction. A heartbeat whose `received_at`
+is itself more than `ABSENCE_THRESHOLD` after its own `sent_at` is marked
+"nachgeliefert" (caught up) -- the same reused threshold, since the agent
+sends a live heartbeat every 120 s, so a receipt delay past six minutes
+can only happen for a heartbeat that was buffered and delivered later via
+a P2.1b catch-up batch. **Window edges are a hard cut, not smoothed
+over:** `Storage.get_heartbeat_history` only ever returns rows with
+`sent_at >= since`; a heartbeat sent before the requested window is never
+used to fabricate a gap against the first heartbeat that *is* in the
+window -- `tests/test_ui_apartment.py
+::test_gap_detection_ignores_data_outside_the_requested_window` builds
+exactly this scenario (an old heartbeat outside a 1-day window, then a
+real 22h gap fully inside it) and asserts exactly one gap, not two.
+
+**Reachable runs are aggregated into one row each; gaps never are
+(cross-review round 1, main-session finding).** The first version of this
+package rendered one `<li>` per stored heartbeat -- up to ~10,000 rows for
+the 14-day cap at one heartbeat every 120 s, found not to scale. Fixed:
+`fleet.ui_apartment._close_run` collapses each *contiguous* run of
+reachable heartbeats (no gap between any two consecutive ones) into a
+single `TimelineEntry` -- "Erreichbar, von X bis Y, N Herzschläge" (or
+just "vor X" for a run of exactly one), plus how many of that run's
+heartbeats were caught up (`caught_up_count`). **A gap keeps its own row
+regardless** -- `_build_timeline` still emits one `TimelineEntry` per
+detected gap, with its own start/end/duration, exactly as before; only the
+*reachable* rows in between are now summarised, never a gap itself,
+matching cross-review's own framing: "section 5 forbids smoothing over
+gaps, not summarising reachable periods." Regression tests:
+`tests/test_ui_apartment.py::test_a_long_run_of_heartbeats_collapses_into_one_row`
+(many heartbeats, one `TimelineEntry`, correct `heartbeat_count`),
+`::test_two_runs_separated_by_a_gap_produce_run_gap_run`,
+`::test_caught_up_count_is_per_run_not_global`, and the pre-existing
+exactly-at-threshold/just-above-threshold tests (unchanged assertions,
+now read against the aggregated entries).
+
+**The interval from the last stored heartbeat up to `now` is deliberately
+never rendered as a trailing gap row (cross-review round 2, explicit
+call-out).** `_build_timeline` only ever compares consecutive *stored*
+heartbeats against each other; there is no closing check of `now -
+last_heartbeat.sent_at` after the loop. An apartment that has simply gone
+silent and not reported since is already surfaced by the open "meldet
+sich nicht" alarm in this same page's "Alarme" section
+(`ApartmentDetail.alarms`, P2.2's `check_absence_alarms`) -- a second,
+differently-worded row for the exact same still-ongoing silence at the
+bottom of the timeline would add no information, only a second place for
+the two to eventually disagree (e.g. a `days` window that excludes the
+alarm's own `raised_at`, or independent wording drift between "Lücke" and
+"Meldet sich nicht"). A *closed* gap between two heartbeats that both
+arrived is a different, already-resolved fact about the past, and keeps
+its own row exactly as before. Pinned by
+`tests/test_ui_apartment.py::test_a_stale_last_heartbeat_is_not_rendered_as_a_trailing_gap`
+(a last heartbeat two days old, `now` two days later -> exactly one run,
+no trailing gap).
+
+**Battery/signal values -- section 9's wording vs. the actual protocol
+(open point, not built, not invented).** Section 9 says "battery and
+signal values ... per device"; `protocol.heartbeat.DeviceState` only ever
+carries the fleet-wide aggregates (`weakest_battery_percent`,
+`worst_signal_quality`, `silent_devices`, `zigbee_bridge`) -- there is no
+per-device breakdown anywhere in the heartbeat wire contract. This page
+shows the aggregates only, with an explanatory note in the template ("Werte
+je einzelnem Gerät werden vom Heartbeat-Protokoll nicht übertragen").
+Adding per-device values would need a `protocol/` extension, which
+CLAUDE.md's security principles require clearing with the project owner
+first (section 18.2: "a field may only ever be added", a *deliberate*
+addition, not incidental to a UI package) -- not invented here, left open.
+
+**Commands -- explicitly deferred (work package's own instruction, section
+9: "the four to seven allowed commands as buttons with confirmation").**
+Not built by this package (a later step, once `POST /v1/commands/...` and
+the SSE channel exist per `docs/implementation_plan.md`'s own ordering).
+The page shows a short static German note in place of any button/form; no
+new `POST` route exists on `fleet/ui_routes.py` for this page.
+
+**Section 6 stays out, same as P3.1.** No room temperature, setpoint,
+schedule, or tenant data is read, shown, or derivable -- `EventRecord` has
+no `titel`/`text` column at all (P1.2), so past faults can only ever show
+`schluessel`/`schwere`/derived kind/receipt time, structurally nothing else
+to leak; verified directly by
+`tests/test_ui_apartment.py::test_events_never_show_titel_or_text_even_with_no_prefix_match`,
+which posts a real event through `POST /v1/events/{apartment}` with marker
+`titel`/`text` values and asserts both are absent from the rendered page,
+and by `::test_no_section_6_data_anywhere_on_the_page` (same forbidden-marker
+list P3.1 uses: `"°C"`/`"Sollwert"`/`"Zeitplan"`/`"Mieter:"`/`"Kontakt:"`).
+
+**Hardened apartment links (P3.1 review, closed here for both views).**
+`fleet/ui_routes.py` registers a Jinja filter, `urlpath`
+(`urllib.parse.quote(value, safe="")`) -- **not** Jinja's own built-in
+`urlencode`, which deliberately leaves `/` unescaped (correct for a query
+string, wrong for a path *segment* that may itself contain a literal `/`).
+`index.html`'s tile link now reads
+`/ui/apartments/{{ tile.apartment_id | urlpath }}`. On the receiving end,
+`fleet/ui_routes.py::apartment_detail` uses Starlette's `{apartment_id:path}`
+converter, not the plain (default) `str` one -- **confirmed empirically
+before choosing it:** a `%2F` inside a URL is decoded by the ASGI
+server/client before Starlette's router splits the path into segments, so
+a plain `str` parameter (whose regex excludes `/`) 404s for an id that
+actually contained a `/`, even though the link encoded it correctly; the
+`:path` converter matches everything after the prefix and round-trips
+`/`, a space, and `<` correctly, covered by
+`tests/test_ui_apartment.py::test_encoded_id_link_from_the_house_view_resolves_to_this_page`
+(builds a real apartment id containing all three, follows the house
+view's own rendered `href`, asserts 200) and
+`::test_xss_escaping_of_id_zone_mode_and_key`.
+
+**Consistent with P3.4's own encoding, not a duplicate mechanism to
+reconcile.** P3.4 (built in parallel, merged afterward, see its own
+section below) independently reached `urllib.parse.quote(id, safe="")`
+for its own task-list links, as a plain Python helper
+(`fleet.ui_tasks._apartment_href`) rather than this package's Jinja
+filter -- both call the exact same stdlib function with the exact same
+arguments, so the two produce byte-identical encoded output; there is
+nothing to unify beyond noting it here, and P3.4's own "pre-existing gap,
+not this package's to fix" note about `index.html` linking with a raw,
+unencoded id is stale now that this package's `urlpath` filter closes it
+(see that section for the corrected wording).
+
+**Route-ordering note, added at the route itself, not only here
+(cross-review round 1).** `fleet/ui_routes.py::apartment_detail`'s
+`{apartment_id:path}` converter greedily matches everything after
+`/ui/apartments/`, including a literal suffix a future, more specific
+sub-route might want (e.g. `/ui/apartments/export`) -- FastAPI/Starlette
+match routes in registration order, so any such future route must be
+registered *before* this one in `fleet/ui_routes.py`, or it would never be
+reached. A one-line comment directly above the route's decorator states
+this for whoever adds the next one; `/ui/tasks` (P3.4) is unaffected, since
+it is a different top-level `/ui/...` path, not a `/ui/apartments/...`
+suffix.
+
+**Tests.** New `tests/test_ui_apartment.py` (42 tests, up from 30 after
+cross-review rounds 1 and 2's fixes) against a real, migrated SQLite database, no
+mocks, mirroring `tests/test_ui_house.py`'s structure: `clamp_history_days`
+unit-tested directly (`None`/zero/negative -> default, over-range ->
+capped, in-range passthrough, plus a valid numeric string and three
+malformed strings -- non-numeric, a float, scientific notation -- all
+degrading to the default, not raising); `build_apartment_detail`
+unit-tested for the unknown-apartment `None` case, the never-reported
+placeholder, gap detection at exactly the threshold (no gap, one collapsed
+run) and just above it (a gap plus two runs), the window-edge case above,
+caught-up vs. live heartbeat marking (now `caught_up_count`, per run),
+run aggregation (a long contiguous run collapses to one row; two runs
+separated by a gap give run/gap/run; caught-up counts stay scoped to their
+own run, not a running total), a stale last heartbeat producing no
+trailing gap row (the still-open interval up to `now` is left to the
+alarms section, see above), `days` clamping, open faults from the
+latest heartbeat, every battery/signal/version/system/control field, the
+outdated-protocol flag (same `monkeypatch.setattr(storage_module,
+"PROTOCOL_VERSION", ...)` technique P3.1 uses), and both an open and a
+since-cleared alarm; the three new `Storage` methods unit-tested directly
+for ordering, the `since` bound, and per-apartment scoping; HTTP-level
+tests logging in via the real P3.0 flow for: unauthenticated access
+redirecting (303), an unknown apartment 404ing with the same base layout,
+every section rendering from real stored data in one combined test, the
+titel/text-leak test described above, `days` capping at the HTTP layer
+(`?days=9999` -> 14, `?days=0` -> 3) plus the three malformed-`days`
+regression tests (`?days=abc`, `?days=3.5`, `?days=1e400`, each asserting
+200 with the default heading, never 422), XSS escaping of an apartment id,
+zone, mode, and event key all containing `<script>`, the encoded-link
+round trip, the section-6 absence check, and the security headers
+(`Content-Security-Policy`, `X-Frame-Options`, `Referrer-Policy`,
+`Cache-Control: no-store`) -- plus a template-level inline-style/script
+check mirroring `tests/test_ui_auth.py`'s existing glob-based one (which
+already also covers `apartment.html` automatically, since it globs every
+template in the directory).
+
+Verification for this round (run against `main` merged in, P3.4 included):
+`ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all clean;
+`python -m pytest -W ignore::ResourceWarning` (402 passed, 99% coverage
+overall, `fleet/ui_apartment.py` and every other P3.2/P3.4 file at 100%).
+
 ## "Aufgaben" -- the fleet UI's tasks view (P3.4, section 9's third view)
 
 `GET /ui/tasks` (behind `require_ui_user`, same as every other `/ui` route)
@@ -116,12 +352,19 @@ all (P1.3) and are not read here either.
 
 **Links use a URL-encoded apartment id, per the work package's explicit
 requirement** (`urllib.parse.quote(id, safe="")`, `fleet.ui_tasks
-._apartment_href`) -- unlike P3.1's `index.html`, which links with the raw,
-unencoded id (a pre-existing gap in that package, not this one's to fix
-without touching P3.1's own files, per this package's "keep changes to
-shared files small" instruction). `/ui/apartments/{id}` itself is P3.2's
-route, built in parallel, not built or tested for resolution here (the work
-package: "do not test that the link resolves").
+._apartment_href`). **Updated note (P3.2 merged afterward, no longer an
+inconsistency):** at the time this package was written, P3.1's
+`index.html` still linked with the raw, unencoded id -- noted here as a
+pre-existing gap in that package, deliberately not fixed from this one
+(per this package's own "keep changes to shared files small" instruction).
+P3.2's own cross-review then closed exactly that gap (`index.html`'s tile
+link now goes through a Jinja `urlpath` filter, see the P3.2 section
+above) -- `fleet.ui_tasks._apartment_href` and P3.2's `urlpath` filter now
+both call `urllib.parse.quote(id, safe="")` with the same arguments and
+therefore produce byte-identical encoded output; two independently-chosen
+mechanisms that agree, not two that need reconciling. `/ui/apartments/{id}`
+itself is P3.2's route, built in parallel, not built or tested for
+resolution here (the work package: "do not test that the link resolves").
 
 **Sorting, decided while building this package (section 8/9 give no
 explicit order among entries of one group):** battery round ascending by
@@ -1493,11 +1736,13 @@ touched, only a new module constant and a docstring sentence added),
 
 **Batch format open point (P2.1's `STATUS.md` entry) is now closed** by
 this package -- `POST /v1/heartbeats`, a plain JSON list of `Heartbeat`,
-`MAX_CATCH_UP_HEARTBEATS = 240`. **Still open, explicitly out of scope
-here, not invented:** gap detection for caught-up heartbeats (section 5,
-"The cloud detects gaps by the timestamp and displays them as such") --
-this package stores the batch; *displaying* a detected gap is a UI concern
-that belongs with P3.2 (the apartment detail view), not this endpoint.
+`MAX_CATCH_UP_HEARTBEATS = 240`. **Gap detection for caught-up heartbeats
+(section 5, "The cloud detects gaps by the timestamp and displays them as
+such") was left open here on purpose** -- this package stores the batch;
+*displaying* a detected gap is a UI concern that belongs with P3.2 (the
+apartment detail view), not this endpoint. **Closed by P3.2**, see this
+file's own "Eine Wohnung" section at the top for
+`fleet.ui_apartment._build_timeline`'s gap/caught-up derivation.
 P2.3 (the agent side that would produce a batch to send here) stays
 deferred, see the note in `docs/implementation_plan.md` under P2.3 and the
 "Decisions by the project owner" note carried by this task.
