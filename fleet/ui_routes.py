@@ -38,6 +38,7 @@ from fleet.ui_auth import (
     resolve_client_ip,
     session_absolute_lifetime_s,
 )
+from fleet.ui_house import build_house_overview
 
 logger = logging.getLogger(__name__)
 
@@ -244,15 +245,23 @@ def logout(
 def index(
     request: Request,
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
-    """The protected placeholder page (P3.0) -- "Das Haus" itself (section
-    9's first view) is P3.1's job, not this package's; this only proves the
-    protected route, navigation, and logout form work end to end."""
+    """"Das Haus" (P3.1, section 9's first view) -- one tile per apartment,
+    sorted by trouble (see `fleet/ui_house.py`'s module docstring for the
+    ordering rule and its reasoning). All derivation/German rendering
+    happens in `fleet.ui_house.build_house_overview`; this route only wires
+    the authenticated request to it and renders the template."""
 
+    tiles = build_house_overview(storage, datetime.now(UTC))
     response = templates.TemplateResponse(
         request,
         "index.html",
-        {"ui_session": authenticated, "csrf_token": authenticated.session.csrf_token},
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "tiles": tiles,
+        },
     )
     response.headers["Cache-Control"] = "no-store"
     return response

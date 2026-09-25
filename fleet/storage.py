@@ -307,6 +307,27 @@ class LatestHeartbeat:
     outdated: bool
 
 
+@dataclass(frozen=True)
+class ApartmentOverview:
+    """Everything "Das Haus" (P3.1, section 9's first view) needs for one
+    apartment's tile, fetched together by `Storage.get_house_overview` so
+    the route/template layer does not run its own per-field queries.
+
+    `latest` is `None` for an apartment that has never sent a heartbeat
+    ("noch nie gemeldet", P3.1's acceptance criterion) -- the same
+    "never reported" case P2.2's alarm check already treats specially
+    (`fleet/alarms.py`: never-reporting apartments are not alarmed either).
+    `open_alarm` is the currently open "not reporting" alarm row (P2.2), or
+    `None` if none is open right now -- sorting "by trouble" and rendering
+    the since-when text are both `fleet/ui_house.py`'s job, not this
+    module's; `Storage` only supplies the raw, already-joined data.
+    """
+
+    apartment_id: str
+    latest: LatestHeartbeat | None
+    open_alarm: AlarmRecord | None
+
+
 def _naive_utc(value: datetime) -> datetime:
     """Strips a timezone, converting to UTC first if one is present.
 
@@ -775,6 +796,62 @@ class Storage:
             record = session.get(AlarmRecord, alarm_id)
             if record is not None:
                 record.snoozed_until = _naive_utc(until)
+
+    # -- house overview (P3.1, section 9's first view) ---------------------------
+
+    # Mirrors `fleet.alarms.AlarmKind.NOT_REPORTING.value` as a plain string
+    # literal -- storage does not import `fleet.alarms`'s enum types (same
+    # "avoid a circular import" reasoning as `EventRecord.fault_kind` and
+    # `AlarmRecord.kind` above, see the module docstring).
+    _NOT_REPORTING_ALARM_KIND = "not_reporting"
+
+    def _get_open_not_reporting_alarms(self) -> dict[str, AlarmRecord]:
+        """`apartment_id -> currently open "not reporting" alarm row`, for
+        every apartment that has one open right now -- one query for every
+        apartment at once, not one query per apartment, so
+        `get_house_overview` below stays at "one query per apartment" (for
+        the latest heartbeat) plus this single batched query, not "one query
+        per apartment per field"."""
+
+        with self.session() as session:
+            rows = session.scalars(
+                select(AlarmRecord).where(
+                    AlarmRecord.kind == self._NOT_REPORTING_ALARM_KIND,
+                    AlarmRecord.cleared_at.is_(None),
+                )
+            ).all()
+            result = {row.apartment_id: row for row in rows}
+            session.expunge_all()
+            return result
+
+    def get_house_overview(self) -> list[ApartmentOverview]:
+        """One `ApartmentOverview` per registered apartment (P3.1) -- the
+        latest heartbeat (if any, via `get_latest_heartbeat`) plus any
+        currently open "not reporting" alarm, fetched together. Order here
+        is insertion order of `list_apartment_ids` and carries no meaning;
+        sorting "by trouble, not by id" (section 9) is a presentation
+        decision made by `fleet/ui_house.py`, not by this read.
+
+        Query count is `2 + len(apartment_ids)`: one for the id list, one
+        batched query for every open "not reporting" alarm, and one for
+        each apartment's latest heartbeat (there is no batched equivalent
+        of `get_latest_heartbeat`'s per-apartment tie-break query without
+        duplicating its ordering logic here) -- acceptable for the handful
+        of apartments a single landlord's fleet actually has (per the work
+        package: "no N+1 concerns beyond reason for ~12 apartments"), and
+        still just one query per apartment, not one per displayed field.
+        """
+
+        apartment_ids = self.list_apartment_ids()
+        open_alarms = self._get_open_not_reporting_alarms()
+        return [
+            ApartmentOverview(
+                apartment_id=apartment_id,
+                latest=self.get_latest_heartbeat(apartment_id),
+                open_alarm=open_alarms.get(apartment_id),
+            )
+            for apartment_id in apartment_ids
+        ]
 
     # -- ui accounts / sessions (P3.0) -------------------------------------------
 

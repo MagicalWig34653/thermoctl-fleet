@@ -2,6 +2,133 @@
 
 Last updated: 2026-09-25.
 
+## "Das Haus" -- the fleet UI's house overview (P3.1, section 9's first view)
+
+`GET /ui/` (P3.0's protected placeholder) now renders section 9's first
+view: one tile per apartment known to storage, "sorted by trouble, not by
+number" -- "whoever has nothing to do sees a quiet surface". Sits directly
+on top of P3.0 (`require_ui_user`, unchanged) and P2.1/P2.2 (heartbeats,
+alarms) -- no new migration, no change to `protocol/`, `fleet/ui_auth.py`,
+or `CommandType`.
+
+**Where the pieces live.** `fleet/storage.py` gained `ApartmentOverview`
+(a per-apartment `latest: LatestHeartbeat | None` plus
+`open_alarm: AlarmRecord | None`) and `Storage.get_house_overview()` -- the
+one storage-level read the work package asked for, so the route/view layer
+runs no per-field queries of its own. Query count is `2 + len(apartments)`:
+one for the id list, one batched query for every currently open
+"not reporting" alarm (`Storage._get_open_not_reporting_alarms`, keyed by
+apartment id), and one `get_latest_heartbeat` call per apartment (its own
+tie-break ordering is not duplicated here) -- acceptable for "~12
+apartments" per the work package, and still one query per apartment, not
+one per displayed field. The "not reporting" alarm kind is compared as the
+plain string literal `"not_reporting"`, mirroring
+`fleet.alarms.AlarmKind.NOT_REPORTING.value` -- `fleet/storage.py` still
+does not import `fleet/alarms.py`'s enum types, same "avoid a circular
+import" reasoning as `EventRecord.fault_kind`/`AlarmRecord.kind` already
+follow.
+
+`fleet/ui_house.py` (new) is the view-model module: `build_house_overview(storage,
+now)` calls `Storage.get_house_overview`, sorts it, and renders every field
+into the German text/booleans `fleet/templates/ui/index.html` prints
+verbatim -- no business logic in the template itself. Deliberately its own
+module, not folded into `fleet/ui_routes.py` (which stays the thin HTTP
+layer its own docstring describes): P3.2/P3.4 are expected to add their own
+`ui_apartment.py`/`ui_tasks.py` next to it, sharing only `base.html`/
+`fleet-ui.css`. `now` is always injected by the caller
+(`fleet/ui_routes.py::index` passes `datetime.now(UTC)`) -- same pattern as
+`fleet/alarms.py`/`fleet/ui_auth.py` -- so every test controls heartbeat/
+alarm age exactly, without waiting on a real clock.
+
+**The ordering rule -- a derived reading of section 9, not a spec quote
+(worth stating plainly, since the specification itself only sets the goal,
+not a concrete rule among several simultaneous kinds of trouble).** Decided
+while building this package, documented in both `fleet/ui_house.py`'s
+module docstring and here so it survives either file being read alone:
+
+1. an apartment with an **open "not reporting" alarm** (P2.2) -- section
+   8's own headline case ("the cloud's value lies in absence, not in
+   receiving").
+2. apartments with **open faults**, worst (most faults) first.
+3. apartments on an **outdated protocol version** (section 18.2).
+4. apartments that have **never reported** -- kept separate from category 1
+   on purpose: P2.2 does not alarm an apartment with no heartbeat ever
+   (open point, this file's "Absence alarming" section below), so there is
+   nothing to escalate on yet, but it is still not "fine".
+5. everything else -- fine, rendered visually quiet.
+
+Ties within a category are broken by apartment id, so the order is fully
+deterministic regardless of query/dict iteration order --
+`tests/test_ui_house.py::test_ordering_across_all_five_categories_and_the_id_tie_break`
+builds one apartment per category plus a same-category pair and asserts the
+exact resulting list.
+
+**What a tile shows, and what it deliberately does not (section 6/9).**
+Apartment id (there is no separate "name" in storage, per the work
+package -- inventing one was out of scope, not merely postponed); last
+contact as receipt time in words ("vor 3 Min.", "vor 2 Std.", "vor 5
+Tagen") or "noch nie gemeldet"; mode and "thermoctl erreichbar" from the
+latest heartbeat's `thermoctl` block; open faults as a count plus German
+labels (`fleet/ui_house.py::FAULT_KIND_LABELS`, a closed mapping covering
+every `protocol.heartbeat.FaultKind` member -- a lookup miss raises
+`KeyError` rather than silently dropping a fault) and the zone id; agent
+and thermoctl version, plus a "veraltete Protokollversion" tag when
+`LatestHeartbeat.outdated` is set; an open "not reporting" alarm's
+since-when ("seit 10 Min."). **Nothing from section 6** (room temperature,
+setpoint, schedule, absence period, tenant name/contact) is read, shown, or
+derivable from what is read -- verified directly by
+`tests/test_ui_house.py::test_house_view_contains_no_section_6_data`, which
+feeds a `tenant_report` fault (the one `FaultKind` whose *event* payload,
+not the heartbeat fault, would carry such data) and asserts none of
+`"°C"`/`"Sollwert"`/`"Zeitplan"`/`"Mieter:"`/`"Kontakt:"` appear -- the
+`OpenFault` model itself only ever carries `kind`/`since`/`zone`, so
+there is structurally nothing to leak here by construction, not only by
+omission. Event `titel`/`text` are not stored at all (P1.3) and are not
+read by this module either.
+
+**"Whoever has nothing to do sees a quiet surface"**
+(`.apartment-tile--quiet` vs. `.apartment-tile--trouble` in
+`fleet/static/ui/fleet-ui.css`) -- a lower-contrast, unaccented left border
+for a fine tile against a red one for anything in categories 0-3. Status is
+always also conveyed by text (the alarm line, the "veraltete
+Protokollversion" tag, the fault list, "Nein" for unreachable) -- never by
+colour alone, per the work package's accessibility requirement. Headings
+(`<h1>`/`<h2>`), a `<dl>` of facts, and a plain `<ul>` of faults, no
+`<style>`/`<script>`/`style=` anywhere (checked by the pre-existing
+`tests/test_ui_auth.py::test_templates_contain_no_inline_style_or_script`,
+which globs every template in the directory, this one included).
+
+**Each tile links to `/ui/apartments/{id}`** (P3.2's route, not built
+here -- the link 404s until then, expected and left as-is per the work
+package: "P3.2 will add that route; do not build it here").
+
+**Tests.** New `tests/test_ui_house.py` (18 tests) against a real, migrated
+SQLite database, no mocks: `Storage.get_house_overview` unit-tested
+directly (every apartment including never-reported, the open-alarm-only
+join, empty-fleet); `fleet.ui_house.build_house_overview` unit-tested for
+every tile field, the never-reported placeholder, an open alarm's
+since-text, a cleared alarm not flagging the tile, the "quiet" boolean for
+a genuinely fine apartment, the outdated flag (via the same
+`monkeypatch.setattr(storage_module, "PROTOCOL_VERSION", ...)` technique
+`tests/test_storage.py`'s own outdated-flag tests use, since a heartbeat's
+`protocol_version` itself must stay `>=1`), `_relative_duration`'s
+sub-minute/hour/day branches, and the full five-category-plus-tie-break
+ordering; HTTP-level tests logging in via the real P3.0 flow (mirroring
+`tests/test_ui_auth.py::_login`) for: unauthenticated access still
+redirecting (303) to `/ui/login`, every stored apartment rendered
+(including never-reported and an open fault's German label), the open
+"not reporting" alarm's text appearing, an apartment id containing
+`<script>...` HTML-escaped (`&lt;script&gt;`, not executed), the section-6
+absence check above, the security headers (`Content-Security-Policy`,
+`X-Frame-Options`, `Referrer-Policy`, `Cache-Control: no-store`) still
+present on this now-non-placeholder page, and the empty-fleet state
+("Keine Wohnungen registriert.").
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol
+fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+(342 passed, 99% coverage overall, `fleet/ui_house.py` and every other P3.1
+file at 100%).
+
 ## Login for the fleet UI (P3.0), round-4: reserve-then-verify + XFF hardening + background notification
 
 Re-review of round 3 reproduced one real defect and asked for two cheap,

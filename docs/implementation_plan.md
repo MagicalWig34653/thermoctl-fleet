@@ -183,6 +183,10 @@ parallel with all other packages of the same stage.
 - **Acceptance:** page loads, shows every apartment with heartbeat age and
   open faults; test via FastAPI's HTTP client.
 - **Depends on:** P1.3, P2.1.
+- [x] done -- see `docs/STATUS.md` for the ordering rule (a derived reading
+  of section 9, not a spec quote), what a tile shows and deliberately does
+  not (section 6), and the new `fleet/ui_house.py`/
+  `Storage.get_house_overview` pieces.
 
 ### P3.2 -- "One apartment" view
 - **Goal:** detail view of a single apartment.
