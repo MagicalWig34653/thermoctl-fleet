@@ -1252,3 +1252,532 @@ def test_inventory_templates_have_no_inline_style_or_script() -> None:
         assert "<style" not in text
         assert "<script" not in text
         assert "style=" not in text
+
+
+# -- P4.3: remove/replace device, change device state --------------------------
+
+
+def _make_apartment_with_device(
+    storage: Storage,
+    apartment_id: str = "house7-a03",
+    device_id: str = "sn-1",
+) -> None:
+    """Mirrors `tests/test_storage.py::_make_apartment_with_device` --
+    a fully commissioned apartment with an `in_service` device and an open
+    assignment (P4.2/P4.2b are not built yet, so this package's own tests
+    reach into `DeviceRecord.state` directly for a state P4.1 has no route
+    to set, the same way this file's own filter tests already do)."""
+
+    from fleet.storage import DeviceRecord
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        apartment_id, property_id=property_.id, label="A", floor=None, orientation=None,
+        state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+    storage.set_apartment_token(apartment_id, secrets.token_urlsafe(32))
+    storage.register_device(
+        device_id, model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    with storage.session() as session:
+        record = session.get(DeviceRecord, device_id)
+        assert record is not None
+        record.state = "in_service"
+    storage.create_assignment(
+        device_id, apartment_id, datetime(2026, 1, 1, tzinfo=UTC), "Erstinbetriebnahme", USERNAME
+    )
+
+
+def test_replace_device_form_unauthenticated_redirects_to_login(client: TestClient) -> None:
+    response = client.get(
+        "/ui/inventory/apartments/house7-a03/replace-device", follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/login"
+
+
+def test_replace_device_form_unknown_apartment_is_404(
+    client: TestClient, password: str, totp_secret: str, user_id: int
+) -> None:
+    _login(client, password, totp_secret)
+
+    response = client.get("/ui/inventory/apartments/unknown/replace-device")
+
+    assert response.status_code == 404
+
+
+def test_replace_device_form_no_open_assignment_is_404(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03", property_id=property_.id, label="A", floor=None, orientation=None,
+        state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+    _login(client, password, totp_secret)
+
+    response = client.get("/ui/inventory/apartments/house7-a03/replace-device")
+
+    assert response.status_code == 404
+
+
+def test_replace_device_form_renders_after_login(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_device(storage)
+    _login(client, password, totp_secret)
+
+    response = client.get("/ui/inventory/apartments/house7-a03/replace-device")
+
+    assert response.status_code == 200
+    assert "sn-1" in response.text
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_replace_device_form_lists_shelf_devices(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_device(storage)
+    storage.register_device(
+        "sn-shelf", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    _login(client, password, totp_secret)
+
+    response = client.get("/ui/inventory/apartments/house7-a03/replace-device")
+
+    assert response.status_code == 200
+    assert "sn-shelf" in response.text
+    assert "/ui/inventory/devices/sn-shelf/prepare" in response.text
+
+
+def test_replace_device_submit_wrong_csrf_is_403(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_device(storage)
+    _login(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={"target_state": "faulty", "reason": "Grund", "csrf_token": "wrong"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_replace_device_submit_missing_reason_rerenders_with_a_message(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={"target_state": "faulty", "reason": "   ", "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    assert "Grund" in response.text
+    assert storage.get_current_assignment("house7-a03") is not None
+
+
+def test_replace_device_submit_rejects_an_over_length_reason(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={"target_state": "faulty", "reason": "R" * 501, "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    assert storage.get_current_assignment("house7-a03") is not None
+
+
+def test_replace_device_submit_rejects_an_unknown_target_state_value(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """`Storage.remove_device`'s own `ValueError` (an unrecognised target
+    state) surfaces as a 400 re-render, not an uncaught exception -- this
+    is not reachable through the form's own `<select>` (which only ever
+    offers `faulty`/`in_storage`), but a raw POST could still send
+    anything."""
+
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={
+            "target_state": "decommissioned",
+            "reason": "Grund",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert storage.get_current_assignment("house7-a03") is not None
+
+
+def test_replace_device_submit_success_closes_assignment_and_revokes_token(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={"target_state": "faulty", "reason": "Gerät defekt", "csrf_token": csrf_token},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/inventory"
+    assert storage.get_current_assignment("house7-a03") is None
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "faulty"
+    assert storage.get_apartment_token_hash("house7-a03") is None
+
+    assignment_log = storage.list_audit_log_for_entity("assignment", "house7-a03:sn-1")
+    assert any(entry.action == "closed" for entry in assignment_log)
+    apartment_log = storage.list_audit_log_for_entity("apartment", "house7-a03")
+    assert any(entry.action == "token_revoked" for entry in apartment_log)
+
+
+def test_replace_device_submit_old_token_gets_403_on_a_real_heartbeat(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """"After revocation a real agent request with the old token must get
+    403" (work package's own acceptance criterion)."""
+
+    from fleet.storage import hash_token
+
+    old_token = secrets.token_urlsafe(32)
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03", property_id=property_.id, label="A", floor=None, orientation=None,
+        state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+    storage.set_apartment_token("house7-a03", old_token)
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    from fleet.storage import DeviceRecord
+
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "in_service"
+    storage.create_assignment(
+        "sn-1", "house7-a03", datetime(2026, 1, 1, tzinfo=UTC), "Erstinbetriebnahme", USERNAME
+    )
+    assert storage.get_apartment_token_hash("house7-a03") == hash_token(old_token)
+
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={"target_state": "faulty", "reason": "Gerät defekt", "csrf_token": csrf_token},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    heartbeat_response = client.post(
+        "/v1/heartbeat",
+        json={
+            "apartment": "house7-a03",
+            "sent_at": "2026-09-22T14:03:11Z",
+            "agent": "0.1.0",
+            "protocol_version": 1,
+            "thermoctl": {"version": "0.9.5", "reachable": True, "mode": "armed"},
+            "control": {
+                "last_decision": "2026-09-22T14:02:47Z",
+                "zones": 6,
+                "zones_with_heat_demand": 2,
+                "zones_without_reading": 0,
+            },
+            "devices": {
+                "zigbee_bridge": "connected",
+                "weakest_battery_percent": 62,
+                "worst_signal_quality": 47,
+                "silent_devices": 0,
+            },
+            "system": {
+                "uptime_s": 962114,
+                "memory_free_percent": 41,
+                "disk_free_percent": 68,
+                "clock_drift_s": 0.4,
+            },
+            "open_faults": [],
+        },
+        headers={"Authorization": f"Bearer {old_token}"},
+    )
+    assert heartbeat_response.status_code == 403
+
+
+def test_replace_device_submit_rejects_when_no_open_assignment(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03", property_id=property_.id, label="A", floor=None, orientation=None,
+        state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={"target_state": "faulty", "reason": "Grund", "csrf_token": csrf_token},
+    )
+
+    # 404s before `Storage.remove_device` even matters here -- there is no
+    # assignment to close, per `build_replace_device_view`.
+    assert response.status_code == 404
+
+
+def test_device_state_submit_wrong_csrf_is_403(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    from fleet.storage import DeviceRecord
+
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "faulty"
+    _login(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={"target_state": "in_storage", "reason": "Grund", "csrf_token": "wrong"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_device_state_submit_unknown_device_is_404(
+    client: TestClient, password: str, totp_secret: str, user_id: int
+) -> None:
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/devices/unknown/state",
+        data={"target_state": "in_storage", "reason": "Grund", "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 404
+
+
+def test_device_state_submit_missing_reason_rerenders_with_a_message(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    from fleet.storage import DeviceRecord
+
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "faulty"
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={"target_state": "in_storage", "reason": "   ", "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    assert "Grund" in response.text
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "faulty"
+
+
+def test_device_state_submit_rejects_an_over_length_reason(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    from fleet.storage import DeviceRecord
+
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "faulty"
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={"target_state": "in_storage", "reason": "R" * 501, "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "faulty"
+
+
+def test_device_state_submit_rejects_a_disallowed_transition(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={"target_state": "in_storage", "reason": "Grund", "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "registered"
+
+
+def test_device_state_submit_success_redirects_and_persists(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    from fleet.storage import DeviceRecord
+
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "faulty"
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={
+            "target_state": "in_storage",
+            "reason": "Geprüft, wiederverwendbar",
+            "csrf_token": csrf_token,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/inventory"
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_storage"
+    log = storage.list_audit_log_for_entity("device", "sn-1")
+    assert len(log) == 1
+    assert log[0].ui_username == USERNAME
+
+
+def test_device_state_submit_in_service_device_cannot_be_changed(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """"in_service cannot be changed via the state form" (work package's
+    own acceptance criterion)."""
+
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={"target_state": "faulty", "reason": "Grund", "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_service"
+
+
+def test_device_state_submit_decommissioned_is_terminal(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+    client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={"target_state": "decommissioned", "reason": "Ausgemustert", "csrf_token": csrf_token},
+        follow_redirects=False,
+    )
+    assert storage.get_device("sn-1").state == "decommissioned"  # type: ignore[union-attr]
+
+    response = client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={"target_state": "in_storage", "reason": "Grund", "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "decommissioned"
+
+
+def test_inventory_view_shows_state_change_form_only_for_allowed_targets(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+    # Decommission it -- a terminal state, no state-change form left.
+    client.post(
+        "/ui/inventory/devices/sn-1/state",
+        data={"target_state": "decommissioned", "reason": "Ausgemustert", "csrf_token": csrf_token},
+        follow_redirects=False,
+    )
+
+    response = client.get("/ui/inventory")
+
+    assert response.status_code == 200
+    assert "/ui/inventory/devices/sn-1/state" not in response.text
+
+
+def test_inventory_view_shows_replace_device_link_for_assigned_apartment(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_device(storage)
+    _login(client, password, totp_secret)
+
+    response = client.get("/ui/inventory")
+
+    assert "Gerät ausbauen/tauschen" in response.text
+    assert "/ui/inventory/apartments/house7-a03/replace-device" in response.text
+
+
+def test_replace_device_templates_have_no_inline_style_or_script() -> None:
+    from pathlib import Path
+
+    templates_dir = Path(__file__).parent.parent / "fleet" / "templates" / "ui"
+    text = (templates_dir / "inventory_replace_device.html").read_text()
+    assert "<style" not in text
+    assert "<script" not in text
+    assert "style=" not in text

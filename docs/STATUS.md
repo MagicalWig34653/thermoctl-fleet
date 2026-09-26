@@ -2,6 +2,191 @@
 
 Last updated: 2026-09-26.
 
+## Remove/replace device, change device state (P4.3, section 20.1-20.3)
+
+**Decisions by the project owner, 2026-09-26 (see this package's own work
+order -- do not re-open):** landlord actions stay `/ui` forms behind the
+P3.0 login with CSRF, `/v1` stays agent-only; P4.2 (prepare + confirm with
+verification code) is built in parallel by another agent and owns migration
+`0007` -- **this package adds no migration**; the new device of a swap
+always goes through P4.2's prepare/confirm flow ("no release without a
+confirmed verification code", 20.3), so this package never assigns a
+device to an apartment -- only a link to P4.2's "Vorbereiten" route.
+
+**Two new pieces of business logic, both additive, neither touching
+`protocol/`, `fleet/auth.py`, or `CommandType`:**
+
+1. **The manual `DeviceLifecycle` transition table (`fleet/device_lifecycle.py`,
+   new module)** -- section 20 gives no explicit transition table; this is
+   a **derived reading**, stated here so it does not stay an unstated
+   assumption:
+
+   | From | To | Reasoning |
+   |---|---|---|
+   | `faulty` | `in_storage` | after inspection, found reusable (20.2 step 2's "moves to faulty or in_storage") |
+   | `in_storage` | `decommissioned` | permanently retiring a shelf device |
+   | `registered` | `decommissioned` | retiring before it is ever placed anywhere |
+   | `prepared` | `decommissioned` | retiring after "prepare" but before a device ever registers |
+   | `faulty` | `decommissioned` | retiring a broken device outright, no reuse |
+
+   Every other one of the 49 possible `(current, target)` pairs is
+   **refused**, in particular:
+   - `in_service -> *` is not in the table **at all** -- the only way out
+     of `in_service` is `Storage.remove_device` (below), which closes the
+     assignment, revokes the token, and sets the new state together,
+     atomically. Allowing it here would let a landlord flip a device's
+     state out from under an apartment whose assignment table still says
+     that device is deployed.
+   - `decommissioned -> *` is refused unconditionally (**terminal**,
+     20.1's own table: "permanently out of circulation, token revoked").
+   - `* -> prepared`/`* -> reported`/`* -> in_service` are never manual --
+     P4.2/P4.2b's flows are the only paths into those three values.
+   - `in_storage -> prepared` (reusing a shelf device for a *different*
+     apartment) is **explicitly not built here** -- the work package's own
+     instruction: "belongs to P4.2 (it demands the 'reset' confirmation)".
+
+   `fleet.device_lifecycle.validate_manual_device_transition` is the
+   **one place** this table is checked -- `Storage.change_device_state`
+   calls straight into it (defence in depth: the check is enforced at the
+   storage layer, not only trusted from the UI form's own restricted
+   drop-down), and the UI's per-device state-change form
+   (`fleet.device_lifecycle.allowed_manual_target_states`) only ever
+   offers the targets that table would accept, so a landlord never sees an
+   option the backend would then refuse. Exhaustively unit-tested over all
+   7 x 7 = 49 pairs: `tests/test_device_lifecycle.py
+   ::test_exhaustive_7x7_transition_table` (parametrized), plus targeted
+   tests for the terminal/never-manual/`in_service`-exclusion properties
+   above.
+
+2. **"Gerät ausbauen / tauschen" (`Storage.remove_device`, section 20.2
+   device-swap steps 1-2)** -- one atomic transaction:
+   - closes the apartment's currently open assignment (`ended_at` = now,
+     `reason` = the given reason -- overwriting the assignment's own
+     creation-time reason, read as the work package's "close ... with
+     until = now + reason" meaning the *closing* reason, not the original
+     commissioning one);
+   - sets the removed device's state to `faulty` or `in_storage`
+     (`fleet.device_lifecycle.REMOVE_DEVICE_TARGET_STATES` -- the only two
+     choices this action offers, section 20.2: "the old one moves to
+     faulty or in_storage");
+   - **revokes the apartment's agent token** (`token_hash = NULL` --
+     section 20.2: "revokes the old device's token", 15.5);
+   - writes **three** audit-log rows, one per kind of change (section
+     20.3: "every change to assignment, state, or token is logged" -- read
+     as three kinds of change, three rows, not one folded row).
+
+   **Safe under a concurrent double removal, proven under real threads,
+   not only argued** (`tests/test_storage.py
+   ::test_remove_device_concurrent_double_removal_only_one_wins`, run 10x
+   during verification with no flake): the assignment close is one atomic
+   `UPDATE ... WHERE id = <this row> AND ended_at IS NULL`, the same
+   pattern `_insert_heartbeats_ignoring_conflicts`
+   (P2.1b)/`reserve_ip_login_attempt` (P3.0) already established for this
+   class of race, not a read-then-write. The losing call's `UPDATE`
+   affects zero rows and raises `ValueError` before writing anything else
+   -- exactly one winner, no double state change, no double token
+   revocation, no double audit row.
+
+   **Rolled back atomically on any failure, proven by forcing one**
+   (`tests/test_storage.py
+   ::test_remove_device_rolls_back_everything_if_a_step_fails`,
+   monkeypatches `Storage._write_inventory_audit_log` to raise on its
+   third call within the transaction): the assignment is still open, the
+   device is still `in_service`, and the token is still present
+   afterward -- `Storage.session()`'s existing rollback-on-exception
+   context manager (P1.3) is what makes this true, not new code in
+   `remove_device` itself.
+
+   **After revocation, a real agent request with the old token gets 403,
+   proven at the HTTP level against a real `POST /v1/heartbeat`**
+   (`tests/test_ui_inventory.py
+   ::test_replace_device_submit_old_token_gets_403_on_a_real_heartbeat`) --
+   `fleet/auth.py` is untouched (per the work package); the same
+   `require_apartment_token_by_hash` -> `WHERE token_hash == <hash>`
+   lookup P4.1 already proved correct for a `NULL` column value applies
+   unchanged here.
+
+**UI (`fleet/ui_routes.py`, `fleet/ui_inventory.py`, `fleet/templates/ui/
+{inventory,inventory_replace_device}.html`), CSRF-checked, `Cache-Control:
+no-store`, no inline style/script, German texts:**
+
+- **`GET`/`POST /ui/inventory/apartments/{id}/replace-device`** -- the
+  confirmation form: target state of the removed device, a mandatory
+  reason, and the shelf (`in_storage`/`registered` devices) each linking
+  to `/ui/inventory/devices/{id}/prepare` (P4.2's own route -- **only a
+  link, no assignment is made here**, per the project owner's decision
+  above). 404 for an unknown apartment or one with no device currently
+  assigned (`fleet.ui_inventory.build_replace_device_view` returns `None`
+  for both, deliberately the same response for both -- there is nothing
+  to remove either way, and distinguishing them is not worth a second
+  branch for what the landlord would do next regardless: pick a different
+  apartment).
+- **`POST /ui/inventory/devices/{id}/state`** -- the per-device
+  state-change form embedded directly on `/ui/inventory` (only the manual
+  transitions `fleet.device_lifecycle` allows *from that device's current
+  state* are offered, so a `decommissioned`/`in_service` device renders no
+  form at all, proven by `tests/test_ui_inventory.py
+  ::test_inventory_view_shows_state_change_form_only_for_allowed_targets`).
+  404 for an unknown device.
+- A `Gerät ausbauen/tauschen` link is shown next to any apartment row that
+  currently has a device assigned (`fleet.ui_inventory.ApartmentRow
+  .replace_device_href`, `None` -- no link rendered -- otherwise).
+
+**Integration note for P4.2 (built in parallel, not yet merged at the time
+this package was written): decommissioning must also invalidate any
+pending registration.** The work package's own instruction: "if P4.2's
+table exists at merge time the main session will wire it; for now document
+that P4.2 must honour `decommissioned`." Not built here -- P4.2 owns its
+own registration-code table (migration `0007`) and did not exist in this
+worktree's branch history at the time P4.3 was implemented. `Storage
+.change_device_state`'s docstring and this note are the hand-off; the main
+session should add "decommissioning a device with a pending registration
+also invalidates that registration" to P4.2's own storage method, or add a
+narrow cross-check here, once both branches are merged together.
+
+**Invariant checked directly, not just assumed: a `decommissioned` device
+has no open assignment, so there is no token to revoke via this path.**
+`Storage.change_device_state` never touches `ApartmentRecord.token_hash`
+at all (only `Storage.remove_device` does, and only for the apartment
+whose *open* assignment it closes) -- a device reaching `decommissioned`
+through this form was, per the transition table above, already
+`registered`/`prepared`/`in_storage`/`faulty` beforehand, none of which
+carry an open assignment (only `in_service` does, and `in_service` is
+never a source in this table) -- there is structurally nothing for this
+path to revoke. `test_change_device_state_decommissioned_is_terminal`
+(and every other `change_device_state` test) never touches
+`ApartmentRecord` at all, which is itself the proof: nothing in that
+method's code path reaches an apartment row.
+
+**Tests.** `tests/test_device_lifecycle.py` (new, 59 tests): the
+exhaustive 7x7 transition table, the terminal/`in_service`/never-into
+properties above, `allowed_manual_target_states`. `tests/test_storage.py`
+gained 16 new tests (`change_device_state`: allowed transition, exactly
+one audit row, unknown device, empty reason, disallowed transition writes
+nothing, `in_service` refused, `decommissioned` terminal;
+`remove_device`: success to both target states, three audit rows, unknown
+target state, empty reason, unknown apartment, no open assignment, the
+forced-rollback test, the concurrent-double-removal test run 10x during
+verification). `tests/test_ui_inventory.py` gained 23 new tests: every new
+route's auth/CSRF/404/validation-error path (including the two over-length
+`reason` cases and the unknown-target-state case that reaches `Storage
+.remove_device`'s own `ValueError`), the successful state change and
+remove/replace flow (asserting storage side effects and audit rows), the
+old-token-gets-403-on-a-real-heartbeat test, the state-change form only
+appearing for devices with allowed targets, the replace-device link only
+appearing for an assigned apartment, and the new template's
+inline-style/script check.
+
+Verification for this round (fresh venv, `python3.13 -m venv`,
+`pip install -e ".[dev,fleet,agent]"` -- SQLAlchemy 2.1.1, mypy 2.3.1):
+`ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all clean;
+`python -m pytest -W ignore::ResourceWarning` (591 passed, 99% coverage
+overall, every P4.3 file -- `fleet/device_lifecycle.py`, `fleet/storage.py`,
+`fleet/ui_inventory.py`, `fleet/ui_routes.py` -- at 100%); both concurrency
+tests (`test_remove_device_concurrent_double_removal_only_one_wins`, plus
+P4.1's own `test_partial_unique_index_for_assignments_is_safe_under_
+concurrent_calls`) re-run 10x in a row, no flake.
+
 ## Inventory foundation + "Inventar" view (P4.1, section 20, absorbs P3.3)
 
 **Decisions by the project owner, 2026-09-26 (do not re-open, see this

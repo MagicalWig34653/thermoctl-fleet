@@ -55,6 +55,7 @@ from fleet.ui_inventory import (
     MAX_REASON_LENGTH,
     MAX_VERSION_LENGTH,
     build_inventory_view,
+    build_replace_device_view,
 )
 from fleet.ui_tasks import build_task_overview
 from protocol.inventory import ApartmentState
@@ -712,6 +713,159 @@ def apartment_edit_submit(
         ui_username=authenticated.user.username,
         reason=reason.strip(),
     )
+    return RedirectResponse(url="/ui/inventory", status_code=303)
+
+
+@router.get(
+    "/inventory/apartments/{apartment_id}/replace-device", response_class=HTMLResponse
+)
+def replace_device_form(
+    request: Request,
+    apartment_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """"Gerät ausbauen / tauschen" (P4.3, section 20.2 device-swap steps
+    1-2) -- the confirmation form: target state of the removed device
+    (`faulty`/`in_storage`), a mandatory reason, and an optional
+    pre-selected replacement device off the shelf linking straight to
+    P4.2's "Vorbereiten" route (only a link, no assignment happens here --
+    see `fleet.ui_inventory.build_replace_device_view`'s own docstring).
+    404 for an unknown apartment or one with no device currently assigned
+    (nothing to remove)."""
+
+    view = build_replace_device_view(storage, apartment_id)
+    if view is None:
+        raise HTTPException(
+            status_code=404, detail="Unbekannte Wohnung oder kein Gerät zugewiesen."
+        )
+
+    response = templates.TemplateResponse(
+        request,
+        "inventory_replace_device.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "view": view,
+            "error": None,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/inventory/apartments/{apartment_id}/replace-device")
+def replace_device_submit(
+    request: Request,
+    apartment_id: str,
+    target_state: str = Form(...),
+    reason: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Applies "Gerät ausbauen / tauschen" -- closes the apartment's open
+    assignment, sets the removed device's state, and revokes the
+    apartment's agent token, all in one transaction
+    (`Storage.remove_device`, see its own docstring for why an agent
+    request with the old token gets 403 immediately afterward)."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    view = build_replace_device_view(storage, apartment_id)
+    if view is None:
+        raise HTTPException(
+            status_code=404, detail="Unbekannte Wohnung oder kein Gerät zugewiesen."
+        )
+
+    def _error(message: str) -> HTMLResponse:
+        response = templates.TemplateResponse(
+            request,
+            "inventory_replace_device.html",
+            {
+                "ui_session": authenticated,
+                "csrf_token": authenticated.session.csrf_token,
+                "view": view,
+                "error": message,
+            },
+            status_code=400,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    if not reason.strip():
+        return _error("Ein Grund ist erforderlich.")
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        return _error(length_error)
+
+    try:
+        storage.remove_device(
+            apartment_id,
+            target_state=target_state,
+            reason=reason.strip(),
+            ui_username=authenticated.user.username,
+            now=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return _error(str(exc))
+
+    return RedirectResponse(url="/ui/inventory", status_code=303)
+
+
+@router.post("/inventory/devices/{device_id}/state")
+def device_state_submit(
+    request: Request,
+    device_id: str,
+    target_state: str = Form(...),
+    reason: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """The per-device "change state" form on `/ui/inventory` (P4.3, section
+    20.1). Only the manual transitions
+    `fleet.device_lifecycle.ALLOWED_MANUAL_DEVICE_TRANSITIONS` permits are
+    ever applied -- `Storage.change_device_state` re-checks this itself
+    (the same table, not a second one) and raises `ValueError` for
+    anything else, including every transition out of `in_service` (only
+    "Gerät ausbauen/tauschen" -- `replace_device_submit` above -- may end
+    an `in_service` device's state) and out of `decommissioned` (terminal).
+    """
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    if storage.get_device(device_id) is None:
+        raise HTTPException(status_code=404, detail="Unbekanntes Gerät.")
+
+    if not reason.strip():
+        return _inventory_response(
+            request,
+            storage,
+            authenticated,
+            device_filter=None,
+            error="Ein Grund ist erforderlich.",
+            status_code=400,
+        )
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        return _inventory_response(
+            request, storage, authenticated, device_filter=None, error=length_error,
+            status_code=400,
+        )
+
+    try:
+        storage.change_device_state(
+            device_id, target_state, reason.strip(), authenticated.user.username
+        )
+    except ValueError as exc:
+        return _inventory_response(
+            request, storage, authenticated, device_filter=None, error=str(exc),
+            status_code=400,
+        )
+
     return RedirectResponse(url="/ui/inventory", status_code=303)
 
 
