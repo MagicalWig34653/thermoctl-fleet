@@ -2,6 +2,149 @@
 
 Last updated: 2026-09-26.
 
+## Cross-review fixes: P5.6 registry path, resumability, manifest digests
+
+Five findings from P5.6's own cross-review (R1-R5) plus one further,
+deeper finding from the main session's read-back (the state file's digest
+is a *registry manifest* digest, not a local image ID) -- all fixed in the
+same worktree, one commit, before P5.6 merges.
+
+**R1/R5 -- `docker run` without `--pull=never` could reach a registry, and
+had no restart policy at all.** Both traced back to the same root cause:
+`Start` ran the digest directly (`docker run -d --name thermoctl-agent
+<digest>`), a command with no volumes, no environment, and -- the sharper
+problem -- no restart policy, so Docker never counted a restart and
+"the container restarted three times in a row" (section 17 step 5) could
+never actually trigger. **Decided (main session): the agent's real run
+configuration lives in a fixed compose file shipped with the system
+image**, `image/common/agent-compose.yml` -- `pull_policy: never` (R1) and
+`restart: on-failure` (so `RestartCount` means something, and Docker does
+not fight the watchdog by resurrecting a container the agent stopped
+*itself* to swap). `watchdog/runtime.go`'s `cliRuntime.Start` now does
+exactly two things, no more: tag the digest locally (no network), then
+`docker compose -f <fixed path> up -d --pull never --force-recreate agent`
+(`--pull never` again, belt and suspenders with the file's own
+`pull_policy`). The compose file is never sent by the cloud -- section 13's
+"no arbitrary compose files" is about what the cloud may hand the agent,
+not about this one fixed file baked into the image like
+`thermoctl-watchdog.service`. New flag `-runtime-compose` (default
+`/etc/thermoctl-agent/compose.yml`); the container name is no longer a
+flag at all (`agentContainerName` constant, fixed by the compose file's
+own `container_name` -- two places to keep in sync by hand was worse than
+one fixed name). `tools/check_image_config.py` gained
+`check_agent_compose_file` (plausibility only, no YAML parser pulled in:
+checks the handful of substrings that would silently defeat R1/R5 if
+lost).
+
+**R4 -- a digest was never validated before reaching argv.** A value
+starting with `-` would have been parsed as a command-line option, not an
+image reference. Fixed with `digestPattern` (`^sha256:[0-9a-f]{64}$`),
+checked in `Start` before anything is even tagged.
+
+**R2 -- resumability: a watchdog restart mid-swap could never roll back an
+unhealthy revision.** `Reconcile` used to treat "the agent is running" as
+"nothing to do", full stop -- if the watchdog itself died and restarted
+while a new, still-unproven digest was running, it would see that digest
+running and return OK forever, never checking whether it had actually
+proved itself within the deadline. Fixed by anchoring `AwaitHealthReport`'s
+deadline to the state file's own `since` (`time.Unix(s.Since,
+0).Add(10*time.Minute)`, section 22.2) instead of to whenever the call
+happened to start, and by having `Reconcile` re-enter the await/rollback
+path whenever the running digest already equals `desired` but `desired !=
+proven` -- resuming with whatever time is actually left, immediate
+rollback if the deadline has already passed. `now func() time.Time` joins
+`sleep` as an injected parameter (still no `Clock` type, still no real
+wait in tests).
+
+**R3 -- `runtime.go` had no tests at all.** Fixed with `execCommand`, a
+package variable standing in for `exec.Command` (`var execCommand =
+exec.Command`) that tests swap for a recording fake -- the exact argv
+`Start`/`Status` build is asserted directly (in particular that `--pull
+never` is present, and that every refused digest -- empty, `-rm`, wrong
+length, non-hex, or already carrying a repo prefix -- never reaches
+`execCommand` at all), without ever touching Docker.
+
+**Deeper finding, main session (read while fixing R1-R5): `desired`/
+`proven` are registry *manifest* digests, not local image IDs.** Section
+13's desired state carries `"digest": "sha256:..."` -- the manifest digest
+the agent already checked against the hard-coded sources (security
+principle 2) before ever writing the state file. `docker inspect -f
+'{{.Image}}'` reports something else entirely: the *local image ID* (a
+content hash of the image config), a different value for the same image.
+Worse, `docker tag sha256:<manifest digest> ...` does not resolve at all --
+only `<repo>@sha256:<manifest digest>` does, and only for an image the
+agent actually pulled by digest (so it carries that reference in its
+`RepoDigests`). Both `Start` (tagging) and `Status` (comparing the running
+digest against `s.Desired`) were wrong as originally written.
+
+**Fixed: a new `-runtime-repo` flag** (default
+`ghcr.io/magicalwig34653/thermoctl-agent`) **-- the agent's own hard-coded
+image source (security principle 2), never the cloud's to name**, only a
+flag default the operator confirms matches `agent/`'s own source list
+before shipping an image. `Start` now tags `<repo>@<digest>` (still no
+network -- `docker tag` only ever resolves something already local, it
+just needed the right reference shape). `Status` now does two `inspect`
+calls where it used to do one: the container's running state, restart
+count, and local image ID, then (`cliRuntime.repoDigest`) `docker image
+inspect -f '{{range .RepoDigests}}{{.}} {{end}}' <image ID>` on that ID,
+matching entries against `<repo>@` and returning the manifest digest after
+the `@`. No matching entry (an image pulled by tag, or from an unrelated
+source) reports an empty digest, which `Reconcile` already treats as
+"something other than desired is running" -- never a false positive match.
+**Contract clarification for P5.4 (agent-side desired-state
+reconciliation), not yet built:** the agent must pull the agent image by
+digest (`<repo>@sha256:...`), not by tag, or the running container will
+have no matching `RepoDigests` entry and the watchdog can never confirm it
+is healthy.
+
+**Line budget: three named functions retired, none of the four required
+capabilities lost.** `AgentStopped` and `StartDigest` -- both from the
+original P5.6 task -- are gone as separate package-level functions.
+Neither survived as *dead* code: `Reconcile` needed the running digest in
+the same `Status` call `AgentStopped` would have made on its own (a
+second, redundant call to check only the boolean half of the same answer
+would have cost more, not less), and `StartDigest` had exactly one call
+site once `Reconcile` existed. Both bodies are inlined at that one call
+site instead, with a comment at each pointing to why. The underlying
+capabilities (section 17 steps 3 and 4) are unchanged and still fully
+exercised -- by `Reconcile`'s own test suite now, where before they had
+their own direct tests. This was not a line-count-first decision: it was
+the reviewer's own two suggested savings (collapsing `Reconcile`'s final
+return, reusing `parseOptionalTimestamp` in `ParseHealth`) plus real
+restructuring (the deadline-as-poll-count trick from before this round
+had to be reverted for R2's sake, which cost lines back) that made it
+necessary to look for more, and these two really were dead weight by the
+time `Reconcile` existed. Documented here in the spirit of section 22's
+introduction, in case a later reader wonders where they went.
+
+Measured with the same counting command as before: `grep -v '^\s*//'
+<file> | grep -v '^\s*$' | wc -l`, summed across the seven production
+files. **299 statement lines** (unchanged from before this round, net: R1
+-5's compose/argv rework and the manifest-digest fix added real weight,
+`repoDigest` alone is new; removing the two dead functions and the
+reviewer's two suggested savings paid for almost all of it). Per file:
+`main.go` 55, `watch.go` 66, `state.go` 39, `health.go` 27, `leds.go` 19,
+`linefile.go` 47, `runtime.go` 46. **1 line of headroom before 300** --
+P5.7 (LED wiring) will need to trim further, not just add; `linefile.go`'s
+`openAndParse` and this round's dead-function removal are the two
+precedents to follow first.
+
+**Tests: `go vet ./...` clean, `go test -count=1 ./...` green three runs
+in a row, no flake, 46 tests** (up from 41: three `AgentStopped`/
+`StartDigest`-specific tests retired along with the functions, replaced by
+one `Reconcile`-level status-error test, against eight new ones -- R3's
+`runtime.go` argv tests (none existed before this round at all: refusing
+every kind of bad digest, tagging `<repo>@<digest>`, `--pull never`
+present, resolving a manifest digest out of `RepoDigests`, and reporting
+"" on no match), plus R2's two resumed-mid-swap `Reconcile` tests and two
+more `AwaitHealthReport` deadline-anchoring tests). `check_contract.sh`
+passes unchanged -- neither the state
+file nor the health report format changed. `gofmt -l .` empty. Python
+side: `ruff check .` clean; `python -m tools.check_image_config` passes
+(new `check_agent_compose_file`); `pytest tests/test_watchdog_contract.py
+tests/test_image_config.py` 15 passed (up from 13: two new compose-file
+plausibility tests).
+
 ## P5.6 -- watchdog main loop implemented (`watchdog/watch.go`, `main.go`)
 
 `AgentStopped`, `StartDigest`, `AwaitHealthReport`, `RollBackToProven` are

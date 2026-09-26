@@ -40,11 +40,29 @@ func (f *fakeRuntime) Start(digest string) error {
 	return nil
 }
 
-// noSleep counts calls instead of ever actually waiting -- AwaitHealthReport's
-// 10-minute deadline must never cost a test real time.
-func noSleep(calls *int) func(time.Duration) {
-	return func(time.Duration) { *calls++ }
+// testNow anchors every test's notion of "the current time" -- Since
+// values are computed relative to it, never to a real clock (cross-review
+// R2: AwaitHealthReport's deadline is now anchored to Since, so tests must
+// keep Since and "now" consistent with each other, not just with zero).
+var testNow = time.Unix(1_700_000_000, 0)
+
+// fakeClock lets a test control both Now and Sleep from one shared,
+// virtual point in time -- sleep advances it, now reads it -- so the
+// 10-minute deadline is exercised deterministically, never a real wait.
+type fakeClock struct {
+	t      time.Time
+	sleeps int
 }
+
+func newFakeClock() *fakeClock { return &fakeClock{t: testNow} }
+
+func (c *fakeClock) now() time.Time        { return c.t }
+func (c *fakeClock) sleep(d time.Duration) { c.t = c.t.Add(d); c.sleeps++ }
+
+// fullWindowPolls is how many times AwaitHealthReport sleeps while waiting
+// out a fresh, un-resumed 10-minute deadline -- used to tell "waited the
+// remainder" apart from "waited a fresh window" in the resumability tests.
+const fullWindowPolls = int(10 * time.Minute / healthPollInterval)
 
 func writeHealth(t *testing.T, digest string, timestamp int64) string {
 	t.Helper()
@@ -56,85 +74,67 @@ func writeHealth(t *testing.T, digest string, timestamp int64) string {
 	return path
 }
 
-func TestAgentStoppedReportsRunning(t *testing.T) {
-	rt := &fakeRuntime{running: true}
-	stopped, err := AgentStopped(rt)
-	if err != nil || stopped {
-		t.Fatalf("stopped=%v err=%v, expected not stopped", stopped, err)
-	}
-}
-
-func TestAgentStoppedReportsStopped(t *testing.T) {
-	rt := &fakeRuntime{running: false}
-	stopped, err := AgentStopped(rt)
-	if err != nil || !stopped {
-		t.Fatalf("stopped=%v err=%v, expected stopped", stopped, err)
-	}
-}
-
-func TestAgentStoppedPropagatesRuntimeError(t *testing.T) {
+func TestReconcileRuntimeStatusErrorIsReported(t *testing.T) {
+	// Step 3 ("has the agent stopped?") is now read as part of Reconcile's
+	// own Status call rather than through a separate AgentStopped -- this
+	// is that error path's test.
 	rt := &fakeRuntime{statusErr: errors.New("runtime unreachable")}
-	if _, err := AgentStopped(rt); err == nil {
+	s := State{Desired: "sha256:new", Proven: "sha256:old"}
+	clock := newFakeClock()
+
+	if _, err := Reconcile(rt, s, "unused", clock.now, clock.sleep); err == nil {
 		t.Fatal("expected error did not occur")
 	}
 }
 
-func TestStartDigestStartsDesired(t *testing.T) {
-	rt := &fakeRuntime{}
-	if err := StartDigest(rt, State{Desired: "sha256:9f2c"}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(rt.startedFor) != 1 || rt.startedFor[0] != "sha256:9f2c" {
-		t.Fatalf("started %v, expected exactly [sha256:9f2c]", rt.startedFor)
-	}
-}
-
-func TestStartDigestReportsRuntimeFailure(t *testing.T) {
-	rt := &fakeRuntime{startErr: map[string]error{"sha256:9f2c": errors.New("no such image")}}
-	if err := StartDigest(rt, State{Desired: "sha256:9f2c"}); err == nil {
-		t.Fatal("expected error did not occur")
-	}
-}
+// Starting the desired digest itself (step 4) is exercised through
+// Reconcile now (no more separate StartDigest): the success path by
+// TestReconcileDesiredEqualsProvenJustRestarts and TestReconcileSwapSucceeds,
+// the failure path by TestReconcileStartFailureIsReportedNotRolledBack
+// below.
 
 func TestAwaitHealthReportHappyPath(t *testing.T) {
-	health := writeHealth(t, "sha256:new", 1000)
+	since := testNow.Unix()
+	health := writeHealth(t, "sha256:new", since)
 	rt := &fakeRuntime{}
-	sleeps := 0
+	clock := newFakeClock()
 
-	reason, err := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: 500}, noSleep(&sleeps))
+	reason, err := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
 	if err != nil || reason != "" {
 		t.Fatalf("reason=%q err=%v, expected healthy", reason, err)
 	}
-	if sleeps != 0 {
-		t.Errorf("slept %d times, expected an immediate match with no sleep", sleeps)
+	if clock.sleeps != 0 {
+		t.Errorf("slept %d times, expected an immediate match with no sleep", clock.sleeps)
 	}
 }
 
 func TestAwaitHealthReportMissingRollsBackAfterDeadline(t *testing.T) {
+	since := testNow.Unix()
 	missing := filepath.Join(t.TempDir(), "never-written.env")
 	rt := &fakeRuntime{}
-	sleeps := 0
+	clock := newFakeClock()
 
-	reason, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new", Since: 500}, noSleep(&sleeps))
+	reason, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if reason == "" {
 		t.Fatal("expected a non-empty reason, got healthy")
 	}
-	if sleeps != maxHealthPolls {
-		t.Errorf("slept %d times, expected the full %d polls of the deadline", sleeps, maxHealthPolls)
+	if clock.sleeps != fullWindowPolls {
+		t.Errorf("slept %d times, expected the full %d polls of a fresh deadline", clock.sleeps, fullWindowPolls)
 	}
 }
 
 func TestAwaitHealthReportWrongDigestTreatedAsMissing(t *testing.T) {
 	// A health report left behind by the previous revision must not fake a
 	// healthy new one (section 22.3).
-	health := writeHealth(t, "sha256:old", 999999)
+	since := testNow.Unix()
+	health := writeHealth(t, "sha256:old", since+999)
 	rt := &fakeRuntime{}
-	sleeps := 0
+	clock := newFakeClock()
 
-	reason, err := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: 500}, noSleep(&sleeps))
+	reason, err := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -146,11 +146,12 @@ func TestAwaitHealthReportWrongDigestTreatedAsMissing(t *testing.T) {
 func TestAwaitHealthReportStaleTimestampTreatedAsMissing(t *testing.T) {
 	// A report older than Since is left behind by the revision being
 	// replaced, not proof the new one is alive (section 22.2).
-	health := writeHealth(t, "sha256:new", 100)
+	since := testNow.Unix()
+	health := writeHealth(t, "sha256:new", since-1)
 	rt := &fakeRuntime{}
-	sleeps := 0
+	clock := newFakeClock()
 
-	reason, _ := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: 500}, noSleep(&sleeps))
+	reason, _ := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
 	if reason == "" {
 		t.Fatal("expected a non-empty reason for the stale timestamp, got healthy")
 	}
@@ -159,27 +160,67 @@ func TestAwaitHealthReportStaleTimestampTreatedAsMissing(t *testing.T) {
 func TestAwaitHealthReportThreeRestartsRollsBackImmediately(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "never-written.env")
 	rt := &fakeRuntime{restarts: 3}
-	sleeps := 0
+	clock := newFakeClock()
 
-	reason, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new"}, noSleep(&sleeps))
+	reason, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new", Since: testNow.Unix()}, clock.now, clock.sleep)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if reason == "" {
 		t.Fatal("expected a non-empty reason for the restart loop, got healthy")
 	}
-	if sleeps != 0 {
-		t.Errorf("slept %d times, expected an immediate rollback with no sleep", sleeps)
+	if clock.sleeps != 0 {
+		t.Errorf("slept %d times, expected an immediate rollback with no sleep", clock.sleeps)
 	}
 }
 
 func TestAwaitHealthReportPropagatesRuntimeError(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "never-written.env")
 	rt := &fakeRuntime{statusErr: errors.New("runtime unreachable")}
-	sleeps := 0
+	clock := newFakeClock()
 
-	if _, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new"}, noSleep(&sleeps)); err == nil {
+	if _, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new", Since: testNow.Unix()}, clock.now, clock.sleep); err == nil {
 		t.Fatal("expected error did not occur")
+	}
+}
+
+// Cross-review R2: the deadline is anchored to Since, not to whenever this
+// call happens to start -- a watchdog restart mid-window must resume with
+// only the time actually left, not a fresh 10 minutes.
+
+func TestAwaitHealthReportDeadlineAlreadyPassedRollsBackImmediately(t *testing.T) {
+	since := testNow.Add(-11 * time.Minute).Unix() // 10-minute deadline already elapsed a minute ago
+	missing := filepath.Join(t.TempDir(), "never-written.env")
+	rt := &fakeRuntime{}
+	clock := newFakeClock()
+
+	reason, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reason == "" {
+		t.Fatal("expected a non-empty reason, got healthy")
+	}
+	if clock.sleeps != 0 {
+		t.Errorf("slept %d times, expected zero -- the deadline was already behind us", clock.sleeps)
+	}
+}
+
+func TestAwaitHealthReportWaitsOnlyTheRemainderWhenResumed(t *testing.T) {
+	since := testNow.Add(-9 * time.Minute).Unix() // 1 minute of the 10 left
+	missing := filepath.Join(t.TempDir(), "never-written.env")
+	rt := &fakeRuntime{}
+	clock := newFakeClock()
+
+	reason, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reason == "" {
+		t.Fatal("expected a non-empty reason, got healthy")
+	}
+	if clock.sleeps == 0 || clock.sleeps >= fullWindowPolls {
+		t.Errorf("slept %d times, expected only the ~1-minute remainder, well under a fresh %d", clock.sleeps, fullWindowPolls)
 	}
 }
 
@@ -212,49 +253,52 @@ func TestRollBackToProvenReportsRuntimeFailure(t *testing.T) {
 	}
 }
 
-func TestReconcileAgentStillRunningDoesNothing(t *testing.T) {
-	rt := &fakeRuntime{running: true}
+func TestReconcileAgentRunningSomethingElseLeftAlone(t *testing.T) {
+	rt := &fakeRuntime{running: true, digest: "sha256:unrelated"}
 	s := State{Desired: "sha256:new", Proven: "sha256:old"}
+	clock := newFakeClock()
 
-	outcome, err := Reconcile(rt, s, "unused", noSleep(new(int)))
+	outcome, err := Reconcile(rt, s, "unused", clock.now, clock.sleep)
 	if err != nil || outcome != OutcomeOK {
 		t.Fatalf("outcome=%v err=%v, expected OutcomeOK/nil", outcome, err)
 	}
 	if len(rt.startedFor) != 0 {
-		t.Fatalf("started %v, expected no action while the agent is running", rt.startedFor)
+		t.Fatalf("started %v, expected no action", rt.startedFor)
 	}
 }
 
 func TestReconcileDesiredEqualsProvenJustRestarts(t *testing.T) {
 	rt := &fakeRuntime{running: false}
 	s := State{Desired: "sha256:same", Proven: "sha256:same"}
-	sleeps := 0
+	clock := newFakeClock()
 
-	outcome, err := Reconcile(rt, s, "unused", noSleep(&sleeps))
+	outcome, err := Reconcile(rt, s, "unused", clock.now, clock.sleep)
 	if err != nil || outcome != OutcomeOK {
 		t.Fatalf("outcome=%v err=%v, expected OutcomeOK/nil", outcome, err)
 	}
 	if len(rt.startedFor) != 1 || rt.startedFor[0] != "sha256:same" {
 		t.Fatalf("started %v, expected exactly one start of sha256:same", rt.startedFor)
 	}
-	if sleeps != 0 {
-		t.Errorf("slept %d times, expected no await/rollback dance -- nothing to swap", sleeps)
+	if clock.sleeps != 0 {
+		t.Errorf("slept %d times, expected no await/rollback dance -- nothing to swap", clock.sleeps)
 	}
 }
 
 func TestReconcileSwapSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	health := filepath.Join(dir, "health.env")
+	since := testNow.Unix()
 	rt := &fakeRuntime{running: false}
 	rt.afterStart = func() {
-		content := "timestamp=1000\ndigest=sha256:new\nversion=0.5.0\n"
+		content := fmt.Sprintf("timestamp=%d\ndigest=sha256:new\nversion=0.5.0\n", since)
 		if err := os.WriteFile(health, []byte(content), 0o600); err != nil {
 			t.Fatalf("setup failed: %v", err)
 		}
 	}
-	s := State{Desired: "sha256:new", Proven: "sha256:old", Since: 500}
+	s := State{Desired: "sha256:new", Proven: "sha256:old", Since: since}
+	clock := newFakeClock()
 
-	outcome, err := Reconcile(rt, s, health, noSleep(new(int)))
+	outcome, err := Reconcile(rt, s, health, clock.now, clock.sleep)
 	if err != nil || outcome != OutcomeOK {
 		t.Fatalf("outcome=%v err=%v, expected OutcomeOK/nil", outcome, err)
 	}
@@ -265,9 +309,10 @@ func TestReconcileSwapSucceeds(t *testing.T) {
 
 func TestReconcileRollsBackWhenHealthNeverArrives(t *testing.T) {
 	rt := &fakeRuntime{running: false}
-	s := State{Desired: "sha256:new", Proven: "sha256:old", Since: 500}
+	s := State{Desired: "sha256:new", Proven: "sha256:old", Since: testNow.Unix()}
+	clock := newFakeClock()
 
-	outcome, err := Reconcile(rt, s, filepath.Join(t.TempDir(), "missing.env"), noSleep(new(int)))
+	outcome, err := Reconcile(rt, s, filepath.Join(t.TempDir(), "missing.env"), clock.now, clock.sleep)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -281,9 +326,10 @@ func TestReconcileRollsBackWhenHealthNeverArrives(t *testing.T) {
 
 func TestReconcileRollsBackAfterThreeRestarts(t *testing.T) {
 	rt := &fakeRuntime{running: false, restarts: 3}
-	s := State{Desired: "sha256:new", Proven: "sha256:old"}
+	s := State{Desired: "sha256:new", Proven: "sha256:old", Since: testNow.Unix()}
+	clock := newFakeClock()
 
-	outcome, err := Reconcile(rt, s, filepath.Join(t.TempDir(), "missing.env"), noSleep(new(int)))
+	outcome, err := Reconcile(rt, s, filepath.Join(t.TempDir(), "missing.env"), clock.now, clock.sleep)
 	if err != nil || outcome != OutcomeRolledBack {
 		t.Fatalf("outcome=%v err=%v, expected OutcomeRolledBack/nil", outcome, err)
 	}
@@ -291,9 +337,10 @@ func TestReconcileRollsBackAfterThreeRestarts(t *testing.T) {
 
 func TestReconcileEmptyProvenReportsErrorWithoutAction(t *testing.T) {
 	rt := &fakeRuntime{running: false}
-	s := State{Desired: "sha256:new", Proven: ""}
+	s := State{Desired: "sha256:new", Proven: "", Since: testNow.Unix()}
+	clock := newFakeClock()
 
-	outcome, err := Reconcile(rt, s, filepath.Join(t.TempDir(), "missing.env"), noSleep(new(int)))
+	outcome, err := Reconcile(rt, s, filepath.Join(t.TempDir(), "missing.env"), clock.now, clock.sleep)
 	if err == nil {
 		t.Fatal("expected error did not occur")
 	}
@@ -310,8 +357,9 @@ func TestReconcileStartFailureIsReportedNotRolledBack(t *testing.T) {
 	// start is only reported -- see Reconcile's own comment.
 	rt := &fakeRuntime{running: false, startErr: map[string]error{"sha256:same": errors.New("no such image")}}
 	s := State{Desired: "sha256:same", Proven: "sha256:same"}
+	clock := newFakeClock()
 
-	outcome, err := Reconcile(rt, s, "unused", noSleep(new(int)))
+	outcome, err := Reconcile(rt, s, "unused", clock.now, clock.sleep)
 	if err == nil {
 		t.Fatal("expected error did not occur")
 	}
@@ -320,5 +368,42 @@ func TestReconcileStartFailureIsReportedNotRolledBack(t *testing.T) {
 	}
 	if len(rt.startedFor) != 1 {
 		t.Fatalf("started %v, expected exactly one attempt, no crash loop", rt.startedFor)
+	}
+}
+
+// Cross-review R2: the watchdog itself may have restarted mid-swap -- a
+// running container on s.Desired must not be mistaken for "done" without
+// checking whether it has actually proved itself yet.
+
+func TestReconcileResumedMidSwapPastDeadlineRollsBack(t *testing.T) {
+	rt := &fakeRuntime{running: true, digest: "sha256:new"}
+	s := State{Desired: "sha256:new", Proven: "sha256:old", Since: testNow.Add(-11 * time.Minute).Unix()}
+	clock := newFakeClock()
+
+	outcome, err := Reconcile(rt, s, filepath.Join(t.TempDir(), "missing.env"), clock.now, clock.sleep)
+	if err != nil || outcome != OutcomeRolledBack {
+		t.Fatalf("outcome=%v err=%v, expected OutcomeRolledBack/nil", outcome, err)
+	}
+	if len(rt.startedFor) != 1 || rt.startedFor[0] != "sha256:old" {
+		t.Fatalf("started %v, expected only the rollback start to proven -- desired was already running", rt.startedFor)
+	}
+	if clock.sleeps != 0 {
+		t.Errorf("slept %d times, expected an immediate rollback -- the deadline was already behind us", clock.sleeps)
+	}
+}
+
+func TestReconcileResumedMidSwapWithTimeRemainingFindsHealthy(t *testing.T) {
+	since := testNow.Add(-9 * time.Minute).Unix() // 1 minute of the 10 left
+	health := writeHealth(t, "sha256:new", since+30)
+	rt := &fakeRuntime{running: true, digest: "sha256:new"}
+	s := State{Desired: "sha256:new", Proven: "sha256:old", Since: since}
+	clock := newFakeClock()
+
+	outcome, err := Reconcile(rt, s, health, clock.now, clock.sleep)
+	if err != nil || outcome != OutcomeOK {
+		t.Fatalf("outcome=%v err=%v, expected OutcomeOK/nil", outcome, err)
+	}
+	if len(rt.startedFor) != 0 {
+		t.Fatalf("started %v, expected no action -- it was already running and proved healthy", rt.startedFor)
 	}
 }

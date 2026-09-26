@@ -29,9 +29,13 @@ Type=simple
 # persisted across reboots. -health-file: the health report (section
 # 22.3), deliberately under /run/ -- in memory, empty after a reboot, so an
 # old report can never cover for a freshly started, not-yet-healthy agent.
-# -runtime-bin/-runtime-container default to "docker"/"thermoctl-agent"
-# (P5.6) -- only add them here if the prepared image uses a different
-# runtime or container name.
+# -runtime-bin defaults to "docker"; -runtime-compose defaults to
+# /etc/thermoctl-agent/compose.yml, the fixed file image/common
+# /agent-compose.yml ships at that exact path (cross-review R5) -- only add
+# either flag here if the prepared image deviates from those defaults. The
+# container name itself is not a flag: it is fixed by that compose file's
+# own container_name, read back by the watchdog (runtime.go's
+# agentContainerName).
 ExecStart=/usr/local/bin/thermoctl-watchdog -file /var/lib/thermoctl-watchdog/state.env -health-file /run/thermoctl-agent-health.env
 Restart=always
 RestartSec=5

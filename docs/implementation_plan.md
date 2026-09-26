@@ -463,19 +463,35 @@ surface each package touches changed, from `/v1/...` to `/ui/inventory/...`.
   parallel with any Python package.
 - [x] done -- `AgentStopped`/`StartDigest`/`AwaitHealthReport`/
   `RollBackToProven` implemented against a new `Runtime` interface
-  (`watchdog/runtime.go`), addressed only via `os/exec` (a plain `docker`
-  wrapper, `-runtime-bin`/`-runtime-container` flags), never a library --
-  `go.mod` still has no `require`. `Reconcile` (new) ties the four
-  together into one pass and returns an `Outcome` for P5.7. `main.go`'s
-  `runLoop` drives it on an interval, forever. No wall clock in tests:
-  `AwaitHealthReport`/`Reconcile` take a `sleep func(time.Duration)`
-  instead of `time.Sleep` directly. Production code (seven files, `main.go`
-  now includes `runtime.go`) at **299** statement lines (was 195; see
-  `docs/STATUS.md`) -- `openAndParse`, a small generic helper in
-  `linefile.go`, absorbed the `LoadState`/`ReadHealth` duplication the same
-  way `readKeyValueLines` did for parsing. `go vet ./...` clean, `go test
-  ./...` green (41 tests, up from 25), `check_contract.sh` unchanged and
-  passing, `gofmt -l .` empty.
+  (`watchdog/runtime.go`), addressed only via `os/exec`, never a library --
+  `go.mod` still has no `require`. `Reconcile` (new) ties them into one
+  pass and returns an `Outcome` for P5.7. Production code (seven files) at
+  **299** statement lines (was 195), `go vet`/`go test` clean (41 tests),
+  `check_contract.sh` passing, `gofmt -l .` empty.
+- [x] **cross-review fixes** (see `docs/STATUS.md` for the full account) --
+  R1/R5: `Start` no longer runs a digest directly; it tags locally, then
+  re-applies a fixed compose file shipped with the image
+  (`image/common/agent-compose.yml`, `pull_policy: never`, `restart:
+  on-failure`) with `--pull never`, never sent by the cloud. New
+  `-runtime-compose`/`-runtime-repo` flags, container name now a fixed
+  constant instead of a flag. R4: digests validated
+  (`^sha256:[0-9a-f]{64}$`) before reaching argv. R2: `AwaitHealthReport`'s
+  deadline is anchored to the state file's `since`, not to whenever the
+  call started -- `Reconcile` now resumes the await/rollback path for an
+  already-running desired digest that has not yet proved itself, instead
+  of treating "running" as "done" forever. R3: `runtime.go` now has argv
+  tests, via an `execCommand` package variable tests swap for a recording
+  fake. Deeper finding (main session): `desired`/`proven` are *registry
+  manifest* digests, not local image IDs -- `Status` now resolves the
+  running container's manifest digest through `RepoDigests`, matched
+  against `-runtime-repo` (contract note for P5.4: the agent must pull the
+  agent image by digest, or this can never match). `AgentStopped` and
+  `StartDigest` retired as separate functions (both now dead weight once
+  `Reconcile` needed the same information in one `Status` call) to make
+  room under the line budget -- their capabilities are unchanged, exercised
+  by `Reconcile`'s own tests now. **299** statement lines still (1 line of
+  headroom), 46 tests, `tools/check_image_config.py` gained
+  `check_agent_compose_file`.
 
 ### P5.7 -- Wire up the status display (section 23)
 - **Goal:** connect `watchdog/leds.go` (`LedSetPattern`) to the states from
@@ -483,7 +499,11 @@ surface each package touches changed, from `/v1/...` to `/ui/inventory/...`.
 - **Files:** `watchdog/watch.go`, `watchdog/leds.go`.
 - **Section:** 23.
 - **Acceptance:** test demonstrates the correct pattern per state; the
-  line count stays under the 300-line production-code limit.
+  line count stays under the 300-line production-code limit -- P5.6 leaves
+  only 1 line of headroom (299/300 after its cross-review fixes), so this
+  package will likely need to trim elsewhere before it can add anything;
+  `linefile.go`'s `openAndParse` and P5.6's own retiring of two
+  redundant functions are the precedents to follow first.
 - **Depends on:** P5.6.
 
 ---
