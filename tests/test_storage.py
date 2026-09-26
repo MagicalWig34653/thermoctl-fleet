@@ -31,6 +31,7 @@ from fleet.storage import (
     ApartmentRecord,
     AssignmentRecord,
     Base,
+    DeviceRecord,
     HeartbeatRecord,
     Storage,
     _alembic_config,
@@ -1706,3 +1707,400 @@ def test_list_audit_log_for_entity_orders_newest_first(storage: Storage) -> None
     log = storage.list_audit_log_for_entity("apartment", "house7-a03")
 
     assert [entry.reason for entry in log] == ["Zweite Änderung", "Erste Änderung"]
+
+
+# -- change_device_state / remove_device (P4.3, section 20.1/20.2) -----------
+
+_CHANGE_STATE_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _make_apartment_with_device(
+    storage: Storage,
+    apartment_id: str = "house7-a03",
+    device_id: str = "sn-1",
+    *,
+    assigned_at: datetime = datetime(2026, 1, 1, tzinfo=UTC),
+) -> None:
+    """A fully commissioned apartment: created via `create_apartment`
+    (never `set_apartment_token`, so it starts with a real token exactly
+    the way P4.2's confirm-device-registration flow would leave it), a
+    registered device forced into `in_service` (P4.1 deliberately leaves
+    the state-machine unenforced at registration time, and P4.2/P4.2b are
+    not built yet -- this package's own tests therefore set up the
+    "already in service" starting point directly, the same way
+    `tests/test_ui_inventory.py`'s filter tests already reach into
+    `DeviceRecord.state` directly for a state P4.1 has no route to set)."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        apartment_id,
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+    storage.set_apartment_token(apartment_id, secrets.token_urlsafe(32))
+    storage.register_device(
+        device_id, model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    with storage.session() as session:
+        record = session.get(DeviceRecord, device_id)
+        assert record is not None
+        record.state = "in_service"
+    storage.create_assignment(
+        device_id, apartment_id, assigned_at, "Erstinbetriebnahme", "landlord"
+    )
+
+
+def test_change_device_state_faulty_to_in_storage(storage: Storage) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "faulty"
+
+    storage.change_device_state(
+        "sn-1", "in_storage", "Geprüft, wiederverwendbar", "landlord", now=_CHANGE_STATE_NOW,
+    )
+
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_storage"
+
+
+def test_change_device_state_writes_exactly_one_audit_row(storage: Storage) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "faulty"
+
+    storage.change_device_state(
+        "sn-1", "in_storage", "Geprüft", "landlord", now=_CHANGE_STATE_NOW,
+    )
+
+    log = storage.list_audit_log_for_entity("device", "sn-1")
+    assert len(log) == 1
+    assert log[0].action == "state_changed"
+    assert log[0].reason == "Geprüft"
+    assert log[0].ui_username == "landlord"
+
+
+def test_change_device_state_rejects_an_unknown_device(storage: Storage) -> None:
+    with pytest.raises(ValueError, match="does not exist"):
+        storage.change_device_state(
+            "unknown", "in_storage", "Grund", "landlord", now=_CHANGE_STATE_NOW,
+        )
+
+
+def test_change_device_state_rejects_an_empty_reason(storage: Storage) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "faulty"
+
+    with pytest.raises(ValueError, match="reason"):
+        storage.change_device_state(
+            "sn-1", "in_storage", "   ", "landlord", now=_CHANGE_STATE_NOW,
+        )
+
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "faulty"  # unchanged
+
+
+def test_change_device_state_rejects_a_disallowed_transition(storage: Storage) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    # Freshly registered device -- state "registered".
+
+    with pytest.raises(ValueError, match="nicht erlaubt"):
+        storage.change_device_state(
+            "sn-1", "in_storage", "Grund", "landlord", now=_CHANGE_STATE_NOW,
+        )
+
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "registered"
+    assert storage.list_audit_log_for_entity("device", "sn-1") == []
+
+
+def test_change_device_state_rejects_in_service_as_a_source(storage: Storage) -> None:
+    _make_apartment_with_device(storage)
+
+    with pytest.raises(ValueError, match="nicht erlaubt"):
+        storage.change_device_state(
+            "sn-1", "faulty", "Grund", "landlord", now=_CHANGE_STATE_NOW,
+        )
+
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_service"
+
+
+def test_change_device_state_decommissioned_is_terminal(storage: Storage) -> None:
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    storage.change_device_state(
+        "sn-1", "decommissioned", "Ausgemustert", "landlord", now=_CHANGE_STATE_NOW,
+    )
+
+    with pytest.raises(ValueError, match="Endzustand"):
+        storage.change_device_state(
+            "sn-1", "in_storage", "Grund", "landlord", now=_CHANGE_STATE_NOW,
+        )
+
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "decommissioned"
+
+
+def test_remove_device_closes_assignment_sets_state_and_revokes_token(
+    storage: Storage,
+) -> None:
+    _make_apartment_with_device(storage)
+    now = datetime(2026, 2, 1, tzinfo=UTC)
+
+    assignment = storage.remove_device(
+        "house7-a03",
+        target_state="faulty",
+        reason="Gerät defekt",
+        ui_username="landlord",
+        now=now,
+    )
+
+    assert assignment.ended_at is not None
+    assert assignment.reason == "Gerät defekt"
+
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "faulty"
+
+    assert storage.get_apartment_token_hash("house7-a03") is None
+    assert storage.get_current_assignment("house7-a03") is None
+
+
+def test_remove_device_to_in_storage(storage: Storage) -> None:
+    _make_apartment_with_device(storage)
+
+    storage.remove_device(
+        "house7-a03",
+        target_state="in_storage",
+        reason="Wohnung aufgegeben",
+        ui_username="landlord",
+        now=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_storage"
+
+
+def test_remove_device_writes_audit_rows_for_assignment_device_and_token(
+    storage: Storage,
+) -> None:
+    _make_apartment_with_device(storage)
+
+    storage.remove_device(
+        "house7-a03",
+        target_state="faulty",
+        reason="Gerät defekt",
+        ui_username="landlord",
+        now=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+
+    assignment_log = storage.list_audit_log_for_entity("assignment", "house7-a03:sn-1")
+    device_log = storage.list_audit_log_for_entity("device", "sn-1")
+    apartment_log = storage.list_audit_log_for_entity("apartment", "house7-a03")
+
+    # Two rows for the assignment entity: the "assigned" one from
+    # `_make_apartment_with_device`'s own `create_assignment` call, plus
+    # this call's own "closed" one.
+    assert len(assignment_log) == 2
+    assert {entry.action for entry in assignment_log} == {"assigned", "closed"}
+    closed_entry = next(entry for entry in assignment_log if entry.action == "closed")
+    assert len(device_log) == 1
+    assert device_log[0].action == "state_changed"
+    assert any(entry.action == "token_revoked" for entry in apartment_log)
+    for entry in (closed_entry, device_log[0]):
+        assert entry.reason == "Gerät defekt"
+        assert entry.ui_username == "landlord"
+
+
+def test_remove_device_rejects_an_unknown_target_state(storage: Storage) -> None:
+    _make_apartment_with_device(storage)
+
+    with pytest.raises(ValueError, match="Zielzustand"):
+        storage.remove_device(
+            "house7-a03",
+            target_state="decommissioned",
+            reason="Grund",
+            ui_username="landlord",
+            now=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+
+    assert storage.get_current_assignment("house7-a03") is not None
+
+
+def test_remove_device_rejects_an_empty_reason(storage: Storage) -> None:
+    _make_apartment_with_device(storage)
+
+    with pytest.raises(ValueError, match="reason"):
+        storage.remove_device(
+            "house7-a03",
+            target_state="faulty",
+            reason="   ",
+            ui_username="landlord",
+            now=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+
+    assert storage.get_current_assignment("house7-a03") is not None
+
+
+def test_remove_device_rejects_an_unknown_apartment(storage: Storage) -> None:
+    with pytest.raises(ValueError, match="does not exist"):
+        storage.remove_device(
+            "unknown",
+            target_state="faulty",
+            reason="Grund",
+            ui_username="landlord",
+            now=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+
+
+def test_remove_device_rejects_an_apartment_with_no_open_assignment(
+    storage: Storage,
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03", property_id=property_.id, label="A", floor=None, orientation=None,
+        state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+
+    with pytest.raises(ValueError, match="no open assignment"):
+        storage.remove_device(
+            "house7-a03",
+            target_state="faulty",
+            reason="Grund",
+            ui_username="landlord",
+            now=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+
+
+def test_remove_device_rolls_back_everything_if_a_step_fails(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forces a failure after the assignment close/device state/token
+    writes have already happened in-session but before the transaction
+    commits (the third `_write_inventory_audit_log` call, for the token
+    revocation, raises) -- asserts the whole transaction rolled back:
+    the assignment is still open, the device is still `in_service`, and
+    the token is still present."""
+
+    _make_apartment_with_device(storage)
+    # Only `create_assignment`'s own "assigned" row exists so far --
+    # `register_device` writes no audit row (see its own docstring).
+    assignment_log_before = storage.list_audit_log_for_entity("assignment", "house7-a03:sn-1")
+    assert len(assignment_log_before) == 1
+    assert assignment_log_before[0].action == "assigned"
+
+    call_count = {"n": 0}
+    original = Storage._write_inventory_audit_log
+
+    def _flaky(self: Storage, session: object, **kwargs: object) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 3:
+            raise RuntimeError("forced failure for the rollback test")
+        original(self, session, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Storage, "_write_inventory_audit_log", _flaky)
+
+    with pytest.raises(RuntimeError, match="forced failure"):
+        storage.remove_device(
+            "house7-a03",
+            target_state="faulty",
+            reason="Gerät defekt",
+            ui_username="landlord",
+            now=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+
+    assert storage.get_current_assignment("house7-a03") is not None
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_service"
+    assert storage.get_apartment_token_hash("house7-a03") is not None
+    # Still exactly the one pre-existing "assigned" row -- no "closed" row
+    # was committed, and no device audit row exists at all.
+    assignment_log_after = storage.list_audit_log_for_entity("assignment", "house7-a03:sn-1")
+    assert [entry.action for entry in assignment_log_after] == ["assigned"]
+    assert storage.list_audit_log_for_entity("device", "sn-1") == []
+
+
+def test_remove_device_concurrent_double_removal_only_one_wins(
+    tmp_path: object,
+) -> None:
+    """Two concurrent `remove_device` calls for the same apartment must
+    leave exactly one winner and no double audit rows -- same class of
+    race `test_partial_unique_index_for_assignments_is_safe_under_
+    concurrent_calls` guards against, here for the atomic assignment-close
+    update in `Storage.remove_device`."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    _make_apartment_with_device(storage)
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def _remove() -> None:
+        try:
+            storage.remove_device(
+                "house7-a03",
+                target_state="faulty",
+                reason="Concurrent removal",
+                ui_username="landlord",
+                now=datetime(2026, 2, 1, tzinfo=UTC),
+            )
+            results.append(object())
+        except ValueError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_remove) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 1
+    assert len(errors) == 4
+
+    assignment_log = storage.list_audit_log_for_entity("assignment", "house7-a03:sn-1")
+    device_log = storage.list_audit_log_for_entity("device", "sn-1")
+    # "assigned" (setup) + exactly one "closed" (the single winner) -- not
+    # a second "closed" row from a losing thread that still wrote one.
+    assert len(assignment_log) == 2
+    assert sorted(entry.action for entry in assignment_log) == ["assigned", "closed"]
+    assert len(device_log) == 1
+    assert storage.get_current_assignment("house7-a03") is None
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "faulty"

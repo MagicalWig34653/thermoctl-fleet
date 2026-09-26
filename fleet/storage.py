@@ -92,6 +92,10 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
+from fleet.device_lifecycle import (
+    REMOVE_DEVICE_TARGET_STATES,
+    validate_manual_device_transition,
+)
 from protocol import Event, Heartbeat, fault_kind_from_key
 from protocol.version import PROTOCOL_VERSION
 
@@ -1783,11 +1787,24 @@ class Storage:
         the request whose `UPDATE` actually matches a row gets the device
         id back; every other concurrent caller for the same code affects
         zero rows and gets `False`.
+
+        **Refuses a `decommissioned` device (cross-review integration,
+        2026-09-26)** -- folded into the same guarded `UPDATE` via a
+        subquery on `devices.state`, not a separate check-then-act read:
+        a device manually decommissioned in the gap between "prepare" and
+        the device's own report must not still be reportable just because
+        its registration row was never explicitly invalidated at
+        decommission time in every code path (defense in depth on top of
+        `change_device_state`'s own invalidation, see there).
         """
 
         code_hash = hash_token(registration_code)
         normalized_now = _naive_utc(now)
         with self.session() as session:
+            not_decommissioned = ~select(DeviceRecord.id).where(
+                DeviceRecord.id == DeviceRegistrationRecord.device_id,
+                DeviceRecord.state == "decommissioned",
+            ).exists()
             statement = (
                 update(DeviceRegistrationRecord)
                 .where(
@@ -1796,6 +1813,7 @@ class Storage:
                     DeviceRegistrationRecord.invalidated_at.is_(None),
                     DeviceRegistrationRecord.confirmed_at.is_(None),
                     DeviceRegistrationRecord.expires_at > normalized_now,
+                    not_decommissioned,
                 )
                 .values(
                     used_at=normalized_now,
@@ -1901,6 +1919,14 @@ class Storage:
            20.3 rule 1) -- **and** a valid `previous_device_target_state`
            (`faulty` or `in_storage`, the form's own explicit choice for
            where the replaced device goes).
+
+        A device manually moved to `decommissioned` (`change_device_state`)
+        can never reach `confirm_device` in the first place -- rule 1 above
+        already requires `reported`, and `decommissioned` is a different,
+        terminal value; `change_device_state` also invalidates the active
+        registration on that transition (see its own docstring), so even a
+        `reported` device that somehow later got manually decommissioned
+        would already fail rule 1's "active registration" half regardless.
 
         **A wrong verification code is handled outside this method's own
         transaction** (see `_record_wrong_verification_code_attempt`):
@@ -2156,6 +2182,284 @@ class Storage:
             session.refresh(device)
             session.expunge(device)
             return device
+
+    def _invalidate_active_registration(
+        self,
+        session: Session,
+        device_id: str,
+        *,
+        ui_username: str,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        """Invalidates `device_id`'s active (non-invalidated, unconfirmed)
+        registration, if any, using the caller's already-open `session` --
+        same "same transaction as the change it describes" discipline as
+        `_write_inventory_audit_log`.
+
+        **Cross-review integration decision (main session, 2026-09-26, a
+        derived reading of section 20):** called by `change_device_state`
+        whenever a manual transition **leaves** `prepared`/`reported` or
+        moves **into** `decommissioned` -- a device manually reclassified
+        away from an in-progress registration, or permanently retired,
+        must not leave a still-valid registration/verification-code pair
+        around that `record_device_report`/`confirm_device` would
+        otherwise still honor for a device no longer in that state. A
+        no-op (no row touched, nothing logged) if there is no active
+        registration to invalidate in the first place.
+        """
+
+        normalized_now = _naive_utc(now)
+        result = cast(
+            CursorResult[Any],
+            session.execute(
+                update(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.device_id == device_id,
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.confirmed_at.is_(None),
+                )
+                .values(invalidated_at=normalized_now)
+            ),
+        )
+        if result.rowcount:
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="device",
+                entity_id=device_id,
+                action="registration_invalidated",
+                reason=reason,
+                before={"invalidated_at": None},
+                after={"invalidated_at": normalized_now.isoformat()},
+            )
+
+    def change_device_state(
+        self,
+        device_id: str,
+        target_state: str,
+        reason: str,
+        ui_username: str,
+        *,
+        now: datetime,
+    ) -> None:
+        """Applies the manual "change device state" form (P4.3, section
+        20.1) -- the *only* place `fleet/ui_routes.py` may change a
+        device's state outside the "Gerät ausbauen/tauschen" flow
+        (`remove_device`, below) or a P4.2/P4.2b prepare/confirm route.
+
+        Enforces `fleet.device_lifecycle.validate_manual_device_transition`
+        itself, not only trusting the caller to have checked it first --
+        defence in depth: a device's `state` is security-relevant (section
+        20.1's own table: `decommissioned` means "token revoked"), so this
+        method refuses exactly the same transitions the UI form's own
+        drop-down never offers, using the *same* table (see that module's
+        docstring), not a second, independently maintained one.
+
+        Raises `ValueError` for: an unknown device, an empty reason, or a
+        transition `validate_manual_device_transition` refuses (including
+        every transition out of `in_service` -- see that module's docstring
+        for why `remove_device` is the only way out of it -- and out of
+        `decommissioned`, which is terminal). Writes exactly one audit row
+        for the state change itself, in the same transaction as the
+        change.
+
+        **Cross-review integration (main session, 2026-09-26, a derived
+        reading of section 20 -- documented as such, not a specification
+        quote): every transition that *leaves* `prepared`/`reported`, and
+        every transition *into* `decommissioned`, also invalidates the
+        device's active registration** (`_invalidate_active_registration`,
+        same transaction, its own audit row if a registration was actually
+        invalidated) -- `fleet.device_lifecycle.ALLOWED_MANUAL_
+        TRANSITIONS` now includes `in_storage -> faulty`, `registered ->
+        faulty`, `prepared -> in_storage`, `prepared -> faulty`, `reported
+        -> faulty`, and `reported -> decommissioned` alongside the
+        original five; every one of the new transitions either leaves
+        `prepared`/`reported` or lands on `decommissioned` (or both, for
+        `reported -> decommissioned`), so this single rule covers all of
+        them without enumerating each pair separately.
+        """
+
+        if not reason.strip():
+            raise ValueError("A reason is required to change a device's state.")
+
+        with self.session() as session:
+            record = session.get(DeviceRecord, device_id)
+            if record is None:
+                raise ValueError(f"Device {device_id!r} does not exist.")
+
+            error = validate_manual_device_transition(record.state, target_state)
+            if error is not None:
+                raise ValueError(error)
+
+            before_state = record.state
+            record.state = target_state
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="device",
+                entity_id=device_id,
+                action="state_changed",
+                reason=reason,
+                before={"state": before_state},
+                after={"state": target_state},
+            )
+
+            if before_state in ("prepared", "reported") or target_state == "decommissioned":
+                self._invalidate_active_registration(
+                    session, device_id, ui_username=ui_username, reason=reason, now=now
+                )
+
+    def remove_device(
+        self,
+        apartment_id: str,
+        *,
+        target_state: str,
+        reason: str,
+        ui_username: str,
+        now: datetime,
+    ) -> AssignmentRecord:
+        """"Gerät ausbauen / tauschen" (P4.3, section 20.2 device-swap steps
+        1-2): closes the apartment's currently open assignment (`until` =
+        `now`, `reason` = the given reason -- overwriting the assignment's
+        own creation-time reason, since the work package's own wording
+        reads this as the *closing* reason: "close the open assignment
+        with until = now + reason"), sets the removed device's state to
+        `target_state` (`faulty` or `in_storage` -- section 20.2: "the old
+        one moves to faulty or in_storage"), and **revokes the apartment's
+        agent token** (`token_hash = NULL` -- section 20.2: "revokes the
+        old device's token", section 15.5) -- all three writes, **each with
+        its own audit-log row** (section 20.3: "every change to
+        assignment, state, or token is logged" -- three kinds of change,
+        three rows), in **one transaction**: a failure partway through
+        leaves nothing applied (proven directly, not only argued, by
+        `tests/test_storage.py::test_remove_device_rolls_back_everything_if_a_step_fails`).
+
+        Raises `ValueError` for: an unrecognised `target_state` (only
+        `faulty`/`in_storage`, `fleet.device_lifecycle
+        .REMOVE_DEVICE_TARGET_STATES`), an empty `reason`, an unknown
+        apartment, or an apartment with **no open assignment** (section
+        20.2's flow assumes exactly one active device -- "at most one" per
+        the partial unique index, and here strictly one, since there is
+        nothing to remove otherwise).
+
+        **Safe under a concurrent double removal, tested directly under
+        real threads (`tests/test_storage.py
+        ::test_remove_device_concurrent_double_removal_only_one_wins`):**
+        the assignment close is one atomic `UPDATE ... WHERE id = <this
+        row> AND ended_at IS NULL`, not a read-then-write -- the same
+        pattern `_insert_heartbeats_ignoring_conflicts` already established
+        for this class of race. Whichever of two concurrent calls' `UPDATE`
+        actually flips a row (`rowcount == 1`) is the one that proceeds to
+        touch the device/apartment/audit log; the loser's `UPDATE` affects
+        zero rows (SQLite serialises writers, so the second call's `UPDATE`
+        only runs once the first has already committed and already cleared
+        `ended_at IS NULL`) and raises `ValueError` before writing anything
+        else at all -- no double state change, no double token revocation,
+        no double audit row.
+
+        **Does not touch `device_registrations` (cross-review integration
+        note):** the device removed here is always the apartment's
+        currently `in_service` device -- never `prepared`/`reported` (its
+        own registration, if any, was already confirmed and consumed the
+        moment it reached `in_service`) and never `decommissioned` (not an
+        allowed `target_state`) -- so `change_device_state`'s new
+        registration-invalidation rule has nothing to apply here.
+        """
+
+        if target_state not in REMOVE_DEVICE_TARGET_STATES:
+            raise ValueError(
+                f"Unbekannter Zielzustand {target_state!r} -- nur "
+                f"{list(REMOVE_DEVICE_TARGET_STATES)} sind erlaubt."
+            )
+        if not reason.strip():
+            raise ValueError("A reason is required to remove a device.")
+
+        now_naive = _naive_utc(now)
+
+        with self.session() as session:
+            if session.get(ApartmentRecord, apartment_id) is None:
+                raise ValueError(f"Apartment {apartment_id!r} does not exist.")
+
+            open_assignment = session.scalar(
+                select(AssignmentRecord).where(
+                    AssignmentRecord.apartment_id == apartment_id,
+                    AssignmentRecord.ended_at.is_(None),
+                )
+            )
+            if open_assignment is None:
+                raise ValueError(
+                    f"Apartment {apartment_id!r} has no open assignment to remove."
+                )
+
+            # `Session.execute` is typed to return the generic `Result[Any]`
+            # (no `rowcount`) even for a Core UPDATE, which always actually
+            # returns a `CursorResult` at runtime -- narrowed explicitly,
+            # same as `reserve_ip_login_attempt` above.
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(AssignmentRecord)
+                    .where(
+                        AssignmentRecord.id == open_assignment.id,
+                        AssignmentRecord.ended_at.is_(None),
+                    )
+                    .values(ended_at=now_naive, reason=reason)
+                ),
+            )
+            if not result.rowcount:
+                # Lost the race to a concurrent removal of the very same
+                # assignment -- see the docstring above.
+                raise ValueError(
+                    f"Apartment {apartment_id!r} has no open assignment to remove."
+                )
+
+            device_id = open_assignment.device_id
+            device = session.get(DeviceRecord, device_id)
+            assert device is not None  # an assignment always names a registered device
+            before_device_state = device.state
+            device.state = target_state
+
+            apartment = session.get(ApartmentRecord, apartment_id)
+            assert apartment is not None  # checked above, same transaction
+            apartment.token_hash = None
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="assignment",
+                entity_id=f"{apartment_id}:{device_id}",
+                action="closed",
+                reason=reason,
+                before={"ended_at": None},
+                after={"ended_at": now_naive.isoformat()},
+            )
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="device",
+                entity_id=device_id,
+                action="state_changed",
+                reason=reason,
+                before={"state": before_device_state},
+                after={"state": target_state},
+            )
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="apartment",
+                entity_id=apartment_id,
+                action="token_revoked",
+                reason=reason,
+                before={"token_hash": "set"},
+                after={"token_hash": None},
+            )
+
+            session.refresh(open_assignment)
+            session.expunge(open_assignment)
+            return open_assignment
+
 
     # -- ui accounts / sessions (P3.0) -------------------------------------------
 

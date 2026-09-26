@@ -47,6 +47,17 @@ module's own docstring); the "create property" form additionally shows a
 static German hint next to the free-text `notes` field, since a free-text
 column cannot structurally enforce what a landlord chooses to type into it
 the way a typed field can.
+
+**Merged with P4.3 (2026-09-26, cross-review integration).** This module
+now also renders P4.3's "Gerät ausbauen/tauschen" (device swap) and
+"change state" forms (`replace_device_href`/`device_state_href`,
+`ReplaceDeviceView`/`ShelfDeviceRow`, `build_replace_device_view`,
+`DeviceRow.allowed_target_states`/`state_action_href`) alongside P4.2's own
+"Vorbereiten"/"Bestätigen" forms -- both packages extend the same
+`ApartmentRow`/`DeviceRow` shapes rather than each keeping a competing one.
+`build_replace_device_view`'s own "if P4.2 has not merged yet, following
+that link 404s" note no longer applies -- P4.2 is merged, so the shelf link
+it produces (`device_prepare_href`) resolves to a real page now.
 """
 
 from __future__ import annotations
@@ -56,6 +67,10 @@ import re
 from dataclasses import dataclass
 from urllib.parse import quote
 
+from fleet.device_lifecycle import (
+    REMOVE_DEVICE_TARGET_STATES,
+    allowed_manual_target_states,
+)
 from fleet.storage import ApartmentRecord, DeviceRecord, PropertyRecord, Storage
 from protocol.inventory import ApartmentState, DeviceLifecycle
 
@@ -108,10 +123,25 @@ def inventory_edit_href(apartment_id: str) -> str:
     return f"/ui/inventory/apartments/{quote(apartment_id, safe='')}/edit"
 
 
+def replace_device_href(apartment_id: str) -> str:
+    """"Gerät ausbauen/tauschen" (P4.3, section 20.2 device-swap steps
+    1-2)."""
+
+    return f"/ui/inventory/apartments/{quote(apartment_id, safe='')}/replace-device"
+
+
+def device_state_href(device_id: str) -> str:
+    """The per-device "change state" form's action (P4.3, section 20.1)."""
+
+    return f"/ui/inventory/devices/{quote(device_id, safe='')}/state"
+
+
 def device_prepare_href(device_id: str) -> str:
     """"Vorbereiten" (P4.2, section 20.2 step 2) -- one action per eligible
     device (`registered` or `in_storage`, see `_device_row` below), same
-    encoding convention as every other href in this module."""
+    encoding convention as every other href in this module. Also linked
+    to from P4.3's "Gerät ausbauen/tauschen" shelf listing
+    (`build_replace_device_view`) for each replacement candidate."""
 
     return f"/ui/inventory/devices/{quote(device_id, safe='')}/prepare"
 
@@ -149,6 +179,10 @@ class ApartmentRow:
     current_device_model: str | None
     href: str
     edit_href: str
+    # P4.3: only set when a device is actually assigned -- there is nothing
+    # to remove/replace otherwise, so the template renders no link at all
+    # for `None` rather than a link to a form that would just 404/error.
+    replace_device_href: str | None
 
 
 @dataclass(frozen=True)
@@ -171,7 +205,13 @@ class DeviceRow:
     # `None` for a device not eligible to be prepared right now (P4.2,
     # section 20.2 step 2) -- `fleet/templates/ui/inventory.html` only
     # shows the "Vorbereiten" link when this is set.
-    prepare_href: str | None = None
+    prepare_href: str | None
+    # P4.3: only the manual transitions `fleet.device_lifecycle` allows
+    # *from this device's current state* -- an empty list (e.g. for a
+    # `decommissioned` device, a terminal state) means the template renders
+    # no state-change form at all for this row.
+    allowed_target_states: list[str]
+    state_action_href: str
 
 
 @dataclass(frozen=True)
@@ -213,6 +253,31 @@ class InventoryView:
     apartment_states: list[str]
 
 
+@dataclass(frozen=True)
+class ShelfDeviceRow:
+    """One replacement candidate on the shelf (`in_storage`/`registered`),
+    shown on the "Gerät ausbauen/tauschen" confirmation page."""
+
+    id: str
+    model: str
+    state: str
+    prepare_href: str
+
+
+@dataclass(frozen=True)
+class ReplaceDeviceView:
+    """"Gerät ausbauen / tauschen" (P4.3, section 20.2 device-swap steps
+    1-2) -- everything `fleet/templates/ui/inventory_replace_device.html`
+    needs, already derived and German-rendered."""
+
+    apartment_id: str
+    apartment_label: str
+    current_device_id: str
+    current_device_model: str
+    target_states: list[str]
+    shelf_devices: list[ShelfDeviceRow]
+
+
 def _apartment_row(storage: Storage, apartment: ApartmentRecord) -> ApartmentRow:
     device = storage.get_current_device_for_apartment(apartment.id)
     return ApartmentRow(
@@ -227,6 +292,7 @@ def _apartment_row(storage: Storage, apartment: ApartmentRecord) -> ApartmentRow
         current_device_model=device.model if device is not None else None,
         href=apartment_href(apartment.id),
         edit_href=inventory_edit_href(apartment.id),
+        replace_device_href=replace_device_href(apartment.id) if device is not None else None,
     )
 
 
@@ -241,6 +307,8 @@ def _device_row(device: DeviceRecord) -> DeviceRow:
         prepare_href=(
             device_prepare_href(device.id) if device.state in _PREPARABLE_DEVICE_STATES else None
         ),
+        allowed_target_states=allowed_manual_target_states(device.state),
+        state_action_href=device_state_href(device.id),
     )
 
 
@@ -349,6 +417,49 @@ def build_inventory_view(storage: Storage, device_filter: str | None) -> Invento
     )
 
 
+def build_replace_device_view(storage: Storage, apartment_id: str) -> ReplaceDeviceView | None:
+    """"Gerät ausbauen / tauschen" (P4.3, section 20.2 device-swap steps
+    1-2) -- `None` for an unknown apartment or one with no open assignment
+    (nothing to remove), both turned into a 404 by the route.
+
+    `shelf_devices` links straight to P4.2's "Vorbereiten" route for each
+    candidate (`fleet.ui_inventory.device_prepare_href`) -- **only a link,
+    no assignment is made here** (project owner decision, 2026-09-26: "the
+    new device of a swap always goes through P4.2's prepare/confirm flow --
+    'no release without a confirmed verification code' (20.3) -- so this
+    work package never assigns a device to an apartment"). P4.2 is merged
+    (see its own STATUS.md section), so this link now resolves to a real
+    page.
+    """
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        return None
+    device = storage.get_current_device_for_apartment(apartment_id)
+    if device is None:
+        return None
+
+    shelf = [
+        ShelfDeviceRow(
+            id=candidate.id,
+            model=candidate.model,
+            state=candidate.state,
+            prepare_href=device_prepare_href(candidate.id),
+        )
+        for candidate in storage.list_devices()
+        if candidate.state in (DeviceLifecycle.IN_STORAGE.value, DeviceLifecycle.REGISTERED.value)
+    ]
+
+    return ReplaceDeviceView(
+        apartment_id=apartment.id,
+        apartment_label=apartment.label,
+        current_device_id=device.id,
+        current_device_model=device.model,
+        target_states=list(REMOVE_DEVICE_TARGET_STATES),
+        shelf_devices=shelf,
+    )
+
+
 __all__ = [
     "APARTMENT_ID_PATTERN",
     "DEFAULT_APARTMENT_STATE",
@@ -369,11 +480,16 @@ __all__ = [
     "DeviceRow",
     "InventoryView",
     "PropertyGroup",
+    "ReplaceDeviceView",
     "ReportedDeviceRow",
+    "ShelfDeviceRow",
     "apartment_href",
     "build_confirm_view",
     "build_inventory_view",
+    "build_replace_device_view",
     "device_confirm_href",
     "device_prepare_href",
+    "device_state_href",
     "inventory_edit_href",
+    "replace_device_href",
 ]
