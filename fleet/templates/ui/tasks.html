@@ -3,10 +3,15 @@
 {% block title %}Aufgaben – thermoctl-fleet{% endblock %}
 
 {% block content %}
-{# "Aufgaben" (P3.4, section 9's third view) -- three task groups, already
-   filtered, sorted, and rendered into German text by
+{# "Aufgaben" (P3.4/P3.4a, section 9's third view) -- three task groups,
+   already filtered, sorted, and rendered into German text by
    fleet/ui_tasks.py::build_task_overview. This template only iterates and
-   prints; it makes no filtering, sorting, or wording decisions of its own. #}
+   prints; it makes no filtering, sorting, or wording decisions of its own.
+   A row for a silent apartment (P3.4a, decision 2026-09-26) carries
+   task.stale (a CSS-only marker, .task-list__stale) plus a second line of
+   literal German hint text (task.stale_hint, e.g. "... Wohnung meldet sich
+   nicht") -- the hint is always text, never colour alone, so it still
+   reads correctly for someone who cannot see the CSS marker. #}
 <h1>Aufgaben</h1>
 
 <section class="task-group" aria-labelledby="task-group-battery">
@@ -14,9 +19,12 @@
     {% if overview.battery_rounds %}
     <ul class="task-list">
         {% for task in overview.battery_rounds %}
-        <li>
+        <li{% if task.stale %} class="task-list__stale"{% endif %}>
             <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
             {{ task.battery_percent }}&nbsp;% (Stand {{ task.last_contact_text }})
+            {% if task.stale %}
+            <br><span class="task-list__stale-hint">{{ task.stale_hint }}</span>
+            {% endif %}
         </li>
         {% endfor %}
     </ul>
@@ -30,9 +38,12 @@
     {% if overview.updates %}
     <ul class="task-list">
         {% for task in overview.updates %}
-        <li>
+        <li{% if task.stale %} class="task-list__stale"{% endif %}>
             <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
             veraltete Protokollversion (Agent {{ task.agent_version }}, thermoctl {{ task.thermoctl_version }})
+            {% if task.stale %}
+            <br><span class="task-list__stale-hint">{{ task.stale_hint }}</span>
+            {% endif %}
         </li>
         {% endfor %}
     </ul>
@@ -46,9 +57,12 @@
     {% if overview.unconfirmed_faults %}
     <ul class="task-list">
         {% for task in overview.unconfirmed_faults %}
-        <li>
+        <li{% if task.stale %} class="task-list__stale"{% endif %}>
             <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
             {{ task.kind_label }} ({{ task.zone }}), {{ task.since_text }}
+            {% if task.stale %}
+            <br><span class="task-list__stale-hint">{{ task.stale_hint }}</span>
+            {% endif %}
         </li>
         {% endfor %}
     </ul>
