@@ -34,6 +34,17 @@ Entirely missing:
   P5.7), and places
   `image/common/agent-registration.empty.json` on the boot partition as
   `agent-registration.json`,
+- creates `/var/lib/thermoctl-watchdog` owned by the agent's own uid/gid
+  (P5.7 hot-fix round 2, `docs/STATUS.md`), e.g. `install -d -m 0755 -o
+  10002 -g 10002 /var/lib/thermoctl-watchdog`, and places the build-time
+  state file there (section 17, "Fallback without a proven revision") --
+  unlike `/run/thermoctl-agent` above, this is `/var/lib`, not tmpfs, so
+  it is created once here rather than recreated by a tmpfiles.d entry,
+- writes `/etc/thermoctl-agent/.env` with `DOCKER_GID=$(getent group
+  docker | cut -d: -f3)` after `image/common/packages.txt`'s container
+  runtime package is installed (P5.7 hot-fix round 2) --
+  `agent-compose.yml`'s `group_add: ["${DOCKER_GID:?...}"]` reads this
+  file automatically and fails loud if it is missing,
 - preloading the agent container image (section 19.3),
 - compressing and checksumming the finished `.img.xz` (section 19.4),
 - the connection to `v*` tags in `.github/workflows/image.yml` -- so far
