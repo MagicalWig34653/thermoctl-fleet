@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block title %}Wohnung bearbeiten – thermoctl-fleet{% endblock %}
+
+{% block content %}
+{# "Inventar" (P4.1) -- edit an existing apartment's label, floor,
+   orientation, heating circuits, state, and pilot_mode. The permanent id
+   itself is never editable -- there is no field for it on this form. #}
+<p><a href="/ui/inventory">&larr; Zurück zum Inventar</a></p>
+<h1>Wohnung {{ apartment.id }} bearbeiten</h1>
+
+{% if error %}
+<p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/ui/inventory/apartments/{{ apartment.id }}/edit">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="label">Bezeichnung
+        <input type="text" id="label" name="label" value="{{ apartment.label }}" required>
+    </label>
+    <label for="floor">Etage
+        <input type="text" id="floor" name="floor" value="{{ apartment.floor or '' }}">
+    </label>
+    <label for="orientation">Ausrichtung
+        <input type="text" id="orientation" name="orientation" value="{{ apartment.orientation or '' }}">
+    </label>
+    <label for="heating_circuits">Anzahl Heizkreise
+        <input type="text" id="heating_circuits" name="heating_circuits" inputmode="numeric" value="{{ apartment.heating_circuits }}" required>
+    </label>
+    <label for="state">Zustand
+        <select id="state" name="state" required>
+            {% for state in apartment_states %}
+            <option value="{{ state }}" {% if state == apartment.state %}selected{% endif %}>{{ state }}</option>
+            {% endfor %}
+        </select>
+    </label>
+    <label for="pilot_mode">
+        <input type="checkbox" id="pilot_mode" name="pilot_mode" value="true" {% if apartment.pilot_mode %}checked{% endif %}>
+        Pilotbetrieb (schaltet den Agent-Befehl "open_access" frei)
+    </label>
+    <label for="reason">Grund (Pflichtfeld)
+        <input type="text" id="reason" name="reason" required>
+    </label>
+    <button type="submit">Speichern</button>
+</form>
+{% endblock %}

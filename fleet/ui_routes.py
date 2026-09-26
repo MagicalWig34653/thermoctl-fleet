@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -41,7 +41,13 @@ from fleet.ui_auth import (
     session_absolute_lifetime_s,
 )
 from fleet.ui_house import build_house_overview
+from fleet.ui_inventory import (
+    APARTMENT_ID_PATTERN,
+    DEFAULT_APARTMENT_STATE,
+    build_inventory_view,
+)
 from fleet.ui_tasks import build_task_overview
+from protocol.inventory import ApartmentState
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +308,345 @@ def tasks(
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+# -----------------------------------------------------------------------------
+# "Inventar" (P4.1, section 9's fourth view, section 20.4) -- properties,
+# apartments, devices; create-property/create-apartment/register-device/
+# edit-apartment forms. All derivation/German rendering happens in
+# `fleet.ui_inventory`; these routes stay the thin HTTP layer this module's
+# own docstring describes -- CSRF checked on every POST, a mandatory
+# "Grund" (`reason`) field on the one form that changes an existing
+# apartment's state/pilot_mode (`apartment_edit_submit`), none on the three
+# pure-creation forms (`Storage.create_property`/`create_apartment`/
+# `register_device` are not audit-logged, see their own docstrings).
+# -----------------------------------------------------------------------------
+
+
+def _inventory_response(
+    request: Request,
+    storage: Storage,
+    authenticated: AuthenticatedUiSession,
+    *,
+    device_filter: str | None,
+    error: str | None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    view = build_inventory_view(storage, device_filter)
+    response = templates.TemplateResponse(
+        request,
+        "inventory.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "view": view,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/inventory", response_class=HTMLResponse)
+def inventory(
+    request: Request,
+    filter: str | None = None,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """"Inventar" (P4.1, section 9's fourth view) -- properties, apartments
+    (each with its current device, if any), and every device not currently
+    `in_service`, optionally narrowed by `?filter=in_storage` or
+    `?filter=faulty` (section 20.4's own two named filters -- any other
+    value is silently treated as "no filter", see
+    `fleet.ui_inventory.build_inventory_view`)."""
+
+    return _inventory_response(request, storage, authenticated, device_filter=filter, error=None)
+
+
+@router.post("/inventory/properties")
+def create_property_submit(
+    request: Request,
+    name: str = Form(...),
+    address: str = Form(...),
+    notes: str = Form(""),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Creates a property (section 20.1). No `reason`/audit log -- a brand-
+    new property changes no prior assignment, state, or token (see
+    `Storage.create_property`'s own docstring)."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    if not name.strip() or not address.strip():
+        return _inventory_response(
+            request,
+            storage,
+            authenticated,
+            device_filter=None,
+            error="Name und Adresse dürfen nicht leer sein.",
+            status_code=400,
+        )
+
+    storage.create_property(name.strip(), address.strip(), notes.strip() or None)
+    return RedirectResponse(url="/ui/inventory", status_code=303)
+
+
+@router.post("/inventory/apartments")
+def create_apartment_submit(
+    request: Request,
+    id: str = Form(...),
+    property_id: str = Form(...),
+    label: str = Form(...),
+    floor: str = Form(""),
+    orientation: str = Form(""),
+    heating_circuits: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Creates an apartment (section 20.1/20.2 step 1). **The id is
+    permanent and validated here** (`APARTMENT_ID_PATTERN`) -- non-empty,
+    restricted charset, and (via `Storage.create_apartment`'s own primary
+    key) unique; there is no field on this form, or any other, that could
+    ever change it afterward. `state` always starts at
+    `DEFAULT_APARTMENT_STATE` (`occupied`) and `pilot_mode` always at
+    `False` -- section 21.4: "a newly created apartment is never
+    accidentally in pilot mode" -- both changeable only via the separate
+    "edit apartment" form, which requires a reason. No `reason`/audit log
+    on *this* form either, same reasoning as `create_property_submit`."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    error: str | None = None
+    parsed_property_id: int | None = None
+    parsed_heating_circuits: int | None = None
+
+    if not APARTMENT_ID_PATTERN.match(id):
+        error = (
+            "Die Wohnungs-ID darf nur Kleinbuchstaben, Ziffern und '-' enthalten "
+            "und darf nicht leer sein."
+        )
+    elif not label.strip():
+        error = "Bezeichnung darf nicht leer sein."
+    else:
+        try:
+            parsed_property_id = int(property_id)
+        except ValueError:
+            error = "Ungültige Liegenschaft."
+        if error is None:
+            try:
+                parsed_heating_circuits = int(heating_circuits)
+                if parsed_heating_circuits < 0:
+                    raise ValueError
+            except ValueError:
+                error = "Anzahl Heizkreise muss eine nicht-negative Zahl sein."
+
+    if error is None and parsed_property_id is not None and storage.get_property(
+        parsed_property_id
+    ) is None:
+        error = "Ungültige Liegenschaft."
+
+    if error is not None:
+        return _inventory_response(
+            request, storage, authenticated, device_filter=None, error=error, status_code=400
+        )
+
+    assert parsed_property_id is not None
+    assert parsed_heating_circuits is not None
+
+    try:
+        storage.create_apartment(
+            id,
+            property_id=parsed_property_id,
+            label=label.strip(),
+            floor=floor.strip() or None,
+            orientation=orientation.strip() or None,
+            state=DEFAULT_APARTMENT_STATE,
+            heating_circuits=parsed_heating_circuits,
+            pilot_mode=False,
+        )
+    except ValueError as exc:
+        return _inventory_response(
+            request, storage, authenticated, device_filter=None, error=str(exc), status_code=400
+        )
+
+    return RedirectResponse(url="/ui/inventory", status_code=303)
+
+
+@router.post("/inventory/devices")
+def register_device_submit(
+    request: Request,
+    id: str = Form(...),
+    model: str = Form(...),
+    acquisition_date: str = Form(...),
+    image_version: str = Form(...),
+    watchdog_version: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Registers a device (section 20.1/20.2 step 1). **`state` is always
+    `registered`** -- there is no `state` field on this form at all
+    (`Storage.register_device` itself has no `state` parameter, see its own
+    docstring: "structurally impossible to violate, not merely validated
+    away"). No `reason`/audit log, same reasoning as the two forms above."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    required_fields = (id, model, image_version, watchdog_version)
+    if any(not field.strip() for field in required_fields):
+        return _inventory_response(
+            request,
+            storage,
+            authenticated,
+            device_filter=None,
+            error="Alle Felder außer dem Anschaffungsdatum sind Pflichtfelder.",
+            status_code=400,
+        )
+
+    try:
+        parsed_date = date.fromisoformat(acquisition_date)
+    except ValueError:
+        return _inventory_response(
+            request,
+            storage,
+            authenticated,
+            device_filter=None,
+            error="Ungültiges Anschaffungsdatum (Format: JJJJ-MM-TT).",
+            status_code=400,
+        )
+
+    try:
+        storage.register_device(
+            id.strip(),
+            model=model.strip(),
+            acquisition_date=parsed_date,
+            image_version=image_version.strip(),
+            watchdog_version=watchdog_version.strip(),
+        )
+    except ValueError as exc:
+        return _inventory_response(
+            request, storage, authenticated, device_filter=None, error=str(exc), status_code=400
+        )
+
+    return RedirectResponse(url="/ui/inventory", status_code=303)
+
+
+@router.get("/inventory/apartments/{apartment_id}/edit", response_class=HTMLResponse)
+def apartment_edit_form(
+    request: Request,
+    apartment_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """Renders the "edit apartment" form (label, floor, orientation,
+    heating circuits, state, `pilot_mode`) -- section 20.3: "an apartment
+    is not deleted, it is retired", so `state` includes `retired` as an
+    ordinary choice here, not a separate delete action anywhere in this
+    module."""
+
+    record = storage.get_apartment(apartment_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    response = templates.TemplateResponse(
+        request,
+        "inventory_apartment_edit.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "apartment": record,
+            "apartment_states": [state.value for state in ApartmentState],
+            "error": None,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/inventory/apartments/{apartment_id}/edit")
+def apartment_edit_submit(
+    request: Request,
+    apartment_id: str,
+    label: str = Form(...),
+    floor: str = Form(""),
+    orientation: str = Form(""),
+    heating_circuits: str = Form(...),
+    state: str = Form(...),
+    pilot_mode: str = Form(""),
+    reason: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Applies the "edit apartment" form (P4.1) -- **a non-empty `reason`
+    is mandatory** (section 20.3: "every change to ... state ... is
+    logged: who, when, why"; CLAUDE.md principle 5: `pilot_mode` changes
+    are security-relevant and always logged with a mandatory reason) --
+    `Storage.update_apartment` enforces this again itself and writes the
+    audit entry in the same transaction as the change, see its own
+    docstring for why this form does not special-case which fields
+    actually changed. `pilot_mode` is an HTML checkbox: present (any
+    value) means checked/`True`, absent means unchecked/`False` -- the
+    same convention every HTML form uses, since an unchecked checkbox
+    submits no field at all.
+    """
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    def _error(message: str) -> HTMLResponse:
+        record = storage.get_apartment(apartment_id)
+        response = templates.TemplateResponse(
+            request,
+            "inventory_apartment_edit.html",
+            {
+                "ui_session": authenticated,
+                "csrf_token": authenticated.session.csrf_token,
+                "apartment": record,
+                "apartment_states": [s.value for s in ApartmentState],
+                "error": message,
+            },
+            status_code=400,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    if storage.get_apartment(apartment_id) is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    if not label.strip():
+        return _error("Bezeichnung darf nicht leer sein.")
+    if state not in {s.value for s in ApartmentState}:
+        return _error("Ungültiger Zustand.")
+    if not reason.strip():
+        return _error("Ein Grund ist erforderlich.")
+    try:
+        parsed_heating_circuits = int(heating_circuits)
+        if parsed_heating_circuits < 0:
+            raise ValueError
+    except ValueError:
+        return _error("Anzahl Heizkreise muss eine nicht-negative Zahl sein.")
+
+    storage.update_apartment(
+        apartment_id,
+        label=label.strip(),
+        floor=floor.strip() or None,
+        orientation=orientation.strip() or None,
+        heating_circuits=parsed_heating_circuits,
+        state=state,
+        pilot_mode=bool(pilot_mode),
+        ui_username=authenticated.user.username,
+        reason=reason.strip(),
+    )
+    return RedirectResponse(url="/ui/inventory", status_code=303)
 
 
 # P3.2 review: any future `/ui/apartments/...` sub-route (a fixed suffix,

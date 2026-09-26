@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+
+{% block title %}Inventar – thermoctl-fleet{% endblock %}
+
+{% block content %}
+{# "Inventar" (P4.1, section 9's fourth, quiet view) -- properties,
+   apartments (each with its current device, if any), and devices not in
+   service. Already German-rendered and derived by
+   fleet/ui_inventory.py::build_inventory_view; this template only
+   iterates and prints. #}
+<h1>Inventar</h1>
+
+{% if error %}
+<p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+<section>
+    <h2>Liegenschaften und Wohnungen</h2>
+    {% if view.property_groups %}
+    {% for group in view.property_groups %}
+    <article class="inventory-property">
+        <h3>{{ group.name }}</h3>
+        <p>{{ group.address }}</p>
+        {% if group.notes %}<p class="apartment-detail__note">{{ group.notes }}</p>{% endif %}
+        {% if group.apartments %}
+        <ul class="inventory-apartments">
+            {% for apartment in group.apartments %}
+            <li>
+                <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
+                – {{ apartment.state }}
+                {% if apartment.floor %}, {{ apartment.floor }}{% endif %}
+                {% if apartment.orientation %}, {{ apartment.orientation }}{% endif %}
+                , {{ apartment.heating_circuits }} Heizkreis(e)
+                {% if apartment.pilot_mode %}<span class="apartment-tile__tag">Pilotbetrieb</span>{% endif %}
+                <br>
+                Gerät:
+                {% if apartment.current_device_id %}
+                {{ apartment.current_device_id }} ({{ apartment.current_device_model }})
+                {% else %}
+                keines zugewiesen
+                {% endif %}
+                &nbsp;<a href="{{ apartment.edit_href }}">Bearbeiten</a>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p>Keine Wohnungen in dieser Liegenschaft.</p>
+        {% endif %}
+    </article>
+    {% endfor %}
+    {% else %}
+    <p>Keine Liegenschaften angelegt.</p>
+    {% endif %}
+
+    {% if view.unassigned_apartments %}
+    <article class="inventory-property">
+        <h3>Ohne Liegenschaft</h3>
+        <ul class="inventory-apartments">
+            {% for apartment in view.unassigned_apartments %}
+            <li>
+                <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
+                – {{ apartment.state }}
+                &nbsp;<a href="{{ apartment.edit_href }}">Bearbeiten</a>
+            </li>
+            {% endfor %}
+        </ul>
+    </article>
+    {% endif %}
+</section>
+
+<section>
+    <h2>Geräte nicht im Einsatz</h2>
+    <nav aria-label="Filter">
+        <a href="/ui/inventory">Alle</a>
+        <a href="/ui/inventory?filter=in_storage">Im Lager</a>
+        <a href="/ui/inventory?filter=faulty">Defekt</a>
+    </nav>
+    {% if view.devices_not_in_service %}
+    <ul class="inventory-devices">
+        {% for device in view.devices_not_in_service %}
+        <li>{{ device.id }} ({{ device.model }}) – {{ device.state }}, seit {{ device.acquisition_date }},
+            Image {{ device.image_version }}, Watchdog {{ device.watchdog_version }}</li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>Keine Geräte in dieser Ansicht.</p>
+    {% endif %}
+</section>
+
+<section>
+    <h2>Liegenschaft anlegen</h2>
+    <form method="post" action="/ui/inventory/properties">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="property_name">Name
+            <input type="text" id="property_name" name="name" required>
+        </label>
+        <label for="property_address">Adresse
+            <input type="text" id="property_address" name="address" required>
+        </label>
+        <label for="property_notes">Notizen (keine Mieterdaten!)
+            <input type="text" id="property_notes" name="notes">
+        </label>
+        <button type="submit">Anlegen</button>
+    </form>
+</section>
+
+<section>
+    <h2>Wohnung anlegen</h2>
+    <form method="post" action="/ui/inventory/apartments">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="apartment_id">Wohnungs-ID (dauerhaft, z. B. house7-a03)
+            <input type="text" id="apartment_id" name="id" pattern="[a-z0-9-]+" required>
+        </label>
+        <label for="apartment_property_id">Liegenschaft
+            <select id="apartment_property_id" name="property_id" required>
+                {% for group in view.property_groups %}
+                <option value="{{ group.id }}">{{ group.name }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label for="apartment_label">Bezeichnung
+            <input type="text" id="apartment_label" name="label" required>
+        </label>
+        <label for="apartment_floor">Etage
+            <input type="text" id="apartment_floor" name="floor">
+        </label>
+        <label for="apartment_orientation">Ausrichtung
+            <input type="text" id="apartment_orientation" name="orientation">
+        </label>
+        <label for="apartment_heating_circuits">Anzahl Heizkreise
+            <input type="text" id="apartment_heating_circuits" name="heating_circuits" inputmode="numeric" required>
+        </label>
+        <button type="submit">Anlegen</button>
+    </form>
+</section>
+
+<section>
+    <h2>Gerät registrieren</h2>
+    <form method="post" action="/ui/inventory/devices">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="device_id">Seriennummer / Hardware-ID
+            <input type="text" id="device_id" name="id" required>
+        </label>
+        <label for="device_model">Modell
+            <input type="text" id="device_model" name="model" required>
+        </label>
+        <label for="device_acquisition_date">Anschaffungsdatum (JJJJ-MM-TT)
+            <input type="text" id="device_acquisition_date" name="acquisition_date" required>
+        </label>
+        <label for="device_image_version">Image-Version
+            <input type="text" id="device_image_version" name="image_version" required>
+        </label>
+        <label for="device_watchdog_version">Watchdog-Version
+            <input type="text" id="device_watchdog_version" name="watchdog_version" required>
+        </label>
+        <button type="submit">Registrieren</button>
+    </form>
+</section>
+{% endblock %}

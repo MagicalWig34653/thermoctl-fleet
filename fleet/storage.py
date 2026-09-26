@@ -53,11 +53,12 @@ per `CLAUDE.md`.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -65,8 +66,10 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Engine,
+    ForeignKey,
     Index,
     Integer,
     String,
@@ -84,6 +87,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects import postgresql as _postgresql_dialect
 from sqlalchemy.dialects import sqlite as _sqlite_dialect
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from protocol import Event, Heartbeat, fault_kind_from_key
@@ -109,7 +113,40 @@ class ApartmentRecord(Base):
     # below. Unique because two apartments sharing one hash would mean two
     # apartments sharing one token, which the registration flow (section 4:
     # "a separate secret per apartment") never produces.
-    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    #
+    # **Nullable since P4.1 (`0006_inventory.py`)**: "an apartment exists
+    # before any device is confirmed" -- a landlord creates the apartment
+    # row (see `create_apartment` below) long before any device ever
+    # registers a token for it. SQL's own "NULL is never equal to another
+    # NULL" semantics mean the unique index still permits any number of
+    # `NULL` rows without a special case, and both `fleet/auth.py` lookups
+    # already treat a `NULL` hash as "never matches" for free -- see that
+    # migration's own docstring and `tests/test_fleet.py`'s coverage.
+    token_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True, index=True
+    )
+
+    # -- inventory foundation (P4.1, section 20.1) ---------------------------
+    # A legacy row created by an earlier package (P1.1-P3.x, id + token_hash
+    # only) is backfilled by `0006_inventory.py`'s own data migration -- see
+    # that file's docstring for the exact default chosen per column.
+    property_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=True, index=True
+    )
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    floor: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    orientation: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # `protocol.inventory.ApartmentState` value (section 20.1/22.4) --
+    # stored as a plain string, not an ORM enum column, mirroring
+    # `EventRecord.fault_kind`/`AlarmRecord.kind`'s existing "avoid a
+    # circular import with `protocol`" reasoning.
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    heating_circuits: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Section 21.4: gates the agent's local `open_access` rejection -- see
+    # `protocol.inventory.Apartment.pilot_mode`'s own docstring. Changing
+    # this is security-relevant (CLAUDE.md principle 5) and therefore always
+    # logged with a mandatory reason, see `Storage.set_apartment_pilot_mode`.
+    pilot_mode: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
 
 
 class HeartbeatRecord(Base):
@@ -288,6 +325,103 @@ class UiSessionRecord(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
 
+class PropertyRecord(Base):
+    __tablename__ = "properties"
+
+    # "The top level, so multiple buildings don't get mixed up" (20.1) --
+    # an autoincrement id, unlike `ApartmentRecord.id`: the specification
+    # gives a property no natural, landlord-chosen id of its own the way an
+    # apartment has one (`house7-a03`).
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    address: Mapped[str] = mapped_column(String(255), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
+class DeviceRecord(Base):
+    __tablename__ = "devices"
+
+    # Section 20.1: "serial number or hardware id" -- a natural key, like
+    # `ApartmentRecord.id`, not a surrogate one.
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    acquisition_date: Mapped[date] = mapped_column(Date(), nullable=False)
+    # Nullable "until registration" (section 20.1's own state table:
+    # `registered`/`prepared` precede the device ever generating a key
+    # pair) -- P4.2b (Ed25519 + signed challenge, not part of this
+    # package) is what eventually fills this in.
+    public_key_fingerprint: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    image_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    watchdog_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    # `protocol.inventory.DeviceLifecycle` value -- plain string, same
+    # reasoning as `ApartmentRecord.state` above. Transitions between these
+    # values are P4.3's job, not enforced here except that registration
+    # (`Storage.register_device`) always forces `registered` regardless of
+    # what is requested (work package's explicit instruction).
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class AssignmentRecord(Base):
+    __tablename__ = "assignments"
+    __table_args__ = (
+        # Section 20.3, rules 1 and 2, enforced at the database level --
+        # same pattern as `0004_alarms.py`'s partial unique index (a
+        # Python-level check-then-insert is not atomic under concurrent
+        # requests, see that migration's own docstring for the reproduced
+        # race this pattern closes). "At most one row with `ended_at IS
+        # NULL`" per apartment/device is exactly "at most one *open*
+        # assignment" -- a closed (replaced/ended) assignment never
+        # blocks a later, genuinely new one.
+        Index(
+            "ux_assignments_apartment_id_open",
+            "apartment_id",
+            unique=True,
+            sqlite_where=text("ended_at IS NULL"),
+            postgresql_where=text("ended_at IS NULL"),
+        ),
+        Index(
+            "ux_assignments_device_id_open",
+            "device_id",
+            unique=True,
+            sqlite_where=text("ended_at IS NULL"),
+            postgresql_where=text("ended_at IS NULL"),
+        ),
+    )
+
+    # "Never a mere field on the device, but its own entry with `from`,
+    # `until`, and a reason" (20.1) -- `started_at`/`ended_at` at the
+    # column level (see `0006_inventory.py`'s docstring for why not
+    # `from`/`until` verbatim: a reserved word in more than one SQL
+    # dialect).
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+
+
+class InventoryAuditLogRecord(Base):
+    __tablename__ = "inventory_audit_log"
+    __table_args__ = (
+        Index("ix_inventory_audit_log_entity", "entity_type", "entity_id"),
+    )
+
+    # "Every change to assignment, state, or token is logged: who, when,
+    # why" (20.3) -- `before_json`/`after_json` are short JSON snapshots of
+    # only the changed fields, never a full-row dump (this table must not
+    # itself become a second place section-6 data could leak from).
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    ui_username: Mapped[str] = mapped_column(String(255), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    before_json: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    after_json: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
 @dataclass(frozen=True)
 class LatestHeartbeat:
     """The most recent stored heartbeat of one apartment, plus whether it is
@@ -342,6 +476,10 @@ class ApartmentOverview:
     apartment_id: str
     latest: LatestHeartbeat | None
     open_alarm: AlarmRecord | None
+    # P4.1: "show the apartment label alongside the id ... if cheap" --
+    # already loaded as part of the same `ApartmentRecord` row `get_house_
+    # overview` reads for `list_apartment_ids` below, so no extra query.
+    label: str | None = None
 
 
 def _naive_utc(value: datetime) -> datetime:
@@ -482,13 +620,33 @@ class Storage:
         Hashes internally (see `hash_token`) so that a caller cannot
         accidentally persist the raw token by calling the wrong function --
         there is no sibling function that stores a token unhashed.
+
+        **P4.1:** if this creates a brand-new apartment row (no prior
+        `create_apartment` call -- the shape every P1.1-P3.x test still
+        uses, registering only a token without going through the inventory
+        UI), the new, now-`NOT NULL` inventory columns are filled with the
+        same defaults `0006_inventory.py`'s data migration applies to a
+        legacy row (see that migration's own docstring): `label` defaults
+        to the apartment id itself, `state` to `ApartmentState.OCCUPIED`,
+        `heating_circuits` to `0`, `pilot_mode` to `False`, no property.
+        An apartment created *through* `create_apartment` first is
+        unaffected -- this only ever fills in a row that did not exist yet.
         """
 
         digest = hash_token(token)
         with self.session() as session:
             record = session.get(ApartmentRecord, apartment_id)
             if record is None:
-                session.add(ApartmentRecord(id=apartment_id, token_hash=digest))
+                session.add(
+                    ApartmentRecord(
+                        id=apartment_id,
+                        token_hash=digest,
+                        label=apartment_id,
+                        state="occupied",
+                        heating_circuits=0,
+                        pilot_mode=False,
+                    )
+                )
             else:
                 record.token_hash = digest
 
@@ -498,6 +656,21 @@ class Storage:
         with self.session() as session:
             record = session.get(ApartmentRecord, apartment_id)
             return record.token_hash if record is not None else None
+
+    def get_apartment_label(self, apartment_id: str) -> str | None:
+        """The apartment's `label`, or `None` if the apartment does not
+        exist (P4.1). `label` is `NOT NULL` for every row that exists (see
+        `create_apartment`/`set_apartment_token`/`0006_inventory.py`'s
+        backfill) -- `None` from this method is therefore unambiguous
+        "unknown apartment", used by `fleet/ui_apartment.py::
+        build_apartment_detail` for its own existence check now that
+        `token_hash` (the check it used before P4.1) may legitimately be
+        `NULL` for an apartment that exists but has no confirmed device
+        yet."""
+
+        with self.session() as session:
+            record = session.get(ApartmentRecord, apartment_id)
+            return record.label if record is not None else None
 
     def get_apartment_id_by_token_hash(self, token_hash: str) -> str | None:
         """The reverse lookup: which apartment does this token hash belong
@@ -858,15 +1031,19 @@ class Storage:
         still just one query per apartment, not one per displayed field.
         """
 
-        apartment_ids = self.list_apartment_ids()
+        with self.session() as session:
+            id_label_pairs = list(
+                session.execute(select(ApartmentRecord.id, ApartmentRecord.label))
+            )
         open_alarms = self._get_open_not_reporting_alarms()
         return [
             ApartmentOverview(
                 apartment_id=apartment_id,
                 latest=self.get_latest_heartbeat(apartment_id),
                 open_alarm=open_alarms.get(apartment_id),
+                label=label,
             )
-            for apartment_id in apartment_ids
+            for apartment_id, label in id_label_pairs
         ]
 
     # -- apartment detail (P3.2, section 9's second view) -------------------------
@@ -954,6 +1131,386 @@ class Storage:
             result = list(rows)
             session.expunge_all()
             return result
+
+    # -- inventory (P4.1, section 20) --------------------------------------------
+    #
+    # "The fleet service keeps the directory: which apartments exist, which
+    # devices are in circulation, and which one currently sits where"
+    # (20). Four entities (`properties`, `apartments` extended, `devices`,
+    # `assignments`) plus `inventory_audit_log` -- see `0006_inventory.py`
+    # for the schema and its own reasoning. State-machine transitions for
+    # `DeviceLifecycle` (P4.3) are explicitly **not** enforced here, per
+    # the work package -- only that a freshly registered device always
+    # starts `registered` regardless of what is requested.
+
+    def _write_inventory_audit_log(
+        self,
+        session: Session,
+        *,
+        ui_username: str,
+        entity_type: str,
+        entity_id: str,
+        action: str,
+        reason: str | None,
+        before: dict[str, object] | None,
+        after: dict[str, object] | None,
+    ) -> None:
+        """Writes one audit row **using the caller's already-open
+        `session`** -- never its own `self.session()` context -- so the
+        entry commits (or rolls back) atomically together with the data
+        change it describes (section 20.3: "every change ... is logged",
+        work package: "in the same transaction as the change")."""
+
+        session.add(
+            InventoryAuditLogRecord(
+                timestamp=_naive_utc(datetime.now(UTC)),
+                ui_username=ui_username,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                action=action,
+                reason=reason,
+                before_json=json.dumps(before) if before is not None else None,
+                after_json=json.dumps(after) if after is not None else None,
+            )
+        )
+
+    def create_property(
+        self, name: str, address: str, notes: str | None = None
+    ) -> PropertyRecord:
+        """Creates a property (section 20.1) -- not audit-logged: the work
+        package only requires logging "every change to assignment, state,
+        or token", and a brand-new property changes none of the three."""
+
+        with self.session() as session:
+            record = PropertyRecord(name=name, address=address, notes=notes)
+            session.add(record)
+            session.flush()
+            session.refresh(record)
+            session.expunge(record)
+            return record
+
+    def list_properties(self) -> list[PropertyRecord]:
+        with self.session() as session:
+            rows = list(session.scalars(select(PropertyRecord).order_by(PropertyRecord.id)).all())
+            session.expunge_all()
+            return rows
+
+    def get_property(self, property_id: int) -> PropertyRecord | None:
+        with self.session() as session:
+            record = session.get(PropertyRecord, property_id)
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def create_apartment(
+        self,
+        apartment_id: str,
+        *,
+        property_id: int,
+        label: str,
+        floor: str | None,
+        orientation: str | None,
+        state: str,
+        heating_circuits: int,
+        pilot_mode: bool,
+    ) -> ApartmentRecord:
+        """Creates a brand-new apartment (section 20.1/20.2 step 1). `id` is
+        permanent -- charset/uniqueness/never-changeable are enforced by
+        `fleet/ui_inventory.py` (the id shape itself, a UI-level decision)
+        and by this table's own primary key (uniqueness, at the database
+        level) respectively; a duplicate id raises `ValueError`, not an
+        uncaught `IntegrityError`, so the UI route can re-render the form
+        with a message instead of a 500.
+
+        Not audit-logged for the same reason as `create_property` above --
+        creating a new row changes no prior assignment, state, or token.
+        """
+
+        with self.session() as session:
+            if session.get(ApartmentRecord, apartment_id) is not None:
+                raise ValueError(f"Apartment {apartment_id!r} already exists.")
+            record = ApartmentRecord(
+                id=apartment_id,
+                token_hash=None,
+                property_id=property_id,
+                label=label,
+                floor=floor,
+                orientation=orientation,
+                state=state,
+                heating_circuits=heating_circuits,
+                pilot_mode=pilot_mode,
+            )
+            session.add(record)
+            session.flush()
+            session.refresh(record)
+            session.expunge(record)
+            return record
+
+    def get_apartment(self, apartment_id: str) -> ApartmentRecord | None:
+        with self.session() as session:
+            record = session.get(ApartmentRecord, apartment_id)
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def list_apartments(self) -> list[ApartmentRecord]:
+        with self.session() as session:
+            rows = list(
+                session.scalars(select(ApartmentRecord).order_by(ApartmentRecord.id)).all()
+            )
+            session.expunge_all()
+            return rows
+
+    def list_apartments_by_property(self, property_id: int) -> list[ApartmentRecord]:
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(ApartmentRecord)
+                    .where(ApartmentRecord.property_id == property_id)
+                    .order_by(ApartmentRecord.id)
+                ).all()
+            )
+            session.expunge_all()
+            return rows
+
+    def update_apartment(
+        self,
+        apartment_id: str,
+        *,
+        label: str,
+        floor: str | None,
+        orientation: str | None,
+        heating_circuits: int,
+        state: str,
+        pilot_mode: bool,
+        ui_username: str,
+        reason: str,
+    ) -> bool:
+        """Applies the "edit apartment" form (P4.1) -- label, floor,
+        orientation, heating circuits, state, and `pilot_mode` all in one
+        call, since the work package presents them as one form. **A
+        mandatory, non-empty `reason` is required on every call**, not only
+        when `state`/`pilot_mode` actually changes -- the simplest rule
+        that still satisfies section 20.3 ("every change to ... state ...
+        is logged: who, when, why") and CLAUDE.md principle 5's "log it
+        with a mandatory reason" for `pilot_mode` specifically, without the
+        route layer having to special-case which fields are
+        security-relevant enough to demand one.
+
+        Returns `False` (no-op, nothing written, nothing logged) for an
+        unknown apartment -- the route turns that into its own error
+        response. Returns `True` and writes exactly one audit row,
+        **in the same transaction as the update**, whenever at least one
+        field actually changed; an edit that changes nothing (a form
+        resubmitted with identical values) writes no audit row at all --
+        there is no real change for "who, when, why" to describe.
+
+        **There is no `id` parameter here on purpose**: the permanent
+        apartment id is never editable after creation (work package's
+        explicit instruction), so this method structurally cannot change
+        it -- not merely "the form doesn't offer it".
+        """
+
+        if not reason.strip():
+            raise ValueError("A reason is required for every apartment change.")
+
+        with self.session() as session:
+            record = session.get(ApartmentRecord, apartment_id)
+            if record is None:
+                return False
+
+            before = {
+                "label": record.label,
+                "floor": record.floor,
+                "orientation": record.orientation,
+                "heating_circuits": record.heating_circuits,
+                "state": record.state,
+                "pilot_mode": record.pilot_mode,
+            }
+            after = {
+                "label": label,
+                "floor": floor,
+                "orientation": orientation,
+                "heating_circuits": heating_circuits,
+                "state": state,
+                "pilot_mode": pilot_mode,
+            }
+            if before == after:
+                return True
+
+            record.label = label
+            record.floor = floor
+            record.orientation = orientation
+            record.heating_circuits = heating_circuits
+            record.state = state
+            record.pilot_mode = pilot_mode
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="apartment",
+                entity_id=apartment_id,
+                action="updated",
+                reason=reason,
+                before={k: v for k, v in before.items() if v != after[k]},
+                after={k: v for k, v in after.items() if v != before[k]},
+            )
+            return True
+
+    def register_device(
+        self,
+        device_id: str,
+        *,
+        model: str,
+        acquisition_date: date,
+        image_version: str,
+        watchdog_version: str,
+    ) -> DeviceRecord:
+        """Adds a device to the directory (section 20.1/20.2 step 1).
+
+        **`state` is always `DeviceLifecycle.REGISTERED`, regardless of
+        anything a caller might otherwise want** -- there is deliberately
+        no `state` parameter on this method at all (the old `/v1` stub's
+        own docstring: "a caller must not be able to register a device in
+        any state other than `registered`") -- structurally impossible to
+        violate, not merely validated away.
+        """
+
+        with self.session() as session:
+            if session.get(DeviceRecord, device_id) is not None:
+                raise ValueError(f"Device {device_id!r} already exists.")
+            record = DeviceRecord(
+                id=device_id,
+                model=model,
+                acquisition_date=acquisition_date,
+                public_key_fingerprint=None,
+                image_version=image_version,
+                watchdog_version=watchdog_version,
+                state="registered",
+            )
+            session.add(record)
+            session.flush()
+            session.refresh(record)
+            session.expunge(record)
+            return record
+
+    def get_device(self, device_id: str) -> DeviceRecord | None:
+        with self.session() as session:
+            record = session.get(DeviceRecord, device_id)
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def list_devices(self) -> list[DeviceRecord]:
+        with self.session() as session:
+            rows = list(session.scalars(select(DeviceRecord).order_by(DeviceRecord.id)).all())
+            session.expunge_all()
+            return rows
+
+    def get_current_assignment(self, apartment_id: str) -> AssignmentRecord | None:
+        """The currently open assignment (`ended_at IS NULL`) for
+        `apartment_id`, or `None` -- section 20.3's "at most one active
+        device per apartment" guarantees at most one such row exists, the
+        partial unique index in `0006_inventory.py` makes it a database
+        guarantee, not just an application-level expectation."""
+
+        with self.session() as session:
+            record = session.scalar(
+                select(AssignmentRecord).where(
+                    AssignmentRecord.apartment_id == apartment_id,
+                    AssignmentRecord.ended_at.is_(None),
+                )
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def get_current_device_for_apartment(self, apartment_id: str) -> DeviceRecord | None:
+        """The device currently assigned to `apartment_id` via its open
+        assignment (section 20.4: "current device per apartment"), or
+        `None` if none is assigned. Two queries (assignment, then device),
+        not a join -- mirrors `get_house_overview`'s existing "acceptable
+        for a handful of apartments" reasoning rather than introducing the
+        first join query in this module."""
+
+        assignment = self.get_current_assignment(apartment_id)
+        if assignment is None:
+            return None
+        return self.get_device(assignment.device_id)
+
+    def create_assignment(
+        self,
+        device_id: str,
+        apartment_id: str,
+        started_at: datetime,
+        reason: str,
+        ui_username: str,
+    ) -> AssignmentRecord:
+        """Opens a new assignment (section 20.1/20.2) -- **not otherwise
+        used by any P4.1 route** (assigning a device is P4.2's "confirm
+        device registration" flow, "no release without a confirmed
+        verification code", section 20.3); provided here so the partial
+        unique indexes from `0006_inventory.py` (at most one open
+        assignment per apartment, at most one per device) have a Storage
+        entry point to be tested against directly, including under
+        concurrent/overlapping calls (see `tests/test_storage.py`).
+
+        A violation of either partial unique index (the apartment or the
+        device already has an open assignment) raises `ValueError`, not an
+        uncaught `IntegrityError` -- the caller (a future P4.2 route) can
+        turn that into its own "already assigned" response.
+        """
+
+        if not reason.strip():
+            raise ValueError("A reason is required to open an assignment.")
+
+        with self.session() as session:
+            record = AssignmentRecord(
+                device_id=device_id,
+                apartment_id=apartment_id,
+                started_at=_naive_utc(started_at),
+                ended_at=None,
+                reason=reason,
+            )
+            session.add(record)
+            try:
+                session.flush()
+            except IntegrityError as error:
+                session.rollback()
+                raise ValueError(
+                    f"Apartment {apartment_id!r} or device {device_id!r} already has an "
+                    "open assignment."
+                ) from error
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="assignment",
+                entity_id=f"{apartment_id}:{device_id}",
+                action="assigned",
+                reason=reason,
+                before=None,
+                after={"device_id": device_id, "apartment_id": apartment_id},
+            )
+            session.refresh(record)
+            session.expunge(record)
+            return record
+
+    def list_audit_log_for_entity(
+        self, entity_type: str, entity_id: str
+    ) -> list[InventoryAuditLogRecord]:
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(InventoryAuditLogRecord)
+                    .where(
+                        InventoryAuditLogRecord.entity_type == entity_type,
+                        InventoryAuditLogRecord.entity_id == entity_id,
+                    )
+                    .order_by(InventoryAuditLogRecord.timestamp.desc())
+                ).all()
+            )
+            session.expunge_all()
+            return rows
 
     # -- ui accounts / sessions (P3.0) -------------------------------------------
 

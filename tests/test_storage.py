@@ -13,11 +13,13 @@ as a real-looking example value").
 from __future__ import annotations
 
 import secrets
+import sqlite3
 import threading
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from sqlalchemy import inspect
@@ -27,9 +29,11 @@ from fleet.alarms import AlarmKind, Urgency
 from fleet.storage import (
     AlarmRecord,
     ApartmentRecord,
+    AssignmentRecord,
     Base,
     HeartbeatRecord,
     Storage,
+    _alembic_config,
     create_engine_from_url,
     create_storage,
     downgrade,
@@ -949,3 +953,633 @@ def test_migration_0004_alarms_downgrade_removes_the_table(tmp_path: object) -> 
     # And back up again -- the round trip other migration tests exercise too.
     upgrade(url)
     assert "alarms" in set(inspect(create_storage(url).engine).get_table_names())
+
+
+# -----------------------------------------------------------------------------
+# P4.1: inventory foundation -- properties, apartments extended, devices,
+# assignments, inventory_audit_log (migration 0006_inventory.py).
+# -----------------------------------------------------------------------------
+
+
+def test_migration_0006_upgrade_creates_the_new_tables(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+
+    upgrade(url)
+
+    engine = create_storage(url).engine
+    tables = set(inspect(engine).get_table_names())
+    assert {"properties", "devices", "assignments", "inventory_audit_log"} <= tables
+
+    apartment_columns = {col["name"] for col in inspect(engine).get_columns("apartments")}
+    assert apartment_columns == {
+        "id",
+        "token_hash",
+        "property_id",
+        "label",
+        "floor",
+        "orientation",
+        "state",
+        "heating_circuits",
+        "pilot_mode",
+    }
+
+
+def test_migration_0006_downgrade_removes_the_new_tables_and_columns(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+
+    downgrade(url, "0005")
+
+    engine = create_storage(url).engine
+    tables = set(inspect(engine).get_table_names())
+    assert "properties" not in tables
+    assert "devices" not in tables
+    assert "assignments" not in tables
+    assert "inventory_audit_log" not in tables
+    apartment_columns = {col["name"] for col in inspect(engine).get_columns("apartments")}
+    assert apartment_columns == {"id", "token_hash"}
+
+    # Round trip.
+    upgrade(url)
+    assert "properties" in set(inspect(create_storage(url).engine).get_table_names())
+
+
+def test_migration_0006_backfills_a_legacy_apartment_row(tmp_path: object) -> None:
+    """A row created by an earlier package (id + token_hash only, before
+    this migration ever ran) migrates cleanly with the documented
+    defaults: `label` -> the id itself, `state` -> `occupied`,
+    `heating_circuits` -> 0, `pilot_mode` -> False, `property_id` -> NULL
+    (see `0006_inventory.py`'s own docstring)."""
+
+
+
+
+    path = f"{tmp_path}/legacy.db"
+    url = f"sqlite:///{path}"
+    config = _alembic_config(url)
+    command.upgrade(config, "0005")
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO apartments (id, token_hash) VALUES (?, ?)", ("house7-a03", "abc123")
+    )
+    connection.commit()
+    connection.close()
+
+    command.upgrade(config, "0006")
+
+    storage = create_storage(url)
+    apartment = storage.get_apartment("house7-a03")
+    assert apartment is not None
+    assert apartment.token_hash == "abc123"
+    assert apartment.property_id is None
+    assert apartment.label == "house7-a03"
+    assert apartment.state == "occupied"
+    assert apartment.heating_circuits == 0
+    assert apartment.pilot_mode is False
+
+
+def test_token_hash_column_is_nullable(storage: Storage) -> None:
+    """The work package's explicit instruction: "make apartments.token_hash
+    nullable -- an apartment exists before any device is confirmed"."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="3. OG links",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    apartment = storage.get_apartment("house7-a03")
+    assert apartment is not None
+    assert apartment.token_hash is None
+
+
+def test_unique_index_on_token_hash_still_permits_multiple_null_rows(
+    storage: Storage,
+) -> None:
+    """SQL's own "NULL is never equal to another NULL" semantics -- the
+    unique index on `token_hash` (unchanged by 0006_inventory.py) must not
+    reject a second apartment with a `NULL` token."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+    storage.create_apartment(
+        "house7-a04",
+        property_id=property_.id,
+        label="B",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    assert storage.get_apartment("house7-a03") is not None
+    assert storage.get_apartment("house7-a04") is not None
+
+
+def test_create_property(storage: Storage) -> None:
+    record = storage.create_property("House 7", "Sample Street 7", "Baujahr 1998")
+
+    assert record.id is not None
+    fetched = storage.get_property(record.id)
+    assert fetched is not None
+    assert fetched.name == "House 7"
+    assert fetched.notes == "Baujahr 1998"
+
+
+def test_get_property_returns_none_for_an_unknown_id(storage: Storage) -> None:
+    assert storage.get_property(999) is None
+
+
+def test_list_properties_orders_by_id(storage: Storage) -> None:
+    first = storage.create_property("A", "Street A")
+    second = storage.create_property("B", "Street B")
+
+    properties = storage.list_properties()
+
+    assert [p.id for p in properties] == [first.id, second.id]
+
+
+def test_create_apartment_and_get_apartment(storage: Storage) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+
+    created = storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="3. OG links",
+        floor="3",
+        orientation="West",
+        state="occupied",
+        heating_circuits=6,
+        pilot_mode=False,
+    )
+
+    assert created.id == "house7-a03"
+    fetched = storage.get_apartment("house7-a03")
+    assert fetched is not None
+    assert fetched.label == "3. OG links"
+    assert fetched.property_id == property_.id
+
+
+def test_create_apartment_rejects_a_duplicate_id(storage: Storage) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    with pytest.raises(ValueError, match="already exists"):
+        storage.create_apartment(
+            "house7-a03",
+            property_id=property_.id,
+            label="B",
+            floor=None,
+            orientation=None,
+            state="occupied",
+            heating_circuits=1,
+            pilot_mode=False,
+        )
+
+
+def test_get_apartment_returns_none_for_an_unknown_id(storage: Storage) -> None:
+    assert storage.get_apartment("unknown") is None
+
+
+def test_list_apartments_by_property(storage: Storage) -> None:
+    property_a = storage.create_property("A", "Street A")
+    property_b = storage.create_property("B", "Street B")
+    storage.create_apartment(
+        "a1",
+        property_id=property_a.id,
+        label="A1",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+    storage.create_apartment(
+        "b1",
+        property_id=property_b.id,
+        label="B1",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    result = storage.list_apartments_by_property(property_a.id)
+
+    assert [a.id for a in result] == ["a1"]
+
+
+def test_update_apartment_requires_a_non_empty_reason(storage: Storage) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    with pytest.raises(ValueError, match="reason"):
+        storage.update_apartment(
+            "house7-a03",
+            label="B",
+            floor=None,
+            orientation=None,
+            heating_circuits=1,
+            state="occupied",
+            pilot_mode=False,
+            ui_username="landlord",
+            reason="   ",
+        )
+
+
+def test_update_apartment_returns_false_for_an_unknown_apartment(storage: Storage) -> None:
+    result = storage.update_apartment(
+        "unknown",
+        label="B",
+        floor=None,
+        orientation=None,
+        heating_circuits=1,
+        state="occupied",
+        pilot_mode=False,
+        ui_username="landlord",
+        reason="Grund",
+    )
+
+    assert result is False
+
+
+def test_update_apartment_changes_fields_and_writes_an_audit_entry(storage: Storage) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="Alt",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    result = storage.update_apartment(
+        "house7-a03",
+        label="Neu",
+        floor="3",
+        orientation="West",
+        heating_circuits=6,
+        state="renovating",
+        pilot_mode=True,
+        ui_username="landlord",
+        reason="Pilotbetrieb und Renovierung",
+    )
+
+    assert result is True
+    apartment = storage.get_apartment("house7-a03")
+    assert apartment is not None
+    assert apartment.label == "Neu"
+    assert apartment.heating_circuits == 6
+    assert apartment.state == "renovating"
+    assert apartment.pilot_mode is True
+
+    log = storage.list_audit_log_for_entity("apartment", "house7-a03")
+    assert len(log) == 1
+    assert log[0].ui_username == "landlord"
+    assert log[0].action == "updated"
+    assert log[0].reason == "Pilotbetrieb und Renovierung"
+    assert log[0].before_json is not None and "pilot_mode" in log[0].before_json
+    assert log[0].after_json is not None and "pilot_mode" in log[0].after_json
+
+
+def test_update_apartment_writes_no_audit_entry_when_nothing_changed(
+    storage: Storage,
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="Gleich",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    result = storage.update_apartment(
+        "house7-a03",
+        label="Gleich",
+        floor=None,
+        orientation=None,
+        heating_circuits=1,
+        state="occupied",
+        pilot_mode=False,
+        ui_username="landlord",
+        reason="Keine Änderung",
+    )
+
+    assert result is True
+    assert storage.list_audit_log_for_entity("apartment", "house7-a03") == []
+
+
+def test_retired_apartment_is_not_deleted(storage: Storage) -> None:
+    """Section 20.3: "an apartment is not deleted, it is retired"."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    storage.update_apartment(
+        "house7-a03",
+        label="A",
+        floor=None,
+        orientation=None,
+        heating_circuits=1,
+        state="retired",
+        pilot_mode=False,
+        ui_username="landlord",
+        reason="Wohnung aufgegeben",
+    )
+
+    apartment = storage.get_apartment("house7-a03")
+    assert apartment is not None
+    assert apartment.state == "retired"
+
+
+def test_register_device_always_starts_registered(storage: Storage) -> None:
+
+    device = storage.register_device(
+        "sn-12345",
+        model="Pi 5",
+        acquisition_date=date(2026, 1, 15),
+        image_version="2026.1",
+        watchdog_version="0.1.0",
+    )
+
+    assert device.state == "registered"
+    assert device.public_key_fingerprint is None
+
+
+def test_register_device_rejects_a_duplicate_id(storage: Storage) -> None:
+
+    storage.register_device(
+        "sn-12345",
+        model="Pi 5",
+        acquisition_date=date(2026, 1, 15),
+        image_version="2026.1",
+        watchdog_version="0.1.0",
+    )
+
+    with pytest.raises(ValueError, match="already exists"):
+        storage.register_device(
+            "sn-12345",
+            model="Pi 5",
+            acquisition_date=date(2026, 1, 15),
+            image_version="2026.1",
+            watchdog_version="0.1.0",
+        )
+
+
+def test_get_device_returns_none_for_an_unknown_id(storage: Storage) -> None:
+    assert storage.get_device("unknown") is None
+
+
+def test_list_devices_orders_by_id(storage: Storage) -> None:
+
+    storage.register_device(
+        "sn-2", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+
+    devices = storage.list_devices()
+
+    assert [d.id for d in devices] == ["sn-1", "sn-2"]
+
+
+def test_create_assignment_and_get_current_device_for_apartment(storage: Storage) -> None:
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+
+    storage.create_assignment(
+        "sn-1", "house7-a03", datetime(2026, 1, 1, tzinfo=UTC), "Erstinbetriebnahme", "landlord"
+    )
+
+    current = storage.get_current_device_for_apartment("house7-a03")
+    assert current is not None
+    assert current.id == "sn-1"
+
+    log = storage.list_audit_log_for_entity("assignment", "house7-a03:sn-1")
+    assert len(log) == 1
+    assert log[0].action == "assigned"
+
+
+def test_get_current_device_for_apartment_is_none_without_an_assignment(
+    storage: Storage,
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    assert storage.get_current_device_for_apartment("house7-a03") is None
+
+
+def test_create_assignment_requires_a_non_empty_reason(storage: Storage) -> None:
+    with pytest.raises(ValueError, match="reason"):
+        storage.create_assignment(
+            "sn-1", "house7-a03", datetime.now(UTC), "  ", "landlord"
+        )
+
+
+def test_partial_unique_index_rejects_a_second_open_assignment_for_the_same_apartment(
+    storage: Storage,
+) -> None:
+    """Section 20.3, rule 1: "an apartment has at most one active
+    device" -- enforced at the database level, checked directly here (not
+    through a higher-level "assign" workflow, since P4.1 builds no UI for
+    that yet -- P4.2 will)."""
+
+
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    storage.register_device(
+        "sn-2", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    storage.create_assignment(
+        "sn-1", "house7-a03", datetime(2026, 1, 1, tzinfo=UTC), "Erst", "landlord"
+    )
+
+    with pytest.raises(ValueError, match="open assignment"):
+        storage.create_assignment(
+            "sn-2", "house7-a03", datetime(2026, 1, 2, tzinfo=UTC), "Zweit", "landlord"
+        )
+
+
+def test_partial_unique_index_rejects_a_second_open_assignment_for_the_same_device(
+    storage: Storage,
+) -> None:
+    """Section 20.3, rule 2: "a device belongs to at most one
+    apartment"."""
+
+
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    storage.create_assignment(
+        "sn-1", "house7-a03", datetime(2026, 1, 1, tzinfo=UTC), "Erst", "landlord"
+    )
+
+    with pytest.raises(ValueError, match="open assignment"):
+        storage.create_assignment(
+            "sn-1", "house7-a04", datetime(2026, 1, 2, tzinfo=UTC), "Zweit", "landlord"
+        )
+
+
+def test_partial_unique_index_for_assignments_is_safe_under_concurrent_calls(
+    tmp_path: object,
+) -> None:
+    """Same class of race `test_raise_alarm_is_safe_under_concurrent_calls`
+    guards against, here for `assignments`: 5 concurrent
+    `create_assignment` calls for the same apartment must leave exactly one
+    open assignment, with exactly one thread's call succeeding."""
+
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    for i in range(5):
+        storage.register_device(
+            f"sn-{i}", model="Pi 5", acquisition_date=date(2026, 1, 1),
+            image_version="2026.1", watchdog_version="0.1.0",
+        )
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def _assign(device_id: str) -> None:
+        try:
+            storage.create_assignment(
+                device_id,
+                "house7-a03",
+                datetime(2026, 1, 1, tzinfo=UTC),
+                "Concurrent test",
+                "landlord",
+            )
+            results.append(device_id)
+        except ValueError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_assign, args=(f"sn-{i}",)) for i in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 1  # exactly one thread's assignment succeeded
+    assert len(errors) == 4
+
+    with storage.session() as session:
+
+        open_rows = list(
+            session.query(AssignmentRecord)
+            .filter(
+                AssignmentRecord.apartment_id == "house7-a03",
+                AssignmentRecord.ended_at.is_(None),
+            )
+            .all()
+        )
+        session.expunge_all()
+    assert len(open_rows) == 1
+
+
+def test_list_audit_log_for_entity_orders_newest_first(storage: Storage) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+    storage.update_apartment(
+        "house7-a03", label="B", floor=None, orientation=None, heating_circuits=1,
+        state="occupied", pilot_mode=False, ui_username="landlord", reason="Erste Änderung",
+    )
+    storage.update_apartment(
+        "house7-a03", label="C", floor=None, orientation=None, heating_circuits=1,
+        state="occupied", pilot_mode=False, ui_username="landlord", reason="Zweite Änderung",
+    )
+
+    log = storage.list_audit_log_for_entity("apartment", "house7-a03")
+
+    assert [entry.reason for entry in log] == ["Zweite Änderung", "Erste Änderung"]

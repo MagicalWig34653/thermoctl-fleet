@@ -1,6 +1,278 @@
 # Status
 
-Last updated: 2026-09-25.
+Last updated: 2026-09-26.
+
+## Inventory foundation + "Inventar" view (P4.1, section 20, absorbs P3.3)
+
+**Decisions by the project owner, 2026-09-26 (do not re-open, see this
+package's own work order):**
+
+1. **Landlord inventory actions are server-rendered `/ui` forms**, behind
+   the P3.0 login (`require_ui_user`) with the per-session CSRF token on
+   every POST -- **not** `/v1` endpoints. `/v1` stays a pure agent API
+   (section 4/18.1's bearer-token check). The six `/v1` inventory stubs
+   that used to sit in `fleet/app.py` (`read_inventory`, `register_device`,
+   `prepare_device`, `confirm_device_registration`, `replace_device`,
+   `change_device_state`, plus `DeviceReplacementRequest`/
+   `DeviceStateRequest`) are **removed**, together with their tests in
+   `tests/test_fleet.py` -- replaced by a single parametrized test
+   (`test_old_v1_inventory_routes_no_longer_exist`) confirming all six
+   paths now 404. P4.2/P4.3 add the remaining device-lifecycle actions
+   (prepare/confirm/replace/state) the same way, under `/ui/inventory/...`,
+   never `/v1/...`.
+2. **P3.3 ("Inventory" view) is built here, not as its own package** --
+   `docs/implementation_plan.md`'s P3.3 entry is marked done and points
+   here; building the schema and the one view that reads it as two
+   separate packages would have made the second only read what the first
+   just wrote, with nothing else to develop against in between.
+
+**Schema (`fleet/migrations/versions/0006_inventory.py`, `down_revision`
+`"0005"`).** Four new/extended entities, section 20.1:
+
+- **`properties`** (`id` autoincrement -- the specification gives a
+  property no permanent id of its own the way an apartment has one --
+  `name`, `address`, `notes`).
+- **`apartments`** extended with `property_id` (FK to `properties.id`,
+  **nullable** -- a legacy row has none, see below), `label`, `floor`,
+  `orientation`, `state` (`ApartmentState` value), `heating_circuits`,
+  `pilot_mode`. **`token_hash` becomes nullable** (the work package's
+  explicit instruction: "an apartment exists before any device is
+  confirmed") -- the existing unique index is untouched, since SQL's own
+  "NULL is never equal to another NULL" semantics already let a unique
+  index hold any number of `NULL` rows without a special case (verified
+  directly, not just assumed: `tests/test_storage.py
+  ::test_unique_index_on_token_hash_still_permits_multiple_null_rows`).
+- **`devices`** (`id` is the serial/hardware id itself, a natural key like
+  `apartments.id` -- `model`, `acquisition_date`, `public_key_fingerprint`
+  nullable "until registration", `image_version`, `watchdog_version`,
+  `state`, a `DeviceLifecycle` value).
+- **`assignments`** (`device_id`, `apartment_id`, `started_at`, `ended_at`
+  nullable, `reason`) -- named `started_at`/`ended_at` at the column
+  level, not `from`/`until` verbatim (a reserved word in more than one SQL
+  dialect). **Two partial unique indexes enforce section 20.3's first two
+  rules at the database level**, the same pattern
+  `0004_alarms.py`'s partial unique index already established for exactly
+  this class of race: `ux_assignments_apartment_id_open` (at most one row
+  with `ended_at IS NULL` per apartment -- "an apartment has at most one
+  active device") and `ux_assignments_device_id_open` (same, per device --
+  "a device belongs to at most one apartment"). Both proven under real
+  concurrent threads against a real, migrated SQLite database, not only
+  single-threaded (`tests/test_storage.py
+  ::test_partial_unique_index_for_assignments_is_safe_under_concurrent_calls`,
+  5 threads racing to assign 5 different devices to one apartment --
+  exactly one wins, the other four get a `ValueError`, exactly one open
+  row remains).
+- **`inventory_audit_log`** (`timestamp`, `ui_username`, `entity_type`,
+  `entity_id`, `action`, `reason` nullable, `before_json`/`after_json` --
+  short JSON snapshots of only the *changed* fields, never a full-row
+  dump, so this table cannot itself become a second place section-6 data
+  could leak from). Written **in the same transaction as the change it
+  describes** (`Storage._write_inventory_audit_log` takes the caller's
+  already-open session, never opens its own) -- section 20.3: "every
+  change to assignment, state, or token is logged: who, when, why".
+
+**Existing apartment rows (P1.1-P3.x, id + token_hash only) migrate with
+these defaults, applied by `0006_inventory.py`'s own data backfill, not
+left for the application layer to paper over on first read:**
+
+| Column | Default for a legacy row | Why |
+|---|---|---|
+| `property_id` | `NULL` | No property existed before this package -- nothing to backfill it from. |
+| `label` | the apartment's own `id` | `protocol.inventory.Apartment.label` is required (`min_length=1`); the id is the only value already known for every existing row. |
+| `floor`/`orientation` | `NULL` | Both optional in the protocol model. |
+| `state` | `"occupied"` | Every apartment that reached P1.1-P3.x already has a real agent token and is understood to be a live, in-service apartment -- the least surprising default for "was already running", not a claim about actual tenancy. |
+| `heating_circuits` | `0` | The only value the previous schema carries no information to derive at all -- corrected via the "edit apartment" form. |
+| `pilot_mode` | `false` | `Apartment.pilot_mode`'s own default (section 21.4), applied identically to a migrated row. |
+
+Proven with a real pre-migration row, not only asserted:
+`tests/test_storage.py::test_migration_0006_backfills_a_legacy_apartment_row`
+inserts a bare `(id, token_hash)` row against a database migrated only to
+`0005`, then upgrades to `0006` and asserts every default above.
+`test_migrations_match_the_orm_model_exactly` (the repository's existing
+`compare_metadata` guard) stays green -- `ApartmentRecord`'s new mapped
+columns match this migration's schema exactly, including the `NOT NULL`
+constraints `label`/`state`/`heating_circuits` end up with once backfilled
+(added via a second `batch_alter_table` pass, after the data backfill, not
+before it -- SQLite would otherwise reject the `NOT NULL` on existing rows
+mid-backfill).
+
+**`Storage.set_apartment_token` fills in the same defaults** when it
+creates a brand-new apartment row (the shape every P1.1-P3.x test still
+uses: registering only a token, never going through the inventory UI) --
+`label` = the apartment id, `state` = `"occupied"`, `heating_circuits` =
+`0`, `pilot_mode` = `False`, no property. An apartment created *through*
+`Storage.create_apartment` first is unaffected; this only ever fills in a
+row that did not exist yet.
+
+**The NULL-token-hash rule, proven, not just argued.** `fleet/auth.py` is
+**untouched** by this package (the work package's explicit instruction) --
+both dependencies already behave correctly for a `NULL` `token_hash`
+without any code change:
+
+- `require_apartment_token` (apartment from the address, e.g.
+  `POST /v1/events/{apartment}`): `stored_hash is None or not
+  hmac.compare_digest(...)` already short-circuits on `None` before ever
+  calling `compare_digest` -- a `NULL` column value and "no apartment row
+  at all" produce the exact same `stored_hash is None` branch.
+- `require_apartment_token_by_hash` (apartment resolved by hash, e.g.
+  `POST /v1/heartbeat`): `WHERE token_hash == <hash>` is a SQL comparison
+  a `NULL` column value can never satisfy, for any presented hash
+  including the hash of an empty string (checked explicitly).
+
+Four new HTTP-level tests in `tests/test_fleet.py`
+(`test_null_token_hash_apartment_gets_403_on_{heartbeat,event,
+commands_stream,command_result}`) create an apartment via
+`Storage.create_apartment` (token-less, exactly the P4.1 "exists before
+confirmation" case) and confirm 403 on all four token-checked endpoints,
+plus two direct storage-level tests
+(`test_get_apartment_token_hash_returns_none_for_a_null_hash`,
+`test_get_apartment_id_by_token_hash_never_matches_a_null_hash`).
+
+**A second, real interaction this package's own change surfaced, fixed in
+the same package (not left as a regression for a later one to find):**
+P3.2's `fleet/ui_apartment.py::build_apartment_detail` used
+`Storage.get_apartment_token_hash(id) is None` as its "does this apartment
+exist" check -- correct before this package (every apartment had exactly
+one token-hash row), wrong after it (an inventory-created apartment with
+no device yet now legitimately has a `NULL` token but very much exists,
+and would have 404'd on "Eine Wohnung" until a device was confirmed to
+it). Fixed by adding `Storage.get_apartment_label` (returns the row's
+`label`, or `None` for a genuinely unknown apartment -- `label` is
+`NOT NULL` for every row that exists, so `None` is unambiguous) and
+switching `build_apartment_detail`'s existence check to that, which
+doubles as the label to show alongside the id (see below). No new test
+regression exists for this, since the fix landed before any test could
+observe the bug -- covered going forward by every existing P3.2 test that
+now runs against apartments created via `Storage.create_apartment` instead
+of only `Storage.set_apartment_token`.
+
+**Apartment label shown alongside the id, "if cheap" (work package's own
+instruction).** `Storage.get_house_overview` now also selects `label` in
+its existing per-apartment query (no extra query); `fleet.ui_house
+.ApartmentTile`/`fleet.ui_apartment.ApartmentDetail` both gained a `label`
+field, and `index.html`/`apartment.html` show it in parentheses next to
+the id when it differs from the id itself (a legacy row's label defaults
+to its id, so showing it twice would be noise, not information).
+
+**Storage methods (`fleet/storage.py`, new "-- inventory (P4.1, section
+20) --" section), all unit-tested directly against a real, migrated
+SQLite database:** `create_property`/`list_properties`/`get_property`;
+`create_apartment` (raises `ValueError` on a duplicate id, not an
+uncaught `IntegrityError`)/`get_apartment`/`list_apartments`/
+`list_apartments_by_property`; `update_apartment` (the single "edit
+apartment" form's backend -- label/floor/orientation/heating_circuits/
+state/`pilot_mode` all in one call, **always** requires a non-empty
+`reason`, writes exactly one audit row per call that actually changes
+something, none for a resubmitted, unchanged form);
+`register_device` (no `state` parameter at all -- "a caller must not be
+able to register a device in any state other than `registered`" is
+therefore structurally impossible to violate, not merely validated
+away)/`get_device`/`list_devices`; `get_current_assignment`/
+`get_current_device_for_apartment` (two queries, not a join, mirroring
+`get_house_overview`'s existing "acceptable for a handful of apartments"
+reasoning); `create_assignment` (not used by any P4.1 route -- P4.2's
+"confirm device registration" flow will call it -- provided here so the
+two partial unique indexes have a tested entry point, including under
+concurrency, see above); `list_audit_log_for_entity`.
+
+**UI (`fleet/ui_inventory.py`, `fleet/ui_routes.py`, `fleet/templates/ui/
+{inventory,inventory_apartment_edit}.html`, `fleet/static/ui/
+fleet-ui.css`), all behind `require_ui_user`, CSRF-checked on every POST,
+`Cache-Control: no-store`, no inline style/script:**
+
+- `GET /ui/inventory` -- properties (each with its apartments, each
+  apartment with its current device via its open assignment if any),
+  apartments with no property (a legacy row), and every device not
+  `in_service`, optionally narrowed by `?filter=in_storage` or
+  `?filter=faulty` (section 20.4's own two named filters -- any other
+  value is silently treated as "no filter", the same forgiving handling
+  `fleet.ui_apartment.clamp_history_days` already applies to its own query
+  parameter). "Inventar" nav link added to `base.html`.
+- `POST /ui/inventory/properties` -- create a property. No `reason`/audit
+  log: a brand-new property changes no prior assignment, state, or token.
+- `POST /ui/inventory/apartments` -- create an apartment. The id is
+  validated against `APARTMENT_ID_PATTERN` (`^[a-z0-9-]+$`, matching the
+  specification's own example `house7-a03`) here, in the UI layer, kept
+  separate from `Storage.create_apartment`'s own uniqueness guarantee (the
+  primary key) -- **there is no field, on this form or any other, that
+  could ever change the id afterward.** `state` always starts at
+  `occupied` and `pilot_mode` always at `False` regardless of anything a
+  form could otherwise carry (section 21.4: "a newly created apartment is
+  never accidentally in pilot mode") -- both changeable only via the
+  separate edit form. No `reason`/audit log, same reasoning as properties.
+- `POST /ui/inventory/devices` -- register a device. **No `state` field on
+  this form at all** -- `Storage.register_device` has no `state`
+  parameter, so "ends up `registered` regardless of what is submitted" is
+  true by construction, not by a check that could be bypassed or
+  forgotten. No `reason`/audit log, same reasoning as the two forms above.
+- `GET`/`POST /ui/inventory/apartments/{id}/edit` -- edit label, floor,
+  orientation, heating circuits, state, `pilot_mode`. **A non-empty
+  `reason` is mandatory on every submission** (not only when
+  `state`/`pilot_mode` actually changes) -- the simplest rule that
+  satisfies both section 20.3's "every change to ... state ... is logged"
+  and CLAUDE.md principle 5's "pilot_mode changes are security-relevant,
+  log with a mandatory reason" without special-casing which of the six
+  fields actually changed. `state` includes `retired` as an ordinary
+  choice -- section 20.3: "an apartment is not deleted, it is retired" --
+  there is no delete action anywhere in this module, proven by
+  `tests/test_ui_inventory.py
+  ::test_apartment_edit_submit_retire_apartment_does_not_delete_it` (the
+  row still exists, still 200s on `GET`, and is still listed on the
+  inventory page afterward). `pilot_mode` is an ordinary HTML checkbox
+  (present = checked = `True`, absent = unchecked = `False`).
+
+**Section 6/20.1 stays out.** No tenant name or contact detail is read,
+shown, or collected anywhere in this package -- `protocol.inventory
+.Property`/`Apartment` already exclude the category (unchanged, `protocol/`
+was not touched); the "create property" form additionally shows a static
+German hint ("keine Mieterdaten") next to the free-text `notes` field,
+since a free-text column cannot structurally enforce what a landlord
+chooses to type into it the way a typed field can. Verified directly by
+`tests/test_ui_inventory.py
+::test_xss_escaping_of_property_and_apartment_free_text_fields`, which
+also confirms every free-text field (property name/address/notes,
+apartment label/floor/orientation) is HTML-escaped, not merely absent of
+section-6 markers.
+
+**Tests.** `tests/test_storage.py` gained 26 new tests (82 total: migration
+up/down/backfill, every new `Storage` method, both partial unique indexes
+including the concurrency test above); `tests/test_ui_inventory.py` (new,
+44 tests) covers `fleet.ui_inventory.build_inventory_view` directly
+(grouping, current-device lookup, both named filters, an unknown filter
+falling back to "no filter", a retired apartment still listed) and every
+route at the HTTP level, logging in via the real P3.0 flow: unauthenticated
+access redirecting (303) for the view and every POST; missing/wrong CSRF
+(403); every validation error (empty label, non-numeric/unknown property
+id, negative heating circuits, malformed date, duplicate ids, missing
+reason, unknown state) re-rendering with a German message (400), not a
+500 or a silent no-op; success writing the entity and, for the edit form,
+an audit entry with the acting username and reason; the `in_storage`/
+`faulty` filters; XSS escaping; the security headers. `tests/test_fleet.py`
+replaced its six removed-endpoint tests with
+`test_old_v1_inventory_routes_no_longer_exist` (parametrized over all six
+paths, asserts 404) and gained the six NULL-token-hash tests described
+above.
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol
+fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+(478 passed, 99% coverage overall, every P4.1 file --
+`fleet/storage.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py`,
+`fleet/app.py`, every migration -- at 100%).
+
+**Open points, left for later packages, not invented here:**
+
+- **P4.2/P4.2b/P4.3** (prepare/confirm/replace/state, device-side Ed25519
+  registration) are not built -- `Storage.create_assignment` exists and is
+  tested, but no `/ui` route calls it yet.
+- **No bulk "assign an existing (legacy) apartment to a property" tool.**
+  A legacy apartment's `property_id` stays `NULL` until someone edits it
+  through a future package -- P4.1's own "edit apartment" form does not
+  offer changing `property_id` either (not asked for by the work package;
+  the create-apartment form is the only place a property is chosen).
+- **`inventory_audit_log` has no UI page of its own yet** -- read only via
+  `Storage.list_audit_log_for_entity` (used by tests), not surfaced
+  anywhere in the "Inventar" view. A future package could add a per-
+  apartment/per-device history section.
 
 ## "Eine Wohnung" -- the fleet UI's apartment detail view (P3.2, section 9's second view)
 
