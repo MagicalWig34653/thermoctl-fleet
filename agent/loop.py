@@ -51,14 +51,27 @@ def collect_heartbeat() -> Heartbeat:
 def send_heartbeat(heartbeat: Heartbeat) -> None:
     """Sends `POST /v1/heartbeat` to the cloud (sections 3, 5).
 
-    Missing: TLS with certificate verification and fingerprint pinning (section 4),
-    the actual sending including error handling, and re-delivering buffered
-    heartbeats after an outage.
+    **P5.0 has already built the transport half of this** -- the pinned,
+    always-verifying HTTPS client (`agent.transport.build_client`, section 4)
+    and the actual send-with-buffering logic, including re-delivering
+    buffered heartbeats after an outage via one `POST /v1/heartbeats` batch
+    call (`agent.heartbeat_sender.send_heartbeat`, section 5). This function
+    itself stays a placeholder, deliberately: wiring it into a real loop
+    needs a client, an apartment id, and a buffer path to hand to
+    `agent.heartbeat_sender.send_heartbeat` -- configuration that in turn
+    depends on `collect_heartbeat` above and the registration this module
+    does not yet perform, both still deferred (project owner, 2026-09-24;
+    `collect_heartbeat` waits on thermoctl's `/api/v1/health`). Once that
+    lands, this function's real body should be a thin call into
+    `agent.heartbeat_sender.send_heartbeat` with the loop's own client/
+    apartment/buffer-path, not a reimplementation.
     """
 
     raise NotImplementedError(
-        "Sending the heartbeat to the cloud is missing -- see docs/specification.md "
-        "sections 3, 4 and 5."
+        "Sending the heartbeat to the cloud is missing from the main loop -- the "
+        "transport itself is implemented (agent/transport.py, "
+        "agent/heartbeat_sender.py, P5.0); see docs/specification.md sections 3, 4 "
+        "and 5."
     )
 
 
@@ -66,8 +79,11 @@ def receive_commands() -> Iterator[Command]:
     """Reads the SSE stream `GET /v1/commands`, or the 60 s fallback (section 3).
 
     Missing: the SSE client itself with `Last-Event-ID` handling for reconnection,
-    detecting an interrupted connection and switching to `?wait=0` polling, as well
-    as TLS pinning like the heartbeat.
+    detecting an interrupted connection and switching to `?wait=0` polling. TLS
+    pinning itself no longer needs inventing here: `agent.transport.build_client`
+    (P5.0) already provides the same pinned, always-verifying `httpx.Client` this
+    function would need -- an SSE client (P5.1) can be built directly on top of it,
+    the same way `agent.heartbeat_sender` already is.
     """
 
     raise NotImplementedError(

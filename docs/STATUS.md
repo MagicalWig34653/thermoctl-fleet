@@ -2,8 +2,212 @@
 
 Last updated: 2026-09-26.
 
-## Cross-review hot fix: P4.2b accepted small-order Ed25519 keys (main
-session) **SR**
+## Agent transport: pinned HTTPS client, device registration, token storage,
+heartbeat sending (P5.0, sections 3, 4, 5, 10, 14, 15.3, 18.1, 18.2, 19.5,
+23.2) **SR**
+
+**Scope, per the project owner's split (2026-09-26).** P2.3 ("agent:
+collect and send heartbeat") was deferred whole because it depends on
+thermoctl's still-missing `/api/v1/health` -- but only `collect_heartbeat`
+(reading thermoctl) actually needs that endpoint. Everything else P2.3
+named -- TLS pinning, sending, catch-up buffering -- does not, and is built
+here as three new modules: `agent/transport.py`, `agent/registration.py`,
+`agent/heartbeat_sender.py`. `agent/loop.py::collect_heartbeat` and the
+main loop itself are untouched; `agent/loop.py::send_heartbeat` stays a
+placeholder too, deliberately (its docstring now explains why: wiring it
+up needs a client/apartment/buffer-path this module's own registration
+flow would produce, which the main loop does not yet assemble).
+
+### The pinned HTTPS client (`agent/transport.py`)
+
+**Fingerprint format: `sha256:<hex>`** -- lowercase, exactly 64 hex
+characters, the SHA-256 digest of the fleet server's **leaf** certificate's
+raw DER bytes. `parse_certificate_fingerprint` rejects anything else
+(wrong prefix, wrong length, non-hex, or uppercase hex -- rejected rather
+than silently lowercased) instead of falling back to "no pin".
+`fingerprint_for_certificate` is the inverse, used by every test that needs
+to compute the pin for a certificate it just generated. `fleet/ui_routes.py`'s
+`FLEET_CERT_FINGERPRINT` env var (the "Vorbereiten" page, P4.2) now
+documents this same format in a comment -- the value itself was already
+opaque there (passed straight into `agent-registration.json`, never parsed
+fleet-side), so no behaviour changed, only the format is now written down
+in one place both sides can point at.
+
+**Two independent barriers, both always on:**
+
+1. **Ordinary certificate verification, never disabled.** `ssl
+   .create_default_context()` (or, for a test, `cafile=<throwaway CA>` --
+   still verifying, just against a different trust root) -- `verify=False`
+   appears nowhere in this module or in any test that exercises it, per the
+   work order's explicit instruction.
+2. **Fingerprint pinning**, as a genuinely separate check on top: the
+   pinned value must equal the SHA-256 digest of whatever leaf certificate
+   the live connection actually negotiates.
+
+**What the pin check guarantees, precisely (investigated, not assumed).**
+`httpx.HTTPTransport` exposes no hook between "TLS handshake completed" and
+"request bytes written" -- it does not even expose `network_backend`, the
+one `httpcore.ConnectionPool` constructor parameter that would allow one.
+This package therefore builds its own minimal transport (`_PinnedTransport`,
+mirroring `httpx.HTTPTransport`'s own `handle_request` translation, the one
+part worth reusing verbatim) wired to a custom `httpcore.NetworkBackend`
+(`_PinningNetworkBackend`) whose connections are wrapped in
+`_PinCheckingStream`. `_PinCheckingStream.start_tls` performs the real
+handshake (delegating to `httpcore`'s own `SyncBackend`), then immediately
+reads the negotiated leaf certificate off the resulting stream
+(`get_extra_info("ssl_object").getpeercert(True)` -- positional, not the
+keyword form, since this is the low-level `_ssl._SSLSocket` object
+`httpcore`'s `SyncBackend` itself hands back, not the higher-level `ssl
+.SSLObject`) and compares its SHA-256 digest to the pinned value **before
+returning that stream to its caller**. `httpcore.ConnectionPool`'s own
+connection-establishment path calls `network_backend.connect_tcp(...)` and
+then `stream.start_tls(...)` strictly *before* constructing the
+`HTTP11Connection` object that would go on to write the request line,
+headers (including `Authorization: Bearer ...`), or body. **A pin mismatch
+therefore aborts before that object exists at all -- no request byte of any
+kind is ever written on that connection before the pin has been checked
+against the actual, live-negotiated certificate.** This is a guarantee
+about bytes on the wire, not merely "the response is discarded" -- the
+minimum the work order asked for is exceeded, not just met.
+`tests/test_agent_transport.py::test_pin_mismatch_refuses_request_and_never_delivers_it`
+and `tests/test_agent_heartbeat_sender.py::test_pin_mismatch_never_delivers_the_bearer_token`
+both prove this directly with a recording TLS server: on mismatch, the
+server's own handler never runs at all, so it records nothing -- not a
+method, not a path, not one header.
+
+On mismatch, `CertificateFingerprintMismatch` (a `httpx.TransportError`
+subclass) is raised; the httpcore response is discarded, unread.
+
+**Only `https://` is accepted** -- `build_client` checks the URL scheme
+before attempting any connection at all (`InvalidFleetAddress`).
+
+**A leaked pool slot, found and fixed while writing the tests.** The first
+version of `_PinnedTransport.handle_request` read a response's body without
+ever closing the underlying `httpcore` response stream -- `httpcore` only
+returns a connection to its pool once that stream is explicitly closed, so
+every request leaked a pool slot instead of reusing a keep-alive
+connection. Invisible at low request volume, but a tight poll loop (the
+registration test's own confirm-then-poll race) exhausted the default
+`max_connections=10` within a couple of dozen calls and raised
+`httpcore.PoolTimeout`. Fixed by closing the response stream in a
+`finally` block; a regression here would show up immediately as a flaky
+`PoolTimeout` in the registration/heartbeat test suites, not silently.
+
+### Device registration (`agent/registration.py`)
+
+Implements 15.3 steps 1-3 exactly as P4.2b defined the fleet side: read
+`agent-registration.json` (default `/boot/firmware/agent-registration.json`,
+the FAT32 boot partition, sections 15.3.1, 19.1, 19.5) -> generate or load
+an Ed25519 key pair -> `POST /v1/registration` with the one-time code and
+the **public** key -> compute and display the verification code
+(`protocol.registration.verification_code_for`) -> poll
+`.../{registration_id}/challenge` every 60 s (honouring the server's own
+`Retry-After`, which `fleet.app.request_token_challenge` always sets to
+`60`) until confirmed -> sign the exact domain-separated message
+`fleet.app.request_device_token` verifies
+(`b"thermoctl-fleet/token/v1\0" + registration_id + b"\0" + nonce"`) ->
+fetch the token once -> store it -> stop.
+
+**Idempotent:** an existing token file short-circuits everything else, no
+network call at all -- proven by pointing a second `register()` call at a
+certainly-unreachable address and confirming it never tries.
+
+**File locations and modes** (`DEFAULT_DATA_DIR = /var/lib/thermoctl-agent`,
+separate from the boot partition, which is world-readable on any computer
+the card is plugged into):
+
+| File | Mode | Content |
+|---|---|---|
+| `device_private_key.pem` | 0600 | Ed25519 private key, PKCS8 PEM, unencrypted -- **never transmitted, never logged**; only `.sign(...)` and, once, `.private_bytes(...)` to write this file, are ever called on it |
+| `agent_token` | 0600 | the raw agent token, once issued |
+| `registration_status` | 0644 | line-based (`status=...`, `verification_code=...` while waiting), the same convention as the watchdog's own state/health-report files (sections 17, 22.3) -- for a local component such as the section 23.2 "waiting for assignment" LED pattern to read without parsing a log line |
+
+Both the private-key file and the token file are written via `os.open`
+with the mode already set at creation (not `write_bytes` + a separate
+`chmod`, which would leave a window at the umask's default mode); the data
+directory itself is created at `0700`.
+
+**Refuses anything unexpected from the server:** every response is
+validated against its `protocol.registration` model
+(`RegistrationAccepted`, `TokenChallenge`, `TokenIssued`) via
+`model_validate` -- a response that does not fit raises
+`pydantic.ValidationError`, uncaught, rather than being guessed at.
+
+**`sleep=` is an injectable parameter, not a `time` module monkeypatch.**
+The first version of the poll-loop test patched `agent.registration.time
+.sleep` directly -- but `agent.registration`'s `time` **is** the process's
+one shared `time` module (`import time` binds the same singleton), and
+`httpcore`'s own connection pool also calls `network_backend.sleep(...)`
+(which delegates to `time.sleep`) for unrelated internal bookkeeping. A
+patched global `time.sleep` therefore also intercepted `httpcore`'s calls,
+producing a confusing mix of the test's own fake delay and `httpcore`'s
+real ones in the same recorded list. `register()`/`_poll_for_challenge`
+instead take `sleep: Callable[[float], None] = time.sleep` as an ordinary
+parameter, defaulting to the real thing in production; a test passes a
+fast fake directly, scoped to exactly this call, nothing else in the
+process.
+
+### Heartbeat sending and buffering (`agent/heartbeat_sender.py`)
+
+`send_heartbeat(client, heartbeat, apartment=..., buffer_path=...)`:
+
+1. First flushes anything already buffered from an earlier outage via one
+   `POST /v1/heartbeats` batch call (section 5's own "in one batch"), so a
+   reconnect never sends a newer heartbeat ahead of the catch-up batch that
+   should have arrived first.
+2. Then sends `heartbeat` itself via `POST /v1/heartbeat`.
+3. On any transport failure (unreachable server, pin mismatch, timeout) or
+   a non-2xx/non-401/403 response, `heartbeat` is appended to a local,
+   persisted buffer (a single JSON file, written atomically -- temporary
+   file plus `Path.replace`, the same pattern `agent.loop
+   .report_watchdog_state` uses) instead of being lost.
+
+**Buffer cap: `protocol.heartbeat.MAX_CATCH_UP_HEARTBEATS` (240), oldest
+dropped first** -- matches `POST /v1/heartbeats`'s own `Body(max_length=240)`
+on the fleet side exactly, proven by feeding 245 heartbeats to a
+permanently-unreachable client and checking the buffer holds exactly 240,
+starting from the sixth one fed in.
+
+**401/403 is never buffered** -- a token the fleet service refuses (revoked,
+or valid for a different apartment) will not start being accepted again by
+retrying with the same token later; `HeartbeatAuthError` is raised
+immediately instead, so a caller can surface "token revoked" rather than
+silently growing a buffer for a token that is never coming back. Proven
+against a real fleet app by revoking a device's token (`Storage
+.remove_device`) mid-test and confirming the next `send_heartbeat` call
+raises without touching the buffer file.
+
+**Never sends a heartbeat for a different apartment than the token's** --
+checked locally (`HeartbeatApartmentMismatch`), before any network call at
+all, as defense in depth on top of the fleet side's own identical check
+(`fleet.app.receive_heartbeat`'s `authenticated_apartment !=
+heartbeat.apartment`).
+
+### Tests, all against real TLS -- no mock of TLS anywhere
+
+`tests/tls_support.py` (not itself a test file) generates a throwaway CA
+and leaf certificate pair with `cryptography` at test runtime (never
+committed) and either starts the **real** `fleet.app.app` under a real
+`uvicorn` server over that TLS (`run_tls_fleet_app`), or a minimal
+`http.server`-based server that records every request it actually receives
+(`run_recording_tls_server`, for the pin-mismatch-never-delivers-anything
+proof). `tests/test_agent_transport.py` (14 tests), `tests
+/test_agent_registration.py` (7 tests, including the full happy path with
+the fleet app run in a background thread while a second, independent
+`Storage` instance on the same sqlite file plays the landlord's confirm
+action), and `tests/test_agent_heartbeat_sender.py` (7 tests) cover the
+full acceptance list from the work order. All three files were run five
+times in a row with no flakiness observed.
+
+**Open points, explicitly not built here:** wiring `send_heartbeat`/
+`register` into an actual running main loop (needs `collect_heartbeat`,
+still deferred); the SSE command channel (P5.1) and everything downstream
+of it in step 5; WireGuard (section 14's own key-pair generation is a
+separate, not-yet-built concern -- this package only reuses section 14's
+"private key never leaves the device" reasoning for the *registration*
+key, not for a WireGuard tunnel).
+
+
 
 **The finding, stated plainly.** P4.2b's own cross-review (2026-09-26)
 reproduced, end to end, that the signed challenge P4.2b's whole design
