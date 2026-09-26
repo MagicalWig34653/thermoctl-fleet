@@ -236,9 +236,16 @@ parallel with all other packages of the same stage.
   `fleet/templates/ui/base.html`).
 - [x] done -- see `docs/STATUS.md` for the three named thresholds (citing
   their own row of section 8's alarm table), the "already on Das Haus"
-  exclusion, and the open points (the version-gap reference needs a "current
-  release" concept this service does not have yet; no fault-acknowledgement
-  mechanism is built).
+  exclusion (superseded by P3.4a below), and the open points (the
+  version-gap reference needs a "current release" concept this service does
+  not have yet; no fault-acknowledgement mechanism is built).
+- [x] **P3.4a** (2026-09-26, project owner decision) -- keep tasks of silent
+  apartments, marked stale: an apartment with an open "not reporting" alarm
+  no longer excluded from every group wholesale; instead each qualifying
+  row stays, carrying a `stale` flag plus a rendered German hint (heartbeat
+  age and alarm-since time, e.g. "... Wohnung meldet sich nicht") -- text,
+  not colour alone. A never-reported apartment stays excluded, unchanged.
+  See `docs/STATUS.md`'s P3.4 section for the full reasoning.
 
 ---
 

@@ -1694,28 +1694,104 @@ itself (a landlord bringing batteries to a visit that actually needed a
 different fix). Left out; if a future package wants to surface it, it
 should get its own task group, not this one.
 
-**Apartments already flagged on "Das Haus" are skipped here entirely --
-decided while building this package, the work package's own "decide,
-document" instruction.** `fleet.ui_tasks._eligible` excludes:
+**Superseded by P3.4a below (project owner decision, 2026-09-26) -- kept
+here only as history.** ~~Apartments already flagged on "Das Haus" are
+skipped here entirely -- decided while building this package, the work
+package's own "decide, document" instruction.~~ `fleet.ui_tasks._eligible`
+used to exclude:
 
 - apartments that have **never reported** (`ApartmentOverview.latest is
   None`) -- there is no heartbeat to read a battery/fault/version value
   from in the first place, so there is structurally nothing to compute a
-  task from, not merely nothing worth showing.
-- apartments with a currently **open "not reporting" alarm**
+  task from, not merely nothing worth showing. **Unchanged by P3.4a.**
+- ~~apartments with a currently **open "not reporting" alarm**
   (`ApartmentOverview.open_alarm is not None`) -- already the single most
   urgent line on "Das Haus" (P3.1's category 0, ranked above everything
   else); a battery percentage, fault, or version read from a heartbeat that
   stopped updating the moment the apartment went silent is stale by
   definition and would duplicate an already-surfaced, more urgent problem
   under a less urgent heading instead of adding a genuinely new piece of
-  work to schedule.
+  work to schedule.~~ **Reversed by P3.4a: this made a genuinely still-open
+  task (a weak battery, an open fault) disappear from the one list people
+  actually work from at exactly the moment the apartment went silent --
+  when a landlord investigating the silence could also act on it.**
 
-Tested directly: `tests/test_ui_tasks.py::
-test_apartment_with_open_not_reporting_alarm_excluded_from_every_group`
-builds an apartment with a very low battery, an old open fault, *and* an
-open "not reporting" alarm, and asserts it appears in none of the three
-groups despite otherwise qualifying for all three.
+## P3.4a -- keep tasks of silent apartments, marked stale (2026-09-26)
+
+**Project owner decision, 2026-09-26.** An apartment with an open "not
+reporting" alarm now **stays** in every task group its last known
+heartbeat still qualifies it for, instead of being excluded from all three
+wholesale. The exact motivating example: apartment 7 last reported battery
+5% and a fault open 3 h, then went silent -- it used to vanish from
+"Aufgaben" entirely, although both tasks almost certainly still applied.
+An apartment that has **never** reported (no heartbeat at all) stays
+excluded, unchanged -- there is structurally nothing to compute a task
+from in that case, a different situation from "last known data now stale."
+
+**What changed (`fleet/ui_tasks.py`):**
+
+- `_eligible` now only checks `overview.latest is not None` -- the
+  "not reporting" alarm check is removed from it.
+- `_stale_hint(now, overview)` returns `None` for a fresh apartment, or a
+  literal German sentence for one with a currently open "not reporting"
+  alarm, naming both the age of the heartbeat the row's value was read
+  from and how long the alarm has been open (e.g. "Wohnung meldet sich
+  nicht (seit 2 Std.) -- Stand der letzten Meldung vor 3 Std."). Text, not
+  colour alone (accessibility) -- the work package's explicit requirement.
+- `BatteryTask`/`UpdateTask`/`FaultTask` each gained `stale: bool` and
+  `stale_hint: str | None`, set by `_battery_task`/`_update_task`/
+  `_fault_task` from `overview.open_alarm is not None` and `_stale_hint`.
+- **Fault age for a stale row is still measured against `now`, not against
+  the heartbeat's own `received_at`** -- unchanged from P3.4, just now
+  reachable for a stale row too: section 8's "Fault open: ... longer than
+  2 h" is a rule about how long the fault has actually been open in
+  wall-clock time. A fault already 3 h old at last contact, apartment
+  silent for 3 h since, is 6 h open *now*, not merely 3 h -- showing the
+  smaller number would understate exactly the entry this group exists to
+  surface.
+- **Sorting is unchanged, and `stale` is deliberately not part of any sort
+  key** -- decided while building this package. For the battery round in
+  particular, the percentage itself remains the more useful ordering
+  signal for someone about to do a battery round: an apartment at 3%
+  that has since gone silent is not a *lower* priority than a fresh one at
+  15%, arguably a higher one (nobody has been able to check on it since).
+  Segregating stale rows to the bottom of each group would bury exactly
+  the entries this decision was made to keep visible; a stale row sorts
+  exactly where its value places it, just carrying the extra flag/hint.
+
+**Template/CSS (`fleet/templates/ui/tasks.html`,
+`fleet/static/ui/fleet-ui.css`):** a stale `<li>` gets a `task-list__stale`
+class (CSS-only, a dashed border) plus a second line,
+`<span class="task-list__stale-hint">`, printing `task.stale_hint`
+verbatim -- the hint is literal text, present in the markup regardless of
+whether the CSS marker renders, per the work package's own accessibility
+requirement ("text, not colour alone"). No inline `style`/`script`
+anywhere, same constraint every other `/ui` template in this repository
+already follows.
+
+**Tests.** `tests/test_ui_tasks.py::
+test_apartment_with_open_not_reporting_alarm_keeps_its_tasks_marked_stale`
+replaces the old exclusion test with the exact example from the work
+package (battery 5%, a fault open 3 h before going silent, then an open
+"not reporting" alarm): both the battery round and the fault entry are
+still present, both `stale`, both hints contain the heartbeat age and
+"meldet sich nicht", and the fault's `since_text` is measured against
+`now` (6 h, not the 3 h visible in the heartbeat).
+`test_fresh_apartment_rows_are_not_marked_stale` checks `stale is False`/
+`stale_hint is None` for an ordinary apartment.
+`test_silent_apartment_with_fine_values_has_no_task` checks a silent
+apartment whose values do not cross any threshold still yields no task --
+staleness keeps an already-qualifying row, it never invents one.
+`test_never_reported_apartment_excluded_from_every_group` (kept from P3.4,
+unchanged) still asserts the never-reported case is excluded.
+`test_tasks_view_marks_a_stale_row_with_text_not_colour_alone` is the
+HTTP-level check: the `task-list__stale` class, the `task-list__stale-hint`
+span, the literal "Wohnung meldet sich nicht" text, and no inline
+`style`/`script` anywhere on the page.
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+(728 passed, 99% coverage overall, `fleet/ui_tasks.py` at 100%).
 
 **No acknowledge/confirm mechanism exists, on purpose -- open point, not
 built here.** The work package's own instruction: an "acknowledge" action on

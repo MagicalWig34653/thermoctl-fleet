@@ -245,22 +245,73 @@ def test_never_reported_apartment_excluded_from_every_group(storage: Storage) ->
     assert overview.unconfirmed_faults == []
 
 
-def test_apartment_with_open_not_reporting_alarm_excluded_from_every_group(
-    storage: Storage, monkeypatch: pytest.MonkeyPatch
+def test_apartment_with_open_not_reporting_alarm_keeps_its_tasks_marked_stale(
+    storage: Storage,
 ) -> None:
-    """An apartment already flagged with an open "not reporting" alarm on
-    "Das Haus" is not repeated here, even though its last-known heartbeat
-    would otherwise qualify for every group (P3.4's own decision, see
-    fleet/ui_tasks.py's module docstring)."""
+    """P3.4a (project owner decision, 2026-09-26): an apartment with an open
+    "not reporting" alarm stays in every task group its last known
+    heartbeat still qualifies it for -- superseding P3.4's original
+    exclusion (`test_apartment_with_open_not_reporting_alarm_excluded_from_
+    every_group`, replaced by this test). The exact example from the work
+    package: battery 5%, a fault open 3 h before going silent, then a
+    heartbeat gap long enough to raise the "not reporting" alarm -- both
+    the battery round and the fault entry are still present, both marked
+    `stale`, and the rendered hint names the heartbeat's age and "meldet
+    sich nicht". No update task here (the heartbeat's protocol version is
+    current) -- that group is exercised by its own tests above."""
 
-    monkeypatch.setattr(storage_module, "PROTOCOL_VERSION", 2)
     storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
     storage.save_heartbeat(
         APARTMENT_A,
         _make_heartbeat(
             APARTMENT_A,
             sent_at=BASE_TIME,
-            protocol_version=1,
+            weakest_battery_percent=5,
+            open_faults=[
+                {
+                    "kind": "sensor_fault",
+                    "since": (BASE_TIME - timedelta(hours=3)).isoformat(),
+                    "zone": "bathroom",
+                }
+            ],
+        ),
+        BASE_TIME,
+    )
+    alarm_raised_at = BASE_TIME + timedelta(minutes=6)
+    storage.raise_alarm(APARTMENT_A, "not_reporting", "high", alarm_raised_at)
+
+    now = BASE_TIME + timedelta(hours=3)
+    overview = build_task_overview(storage, now)
+
+    assert [task.apartment_id for task in overview.battery_rounds] == [APARTMENT_A]
+    battery_task = overview.battery_rounds[0]
+    assert battery_task.stale is True
+    assert battery_task.stale_hint is not None
+    assert "meldet sich nicht" in battery_task.stale_hint
+    assert battery_task.last_contact_text in battery_task.stale_hint
+
+    assert len(overview.unconfirmed_faults) == 1
+    fault_task = overview.unconfirmed_faults[0]
+    assert fault_task.apartment_id == APARTMENT_A
+    assert fault_task.stale is True
+    assert fault_task.stale_hint is not None
+    assert "meldet sich nicht" in fault_task.stale_hint
+    # The fault age is measured against `now`, not against the heartbeat's
+    # own `received_at` -- the fault opened 3 h before the last heartbeat
+    # and the apartment has been silent for another 3 h since, so it has
+    # been open 6 h by `now`, not merely the 3 h visible in the heartbeat.
+    assert fault_task.since_text == "seit 6 Std."
+
+    assert overview.updates == []
+
+
+def test_fresh_apartment_rows_are_not_marked_stale(storage: Storage) -> None:
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
+    storage.save_heartbeat(
+        APARTMENT_A,
+        _make_heartbeat(
+            APARTMENT_A,
+            sent_at=BASE_TIME,
             weakest_battery_percent=5,
             open_faults=[
                 {
@@ -272,9 +323,29 @@ def test_apartment_with_open_not_reporting_alarm_excluded_from_every_group(
         ),
         BASE_TIME,
     )
+
+    overview = build_task_overview(storage, BASE_TIME + timedelta(hours=1))
+
+    assert len(overview.battery_rounds) == 1
+    assert overview.battery_rounds[0].stale is False
+    assert overview.battery_rounds[0].stale_hint is None
+    assert len(overview.unconfirmed_faults) == 1
+    assert overview.unconfirmed_faults[0].stale is False
+    assert overview.unconfirmed_faults[0].stale_hint is None
+
+
+def test_silent_apartment_with_fine_values_has_no_task(storage: Storage) -> None:
+    """A silent apartment (open "not reporting" alarm) whose last known
+    values do not cross any threshold still gets no task -- staleness only
+    keeps an already-qualifying row, it never invents a new one."""
+
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
+    storage.save_heartbeat(
+        APARTMENT_A, _make_heartbeat(APARTMENT_A, sent_at=BASE_TIME), BASE_TIME
+    )
     storage.raise_alarm(APARTMENT_A, "not_reporting", "high", BASE_TIME + timedelta(minutes=6))
 
-    overview = build_task_overview(storage, BASE_TIME + timedelta(hours=4))
+    overview = build_task_overview(storage, BASE_TIME + timedelta(hours=1))
 
     assert overview.battery_rounds == []
     assert overview.updates == []
@@ -444,6 +515,38 @@ def test_tasks_view_shows_an_unconfirmed_fault_entry(
     assert response.status_code == 200
     assert "Bridge-Fehler" in response.text
     assert "flur" in response.text
+
+
+def test_tasks_view_marks_a_stale_row_with_text_not_colour_alone(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """P3.4a: an apartment with an open "not reporting" alarm still shows
+    its battery task, marked `stale` (CSS-only, `.task-list__stale`), with
+    a second-line German hint that is plain text -- present in the markup
+    independently of any colour/CSS, per the work package's accessibility
+    requirement."""
+
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
+    storage.save_heartbeat(
+        APARTMENT_A,
+        _make_heartbeat(APARTMENT_A, sent_at=BASE_TIME, weakest_battery_percent=5),
+        BASE_TIME,
+    )
+    storage.raise_alarm(APARTMENT_A, "not_reporting", "high", BASE_TIME + timedelta(minutes=6))
+
+    _login(client, password, totp_secret)
+    response = client.get("/ui/tasks")
+
+    assert response.status_code == 200
+    assert "5&nbsp;%" in response.text
+    assert 'class="task-list__stale"' in response.text
+    assert "task-list__stale-hint" in response.text
+    assert "Wohnung meldet sich nicht" in response.text
+    assert "vor" in response.text  # heartbeat age, part of the rendered hint
+    # No inline style/script anywhere on the page -- CSS lives only in
+    # fleet/static/ui/fleet-ui.css (CLAUDE.md/work package constraint).
+    assert "style=" not in response.text
+    assert "<script" not in response.text
 
 
 def test_tasks_view_shows_the_empty_state_for_every_group(
