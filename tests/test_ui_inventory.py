@@ -1680,6 +1680,64 @@ def test_replace_device_submit_stale_form_is_refused(
     )
 
 
+def test_replace_device_submit_missing_expected_assignment_id_rerenders_with_a_message(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Cross-review round 2 fix: a missing `expected_assignment_id` field
+    must rerender with the same "stale form" message, never FastAPI's raw
+    `422` -- `fleet.ui_routes.replace_device_submit` types the field
+    `str | None`, not `int`, for exactly this reason (see its own
+    docstring)."""
+
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={"target_state": "faulty", "reason": "Grund", "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    assert "Die Zuordnung hat sich inzwischen geändert" in response.text
+    assert storage.get_current_assignment("house7-a03") is not None
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_service"
+    assert storage.list_audit_log_for_entity("device", "sn-1") == []
+
+
+def test_replace_device_submit_non_integer_expected_assignment_id_rerenders_with_a_message(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """The same guard for a value that is present but does not parse as an
+    integer -- e.g. a tampered hidden field."""
+
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={
+            "expected_assignment_id": "not-a-number",
+            "target_state": "faulty",
+            "reason": "Grund",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Die Zuordnung hat sich inzwischen geändert" in response.text
+    assert storage.get_current_assignment("house7-a03") is not None
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_service"
+    assert storage.list_audit_log_for_entity("device", "sn-1") == []
+
+
 def test_device_state_submit_wrong_csrf_is_403(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:

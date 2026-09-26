@@ -751,6 +751,81 @@ def test_confirm_device_replace_previous_forced_confirm_wins_first(storage: Stor
 # actually exercised on every run, not only "most runs" of the tests above.
 
 
+def test_confirm_device_device_state_guard_fails_if_state_changes_mid_call(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forces `confirm_device`'s phase-2 **device**-state guard
+    (`device_result.rowcount == 0`, `fleet/storage.py`'s own "cross-review
+    integration fix" comment block) deterministically -- cross-review
+    (main session) flagged this branch as covered only by scheduling luck
+    in the real-thread race test above (`test_concurrent_confirm_racing_
+    manual_reported_to_faulty_exactly_one_outcome`), showing up as a 21/22
+    coverage wobble across otherwise-identical runs. Same technique as
+    `test_confirm_device_registration_claim_fails_if_invalidated_mid_call`
+    below, one step earlier: the device is moved out of `reported` *within
+    the same transaction*, via `Storage._write_inventory_audit_log` --
+    specifically the moment the new assignment's own "assigned" audit row
+    is written, i.e. strictly *after* phase 2's own initial recheck already
+    passed (`device.state != "reported"` a few lines above, itself only
+    reachable through an artificial construction per that branch's own
+    `# pragma: no cover` comment) but strictly *before* the device-guarded
+    `UPDATE` this test targets ever runs. A concurrent `change_device_state
+    ("reported" -> "faulty")` landing in that exact gap would look
+    identical from the guard's own perspective; using the same
+    session/transaction is the honest way to hit it deterministically
+    rather than relying on real-thread timing."""
+
+    _make_apartment(storage)
+    _register_device(storage)
+    _prepare_and_report(storage)
+
+    from sqlalchemy.orm import Session as SqlalchemySession
+
+    from fleet.storage import Storage as StorageClass
+
+    real_write_audit_log = StorageClass._write_inventory_audit_log
+
+    def _write_audit_log_then_move_out_of_reported(
+        self: Storage, session: SqlalchemySession, **kwargs: object
+    ) -> None:
+        real_write_audit_log(self, session, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("entity_type") == "assignment" and kwargs.get("action") == "assigned":
+            session.execute(
+                update(DeviceRecord).where(DeviceRecord.id == "sn-1").values(state="faulty")
+            )
+
+    monkeypatch.setattr(
+        StorageClass, "_write_inventory_audit_log", _write_audit_log_then_move_out_of_reported
+    )
+
+    with pytest.raises(ValueError, match="anderweitig bearbeitet"):
+        storage.confirm_device(
+            "sn-1", "house7-a03", "verif-abc", ui_user=USERNAME, reason="x",
+            replace_previous=False, previous_device_target_state=None,
+            now=datetime(2026, 1, 1, 1, tzinfo=UTC),
+        )
+
+    # Rolled back in full: the injected mid-transaction mutation ("faulty")
+    # is itself undone along with everything else this call attempted --
+    # the device is back to "reported" (never left "faulty", never reached
+    # "in_service"), no new assignment, no *new* audit row (only
+    # `prepare_device`'s own pre-existing "prepared" row from setup, in a
+    # separate, already-committed transaction, survives), the registration
+    # untouched (still active, not confirmed).
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "reported"
+    assert storage.get_current_assignment("house7-a03") is None
+    assert storage.list_audit_log_for_entity("assignment", "house7-a03:sn-1") == []
+    assert [
+        entry.action for entry in storage.list_audit_log_for_entity("device", "sn-1")
+    ] == ["prepared"]
+    registration = storage.get_active_registration_for_device("sn-1")
+    assert registration is not None
+    assert registration.confirmed_at is None
+    assert registration.invalidated_at is None
+
+
 def test_confirm_device_registration_claim_fails_if_invalidated_mid_call(
     storage: Storage, monkeypatch: pytest.MonkeyPatch
 ) -> None:

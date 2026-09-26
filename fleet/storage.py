@@ -94,6 +94,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from fleet.device_lifecycle import (
     REMOVE_DEVICE_TARGET_STATES,
+    STALE_ASSIGNMENT_MESSAGE,
     validate_manual_device_transition,
 )
 from protocol import Event, Heartbeat, fault_kind_from_key
@@ -2938,12 +2939,6 @@ class Storage:
                     session, device_id, ui_username=ui_username, reason=reason, now=now
                 )
 
-    # A landlord-facing message, shown as-is (same convention as every
-    # other `ValueError` this module raises for the UI to display) --
-    # reused by every branch below that refuses because the assignment the
-    # form was built against is no longer the apartment's current one.
-    _STALE_ASSIGNMENT_MESSAGE = "Die Zuordnung hat sich inzwischen geändert -- bitte neu laden."
-
     def remove_device(
         self,
         apartment_id: str,
@@ -3056,7 +3051,7 @@ class Storage:
                 # replaced or removed the device the caller actually saw.
                 # Never silently act on whatever happens to be open now
                 # (see the docstring above).
-                raise ValueError(self._STALE_ASSIGNMENT_MESSAGE)
+                raise ValueError(STALE_ASSIGNMENT_MESSAGE)
 
             # `Session.execute` is typed to return the generic `Result[Any]`
             # (no `rowcount`) even for a Core UPDATE, which always actually
@@ -3079,7 +3074,7 @@ class Storage:
                 # very same assignment between the read above and this
                 # guarded write -- same message, same "nothing touched"
                 # guarantee, see the docstring above.
-                raise ValueError(self._STALE_ASSIGNMENT_MESSAGE)
+                raise ValueError(STALE_ASSIGNMENT_MESSAGE)
 
             device_id = open_assignment.device_id
             device = session.get(DeviceRecord, device_id)

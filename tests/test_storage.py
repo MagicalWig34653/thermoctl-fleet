@@ -12,6 +12,7 @@ as a real-looking example value").
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 import threading
@@ -1952,6 +1953,84 @@ def test_remove_device_writes_audit_rows_for_assignment_device_and_token(
     for entry in (closed_entry, device_log[0]):
         assert entry.reason == "Gerät defekt"
         assert entry.ui_username == "landlord"
+
+
+def test_remove_device_token_revoked_audit_row_before_json_reflects_an_actual_token(
+    storage: Storage,
+) -> None:
+    """Positive counterpart to the `had_token` fix (cross-review round 2):
+    `_make_apartment_with_device` gives the apartment a real token via
+    `set_apartment_token`, so the `token_revoked` audit row's own
+    `before_json` must say so -- `{"token_hash": "set"}`, not a hard-coded
+    claim that happens to be true here but was previously unconditional."""
+
+    _make_apartment_with_device(storage)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
+    assert storage.get_apartment_token_hash("house7-a03") is not None
+
+    storage.remove_device(
+        "house7-a03",
+        expected_assignment_id=current_assignment.id,
+        target_state="faulty",
+        reason="Gerät defekt",
+        ui_username="landlord",
+        now=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+
+    apartment_log = storage.list_audit_log_for_entity("apartment", "house7-a03")
+    token_revoked_entry = next(entry for entry in apartment_log if entry.action == "token_revoked")
+    assert token_revoked_entry.before_json is not None
+    assert token_revoked_entry.after_json is not None
+    assert json.loads(token_revoked_entry.before_json) == {"token_hash": "set"}
+    assert json.loads(token_revoked_entry.after_json) == {"token_hash": None}
+
+
+def test_remove_device_token_revoked_audit_row_before_json_reflects_no_token(
+    storage: Storage,
+) -> None:
+    """The other half: an apartment that never had a token (e.g. one whose
+    device reached `in_service` via `Storage.confirm_device` without
+    P4.2b's separate token-issuance endpoint ever having run) must not get
+    a `token_revoked` audit row falsely claiming `{"token_hash": "set"}` --
+    the exact bug found while investigating the confirm/remove race, fixed
+    in `Storage.remove_device`'s own `had_token` computation."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03", property_id=property_.id, label="A", floor=None, orientation=None,
+        state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "in_service"
+    storage.create_assignment(
+        "sn-1", "house7-a03", datetime(2026, 1, 1, tzinfo=UTC), "Erstinbetriebnahme", "landlord"
+    )
+    assert storage.get_apartment_token_hash("house7-a03") is None
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
+
+    storage.remove_device(
+        "house7-a03",
+        expected_assignment_id=current_assignment.id,
+        target_state="faulty",
+        reason="Gerät defekt",
+        ui_username="landlord",
+        now=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+
+    apartment_log = storage.list_audit_log_for_entity("apartment", "house7-a03")
+    token_revoked_entry = next(entry for entry in apartment_log if entry.action == "token_revoked")
+    assert token_revoked_entry.before_json is not None
+    assert token_revoked_entry.after_json is not None
+    assert json.loads(token_revoked_entry.before_json) == {"token_hash": None}
+    assert json.loads(token_revoked_entry.after_json) == {"token_hash": None}
 
 
 def test_remove_device_rejects_an_unknown_target_state(storage: Storage) -> None:

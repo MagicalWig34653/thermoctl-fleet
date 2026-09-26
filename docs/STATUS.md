@@ -203,6 +203,64 @@ race tests re-run again on the final code: the real-thread race test 200x
 (0 failures), both deterministic tests and both
 `test_device_registration.py` siblings 50x each (0 failures).
 
+**Cross-review round 2: three follow-ups, all fixed here.**
+
+1. **The `fleet/storage.py:2271` coverage wobble above is now
+   deterministic, not scheduling luck.** New test
+   `test_confirm_device_device_state_guard_fails_if_state_changes_mid_call`
+   (`tests/test_device_lifecycle_registration_integration.py`, same
+   technique as `test_confirm_device_registration_claim_fails_if_
+   invalidated_mid_call` right below it, one guard earlier): the device is
+   moved out of `reported` *within the same transaction*, via
+   `Storage._write_inventory_audit_log`, at the moment the new
+   assignment's own `"assigned"` audit row is written -- strictly after
+   phase 2's own initial recheck already passed, strictly before the
+   device-guarded `UPDATE` this test targets ever runs. `confirm_device`
+   then fails cleanly (`"anderweitig bearbeitet"`) and rolls back
+   everything: device back to `reported`, no new assignment, no new audit
+   row beyond `prepare_device`'s own pre-existing `"prepared"` one, the
+   registration untouched. No `# pragma: no cover` needed -- this branch is
+   now exercised on every run.
+2. **A missing or non-integer `expected_assignment_id` used to fall
+   straight through to FastAPI's raw `422`, unlike every other field this
+   route validates.** `STALE_ASSIGNMENT_MESSAGE` moved from a private
+   `Storage` class attribute to a shared, public constant
+   (`fleet.device_lifecycle.STALE_ASSIGNMENT_MESSAGE`, the same "defined
+   once, used by both the storage layer and the route's own re-render"
+   pattern `validate_manual_device_transition`'s message already
+   established). `fleet/ui_routes.py::replace_device_submit` now types
+   `expected_assignment_id: str | None` (same reasoning as `fleet
+   .ui_apartment.clamp_history_days`'s own docstring for `days`), parses it
+   itself, and re-renders the same `400` with the same message on a
+   missing or unparseable value -- checked in the same place as
+   `reason`/`target_state`, after the CSRF check. Two new tests
+   (`tests/test_ui_inventory.py
+   ::test_replace_device_submit_missing_expected_assignment_id_rerenders_
+   with_a_message`, `::test_replace_device_submit_non_integer_expected_
+   assignment_id_rerenders_with_a_message`): both `400`, nothing changed,
+   no audit row.
+3. **Positive test for the `had_token` audit fix.** Two new
+   `tests/test_storage.py` tests assert the `token_revoked` row's
+   `before_json` directly: `{"token_hash": "set"}` for an apartment that
+   actually had one (`_make_apartment_with_device`'s own
+   `set_apartment_token`), `{"token_hash": null}` for one that never did
+   (built by hand, the same way `tests/test_ui_inventory.py
+   ::test_replace_device_submit_old_token_gets_403_on_a_real_heartbeat`
+   already reaches into `DeviceRecord.state` for a state P4.2/P4.2b give no
+   route to set yet).
+
+Verification for this round (same fresh venv): `ruff check .`, `mypy .`,
+`mypy protocol fleet agent tools` all clean; `python -m pytest -W
+ignore::ResourceWarning` run 3x -- **741 passed** every time, `TOTAL`
+missed-statement count **identical across all three runs** (2948
+statements, 21 missed, 99%), every touched file
+(`fleet/storage.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py`,
+`fleet/device_lifecycle.py`) at 100% -- the coverage wobble from the
+previous round is gone. Both real-thread race tests
+(`test_confirm_device_replace_previous_races_a_concurrent_remove_device`,
+`test_concurrent_confirm_racing_manual_reported_to_faulty_exactly_one_
+outcome`) re-run 200x each, 0 failures.
+
 ## `PROTOCOL_VERSION` bump to 2 for the P4.2b registration models (main
 session)
 
