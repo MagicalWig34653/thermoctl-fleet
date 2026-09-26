@@ -37,3 +37,19 @@ file but needs a real build step (see `docs/STATUS.md`):
 - WireGuard **installed but not configured** (section 14).
 - No SSH password access; keys are deposited during preparation or not at
   all (section 19.3).
+- **`/var/lib/thermoctl-watchdog` created and owned by uid/gid 10002**
+  (P5.7 hot-fix, `docs/STATUS.md`) -- matching `docker/Dockerfile.agent`'s
+  pinned `agent` user/group exactly, the same requirement
+  `tmpfiles.d/thermoctl-agent.conf`'s own comment states for
+  `/run/thermoctl-agent` (that one is enforced by this repository's own
+  `tools/check_image_config.py::check_tmpfiles_entry`; this one is not
+  yet, since the directory is created once at image build time, section
+  17 "Fallback without a proven revision", not by a checked-in file --
+  do not rediscover this the way P5.7's cross-review had to).
+- **`/etc/thermoctl-agent/.env` with `DOCKER_GID=<gid>`** (P5.7 hot-fix,
+  round 2, `docs/STATUS.md`), generated once during this same build step
+  with `getent group docker | cut -d: -f3` -- `agent-compose.yml`'s
+  `group_add: ["${DOCKER_GID:?...}"]` reads this file automatically
+  (`docker compose` loads `.env` from the compose file's own directory),
+  and fails loud rather than starting the agent without access to the
+  Docker socket it was bind-mounted for.

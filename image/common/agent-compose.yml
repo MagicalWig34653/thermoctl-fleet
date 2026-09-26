@@ -34,6 +34,40 @@ services:
     container_name: thermoctl-agent
     pull_policy: never
     restart: on-failure
+    # Same root cause as the volumes below, same round-2 hot fix
+    # (docs/STATUS.md): the agent runs as uid/gid 10002
+    # (docker/Dockerfile.agent), not root, but the host's Docker socket
+    # (bind-mounted below, section 13) is owned `root:docker 0660` -- an
+    # unprivileged uid with no group membership in the host's "docker"
+    # group cannot open it at all, no matter how the socket file itself
+    # is mounted. `group_add` puts the agent's process into that
+    # *numeric* host gid as a supplementary group inside the container
+    # (Docker's own container user stays uid 10002; this only adds a
+    # group, it does not change to root). `${DOCKER_GID:?...}` is
+    # deliberately unresolved here -- the actual gid is whatever the
+    # image build assigned the "docker" group when packages.txt's
+    # container-runtime package was installed (system-allocated, not a
+    # value this repository can pin), so it is supplied at image-build
+    # time via /etc/thermoctl-agent/.env (`DOCKER_GID=<gid>`, generated
+    # once with `getent group docker | cut -d: -f3` during the still-
+    # unimplemented build step, section 19.4/19.5 -- tracked in
+    # image/common/README.md) and picked up automatically by `docker
+    # compose` from that file (same directory as this one,
+    # /etc/thermoctl-agent/). Deliberately failing loud (`:?`, "no digest,
+    # no start" applied here too) rather than silently defaulting to a
+    # guessed gid, which could hand the agent a *different*, wrong
+    # group's privileges instead of merely failing to start.
+    #
+    # Security note (principle 5/6): membership in the host's "docker"
+    # group is, in practice, equivalent to root on the host -- anything
+    # this grants the agent is bounded only by security principle 2
+    # (hard-coded image sources) and principle 5 (every check lives in
+    # `agent/`, enforced there), exactly the same bound the Docker socket
+    # mount below already documents for itself. This does not widen that
+    # bound, it is what makes the socket mount actually usable by a
+    # non-root container in the first place.
+    group_add:
+      - "${DOCKER_GID:?DOCKER_GID is missing -- see image/common/README.md, generated at image build time from the host's docker group}"
     volumes:
       # Directories, not individual files (P5.7 hot-fix, cross-review
       # finding: this file originally bind-mounted state.env/health.env as
@@ -57,8 +91,13 @@ services:
       #
       # /var/lib/thermoctl-watchdog: the state file (section 17 step 2),
       # persistent -- the directory (and its state.env) already exists
-      # from image build time (section 22.5, "fallback without a proven
-      # revision"), this mount only exposes it to the container too.
+      # from image build time (section 17, "Fallback without a proven
+      # revision"), this mount only exposes it to the container too. That
+      # directory must be owned by the agent's own uid/gid (10002, see
+      # docker/Dockerfile.agent and image/common/tmpfiles.d
+      # /thermoctl-agent.conf's own comment) when the still-unimplemented
+      # image build step (section 19.4) creates it -- tracked as a TODO in
+      # image/common/README.md, not yet automated anywhere.
       - /var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog
       # /run/thermoctl-agent: the health report (section 22.3) and the new
       # status-LED file (P5.7) -- both under /run/ deliberately (tmpfs,
@@ -81,4 +120,9 @@ services:
       # agent real power on the host; everything it can do with it is
       # bounded by security principle 2 (hard-coded sources) and principle
       # 5 (every check lives in agent/, enforced there), not by this file.
+      # This mount alone is not enough for the agent to actually use the
+      # socket, though: the socket itself is owned `root:docker 0660`, and
+      # the agent runs as unprivileged uid 10002 -- see this service's own
+      # `group_add` above for why that additionally requires the host's
+      # "docker" gid.
       - /var/run/docker.sock:/var/run/docker.sock

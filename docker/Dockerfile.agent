@@ -15,7 +15,16 @@ RUN pip install --no-cache-dir --prefix=/install ".[agent]"
 
 FROM python:3.13-slim
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
-RUN useradd --system --create-home --uid 10002 agent
+# uid/gid 10002 pinned explicitly (both, not just the uid) -- P5.7 hot fix,
+# cross-review: image/common/tmpfiles.d/thermoctl-agent.conf and
+# image/common/agent-compose.yml's mounted directories rely on this exact
+# numeric id to give the agent write access to /run/thermoctl-agent and
+# /var/lib/thermoctl-watchdog on the host, where no "agent" user/group
+# exists to resolve a name against -- an implicit, auto-picked gid from a
+# bare `useradd` would make that agreement a coincidence instead of a
+# contract. See docs/STATUS.md's P5.7 hot-fix entry for the full account.
+RUN groupadd --system --gid 10002 agent \
+    && useradd --system --create-home --uid 10002 --gid 10002 agent
 COPY --from=build /install /usr/local
 USER agent
 WORKDIR /app

@@ -2,6 +2,121 @@
 
 Last updated: 2026-09-27.
 
+## Cross-review hot fix, round 2: directories owned by root, and an agent with no access to the socket it was mounted for
+
+**Two further findings on the same fix (round 1, entry directly below),
+both reproduced by reading `docker/Dockerfile.agent` rather than assumed.**
+
+**Finding 1: the tmpfiles.d directory was owned by root.** Round 1 shipped
+`image/common/tmpfiles.d/thermoctl-agent.conf` as `d /run/thermoctl-agent
+0755 root root -`. `docker/Dockerfile.agent` runs the agent as an
+unprivileged, explicitly non-root user (`useradd --system --uid 10002
+agent`, `USER agent`) -- a root-owned, mode-0755 directory gives that uid
+read-and-execute access (list, traverse) but **no write permission at
+all**. Every one of the agent's atomic writes into that directory (the
+health report, the new LED status file) would therefore fail with
+`EACCES`, silently undoing the entire point of round 1's directory-mount
+fix: the directory would exist and be mountable, but the agent could never
+actually write into it. **Fix:** `docker/Dockerfile.agent` now pins the
+group explicitly too (`groupadd --system --gid 10002 agent`, then
+`useradd ... --uid 10002 --gid 10002 agent` -- previously only the uid was
+pinned, the gid was whatever `useradd` picked on its own, which is not
+guaranteed stable release to release); `thermoctl-agent.conf`'s entry is
+now `d /run/thermoctl-agent 0755 10002 10002 -`, and its own comment cross-
+references the Dockerfile line and explains *why* a plain name would not
+have worked (no `agent` user/group exists on the *host*, only inside the
+container -- the numeric id is the actual, and only, shared contract).
+`/var/lib/thermoctl-watchdog` needs the identical ownership for the
+identical reason (the agent writes `state.env` into it too) but has no
+tmpfiles.d entry of its own (created once at image build time, not
+recreated per boot, section 17 "Fallback without a proven revision") --
+that requirement is now a documented TODO in `image/common/README.md`
+instead, so the still-unimplemented build step (section 19.4) does not
+have to rediscover it the way this cross-review did.
+`tools/check_image_config.py::check_tmpfiles_entry` now parses the actual
+`d <path> <mode> <uid> <gid> <age>` line structurally (not a substring
+match, which could pass on "10002" appearing in the wrong field or a
+comment while the real uid/gid still said "root") and rejects anything
+other than `10002:10002`; four new tests in `tests/test_image_config.py`
+(owned by root, mismatched gid, too few fields, the correct ownership
+passing).
+
+**Finding 2: the agent had no access to the Docker socket it was mounted
+for.** `image/common/agent-compose.yml` bind-mounts `/var/run/docker.sock`
+so the agent can reconcile the other three services (section 13) -- but
+the socket is owned `root:docker 0660` on the host, and the agent's own
+uid 10002 is not a member of that group by default, and cannot be made one
+by anything baked into the *agent's own container image* (group
+membership for a host-socket permission has to come from the host, at
+runtime, not from `docker/Dockerfile.agent`). Without it, `agent-compose
+.yml`'s existing Docker-socket mount would have been present but useless:
+the agent could open the socket file (it is bind-mounted, so the path
+exists inside the container) but every actual call against it would be
+refused by the daemon's own permission check on the connecting process's
+group membership. **Fix, the simplest robust variant that keeps nothing
+per-host hard-coded in the repository:** `agent-compose.yml`'s `agent`
+service now declares `group_add: ["${DOCKER_GID:?...}"]` -- Compose's own
+supplementary-group mechanism, which adds the named *numeric* gid to the
+container's process without changing its uid away from 10002 or otherwise
+touching `docker/Dockerfile.agent`. The gid itself is intentionally left
+unresolved in the repository (`${DOCKER_GID:?message}` fails the `docker
+compose` invocation loud and immediately if unset, the same "no digest, no
+start" reasoning security principle 2 already applies elsewhere) -- the
+"docker" group's gid is whatever the image build's own package install
+assigned it (system-allocated, not a value this repository could pin
+without risking a silent mismatch against the real host), so it is
+resolved exactly once, by the still-unimplemented image build step
+(section 19.4), via `getent group docker | cut -d: -f3`, and written to
+`/etc/thermoctl-agent/.env` (`DOCKER_GID=<gid>`) -- the same directory as
+`compose.yml` itself, which `docker compose` reads a `.env` file from
+automatically, needing no change to how the watchdog invokes it
+(`watchdog/runtime.go`'s `cliRuntime.Start` passes no extra flag for
+this). Documented as a new TODO bullet in `image/common/README.md`,
+alongside the ownership one above. `tools/check_image_config
+.py::check_agent_compose_file` gained two more required substrings
+(`"group_add:"`, `"${DOCKER_GID:?"`), plus one new test asserting a
+compose file with every other requirement met but no `group_add` is still
+rejected. The security meaning is noted directly in the compose file's own
+comment: membership in the host's "docker" group is, in practice,
+equivalent to root on the host, bounded only by security principles 2 and
+5 -- the same bound the socket mount's own comment already stated, not
+widened by this fix, only made *usable* by an unprivileged container in
+the first place.
+
+**Cosmetic corrections, same pass:** round 1's entry (and
+`image/common/agent-compose.yml`'s own comment) cited "section 22.5" for
+the image-build-time state file guarantee; the actual source is section
+17's "Fallback without a proven revision" subsection (22.5 does not exist
+as a citation for this -- corrected in both places; the older,
+pre-existing citations of the same "22.5" mistake in `watchdog/state.go`,
+`watchdog/watch.go`, and `watchdog/README.md` predate this task and are
+out of scope for it, left alone rather than touched incidentally). Round
+1's own STATUS.md text said "six new tests" where it was actually four;
+corrected there, with a forward pointer to the further tests this round
+adds.
+
+**Verification (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`):** `ruff check .`, `mypy .` (61 source files),
+`mypy protocol fleet agent tools` (38 source files) all clean; `python -m
+tools.check_image_config` passes; `python -m pytest -W
+ignore::ResourceWarning` **744 passed**, TOTAL 2963 stmts / 21 miss = 99%
+overall coverage (the two remaining uncovered spots,
+`tools/check_image_config.py` lines 107 and 241-247, are the same
+pre-existing, unrelated gaps as both entries above --
+`check_watchdog_unit`'s untested branch and `main()`'s own body; every new
+assertion added across both rounds, including `check_tmpfiles_entry`'s
+ownership check, its too-few-fields guard, and `check_agent_compose_file`'s
+`group_add` check, is covered by its own dedicated test). `watchdog/`: this round
+touched no Go file at all (`docker/Dockerfile.agent`,
+`image/common/agent-compose.yml`, `image/common/tmpfiles.d
+/thermoctl-agent.conf`, `image/common/README.md`, `tools
+/check_image_config.py`, `tests/test_image_config.py`, `docs/STATUS.md`
+only) -- `go vet ./...` clean, `go test -count=1 ./...` green across all
+three packages (run three times in a row, no flake), `gofmt -l .` empty,
+`bash check_contract.sh` passes, `grep -c require go.mod` still `0`. Line
+counts unchanged from round 1: watchdog's own six files **280/300**;
+`cmd/thermoctl-leds` + `internal/ledsysfs` **353** combined.
+
 ## Cross-review hot fix: P5.7's status file, and P5.6's compose file before it, bind-mounted single files instead of directories
 
 **The finding, stated plainly.** P5.7's own cross-review (2026-09-27)
@@ -42,8 +157,8 @@ themselves.** `image/common/agent-compose.yml` now bind-mounts:
 
 - `/var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog` (was
   `.../state.env:.../state.env`) -- persistent, the directory (and its
-  `state.env`) already exists from image build time (section 22.5,
-  "fallback without a proven revision"); this mount only exposes it to the
+  `state.env`) already exists from image build time (section 17,
+  "Fallback without a proven revision"); this mount only exposes it to the
   container too.
 - `/run/thermoctl-agent:/run/thermoctl-agent` (was
   `/run/thermoctl-agent-health.env:/run/thermoctl-agent-health.env`) --
@@ -61,14 +176,17 @@ themselves.** `image/common/agent-compose.yml` now bind-mounts:
 
 **A directory that does not yet exist on the host at boot time, for the
 `/run/` one:** new `image/common/tmpfiles.d/thermoctl-agent.conf`, a
-`systemd-tmpfiles` snippet (`d /run/thermoctl-agent 0755 root root -`)
-installed as `/etc/tmpfiles.d/thermoctl-agent.conf` during image
-preparation (section 19.3) and applied by `systemd-tmpfiles-setup.service`
-during early boot, before `docker.service` starts any container -- the
-directory must exist on the host before the compose file's bind mount can
-attach to it. `/var/lib/thermoctl-watchdog` needs no such entry: it is
-persistent (`/var/lib`, not tmpfs) and already created once at image build
-time, per section 22.5.
+`systemd-tmpfiles` snippet installed as `/etc/tmpfiles.d/thermoctl-agent
+.conf` during image preparation (section 19.3) and applied by
+`systemd-tmpfiles-setup.service` during early boot, before `docker.service`
+starts any container -- the directory must exist on the host before the
+compose file's bind mount can attach to it. `/var/lib/thermoctl-watchdog`
+needs no such entry: it is persistent (`/var/lib`, not tmpfs) and already
+created once at image build time, per section 17 ("Fallback without a
+proven revision"). **Ownership: see the round-2 hot-fix entry directly
+below** -- this entry originally shipped the tmpfiles.d line as `d
+/run/thermoctl-agent 0755 root root -`, which a same-day re-review caught
+as wrong before this branch was ever merged.
 
 **Every default path updated to match:**
 `watchdog/cmd/thermoctl-leds/main.go`'s own flag defaults --
@@ -97,11 +215,12 @@ caught, not just a wholesale one. New `check_tmpfiles_entry` asserts
 `image/common/tmpfiles.d/thermoctl-agent.conf` exists and actually
 mentions `/run/thermoctl-agent` -- without it, the directory mount above
 has nothing to attach to before the agent container starts. Both wired
-into `check_all`. Six new tests in `tests/test_image_config.py`: directory
+into `check_all`. Four new tests in `tests/test_image_config.py`: directory
 mounts missing (rejected even with every other required substring
 present), single-file mounts present alongside the correct directory
 mounts (still rejected -- a partial revert), tmpfiles entry missing,
-tmpfiles entry present but naming the wrong directory.
+tmpfiles entry present but naming the wrong directory. (Three more tests,
+for ownership, are added by the round-2 entry below.)
 
 **Python: a new test proving the invariant the whole fix depends on**,
 not just asserting the fix from the outside. `tests/test_watchdog_contract

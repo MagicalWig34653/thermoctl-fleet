@@ -136,6 +136,13 @@ def check_agent_compose_file(path: Path) -> None:
     present, and the old single-file mount lines this bug shipped with
     must **not** be -- a regression back to file-level mounts would
     otherwise pass every other check here unnoticed.
+
+    **P5.7 hot-fix, round 2:** also asserts `group_add` puts the agent
+    into the host's Docker group via `${DOCKER_GID:?...}` -- without it,
+    the agent (an unprivileged uid, 10002, not root) can have the socket
+    bind-mounted into its container and still be refused by the daemon at
+    the far end of it, since the socket itself is owned `root:docker
+    0660` on the host.
     """
 
     if not path.is_file():
@@ -147,6 +154,8 @@ def check_agent_compose_file(path: Path) -> None:
         "image: thermoctl-agent:current",
         "- /var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog",
         "- /run/thermoctl-agent:/run/thermoctl-agent",
+        "group_add:",
+        "${DOCKER_GID:?",
     ]
     missing = [line for line in required if line not in content]
     if missing:
@@ -164,17 +173,55 @@ def check_agent_compose_file(path: Path) -> None:
         )
 
 
+# The uid/gid docker/Dockerfile.agent's `agent` user/group is pinned to --
+# checked in two independent places (this module and the Dockerfile
+# itself) precisely so neither can silently drift from the other (P5.7
+# hot-fix, cross-review: a root-owned /run/thermoctl-agent gave the
+# actually-unprivileged agent container no write permission at all).
+_AGENT_UID_GID = "10002"
+
+
 def check_tmpfiles_entry(path: Path) -> None:
     """Checks that the tmpfiles.d snippet recreating `/run/thermoctl-agent`
-    on every boot exists and actually names that directory (P5.7 hot-fix)
-    -- without it, `image/common/agent-compose.yml`'s directory mount has
-    nothing to bind to before the agent container ever starts."""
+    on every boot exists, actually names that directory, and -- the
+    cross-review finding this check exists for -- owns it by the agent
+    container's own uid/gid (`_AGENT_UID_GID`, matching
+    `docker/Dockerfile.agent`'s pinned `agent` user/group), not root.
+    Without the directory existing at all, `image/common/agent-compose
+    .yml`'s directory mount has nothing to bind to before the agent
+    container starts; without the right ownership, the agent can open the
+    directory (mode 0755, world-readable) but never write into it.
+
+    Parses the one real `d <path> <mode> <uid> <gid> <age> [argument]`
+    line structurally (comments and blank lines skipped) rather than a
+    plain substring match: a substring check for "10002" would pass even
+    if that number showed up in the wrong field (or in a comment) while
+    the actual uid/gid line still said "root".
+    """
 
     if not path.is_file():
         raise ImageError(f"{path}: tmpfiles.d entry for /run/thermoctl-agent is missing.")
-    content = path.read_text(encoding="utf-8")
-    if "/run/thermoctl-agent" not in content:
-        raise ImageError(f"{path}: does not mention /run/thermoctl-agent.")
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    entries = [line for line in lines if line.split()[1:2] == ["/run/thermoctl-agent"]]
+    if not entries:
+        raise ImageError(f"{path}: does not define /run/thermoctl-agent.")
+    fields = entries[0].split()
+    if len(fields) < 5:
+        raise ImageError(
+            f"{path}: entry for /run/thermoctl-agent has too few fields: {entries[0]!r}."
+        )
+    _entry_type, _entry_path, _mode, uid, gid = fields[:5]
+    if uid != _AGENT_UID_GID or gid != _AGENT_UID_GID:
+        raise ImageError(
+            f"{path}: /run/thermoctl-agent is owned by {uid}:{gid}, must be "
+            f"{_AGENT_UID_GID}:{_AGENT_UID_GID} (docker/Dockerfile.agent's "
+            f"pinned agent uid/gid) -- a root-owned directory gives the "
+            f"unprivileged agent container no write permission."
+        )
 
 
 def check_all(root: Path = IMAGE_DIR) -> None:
