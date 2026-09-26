@@ -212,9 +212,11 @@ def test_auth_failure_surfaced_not_buffered(tmp_path: Path, app_storage: Storage
     must raise, not silently buffer forever."""
 
     token = _issue_token(app_storage)
+    current_assignment = app_storage.get_current_assignment(APARTMENT)
+    assert current_assignment is not None
     app_storage.remove_device(
-        APARTMENT, target_state="in_storage", reason="Ausbau", ui_username=USERNAME,
-        now=datetime.now(UTC),
+        APARTMENT, expected_assignment_id=current_assignment.id, target_state="in_storage",
+        reason="Ausbau", ui_username=USERNAME, now=datetime.now(UTC),
     )
     buffer_path = tmp_path / "buffer.json"
 
