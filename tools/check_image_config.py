@@ -107,6 +107,25 @@ def check_watchdog_unit(path: Path) -> None:
         raise ImageError(f"{path}: watchdog unit is missing.")
 
 
+def check_agent_compose_file(path: Path) -> None:
+    """Checks the fixed compose file the watchdog re-applies on every swap
+    (P5.6, cross-review R5) -- not a real YAML parse (no third-party
+    dependency needed for a plausibility check), just the handful of plain
+    substrings that would silently defeat R1/R5 if lost: never pulling from
+    a registry, never fighting the watchdog's own restart-policy semantics,
+    and referencing the exact fixed tag `watchdog/runtime.go`'s Start
+    always tags to before re-applying this file.
+    """
+
+    if not path.is_file():
+        raise ImageError(f"{path}: agent compose file is missing.")
+    content = path.read_text(encoding="utf-8")
+    required = ["pull_policy: never", "restart: on-failure", "image: thermoctl-agent:current"]
+    missing = [line for line in required if line not in content]
+    if missing:
+        raise ImageError(f"{path}: missing required line(s): {missing!r}.")
+
+
 def check_all(root: Path = IMAGE_DIR) -> None:
     """Runs all checks; raises on the first failure."""
 
@@ -115,6 +134,7 @@ def check_all(root: Path = IMAGE_DIR) -> None:
     check_udev_rule(common / "udev" / "99-zigbee-stick.rules")
     check_agent_registration_template(common / "agent-registration.empty.json")
     check_watchdog_unit(root.parent / "watchdog" / "thermoctl-watchdog.service")
+    check_agent_compose_file(common / "agent-compose.yml")
 
 
 def main() -> int:

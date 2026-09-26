@@ -8,8 +8,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"os"
-	"strconv"
 )
 
 // Health is the parsed content of the health report file.
@@ -29,19 +27,14 @@ func ParseHealth(r io.Reader) (Health, error) {
 	if values["timestamp"] == "" {
 		return Health{}, fmt.Errorf("health report: 'timestamp' is missing or empty")
 	}
-	timestamp, err := strconv.ParseInt(values["timestamp"], 10, 64)
+	timestamp, err := parseOptionalTimestamp(values["timestamp"], "timestamp", "health report")
 	if err != nil {
-		return Health{}, fmt.Errorf("health report: 'timestamp' is not a Unix timestamp: %w", err)
+		return Health{}, err
 	}
 	return Health{Timestamp: timestamp, Digest: values["digest"], Version: values["version"]}, nil
 }
 
 // ReadHealth opens path and parses it.
 func ReadHealth(path string) (Health, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return Health{}, err
-	}
-	defer file.Close()
-	return ParseHealth(file)
+	return openAndParse(path, ParseHealth)
 }
