@@ -227,3 +227,34 @@ ul.task-list {
     border-radius: 0.25rem;
     padding: 0.5rem 0.75rem;
 }
+
+/* "Inventar" (P4.1) -- properties, apartments, devices. A quiet view, per
+ * section 20.4 ("the questions that are not urgent") -- no colour coding,
+ * plain lists and cards, same as "Aufgaben"'s task list above.
+ */
+.inventory-property {
+    border: 1px solid #8888;
+    border-radius: 0.25rem;
+    padding: 0.75rem 1rem;
+    margin-top: 1rem;
+}
+
+.inventory-property h3 {
+    margin-top: 0;
+}
+
+ul.inventory-apartments,
+ul.inventory-devices {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+}
+
+ul.inventory-apartments li,
+ul.inventory-devices li {
+    border: 1px solid #8888;
+    border-radius: 0.25rem;
+    padding: 0.5rem 0.75rem;
+}

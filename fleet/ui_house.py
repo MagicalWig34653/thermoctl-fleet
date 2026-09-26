@@ -77,6 +77,7 @@ class ApartmentTile:
     not in a template)."""
 
     apartment_id: str
+    label: str | None
     never_reported: bool
     last_contact_text: str
     mode: str | None
@@ -152,6 +153,7 @@ def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
     if latest is None:
         return ApartmentTile(
             apartment_id=overview.apartment_id,
+            label=overview.label,
             never_reported=True,
             last_contact_text="noch nie gemeldet",
             mode=None,
@@ -167,6 +169,7 @@ def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
     heartbeat = latest.heartbeat
     return ApartmentTile(
         apartment_id=overview.apartment_id,
+        label=overview.label,
         never_reported=False,
         last_contact_text=f"vor {_relative_duration(now, latest.received_at)}",
         mode=heartbeat.thermoctl.mode,

@@ -232,6 +232,7 @@ class ApartmentDetail:
     rule `fleet/ui_house.py::ApartmentTile` follows)."""
 
     apartment_id: str
+    label: str | None
     history_days: int
     timeline: list[TimelineEntry]
     never_reported: bool
@@ -381,10 +382,13 @@ def build_apartment_detail(
 ) -> ApartmentDetail | None:
     """`None` for an apartment unknown to storage (`fleet/ui_routes.py`
     turns that into a 404) -- existence is checked via
-    `Storage.get_apartment_token_hash`, the same lookup P1.1's agent auth
-    already performs for a different purpose (every registered apartment
-    has exactly one token-hash row, `Storage.set_apartment_token`), so no
-    separate "does this apartment exist" storage method was needed.
+    `Storage.get_apartment_label` (P4.1: an apartment can now exist with no
+    token at all, created via the inventory UI before any device has been
+    confirmed to it -- `get_apartment_token_hash` alone would wrongly 404 an
+    apartment that genuinely exists but has no device yet, so this module
+    switched to the row-existence check `get_apartment_label` provides,
+    which doubles as the label to show alongside the id, "if cheap"
+    per P4.1's own instruction).
 
     `days` accepts `int | str | None` -- see `clamp_history_days` for why
     `str` is accepted (the HTTP route passes the raw, unvalidated query
@@ -396,7 +400,8 @@ def build_apartment_detail(
     clock.
     """
 
-    if storage.get_apartment_token_hash(apartment_id) is None:
+    label = storage.get_apartment_label(apartment_id)
+    if label is None:
         return None
 
     history_days = clamp_history_days(days)
@@ -437,6 +442,7 @@ def build_apartment_detail(
     if latest is None:
         return ApartmentDetail(
             apartment_id=apartment_id,
+            label=label,
             history_days=history_days,
             timeline=timeline,
             never_reported=True,
@@ -466,6 +472,7 @@ def build_apartment_detail(
     heartbeat = latest.heartbeat
     return ApartmentDetail(
         apartment_id=apartment_id,
+        label=label,
         history_days=history_days,
         timeline=timeline,
         never_reported=False,

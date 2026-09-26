@@ -202,16 +202,16 @@ parallel with all other packages of the same stage.
   battery/signal values -- not in the heartbeat protocol; commands -- a
   later step).
 
-### P3.3 -- "Inventory" view
-- **Goal:** fourth view for property/apartment/device/assignment.
-- **Files:** as P3.1, reads `fleet/app.py`'s inventory endpoints (see
-  P4.x).
-- **Section:** 20.4.
-- **Acceptance:** page shows all four entities; test checks that every
-  reference in it is reachable (follow the `tests/test_smoke_test.py`
-  pattern from thermoctl).
-- **Depends on:** P4.1 (at least a reading inventory endpoint).
-- **Parallel to:** P3.1, P3.2 once their templates exist.
+### P3.3 -- "Inventory" view -- **merged into P4.1**
+- **Goal (as originally planned):** fourth view for property/apartment/
+  device/assignment.
+- [x] done -- **built as part of P4.1, not as its own package.** Decided by
+  the project owner, 2026-09-26, alongside P4.1's own rework: landlord
+  inventory actions are `/ui` forms, not `/v1` endpoints, so this view and
+  P4.1's storage/schema foundation are one cohesive piece of work, not two
+  packages where the second only reads what the first wrote. See P4.1
+  below and `docs/STATUS.md`'s P4.1 section for the "Inventar" view itself
+  (`fleet/ui_inventory.py`, `fleet/templates/ui/inventory*.html`).
 
 ### P3.4 -- "Tasks" view
 - **Goal:** section 9's third view, "what is due": battery rounds, updates,
@@ -244,34 +244,98 @@ parallel with all other packages of the same stage.
 
 ## Step 4 -- Inventory management (section 20)
 
-The six endpoints in `fleet/app.py` are laid out; none checks or enforces
-anything. Split by the three rules from section 20.3, so that no package
-touches all six endpoints at once.
+**Reworked in scope by the project owner, 2026-09-26 (P4.1):** the six
+`/v1` endpoints this step's packages were originally going to fill in
+(`read_inventory`, `register_device`, `prepare_device`,
+`confirm_device_registration`, `replace_device`, `change_device_state`)
+have been **removed from `fleet/app.py`** -- landlord inventory actions are
+server-rendered `/ui` forms behind the P3.0 login, not agent-reachable
+`/v1` endpoints; `/v1` stays a pure agent API (section 4/18.1's token
+check, not the P3.0 session/CSRF this now uses). The three rules from
+section 20.3 (at most one active device per apartment, a device belongs to
+at most one apartment, no release without a confirmed verification code)
+still split this step's remaining work the same way; only the endpoint
+surface each package touches changed, from `/v1/...` to `/ui/inventory/...`.
 
-### P4.1 -- Read inventory, register device
-- **Goal:** implement `read_inventory`, `register_device` (reading and
-  plain creation respectively, none of the three rules from 20.3 apply).
-- **Files:** `fleet/app.py`, P1.3's storage layer.
-- **Section:** 20.1-20.3.
-- **Acceptance:** test registers a device and reads it back via
-  `read_inventory`.
+### P4.1 -- Inventory foundation + "Inventar" view
+- **Goal:** the schema (`properties`, `apartments` extended, `devices`,
+  `assignments`, `inventory_audit_log`; migration `0006_inventory.py`),
+  `Storage` methods for all of it, and the "Inventar" UI (section 9's
+  fourth view, section 20.4 -- **absorbs P3.3**, see that package's own
+  entry above): create a property, create an apartment (permanent id,
+  charset/uniqueness validated, never editable afterward), register a
+  device (initial state always `registered`), edit an apartment's label/
+  floor/orientation/heating circuits/state/`pilot_mode` (with a mandatory
+  logged reason -- `pilot_mode` is security-relevant, CLAUDE.md principle
+  5), list properties/apartments/devices with the "in_storage"/"faulty"
+  filters. None of the three section 20.3 rules apply yet (reading and
+  plain creation only) except that `apartments.token_hash` becoming
+  nullable ("an apartment exists before any device is confirmed") had to
+  be proven not to weaken `fleet/auth.py`'s token check.
+- **Files:** `fleet/migrations/versions/0006_inventory.py`,
+  `fleet/storage.py`, `fleet/ui_inventory.py` (new), `fleet/ui_routes.py`,
+  `fleet/templates/ui/{inventory,inventory_apartment_edit}.html`,
+  `fleet/static/ui/fleet-ui.css`, `fleet/app.py` (the six old `/v1` stubs
+  removed).
+- **Section:** 20.1-20.4.
+- **Acceptance:** an apartment can be created and its device registered
+  and read back via the "Inventar" view; a `NULL` `token_hash` apartment
+  still gets 403 on every agent endpoint; the two partial unique indexes
+  from section 20.3 (one open assignment per apartment/per device) are
+  enforced at the database level, including under concurrent calls; every
+  change to assignment/state/token is logged with who/when/why.
 - **Depends on:** P1.3.
+- [x] done -- see `docs/STATUS.md` for the schema, the migration's legacy-
+  row defaults, the NULL-token-hash proof, and the audit log.
 
 ### P4.2 -- Prepare device, confirm registration and assign
-- **Goal:** implement `prepare_device`, `confirm_device_registration`,
-  including "no release without a confirmed verification code" (20.3) and
-  "a device belongs to at most one apartment" on assignment.
-- **Files:** `fleet/app.py`.
+- **Goal:** UI routes under `/ui/inventory/devices/{id}/prepare` and
+  `/ui/inventory/apartments/{id}/confirm-device` (reworked from the former
+  `/v1` stubs `prepare_device`/`confirm_device_registration`, same
+  rework as P4.1's own), including "no release without a confirmed
+  verification code" (20.3) and "a device belongs to at most one
+  apartment" on assignment. Device-side registration itself moves to
+  P4.2b (Ed25519 + a signed challenge), not built here or in P4.1.
+- **Files:** `fleet/ui_routes.py`, `fleet/ui_inventory.py`.
 - **Section:** 15.3, 20.3.
 - **Acceptance:** test demonstrates both rules negatively (an assignment
   attempt without a confirmed verification code fails; a double assignment
   fails).
 - **Depends on:** P4.1.
 
+### P4.2b -- Device-side registration (Ed25519 + signed challenge) **SR**
+- **Goal:** the device side of section 15.3 step 2/4: a freshly started
+  agent generates its own Ed25519 key pair (never leaving the device,
+  CLAUDE.md security principle 3), registers with the cloud using the
+  one-time registration code (P4.2's `prepare`) and its **public** key via
+  a new `/v1/registration/...` endpoint group, and answers a signed
+  challenge from the cloud to prove possession of the corresponding
+  private key before `Storage.get_current_device_for_apartment`'s
+  `public_key_fingerprint` is ever trusted for anything security-relevant.
+- **Files:** `agent/` (key generation, challenge response), `fleet/app.py`
+  (`/v1/registration/...`, new -- the one exception to "inventory is `/ui`
+  only", since this is the agent's own registration, not a landlord
+  action), `protocol/registration.py` (if a new field is genuinely needed --
+  clear with the project owner first, per CLAUDE.md).
+- **Section:** 4, 14, 15.3.
+- **Acceptance:** a registration request with a valid code and public key
+  succeeds; an unsigned or wrongly-signed challenge response is rejected;
+  the private key never appears in any request, response, log line, or
+  stored value anywhere in the cloud (CLAUDE.md security principle 3).
+- **Depends on:** P4.2.
+- **Read back by:** main session (private-key handling, security
+  principle 3).
+- [ ] not done.
+
 ### P4.3 -- Replace device, change state
-- **Goal:** implement `replace_device`, `change_device_state`, including
-  "at most one active device per apartment".
-- **Files:** `fleet/app.py`.
+- **Goal:** UI routes under `/ui/inventory/apartments/{id}/replace-device`
+  and `/ui/inventory/devices/{id}/state` (reworked from the former `/v1`
+  stubs `replace_device`/`change_device_state`, same rework as P4.1's
+  own), including "at most one active device per apartment" and
+  `DeviceLifecycle` transition checks (P4.1 deliberately does not enforce
+  transitions -- "not part of this package, except that registration sets
+  `registered`").
+- **Files:** `fleet/ui_routes.py`, `fleet/ui_inventory.py`.
 - **Section:** 15 (device swap), 20.3.
 - **Acceptance:** test demonstrates: a second active device for the same
   apartment is rejected; a state transition in `DeviceLifecycle` outside

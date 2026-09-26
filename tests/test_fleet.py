@@ -952,68 +952,147 @@ def test_command_result_missing_token_and_malformed_body_is_401_not_422(
 
 
 # -----------------------------------------------------------------------------
-# Inventory endpoints (section 20) -- out of scope for P1.1, no token check
-# yet (see fleet/app.py docstrings); tests unchanged, no auth header needed.
+# Former inventory endpoints (section 20) -- **removed from `/v1` by P4.1**
+# (project owner decision, 2026-09-26): inventory management is a
+# server-rendered `/ui` form, behind the P3.0 login, not an agent-reachable
+# `/v1` endpoint -- see `fleet/app.py`'s own comment where these six stubs
+# used to sit, and `fleet/ui_inventory.py`/`fleet/ui_routes.py` for where
+# this functionality now lives. What is tested here instead: the six old
+# paths are genuinely gone from the agent API, not merely renamed.
 # -----------------------------------------------------------------------------
 
-DEVICE_EXAMPLE = {
-    "id": "sn-12345",
-    "model": "Pi 5",
-    "acquisition_date": "2026-01-15",
-    "public_key_fingerprint": "ab:cd:ef",
-    "image_version": "2026.1",
-    "watchdog_version": "0.1.0",
-    "state": "registered",
-}
 
-
-def test_read_inventory_reports_missing_implementation(client: TestClient) -> None:
-    with pytest.raises(NotImplementedError):
-        client.get("/v1/inventory")
-
-
-def test_register_device_accepts_the_model_and_reports_missing_implementation(
-    client: TestClient,
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("GET", "/v1/inventory"),
+        ("POST", "/v1/devices"),
+        ("POST", "/v1/devices/sn-12345/prepare"),
+        ("POST", "/v1/devices/sn-12345/confirm"),
+        ("POST", f"/v1/apartments/{APARTMENT}/replace-device"),
+        ("POST", "/v1/devices/sn-12345/state"),
+    ],
+)
+def test_old_v1_inventory_routes_no_longer_exist(
+    client: TestClient, method: str, path: str
 ) -> None:
-    with pytest.raises(NotImplementedError):
-        client.post("/v1/devices", json=DEVICE_EXAMPLE)
+    """P4.1: the six `/v1` inventory stubs are gone -- FastAPI returns 404
+    for a path with no matching route at all (not 405, since no other
+    method is registered on any of these paths either)."""
+
+    response = client.request(method, path, json={})
+
+    assert response.status_code == 404
 
 
-def test_register_device_rejects_a_malformed_body_structurally(client: TestClient) -> None:
-    malformed = {k: v for k, v in DEVICE_EXAMPLE.items() if k != "model"}
-
-    response = client.post("/v1/devices", json=malformed)
-
-    assert response.status_code == 422
-
-
-def test_prepare_device_reports_missing_implementation(client: TestClient) -> None:
-    with pytest.raises(NotImplementedError):
-        client.post("/v1/devices/sn-12345/prepare")
+# -----------------------------------------------------------------------------
+# NULL `apartments.token_hash` (P4.1, `0006_inventory.py`): "an apartment
+# exists before any device is confirmed" -- `fleet/auth.py` must behave
+# identically for such an apartment as for one that never existed at all
+# (403, never a match), on every endpoint that checks a token. Neither
+# dependency in `fleet/auth.py` needed a code change for this (see that
+# migration's own docstring) -- these tests confirm that claim directly,
+# not just assume it.
+# -----------------------------------------------------------------------------
 
 
-def test_confirm_device_registration_reports_missing_implementation(client: TestClient) -> None:
-    with pytest.raises(NotImplementedError):
-        client.post(
-            "/v1/devices/sn-12345/confirm",
-            json={"verification_code": "4711", "apartment": APARTMENT},
-        )
+def _create_apartment_without_a_token(storage: Storage, apartment_id: str) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        apartment_id,
+        property_id=property_.id,
+        label=apartment_id,
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
 
 
-def test_replace_device_reports_missing_implementation(client: TestClient) -> None:
-    with pytest.raises(NotImplementedError):
-        client.post(
-            f"/v1/apartments/{APARTMENT}/replace-device",
-            json={"replacement_device_id": "sn-67890"},
-        )
+def test_null_token_hash_apartment_gets_403_on_heartbeat(
+    client: TestClient, storage: Storage
+) -> None:
+    _create_apartment_without_a_token(storage, APARTMENT)
+    heartbeat = dict(HEARTBEAT_EXAMPLE)
+
+    response = client.post(
+        "/v1/heartbeat", json=heartbeat, headers=_bearer("agent_house7-a03_anything")
+    )
+
+    assert response.status_code == 403
 
 
-def test_change_device_state_reports_missing_implementation(client: TestClient) -> None:
-    with pytest.raises(NotImplementedError):
-        client.post("/v1/devices/sn-12345/state", json={"state": "in_storage"})
+def test_null_token_hash_apartment_gets_403_on_heartbeats_batch(
+    client: TestClient, storage: Storage
+) -> None:
+    _create_apartment_without_a_token(storage, APARTMENT)
+    heartbeat = dict(HEARTBEAT_EXAMPLE)
+
+    response = client.post(
+        "/v1/heartbeats", json=[heartbeat], headers=_bearer("agent_house7-a03_anything")
+    )
+
+    assert response.status_code == 403
 
 
-def test_change_device_state_rejects_an_unknown_state_structurally(client: TestClient) -> None:
-    response = client.post("/v1/devices/sn-12345/state", json={"state": "missing"})
+def test_null_token_hash_apartment_gets_403_on_event(
+    client: TestClient, storage: Storage
+) -> None:
+    _create_apartment_without_a_token(storage, APARTMENT)
 
-    assert response.status_code == 422
+    response = client.post(
+        f"/v1/events/{APARTMENT}",
+        json={"schluessel": "zigbee2mqtt:bruecke", "schwere": "stoerung"},
+        headers=_bearer("agent_house7-a03_anything"),
+    )
+
+    assert response.status_code == 403
+
+
+def test_null_token_hash_apartment_gets_403_on_commands_stream(
+    client: TestClient, storage: Storage
+) -> None:
+    _create_apartment_without_a_token(storage, APARTMENT)
+
+    response = client.get("/v1/commands", headers=_bearer("agent_house7-a03_anything"))
+
+    assert response.status_code == 403
+
+
+def test_null_token_hash_apartment_gets_403_on_command_result(
+    client: TestClient, storage: Storage
+) -> None:
+    _create_apartment_without_a_token(storage, APARTMENT)
+
+    response = client.post(
+        "/v1/commands/abc123/result",
+        json=COMMAND_RESULT_EXAMPLE,
+        headers=_bearer("agent_house7-a03_anything"),
+    )
+
+    assert response.status_code == 403
+
+
+def test_get_apartment_token_hash_returns_none_for_a_null_hash(storage: Storage) -> None:
+    """Direct storage-level check (not only through the HTTP layer above):
+    `get_apartment_token_hash` returns `None` for an apartment that exists
+    but has no token yet -- indistinguishable, on purpose, from an unknown
+    apartment, which is exactly what `fleet/auth.py::require_apartment_token`
+    relies on (`stored_hash is None or ...`)."""
+
+    _create_apartment_without_a_token(storage, APARTMENT)
+
+    assert storage.get_apartment_token_hash(APARTMENT) is None
+
+
+def test_get_apartment_id_by_token_hash_never_matches_a_null_hash(storage: Storage) -> None:
+    """Direct storage-level check for the other lookup direction
+    (`fleet/auth.py::require_apartment_token_by_hash`): a `NULL` column
+    value can never satisfy a `WHERE token_hash == <hash>` lookup, so no
+    hash at all -- including the hash of an empty string, checked
+    explicitly here -- ever resolves to an apartment with a `NULL` token."""
+
+    _create_apartment_without_a_token(storage, APARTMENT)
+
+    assert storage.get_apartment_id_by_token_hash(storage_module.hash_token("")) is None

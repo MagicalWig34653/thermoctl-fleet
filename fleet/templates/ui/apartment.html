@@ -8,7 +8,7 @@
    This template only iterates and prints; it makes no ordering, wording, or
    gap/caught-up decisions of its own. #}
 <p><a href="/ui/">&larr; Zurück zum Haus</a></p>
-<h1>{{ apartment_id }}</h1>
+<h1>{{ apartment_id }}{% if detail and detail.label and detail.label != apartment_id %} ({{ detail.label }}){% endif %}</h1>
 
 {% if detail is none %}
 <p>Diese Wohnung ist nicht bekannt.</p>

@@ -25,22 +25,14 @@ from typing import Annotated
 
 from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from fleet.storage import Storage, get_storage
 from fleet.ui_routes import install_security_headers
 from fleet.ui_routes import router as ui_router
-from protocol import (
-    CommandResult,
-    DeviceLifecycle,
-    Event,
-    Heartbeat,
-    RegistrationConfirmation,
-)
+from protocol import CommandResult, Event, Heartbeat
 from protocol.heartbeat import MAX_CATCH_UP_HEARTBEATS
-from protocol.inventory import Device
 from protocol.version import PROTOCOL_VERSION
 
 logger = logging.getLogger(__name__)
@@ -328,126 +320,19 @@ def receive_command_result(
 
 # -----------------------------------------------------------------------------
 # Inventory: properties, apartments, devices, assignments (section 20).
-# "Without this directory there is no assignment, and without an assignment no
-# configuration is released (section 15.5)." The two workflows from section 20.2
-# (initial setup, device swap) are spread across the endpoints below; none of
-# them yet checks or enforces anything -- the three rules from section 20.3 (at
-# most one active device per apartment, a device belongs to at most one
-# apartment, no release without a confirmed verification code) are missing at
-# every place they would apply.
+# **Not part of the `/v1` agent API** -- decided by the project owner,
+# 2026-09-26 (P4.1, docs/implementation_plan.md): landlord inventory actions
+# (create a property/apartment, register a device, edit an apartment) are
+# server-rendered UI forms under `/ui`, behind the P3.0 login
+# (`require_ui_user`) with the per-session CSRF token on every POST, exactly
+# like every other `/ui` route -- not a sixth-through-eleventh `/v1` endpoint
+# an agent could reach with a bearer token. The six `/v1` stubs that used to
+# sit here (`read_inventory`, `register_device`, `prepare_device`,
+# `confirm_device_registration`, `replace_device`, `change_device_state`)
+# have been removed, together with `DeviceReplacementRequest`/
+# `DeviceStateRequest` and their tests -- see `fleet/ui_inventory.py` and
+# `fleet/ui_routes.py` for where this functionality now lives (P4.1's
+# "Inventar" view), and `docs/STATUS.md` for the full reasoning. P4.2/P4.3
+# add the remaining device-lifecycle UI routes (prepare/confirm/replace/
+# state) the same way, still under `/ui`, not `/v1`.
 # -----------------------------------------------------------------------------
-
-
-class DeviceReplacementRequest(BaseModel):
-    replacement_device_id: str
-
-
-class DeviceStateRequest(BaseModel):
-    state: DeviceLifecycle
-
-
-@app.get("/v1/inventory")
-def read_inventory() -> None:
-    """Properties, apartments, devices, with a filter on "in_storage"/"faulty"
-    (section 20.4, the fourth view "Inventory").
-
-    Missing: registration check of the fleet UI (not of the agent -- a different
-    auth path than section 4), storage, filtering.
-    """
-
-    raise NotImplementedError(
-        "Reading the inventory is missing -- see docs/specification.md "
-        "sections 20.1 and 20.4."
-    )
-
-
-@app.post("/v1/devices", status_code=201)
-def register_device(device: Device) -> None:
-    """Adds a device to the directory, "not yet physically prepared" (section
-    20.1, state `registered`; section 20.2, initial setup step 1).
-
-    Missing: registration check, storage, enforcing the initial state
-    `registered` regardless of what `device.state` carries in the request body --
-    a caller must not be able to register a device in any state other than
-    `registered`.
-    """
-
-    raise NotImplementedError(
-        f"Registering device {device.id!r} is missing -- see "
-        "docs/specification.md sections 20.1 and 20.2."
-    )
-
-
-@app.post("/v1/devices/{device_id}/prepare", status_code=200)
-def prepare_device(device_id: str) -> None:
-    """Generates a registration code (section 20.2, initial setup step 2;
-    sections 15.3, 19.5).
-
-    Writing the image itself is still done by the Raspberry Pi Imager or `dd` --
-    this endpoint only supplies the one-time, time-limited code for
-    `agent-registration.json` (section 4). Entirely missing: registration check,
-    generating and storing the code, state transition to `prepared`.
-    """
-
-    raise NotImplementedError(
-        f"Preparing device {device_id!r} (generating registration code) is "
-        "missing -- see docs/specification.md sections 15.3, 19.5 and 20.2."
-    )
-
-
-@app.post("/v1/devices/{device_id}/confirm", status_code=200)
-def confirm_device_registration(
-    device_id: str, confirmation: RegistrationConfirmation
-) -> None:
-    """Confirms the registration and assigns the device (section 20.2, initial
-    setup steps 3-4; section 15.3, step 3).
-
-    "Only this confirmation releases the configuration" (15.3) -- section 20.3:
-    "No release without a confirmed verification code. The id alone is never
-    enough." Entirely missing: registration check, matching the verification
-    code, creating the `Assignment`, state transition to `in_service`, releasing
-    the configuration.
-    """
-
-    raise NotImplementedError(
-        f"Confirming and assigning device {device_id!r} to apartment "
-        f"{confirmation.apartment!r} is missing -- see docs/specification.md "
-        "sections 15.3, 20.2 and 20.3."
-    )
-
-
-@app.post("/v1/apartments/{apartment_id}/replace-device", status_code=200)
-def replace_device(apartment_id: str, request: DeviceReplacementRequest) -> None:
-    """Replaces a device (section 20.2, device swap).
-
-    Entirely missing: registration check, explicit confirmation (section 20.2
-    step 2, section 20.3 rule 2 -- "must have been reset beforehand"), revoking
-    the old device's token, closing the old `Assignment` with `until`, creating
-    the new `Assignment`, handing the last encrypted backup over to the
-    replacement device (section 15.1).
-    """
-
-    raise NotImplementedError(
-        f"Replacing the device in apartment {apartment_id!r} with "
-        f"{request.replacement_device_id!r} is missing -- see "
-        "docs/specification.md sections 15.1 and 20.2."
-    )
-
-
-@app.post("/v1/devices/{device_id}/state", status_code=200)
-def change_device_state(device_id: str, request: DeviceStateRequest) -> None:
-    """Changes the state (section 20.1, state machine `registered` → `prepared`
-    → `reported` → `in_service`, alongside `in_storage`, `faulty`,
-    `decommissioned`).
-
-    Entirely missing: registration check, checking for allowed transitions (the
-    `DeviceLifecycle` enum permits every value at every point -- a jump from
-    `registered` straight to `in_service` is not structurally excluded and must
-    be prevented here), logging (section 20.3: "Every change to assignment,
-    state, or token is logged").
-    """
-
-    raise NotImplementedError(
-        f"Changing the state of device {device_id!r} to {request.state!r} is "
-        "missing -- see docs/specification.md sections 20.1 and 20.3."
-    )
