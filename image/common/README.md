@@ -11,7 +11,8 @@ twice, "take a finished Debian, apply this to it".
 | `udev/99-zigbee-stick.rules` | Fixed device name for the Zigbee radio stick, so it is not `ttyUSB0` once and `ttyUSB1` after a reboot |
 | `unattended-upgrades/` | Security updates automatically, reboot only within the maintenance window |
 | `agent-registration.empty.json` | Template for the boot partition (sections 15.3, 19.5) -- the fields from `protocol.registration.AgentRegistrationFile`, empty, until the preparation tool fills them when writing the image |
-| `agent-compose.yml` | Fixed run configuration for the agent container (P5.6, cross-review R5) -- shipped at `/etc/thermoctl-agent/compose.yml`, the watchdog's `-runtime-compose` default; the watchdog only tags a digest and re-applies this file, never edits or generates one (section 13's "no arbitrary compose files" is about what the cloud may hand the agent, not about this fixed, locally shipped one) |
+| `agent-compose.yml` | Fixed run configuration for the agent container (P5.6, cross-review R5; volumes corrected to directory mounts by the P5.7 hot-fix, see `docs/STATUS.md`) -- shipped at `/etc/thermoctl-agent/compose.yml`, the watchdog's `-runtime-compose` default; the watchdog only tags a digest and re-applies this file, never edits or generates one (section 13's "no arbitrary compose files" is about what the cloud may hand the agent, not about this fixed, locally shipped one) |
+| `tmpfiles.d/thermoctl-agent.conf` | `systemd-tmpfiles` snippet (P5.7 hot-fix) recreating `/run/thermoctl-agent` on every boot, installed as `/etc/tmpfiles.d/thermoctl-agent.conf` -- `agent-compose.yml`'s bind mount for that directory needs it to exist before the container starts |
 
 **The watchdog's systemd unit deliberately does not live here**, but with
 its code at

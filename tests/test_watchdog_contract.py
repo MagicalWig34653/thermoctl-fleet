@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from agent.loop import report_health, report_led_status, report_watchdog_state
 
 
@@ -160,3 +162,38 @@ def test_report_led_status_overwrites_previous_content(tmp_path: Path) -> None:
     lines = path.read_text(encoding="utf-8").splitlines()
     assert "cloud_contact=ok" in lines
     assert "cloud_contact=lost" not in lines
+
+
+def test_atomic_writes_stay_within_the_target_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P5.7 hot-fix (cross-review finding, docs/STATUS.md): the prepared
+    system image's `agent-compose.yml` bind-mounts the *directories* that
+    hold these three files into the agent container, not the files
+    individually -- a single-file bind mount cannot be replaced by a
+    rename the way `Path.replace` (a thin wrapper over `rename(2)`) does it,
+    since a rename only ever succeeds within one filesystem. That fix only
+    actually works if the temp file each of these three writers creates
+    lives in the **same directory** as its final target -- checked here
+    directly, for all three, rather than only assumed from reading
+    `path.with_suffix(path.suffix + ".tmp")` in the source.
+    """
+
+    recorded: list[tuple[Path, Path]] = []
+    original_replace = Path.replace
+
+    def spy_replace(self: Path, target: Path) -> Path:
+        recorded.append((self.parent, Path(target).parent))
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", spy_replace)
+
+    report_watchdog_state(tmp_path / "state.env", desired="sha256:" + "a" * 64)
+    report_health(tmp_path / "health.env", digest="sha256:" + "b" * 64, version="0.1.0")
+    report_led_status(
+        tmp_path / "led-status.env", cloud_contact="ok", fault="none", control="ok"
+    )
+
+    assert len(recorded) == 3
+    for temp_parent, target_parent in recorded:
+        assert temp_parent == target_parent == tmp_path

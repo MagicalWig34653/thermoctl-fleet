@@ -124,15 +124,57 @@ def check_agent_compose_file(path: Path) -> None:
     a registry, never fighting the watchdog's own restart-policy semantics,
     and referencing the exact fixed tag `watchdog/runtime.go`'s Start
     always tags to before re-applying this file.
+
+    **P5.7 hot-fix, cross-review finding:** also asserts the two mounts the
+    agent's atomically-replaced files (state file, health report, the new
+    status-LED file) depend on are **directories**, not individual files --
+    a single-file bind mount cannot be replaced by the temp-file-plus-
+    rename pattern `agent/loop.py` uses throughout (rename only succeeds
+    within the filesystem/directory it started in; see this file's own
+    comment and `docs/STATUS.md`'s P5.7 hot-fix entry for the full
+    account). Checked both ways: the two directory-mount lines must be
+    present, and the old single-file mount lines this bug shipped with
+    must **not** be -- a regression back to file-level mounts would
+    otherwise pass every other check here unnoticed.
     """
 
     if not path.is_file():
         raise ImageError(f"{path}: agent compose file is missing.")
     content = path.read_text(encoding="utf-8")
-    required = ["pull_policy: never", "restart: on-failure", "image: thermoctl-agent:current"]
+    required = [
+        "pull_policy: never",
+        "restart: on-failure",
+        "image: thermoctl-agent:current",
+        "- /var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog",
+        "- /run/thermoctl-agent:/run/thermoctl-agent",
+    ]
     missing = [line for line in required if line not in content]
     if missing:
         raise ImageError(f"{path}: missing required line(s): {missing!r}.")
+
+    forbidden = [
+        "/var/lib/thermoctl-watchdog/state.env:/var/lib/thermoctl-watchdog/state.env",
+        "/run/thermoctl-agent-health.env:/run/thermoctl-agent-health.env",
+    ]
+    present = [line for line in forbidden if line in content]
+    if present:
+        raise ImageError(
+            f"{path}: single-file bind mount(s) present, must be directory "
+            f"mounts instead (P5.7 hot-fix): {present!r}."
+        )
+
+
+def check_tmpfiles_entry(path: Path) -> None:
+    """Checks that the tmpfiles.d snippet recreating `/run/thermoctl-agent`
+    on every boot exists and actually names that directory (P5.7 hot-fix)
+    -- without it, `image/common/agent-compose.yml`'s directory mount has
+    nothing to bind to before the agent container ever starts."""
+
+    if not path.is_file():
+        raise ImageError(f"{path}: tmpfiles.d entry for /run/thermoctl-agent is missing.")
+    content = path.read_text(encoding="utf-8")
+    if "/run/thermoctl-agent" not in content:
+        raise ImageError(f"{path}: does not mention /run/thermoctl-agent.")
 
 
 def check_all(root: Path = IMAGE_DIR) -> None:
@@ -145,6 +187,7 @@ def check_all(root: Path = IMAGE_DIR) -> None:
     check_watchdog_unit(root.parent / "watchdog" / "thermoctl-watchdog.service")
     check_leds_unit(root.parent / "watchdog" / "cmd" / "thermoctl-leds" / "thermoctl-leds.service")
     check_agent_compose_file(common / "agent-compose.yml")
+    check_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-agent.conf")
 
 
 def main() -> int:

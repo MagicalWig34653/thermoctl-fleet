@@ -20,6 +20,7 @@ from tools.check_image_config import (
     check_all,
     check_leds_unit,
     check_package_list,
+    check_tmpfiles_entry,
     check_udev_rule,
 )
 
@@ -94,3 +95,57 @@ def test_agent_compose_file_without_pull_policy_never_is_rejected(
 
     with pytest.raises(ImageError):
         check_agent_compose_file(path)
+
+
+def test_agent_compose_file_without_directory_mounts_is_rejected(
+    tmp_path: Path,
+) -> None:
+    # P5.7 hot-fix: the other three required substrings present, but
+    # neither directory mount -- must still be rejected, not just the
+    # pull-policy/restart-policy/image-tag checks above.
+    path = tmp_path / "agent-compose.yml"
+    path.write_text(
+        "services:\n  agent:\n    image: thermoctl-agent:current\n"
+        "    pull_policy: never\n    restart: on-failure\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_agent_compose_file(path)
+
+
+def test_agent_compose_file_with_single_file_mounts_is_rejected(
+    tmp_path: Path,
+) -> None:
+    # P5.7 hot-fix, the actual finding: a single-file bind mount cannot be
+    # replaced by the agent's temp-file-plus-rename pattern (EBUSY, or a
+    # detached mount) -- this must be rejected even though every other
+    # required substring, including the *directory* mount lines, is also
+    # present (a partial revert back to file-level mounts, alongside the
+    # correct directory mounts, must still be caught).
+    path = tmp_path / "agent-compose.yml"
+    path.write_text(
+        "services:\n  agent:\n    image: thermoctl-agent:current\n"
+        "    pull_policy: never\n    restart: on-failure\n"
+        "    volumes:\n"
+        "      - /var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog\n"
+        "      - /run/thermoctl-agent:/run/thermoctl-agent\n"
+        "      - /var/lib/thermoctl-watchdog/state.env:/var/lib/thermoctl-watchdog/state.env\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_agent_compose_file(path)
+
+
+def test_tmpfiles_entry_missing_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ImageError):
+        check_tmpfiles_entry(tmp_path / "does-not-exist.conf")
+
+
+def test_tmpfiles_entry_without_the_directory_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "thermoctl-agent.conf"
+    path.write_text("d /run/some-other-thing 0755 root root -\n", encoding="utf-8")
+
+    with pytest.raises(ImageError):
+        check_tmpfiles_entry(path)

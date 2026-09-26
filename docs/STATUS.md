@@ -1,6 +1,160 @@
 # Status
 
-Last updated: 2026-09-26.
+Last updated: 2026-09-27.
+
+## Cross-review hot fix: P5.7's status file, and P5.6's compose file before it, bind-mounted single files instead of directories
+
+**The finding, stated plainly.** P5.7's own cross-review (2026-09-27)
+found that `/run/thermoctl-agent-led-status.env` (the new agent-written
+status file) was never mounted into the agent container at all in
+`image/common/agent-compose.yml` -- the agent would have written it into
+the container's own private `/run`, the host (and therefore
+`cmd/thermoctl-leds`, running on the host) would never see it, and every
+device would have permanently shown LED 1 slow-blinking ("not yet
+healthy") and LED 2 slow-blinking ("open fault"), regardless of the
+agent's real state. Chasing that finding to its root cause surfaced a
+second, wider one already sitting on `main`, from P5.6: the compose file's
+*existing* two volumes, `/var/lib/thermoctl-watchdog/state.env` and
+`/run/thermoctl-agent-health.env`, bind-mount **individual files**, not the
+directories that hold them. `agent.loop.report_watchdog_state` and
+`report_health` (P5.6) -- and `report_led_status` (P5.7) -- all write
+these files the same way: a temporary file next to the target, then
+`Path.replace` (a thin wrapper over `rename(2)`). A rename only ever
+succeeds within the filesystem/directory it started in. With the target
+bind-mounted as a single file, the temporary file the agent creates next
+to it lives on the *container's own* private overlay filesystem -- so the
+rename either fails outright (`EBUSY`, a single-file bind mount cannot be
+replaced by renaming a different inode onto it) or, depending on the
+container runtime and kernel, "succeeds" locally and silently detaches the
+mount, after which the host keeps looking at whatever snapshot happened to
+be there when the container started -- forever. Where the host file did
+not exist yet at all, Docker's own bind-mount behaviour additionally
+creates a **directory** at that path instead of a file, which would have
+made the agent's very first write fail outright with `IsADirectoryError`.
+In short: the state file and health report were *already* broken by this
+bug on `main` before this task started (P5.6's own tests never exercise
+the real compose file end to end, only the file format each side reads
+and writes -- exactly the gap a cross-review, not a unit test, is for),
+and P5.7's new file would have shipped with the identical bug on day one.
+
+**The fix: mount the two directories that hold these files, not the files
+themselves.** `image/common/agent-compose.yml` now bind-mounts:
+
+- `/var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog` (was
+  `.../state.env:.../state.env`) -- persistent, the directory (and its
+  `state.env`) already exists from image build time (section 22.5,
+  "fallback without a proven revision"); this mount only exposes it to the
+  container too.
+- `/run/thermoctl-agent:/run/thermoctl-agent` (was
+  `/run/thermoctl-agent-health.env:/run/thermoctl-agent-health.env`) --
+  a new shared directory for **both** `/run`-resident files: the health
+  report (now `/run/thermoctl-agent/health.env`, was
+  `/run/thermoctl-agent-health.env`) and the new agent status file (now
+  `/run/thermoctl-agent/led-status.env`, was
+  `/run/thermoctl-agent-led-status.env`). One directory for both rather
+  than two, since both are tmpfs-resident, wiped-on-reboot, agent-written
+  live status files with the identical "must not survive as a stale
+  snapshot" reasoning (section 22.3) -- no reason to give them two mounts
+  where one does the same job.
+- `/var/lib/thermoctl-agent:/var/lib/thermoctl-agent` (unchanged --
+  already a directory mount, never affected by this bug).
+
+**A directory that does not yet exist on the host at boot time, for the
+`/run/` one:** new `image/common/tmpfiles.d/thermoctl-agent.conf`, a
+`systemd-tmpfiles` snippet (`d /run/thermoctl-agent 0755 root root -`)
+installed as `/etc/tmpfiles.d/thermoctl-agent.conf` during image
+preparation (section 19.3) and applied by `systemd-tmpfiles-setup.service`
+during early boot, before `docker.service` starts any container -- the
+directory must exist on the host before the compose file's bind mount can
+attach to it. `/var/lib/thermoctl-watchdog` needs no such entry: it is
+persistent (`/var/lib`, not tmpfs) and already created once at image build
+time, per section 22.5.
+
+**Every default path updated to match:**
+`watchdog/cmd/thermoctl-leds/main.go`'s own flag defaults --
+`-health-file` from `/run/thermoctl-agent-health.env` to
+`/run/thermoctl-agent/health.env`, `-agent-status-file` from
+`/run/thermoctl-agent-led-status.env` to
+`/run/thermoctl-agent/led-status.env`; `-state-file` unchanged
+(`/var/lib/thermoctl-watchdog/state.env` -- only the *mount*, not the
+path, changed for that one). `watchdog/main.go` itself hard-codes no
+default paths (both its `-file`/`-health-file` flags default to `""`, set
+only via the systemd unit's `ExecStart`), so only
+`watchdog/thermoctl-watchdog.service` needed its `-health-file` argument
+updated the same way. `watchdog/cmd/thermoctl-leds/thermoctl-leds.service`
+passes no path flags at all (relies on `main.go`'s own defaults), so it
+needed no change. **Watchdog line count: unchanged at 280/300** -- only a
+string literal and a comment changed in `cmd/thermoctl-leds/main.go`,
+which is not one of the watchdog's own six counted files, and no line was
+added to or removed from any of those six.
+
+**`tools/check_image_config.py`, extended, not just documentation:**
+`check_agent_compose_file` now also asserts the two directory-mount lines
+are present *and* that the two old single-file-mount lines are **absent**
+-- checked both ways so a partial revert (the directory lines added back
+in without also removing the file-level ones, or vice versa) is still
+caught, not just a wholesale one. New `check_tmpfiles_entry` asserts
+`image/common/tmpfiles.d/thermoctl-agent.conf` exists and actually
+mentions `/run/thermoctl-agent` -- without it, the directory mount above
+has nothing to attach to before the agent container starts. Both wired
+into `check_all`. Six new tests in `tests/test_image_config.py`: directory
+mounts missing (rejected even with every other required substring
+present), single-file mounts present alongside the correct directory
+mounts (still rejected -- a partial revert), tmpfiles entry missing,
+tmpfiles entry present but naming the wrong directory.
+
+**Python: a new test proving the invariant the whole fix depends on**,
+not just asserting the fix from the outside. `tests/test_watchdog_contract
+.py::test_atomic_writes_stay_within_the_target_directory` monkeypatches
+`pathlib.Path.replace` to record, for all three writers
+(`report_watchdog_state`, `report_health`, `report_led_status`), the
+parent directory of both the rename's source (the temp file) and its
+target (the real file) -- and asserts they are identical for every call.
+This is precisely the property a directory-level bind mount requires and
+a file-level one cannot provide: `rename(2)` only ever succeeds within one
+filesystem, so as long as the temp file and its target share a parent
+directory, mounting that one directory into the container is sufficient;
+if either writer ever changed to build its temp file's path differently
+(e.g. under a shared `/tmp`), this test would fail immediately rather than
+the bug resurfacing silently on a real device.
+
+**Why a unit test did not already catch this, and what would have:** every
+existing test (`tests/test_watchdog_contract.py`,
+`watchdog/check_contract.sh`) exercises the file format and the read/write
+contract directly against a plain temp directory -- correctly, since that
+directory is never bind-mounted in a test, single-file-mount-vs-directory
+-mount is not a distinction a test without a real Docker container can
+observe at all. `tools/check_image_config.py` was the right layer to add
+the missing check to instead: it already is the tool that reads
+`agent-compose.yml` as data and asserts properties about it (P5.6's own
+`check_agent_compose_file`), and cross-review -- reading the actual
+compose file end to end against what the agent actually does when it
+writes -- is what surfaced this, not a test that only exercises one side
+of the contract in isolation. This is the documented "no substitute for an
+actual build" gap `tools/check_image_config.py`'s own module docstring
+already names: a real end-to-end run (agent container actually writing
+through the actual bind mount) would need `image.yml`'s eventual real
+build (section 19.4, still not implemented, see `image/README.md`'s "State
+of this scaffold"), not this scaffold's plausibility check -- which now at
+least catches the specific regression this fix corrects.
+
+**Verification (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`):** `ruff check .`, `mypy .` (61 source files),
+`mypy protocol fleet agent tools` (38 source files) all clean; `python -m
+tools.check_image_config` passes; `python -m pytest -W
+ignore::ResourceWarning` **739 passed**, TOTAL 2955 stmts / 21 miss = 99%
+overall coverage (the newly-listed uncovered lines in
+`tools/check_image_config.py`, 107 and 194-200, are `check_watchdog_unit`'s
+pre-existing untested branch and `main()`'s own body -- the same
+pre-existing, unrelated gaps as before this hot fix, not the new
+`check_agent_compose_file`/`check_tmpfiles_entry` assertions, which are
+each directly covered by their own new test). `watchdog/`: `go vet ./...`
+clean, `go test -count=1 ./...` green across all three packages (run three
+times in a row, no flake), `gofmt -l .` empty, `bash check_contract.sh`
+passes (rebuilt against the corrected default paths), `grep -c require
+go.mod` still `0`. Line counts: watchdog's own six files unchanged at
+**280/300**; `cmd/thermoctl-leds` + `internal/ledsysfs` unchanged at
+**353** combined (not counted against the watchdog's budget).
 
 ## P5.7 -- status LEDs as a separate program next to the watchdog (section 23)
 
@@ -66,10 +220,13 @@ dependency" point applied here too):**
    ```
    No fixed path is hard-coded in `report_led_status` itself (same rule as
    `report_watchdog_state`/`report_health`); `cmd/thermoctl-leds`'s own
-   `-agent-status-file` flag defaults to `/run/thermoctl-agent-led-
+   `-agent-status-file` flag defaults to `/run/thermoctl-agent/led-
    status.env` -- under `/run/`, like the health report, because it is a
    live status snapshot, not persisted state that should survive a reboot
-   stale.
+   stale. **Corrected by the hot-fix entry below** (originally
+   `/run/thermoctl-agent-led-status.env`, a single file rather than a path
+   inside the shared `/run/thermoctl-agent/` directory -- see that entry
+   for why this had to change before it ever reached a real device).
 
 **Staleness (documented threshold: 3x the heartbeat interval, 120s ->
 360s, `cmd/thermoctl-leds`'s own `-stale-after` flag, overridable):**

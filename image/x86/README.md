@@ -25,8 +25,11 @@ Entirely missing:
 
 - an `mkosi.conf`/`debos` recipe file that carries out the same shared
   steps as `image/pi/`: installing `image/common/packages.txt`, applying
-  the udev rule and the `unattended-upgrades` configuration, copying and
-  enabling the watchdog unit from
+  the udev rule and the `unattended-upgrades` configuration, installing
+  `image/common/tmpfiles.d/thermoctl-agent.conf` (P5.7 hot-fix, needed on
+  this target too -- `/run/thermoctl-agent` is required by the agent
+  container's own bind mount regardless of whether the LED display is
+  present), copying and enabling the watchdog unit from
   `../../watchdog/thermoctl-watchdog.service`, placing
   `agent-registration.empty.json` on the boot partition as
   `agent-registration.json`,
