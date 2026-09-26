@@ -2,6 +2,43 @@
 
 Last updated: 2026-09-26.
 
+## `PROTOCOL_VERSION` bump to 2 for the P4.2b registration models (main
+session)
+
+**Decision by the project owner (2026-09-26):** section 18.2's "a number
+that increases with every change to the models" is read **literally** --
+every change to the models, including purely additive ones, bumps it. The
+four models P4.2b added (`RegistrationAccepted`, `TokenChallenge`,
+`TokenRequest`, `TokenIssued`) therefore bump `PROTOCOL_VERSION` from 1 to
+**2**, reversing the "not bumped" call made at the time (still recorded,
+now marked superseded, in this file's P4.2b section below and in
+`protocol/registration.py`'s module docstring). The compatibility rules of
+18.2 are unchanged: the fleet still accepts an older version and flags it
+"outdated" rather than rejecting it, the agent still rejects only commands
+of a newer version, and a field is still only ever added.
+
+**Effect:** agents reporting `protocol_version` 1 now show as "outdated
+version" on "Das Haus" and "Eine Wohnung", and get an update task on
+"Aufgaben" -- expected, not a regression; no agent is deployed yet, so
+nothing currently reporting is affected. `docs/specification.md` 18.2 gets
+a short "Decided afterward" paragraph stating this; nothing else in the
+spec changes. Tests that hard-coded a literal `1` as the *current* protocol
+version's default (`tests/test_ui_apartment.py`, `tests/test_ui_tasks.py`,
+`tests/test_ui_house.py`, each a `_make_heartbeat` helper's
+`protocol_version` default) were changed to default to the
+`protocol.version.PROTOCOL_VERSION` constant instead -- those tests do not
+care about the outdated flag and would otherwise have started asserting
+"outdated" apartments as "fine" ones by accident. Tests that hard-code `1`
+to deliberately represent an *older* agent (e.g.
+`tests/test_ui_apartment.py::test_outdated_protocol_version_is_flagged`,
+several inline heartbeat JSON bodies in HTTP-level tests unrelated to the
+outdated flag) were left as literal `1`, now a real older version rather
+than a merely hypothetical one. `tests/test_protocol.py
+::test_heartbeat_with_lower_protocol_version_is_accepted`'s docstring
+("`PROTOCOL_VERSION` is currently 1 -- there is no real older version yet
+to test against") was rewritten to use the now-real older version 1
+instead of modelling a hypothetical future one.
+
 ## Cross-review hot fix: P4.2b accepted small-order Ed25519 keys (main
 session) **SR**
 
@@ -226,11 +263,14 @@ fingerprint (a 2**40 search) still cannot answer that challenge with the
 legitimate device's own private key. Deterministic, differs for different
 keys, format-tested directly (`tests/test_registration_protocol.py`).
 
-**Protocol additions, purely additive (section 18.2), `PROTOCOL_VERSION`
-**not** bumped** (the same section: a bump is only required for a changed
-field name, a changed required field, or a changed meaning of an existing
-field -- every change here is a brand-new model or a new pure function; no
-existing model's fields changed at all): `RegistrationAccepted
+**Protocol additions, purely additive (section 18.2).** `PROTOCOL_VERSION`
+was *not* bumped at the time this section was originally written (the
+argument then: a bump is only required for a changed field name, a changed
+required field, or a changed meaning of an existing field -- every change
+here is a brand-new model or a new pure function; no existing model's
+fields changed at all). **Superseded, see "`PROTOCOL_VERSION` bump to 2"
+below: the project owner has since read section 18.2 literally, and these
+four models are exactly what bumped it to 2.** `RegistrationAccepted
 {registration_id}`, `TokenChallenge{nonce, expires_at}`, `TokenRequest{nonce,
 signature}`, `TokenIssued{token}` (no `examples=`/default value on `token`
 -- CLAUDE.md: "no secrets in the repo, not even as a real-looking example

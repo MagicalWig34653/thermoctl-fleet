@@ -708,6 +708,13 @@ silently break interoperability with a system this repository does not control.)
 - A field may only ever be added, never change its meaning. Whoever means something
   different names it differently.
 
+**Decided afterward (project owner, 2026-09-26):** "a number that increases with
+every change to the models" is read literally -- any change to a model counts,
+including a purely additive, backward-compatible one such as a wholly new model.
+Version 2 is exactly the four registration models P4.2b added (`RegistrationAccepted`,
+`TokenChallenge`, `TokenRequest`, `TokenIssued`); nothing else in this section changes,
+and the compatibility rules above apply unchanged to the 1-to-2 step like to any other.
+
 ### 18.3 Where the watchdog lives, and what it is written in
 
 **In the same repository, its own folder `watchdog/`, written in Go, no Docker image.**

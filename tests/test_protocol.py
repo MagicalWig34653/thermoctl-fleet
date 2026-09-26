@@ -145,20 +145,22 @@ def test_diagnostic_bundle_is_stage_1_and_is_accepted() -> None:
 def test_heartbeat_with_lower_protocol_version_is_accepted() -> None:
     """Section 18.2: 'The fleet service accepts an older version ... It does
 
-    not reject it.' `PROTOCOL_VERSION` is currently 1 -- there is no real older
-    version yet to test against. The test therefore models the future
-    situation: a `protocol_version` older than an assumed next version must
-    still be structurally acceptable to `Heartbeat`. Whether an apartment is
-    therefore shown as "outdated version" is still a missing application
-    decision of the fleet service, not one `Heartbeat` itself makes.
+    not reject it.' `PROTOCOL_VERSION` is 2 as of the P4.2b registration
+    models (project owner decision 2026-09-26, see `protocol/version.py`) --
+    version 1 (pre-P4.2b, no registration models) is therefore a real older
+    version, not merely an assumed future one, and this test uses it as
+    such: a `protocol_version` below the package's current one must still be
+    structurally acceptable to `Heartbeat`. Whether an apartment is therefore
+    shown as "outdated version" is still application logic of the fleet
+    service (`fleet.storage`), not one `Heartbeat` itself makes.
     """
 
-    future_version = PROTOCOL_VERSION + 1
-    older_version = {**HEARTBEAT_EXAMPLE, "protocol_version": PROTOCOL_VERSION}
+    assert PROTOCOL_VERSION > 1, "this test's whole premise is a real older version"
+    older_version = {**HEARTBEAT_EXAMPLE, "protocol_version": 1}
 
     heartbeat = Heartbeat.model_validate(older_version)
 
-    assert heartbeat.protocol_version < future_version
+    assert heartbeat.protocol_version < PROTOCOL_VERSION
 
 
 def test_event_accepts_thermoctls_real_webhook_payload() -> None:
