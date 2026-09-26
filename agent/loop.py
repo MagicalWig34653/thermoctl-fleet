@@ -79,17 +79,28 @@ def send_heartbeat(heartbeat: Heartbeat) -> None:
 def receive_commands() -> Iterator[Command]:
     """Reads the SSE stream `GET /v1/commands`, or the 60 s fallback (section 3).
 
-    Missing: the SSE client itself with `Last-Event-ID` handling for reconnection,
-    detecting an interrupted connection and switching to `?wait=0` polling. TLS
-    pinning itself no longer needs inventing here: `agent.transport.build_client`
-    (P5.0) already provides the same pinned, always-verifying `httpx.Client` this
-    function would need -- an SSE client (P5.1) can be built directly on top of it,
-    the same way `agent.heartbeat_sender` already is.
+    **P5.1 has already built this** -- `agent.commands_channel.receive_commands`,
+    on top of the same pinned `httpx.Client` (P5.0, `agent.transport
+    .build_client`): `Last-Event-ID` handling for reconnection, detecting an
+    interrupted connection and switching to `?wait=0` polling every 60 s
+    (clamping the fleet's own `Retry-After` hint), and classifying every
+    event into either a valid `protocol.commands.Command` or an
+    `agent.commands_channel.RejectedCommand` (a malformed event, an unknown
+    `CommandType`, or a newer `protocol_version` than this agent
+    understands -- section 18.2). This function itself stays a placeholder,
+    deliberately: wiring it into a real main loop needs a client and a
+    `last_event_id_path` to hand to `agent.commands_channel.receive_commands`,
+    plus P5.2's executor to actually act on what it yields (id
+    de-duplication, expiry checking, execution) -- none of which this
+    module assembles yet. Once that lands, this function's real body
+    should be a thin call into `agent.commands_channel.receive_commands`
+    with the loop's own client/path, not a reimplementation.
     """
 
     raise NotImplementedError(
-        "Reading the SSE command channel is missing -- see docs/specification.md "
-        "section 3."
+        "Reading the SSE command channel is missing from the main loop -- the "
+        "channel itself is implemented (agent/commands_channel.py, P5.1); see "
+        "docs/specification.md section 3."
     )
     yield  # pragma: no cover -- turns the function into a generator, never reached.
 
@@ -116,11 +127,23 @@ def execute_command(command: Command, state: AgentState) -> CommandResult:
 
 
 def report_result(result: CommandResult) -> None:
-    """Reports a command result via `POST /v1/commands/{id}/result`."""
+    """Reports a command result via `POST /v1/commands/{id}/result`.
+
+    **P5.1 has already built this** -- `agent.commands_channel.report_result`,
+    over the same pinned `httpx.Client` (P5.0): reports `result`, buffering
+    it locally on a transport failure and retrying on the next call
+    (bounded, `agent.commands_channel.MAX_OUTBOX_RESULTS`, the same pattern
+    `agent.heartbeat_sender`'s own buffer uses). This function itself stays
+    a placeholder for the same reason `send_heartbeat` above does: wiring
+    it up needs a client and an outbox path this module does not yet
+    assemble, plus P5.2's executor to actually produce a `CommandResult` to
+    report in the first place.
+    """
 
     raise NotImplementedError(
-        "Reporting the command result is missing -- see docs/specification.md "
-        "section 7."
+        "Reporting the command result is missing from the main loop -- the "
+        "reporting itself is implemented (agent/commands_channel.py, P5.1); see "
+        "docs/specification.md section 7."
     )
 
 

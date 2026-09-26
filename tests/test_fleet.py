@@ -18,6 +18,7 @@ real-looking example value").
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import sqlite3
 from collections.abc import Iterator
@@ -25,12 +26,16 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
+import fleet.app as fleet_app
 import fleet.storage as storage_module
+import protocol.commands as protocol_commands
 from fleet.alarms import NotifierConfigError
 from fleet.app import app
-from fleet.storage import Storage, create_storage, get_storage, upgrade
+from fleet.storage import CommandRecord, Storage, create_storage, get_storage, upgrade
 from protocol import Heartbeat
+from protocol.commands import CommandType
 from protocol.version import PROTOCOL_VERSION
 
 APARTMENT = "house7-a03"
@@ -877,11 +882,245 @@ def test_commands_stream_with_an_unknown_apartment_token_is_403(client: TestClie
     assert response.status_code == 403
 
 
-def test_commands_stream_with_a_valid_token_passes_through_to_not_implemented(
+def test_commands_stream_wait_0_with_no_pending_commands_is_an_empty_list(
     client: TestClient, token: str
 ) -> None:
-    with pytest.raises(NotImplementedError):
-        client.get("/v1/commands", headers=_bearer(token))
+    """P5.1, section 3's own fallback: `wait=0` with nothing pending closes
+    immediately with an empty JSON list, not a hanging connection."""
+
+    response = client.get("/v1/commands?wait=0", headers=_bearer(token))
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_commands_stream_wait_0_returns_a_pending_command(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """The section-3 fallback (`?wait=0`): a command created for the
+    apartment shows up in the one-shot response, JSON-shaped exactly like
+    `protocol.commands.Command`."""
+
+    command = storage.create_command(
+        APARTMENT,
+        CommandType.REPORT_NOW,
+        lines=None,
+        ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.get("/v1/commands?wait=0", headers=_bearer(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["id"] == command.id
+    assert body[0]["command"] == "report_now"
+    assert body[0]["protocol_version"] == PROTOCOL_VERSION
+
+
+def test_commands_stream_wait_0_never_shows_another_apartments_command(
+    client: TestClient, storage: Storage, token: str, other_token: str
+) -> None:
+    """A command created for `OTHER_APARTMENT` must never appear in
+    `APARTMENT`'s own stream, `wait=0` or otherwise -- the SSE stream must
+    not leak other apartments' data (this package's own constraint)."""
+
+    storage.create_command(
+        OTHER_APARTMENT,
+        CommandType.REPORT_NOW,
+        lines=None,
+        ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.get("/v1/commands?wait=0", headers=_bearer(token))
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_commands_stream_wait_0_never_returns_an_expired_command(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """Section 7: "if an apartment comes back after three days, an old
+    command is not executed any more" -- an expired command must never be
+    delivered at all, checked here with an injected clock (the command was
+    "created" 20 minutes ago, past the 15-minute default expiry)."""
+
+    storage.create_command(
+        APARTMENT,
+        CommandType.REPORT_NOW,
+        lines=None,
+        ui_username="landlord",
+        now=datetime.now(UTC) - timedelta(minutes=20),
+    )
+
+    response = client.get("/v1/commands?wait=0", headers=_bearer(token))
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_commands_stream_wait_0_honours_last_event_id(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """`Last-Event-ID` resumption applies to the `wait=0` fallback too, not
+    only to an open SSE connection -- a polling client that already saw
+    the first command must not see it again."""
+
+    first = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    second = storage.create_command(
+        APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    # Fetch once to learn the first command's own sequence number (its
+    # response-visible `id` is the wire uuid, not the sequence -- the
+    # sequence only ever appears as the SSE `id:` field, so we read it back
+    # from storage directly, exactly as the agent would from `Last-Event-ID`
+    # after its first delivery).
+    pending = storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
+    assert [item.command.id for item in pending] == [first.id, second.id]
+    first_sequence = pending[0].sequence
+
+    response = client.get(
+        "/v1/commands?wait=0",
+        headers={**_bearer(token), "Last-Event-ID": str(first_sequence)},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [entry["id"] for entry in body] == [second.id]
+
+
+def test_commands_stream_wait_0_with_a_malformed_last_event_id_is_treated_as_0(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """A non-numeric `Last-Event-ID` (a forged or corrupted header --
+    CLAUDE.md security principle 5 applied to a client-supplied value)
+    falls back to `0` ("everything still pending"), never a 500."""
+
+    command = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.get(
+        "/v1/commands?wait=0",
+        headers={**_bearer(token), "Last-Event-ID": "not-a-number"},
+    )
+
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [command.id]
+
+
+def test_commands_stream_sse_delivers_pending_command_with_correct_id_and_data(
+    storage: Storage, token: str
+) -> None:
+    """Direct test of `fleet.app._stream_command_events` (the open-connection
+    SSE generator `commands_stream` builds `EventSourceResponse` from) --
+    see the module import comment above for why this is driven directly
+    rather than through `TestClient`'s own streaming transport, which does
+    not read an `EventSourceResponse` incrementally.
+
+    Asserts the SSE event's `id:` is the storage sequence number (what
+    `Last-Event-ID` resumes from) and `data:` round-trips to the exact
+    `Command` that was created.
+    """
+
+    command = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    calls = {"n": 0}
+
+    async def is_disconnected() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 2  # stop after a couple of empty/one-event polls
+
+    async def run() -> list[dict[str, object]]:
+        events = []
+        async for event in fleet_app._stream_command_events(
+            storage, APARTMENT, 0, 0.001, 5000, is_disconnected
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(run())
+
+    assert len(events) == 1
+    assert events[0]["event"] == "message"
+    assert events[0]["id"] == "1"
+    raw_data = events[0]["data"]
+    assert isinstance(raw_data, str)
+    delivered = protocol_commands.Command.model_validate_json(raw_data)
+    assert delivered == command
+
+
+def test_commands_stream_sse_last_event_id_resume_skips_older_ones(
+    storage: Storage, token: str
+) -> None:
+    """A resuming client (`after_sequence` = the first command's own
+    sequence) never sees that first command again -- only the one created
+    after it."""
+
+    storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    second = storage.create_command(
+        APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    calls = {"n": 0}
+
+    async def is_disconnected() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    async def run() -> list[dict[str, object]]:
+        events = []
+        async for event in fleet_app._stream_command_events(
+            storage, APARTMENT, 1, 0.001, 5000, is_disconnected
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(run())
+
+    assert len(events) == 1
+    raw_data = events[0]["data"]
+    assert isinstance(raw_data, str)
+    delivered = protocol_commands.Command.model_validate_json(raw_data)
+    assert delivered.id == second.id
+
+
+def test_commands_stream_sse_never_delivers_another_apartments_command(
+    storage: Storage, other_token: str
+) -> None:
+    storage.create_command(
+        OTHER_APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    async def is_disconnected() -> bool:
+        return True
+
+    async def run() -> list[dict[str, object]]:
+        events = []
+        async for event in fleet_app._stream_command_events(
+            storage, APARTMENT, 0, 0.001, 5000, is_disconnected
+        ):
+            events.append(event)
+        return events
+
+    assert asyncio.run(run()) == []
 
 
 # -----------------------------------------------------------------------------
@@ -932,23 +1171,142 @@ def test_command_result_with_an_unknown_apartment_token_is_403(client: TestClien
     assert response.status_code == 403
 
 
-def test_command_result_with_a_valid_token_passes_through_to_not_implemented(
-    client: TestClient, token: str
-) -> None:
-    with pytest.raises(NotImplementedError):
-        client.post(
-            "/v1/commands/abc123/result",
-            json=COMMAND_RESULT_EXAMPLE,
-            headers=_bearer(token),
-        )
-
-
 def test_command_result_missing_token_and_malformed_body_is_401_not_422(
     client: TestClient,
 ) -> None:
     response = client.post("/v1/commands/abc123/result", json={"id": "abc123"})
 
     assert response.status_code == 401
+
+
+def test_command_result_unknown_command_id_is_404(
+    client: TestClient, token: str
+) -> None:
+    """P5.1: an unknown command id (never created) is a 404 -- the same
+    response an id belonging to a different apartment gets, see the next
+    test."""
+
+    response = client.post(
+        "/v1/commands/does-not-exist/result",
+        json={"id": "does-not-exist", "successful": True, "duration_s": 1.0},
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 404
+
+
+def test_command_result_another_apartments_command_id_is_404(
+    client: TestClient, storage: Storage, token: str, other_token: str
+) -> None:
+    """Section 7 result reporting, this package's own constraint: a command
+    id that exists, but belongs to a different apartment, must be
+    indistinguishable from an unknown one -- 404, not some other status
+    that would let a caller learn "that id exists, just not for you"."""
+
+    command = storage.create_command(
+        OTHER_APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.post(
+        f"/v1/commands/{command.id}/result",
+        json={"id": command.id, "successful": True, "duration_s": 1.0},
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 404
+
+
+def test_command_result_path_and_body_id_mismatch_is_400(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    command = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.post(
+        f"/v1/commands/{command.id}/result",
+        json={"id": "a-different-id", "successful": True, "duration_s": 1.0},
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 400
+
+
+def test_command_result_stored_fields(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    command = storage.create_command(
+        APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.post(
+        f"/v1/commands/{command.id}/result",
+        json={
+            "id": command.id,
+            "successful": False,
+            "duration_s": 2.5,
+            "error_text": "disk full",
+        },
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 204
+
+    with storage.session() as session:
+        row = session.scalar(
+            select(CommandRecord).where(CommandRecord.command_id == command.id)
+        )
+        assert row is not None
+        assert row.successful is False
+        assert row.duration_s == 2.5
+        assert row.error_text == "disk full"
+        assert row.result_received_at is not None
+
+
+def test_command_result_double_report_with_identical_content_is_204(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """P5.1's decided idempotency: a second report with the exact same
+    content (an agent retry after a lost response) is a no-op success, not
+    an error."""
+
+    command = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    payload = {"id": command.id, "successful": True, "duration_s": 1.0}
+
+    first = client.post(f"/v1/commands/{command.id}/result", json=payload, headers=_bearer(token))
+    second = client.post(f"/v1/commands/{command.id}/result", json=payload, headers=_bearer(token))
+
+    assert first.status_code == 204
+    assert second.status_code == 204
+
+
+def test_command_result_double_report_with_conflicting_content_is_409(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    command = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    first = client.post(
+        f"/v1/commands/{command.id}/result",
+        json={"id": command.id, "successful": True, "duration_s": 1.0},
+        headers=_bearer(token),
+    )
+    second = client.post(
+        f"/v1/commands/{command.id}/result",
+        json={"id": command.id, "successful": False, "duration_s": 2.0, "error_text": "oops"},
+        headers=_bearer(token),
+    )
+
+    assert first.status_code == 204
+    assert second.status_code == 409
 
 
 # -----------------------------------------------------------------------------

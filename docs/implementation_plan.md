@@ -438,14 +438,32 @@ storage, heartbeat sending **SR**
   locations and modes, the poll interval, and the buffer rules.
 
 ### P5.1 -- SSE channel `GET /v1/commands`
-- **Goal:** implement `fleet/app.py::commands_stream` and
-  `agent/loop.py::receive_commands`: SSE delivery, `Last-Event-ID`
-  reconnection, 60-second poll fallback on an interrupted connection.
-- **Files:** `fleet/app.py`, `agent/loop.py`.
-- **Section:** 3, 7.
+- **Goal:** implement `fleet/app.py::commands_stream` and the agent's own
+  command channel: SSE delivery, `Last-Event-ID` reconnection, 60-second
+  poll fallback on an interrupted connection.
+- **Files:** `fleet/app.py` (`commands_stream`, `receive_command_result`),
+  `fleet/storage.py` (`commands` table, `create_command`,
+  `pending_commands`, `record_command_result`),
+  `fleet/migrations/versions/0009_commands.py`, `protocol/commands.py`
+  (`Command.protocol_version`), `protocol/version.py` (`PROTOCOL_VERSION`
+  bumped to 3), `agent/commands_channel.py` (new -- `receive_commands`,
+  `report_result`), `agent/loop.py` (docstring updates only, pointing at
+  the new module, mirroring P5.0's `send_heartbeat` placeholder).
+- **Section:** 3, 7, 18.2.
 - **Acceptance:** test holds an SSE connection, interrupts it, confirms
-  the 60-second poll as the fallback.
+  the 60-second poll as the fallback, then resumes the stream -- done
+  against a real fleet app over real TLS, the server actually stopped and
+  restarted mid-test (`tests/test_agent_commands_channel.py`). A malformed
+  event or an unknown `CommandType` is surfaced as a rejected item, never
+  executed; a newer `protocol_version` than this agent understands is
+  rejected the same way (section 18.2).
 - **Depends on:** P1.1.
+- [x] done -- see `docs/STATUS.md`'s P5.1 section for the SSE event
+  format, `Last-Event-ID`/`wait=0` semantics, the fallback polling cadence,
+  the result endpoint's exact status-code mapping, and the P5.0 transport
+  fix (`agent/transport.py`'s pinned client no longer buffers a response
+  body eagerly) this package needed to hold a real streaming connection
+  open at all.
 
 ### P5.2 -- Command execution in the agent **SR**
 - **Goal:** implement `agent/loop.py::execute_command` for the four

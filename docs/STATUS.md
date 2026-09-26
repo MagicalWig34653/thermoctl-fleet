@@ -2,6 +2,255 @@
 
 Last updated: 2026-09-27.
 
+## SSE command channel between fleet and agent (P5.1, sections 3, 7, 18.2)
+
+**`PROTOCOL_VERSION` bumped to 3** for `protocol.commands.Command.protocol_version`
+(new, required field) -- section 18.2's "a number that increases with every
+change to the models" read literally, exactly as the project owner's
+2026-09-26 decision (recorded for version 2 above) already established.
+`CommandType` itself is untouched (principle 1, the command list stays
+closed).
+
+### Protocol: `Command.protocol_version`
+
+A `Command` now carries the `PROTOCOL_VERSION` it was created under --
+section 18.2's "the agent rejects commands of a newer version it does not
+know ... reports that as a result, and keeps running" needs a value to
+compare against; without this field there was nothing to reject *on*.
+Required (`Field(ge=1)`), not defaulted at the model level: `fleet.storage
+.Storage.create_command` is what actually stamps it, from
+`protocol.version.PROTOCOL_VERSION` at creation time.
+
+### Fleet: storage, `GET /v1/commands`, `POST /v1/commands/{id}/result`
+
+**Migration `0009_commands.py`** (`down_revision="0008"`, `0001`-`0008`
+untouched): a `commands` table. `id` (autoincrement) doubles as the SSE
+stream's own monotonically increasing sequence number -- a database
+autoincrement primary key already guarantees "only ever goes up", so a
+separate `sequence` column would only duplicate it (the same reasoning
+`HeartbeatRecord.id`/`EventRecord.id` already rely on). `command_id` (the
+wire `id`, a `uuid4` hex string) is a **separate**, unique, indexed column
+-- deliberately not the primary key, so an agent (or an attacker holding a
+valid token) cannot enumerate other apartments' command counts by
+incrementing a path segment (mirrors `0008`'s own `external_id` reasoning).
+`lines` (`fetch_logs` only), `created_at`/`expires_at` (`expires_at` always
+`created_at` + 15 minutes, computed once at creation, never derived later),
+`created_by` (UI username, for P5.1b), `protocol_version`, `delivered_at`
+(set once, first delivery, via either SSE or a `wait=0` poll), and the
+result fields (`successful`/`duration_s`/`error_text`/`result_received_at`).
+`alembic.autogenerate.compare_metadata` stays empty against `0001`-`0009`.
+
+**`Storage.create_command(apartment_id, command_type, *, lines, ui_username,
+now)`** -- the function P5.1b's UI buttons will call, built and tested here.
+Refuses (`ValueError`) an unknown apartment, a retired apartment
+(`ApartmentRecord.state == "retired"`), or `lines` set for anything other
+than `CommandType.FETCH_LOGS`. Returns the wire `Command`
+(`id=uuid4().hex`, `expires_at = now + 15 min`, `protocol_version =
+PROTOCOL_VERSION` at call time).
+
+**`Storage.pending_commands(apartment_id, after_sequence, now)`** -- not
+expired (`expires_at > now`), no result yet (`result_received_at IS NULL`),
+sequence greater than `after_sequence`, ordered by sequence. **Expired
+commands are never returned**, filtered here, not by a status column --
+section 7: "if an apartment comes back after three days, an old command is
+not executed any more". Marks `delivered_at` for every row it returns that
+does not have one yet -- the one place both SSE delivery and `wait=0`
+polling go through, so "first delivery" bookkeeping is not duplicated in
+both callers.
+
+**`Storage.record_command_result(command_id, apartment_id, result, now)`**
+-- returns a `RecordCommandResultOutcome`: `NOT_FOUND` (unknown command id,
+*or* one belonging to a different apartment -- deliberately
+indistinguishable, mirroring `fleet/auth.py`'s "wrong token vs. unknown
+apartment" precedent), `STORED` (first report), `DUPLICATE_IDENTICAL` (a
+second report with the exact same `successful`/`duration_s`/`error_text` --
+an agent retry after a lost response, not an error), or `CONFLICT` (a
+second report that *disagrees* with what is stored -- the first,
+authoritative report is never overwritten). **Decided: idempotent-same-
+content is `204`, not `409`** -- a plain retry must not become a permanent
+error for a well-behaved agent that simply never saw its own `204`; only a
+genuinely *conflicting* second report is `409`. Not gated on `expires_at` --
+expiry only ever gates delivery, never whether an already-delivered
+command's result may still be reported.
+
+**`GET /v1/commands`** (`commands_stream`), behind the existing
+`require_apartment_token_by_hash` (P1.1): `?wait=0` is the section-3
+fallback, one-shot -- **decided and documented here: a plain JSON list of
+`Command` objects**, not a one-event SSE stream (simpler for a polling
+client, no SSE parser needed for the fallback path at all); the response
+also carries `Retry-After: 60` (section 3's own cadence, the same
+convention `request_token_challenge` already uses). The open-connection
+case is `sse_starlette.EventSourceResponse` wrapping
+`_stream_command_events` (a module-level, directly testable async
+generator, deliberately pulled out of the route closure -- `TestClient`
+does not read an `EventSourceResponse` incrementally, so
+`tests/test_fleet.py` drives this generator directly with a fake
+`is_disconnected` callable rather than through a real streaming HTTP round
+trip): one SSE event per pending command, `id: <sequence>` (what
+`Last-Event-ID` resumes from), `data: <Command JSON>`, a `retry:` hint;
+polls `Storage.pending_commands` at a small, configurable interval
+(`FLEET_COMMANDS_POLL_INTERVAL_S`, default 1 s) rather than busy-looping;
+ends on client disconnect (`request.is_disconnected()`, checked before
+every poll); keep-alive comments (`: ping`) are `EventSourceResponse`'s own
+built-in mechanism (`ping=`, `FLEET_COMMANDS_SSE_PING_INTERVAL_S`, default
+15 s), not reimplemented. `Last-Event-ID` parsed via `_last_event_id`:
+absent or unparsable both fall back to `0` ("everything still pending"),
+never a 500 -- CLAUDE.md principle 5 applied to a client-supplied value.
+
+**`POST /v1/commands/{id}/result`**: path `id` must equal `result.id` --
+checked before storage is ever touched, `400` on a mismatch. Otherwise maps
+`Storage.record_command_result`'s outcome via `_COMMAND_RESULT_STATUS`:
+`NOT_FOUND` -> `404`, `STORED`/`DUPLICATE_IDENTICAL` -> `204`, `CONFLICT`
+-> `409`.
+
+### P5.0 transport fix this package needed: no more eager response buffering
+
+**Found while building the agent side**: `agent.transport._PinnedTransport
+.handle_request` used to read the *entire* response body eagerly
+(`b"".join(response.stream)`) before ever returning to `httpx` -- correct
+for the short request/response calls P5.0 built (registration, heartbeat),
+but P5.1's SSE stream is the first caller that reads a response
+incrementally over a connection meant to stay open; the eager join blocked
+forever on a body that is never meant to end. Fixed with `_LazyHttpcoreStream`,
+a small `httpx.SyncByteStream` wrapping the `httpcore` stream **without**
+reading it -- correct for both call styles `httpx.Client` produces: an
+ordinary `client.get`/`.post` (`stream=False`) still has `httpx.Client.send`
+call `response.read()` immediately, consuming and closing exactly as
+before; `client.stream(...)` (what `httpx_sse.connect_sse` uses) instead
+leaves iteration and closing to the caller's own `with` block, which is
+what makes a long-lived, incrementally-delivered response possible at all.
+
+**A second, related gap found and fixed in the same pass**: iterating that
+lazy stream after a connection drops mid-read raised a raw
+`httpcore.RemoteProtocolError` (or `ReadTimeout`/`ConnectError`/...),
+never translated into the matching `httpx.*` exception every caller in
+this codebase already catches (`except httpx.TransportError`) -- because
+the old code's only exception handling (`httpcore.ConnectError` ->
+`httpx.ConnectError`) covered just the *initial* `handle_request` call, not
+the stream read that follows. `_map_httpcore_exceptions` (mirrors
+`httpx`'s own internal `HTTPTransport`/`map_httpcore_exceptions`, applied
+around both the initial request and the stream iteration) closes this for
+every exception `httpcore` can raise, ordered most-specific-first
+(`_HTTPCORE_EXCEPTION_MAP`). Both fixes are exercised for real:
+`tests/test_agent_commands_channel.py`'s stop/restart-the-server test would
+not pass without either -- reproduced by running that test directly before
+the fix and observing it hang, then hit an uncaught `httpcore
+.RemoteProtocolError`, before both were fixed. `tests/test_agent_transport
+.py` gained direct tests for `_map_httpcore_exceptions` (an unrelated
+exception passes through unchanged; `CertificateFingerprintMismatch`
+passes through unchanged) -- `agent/transport.py` at 100% coverage.
+
+### Agent: `agent/commands_channel.py` (new)
+
+**`receive_commands(client, last_event_id_path, *, fallback_poll_interval_s=60.0,
+sleep=time.sleep)`** -- a `Generator[Command | RejectedCommand, None, None]`
+(typed `Generator`, not the narrower `Iterator`, specifically so a caller
+can `.close()` it, which every short-lived test in
+`tests/test_agent_commands_channel.py` does). Over P5.0's **pinned** client
+only, never a plain `httpx.Client`. Outer loop: attempt the SSE stream
+(`_stream_once`, `httpx_sse.connect_sse`, sending `Last-Event-ID` from
+whatever was last persisted); on failure or a non-200 response
+(`CommandStreamError`), do exactly one `wait=0` poll (`_poll_once`), yield
+what it returned, sleep for the fleet's own `Retry-After` (clamped via the
+same `agent.registration._parse_and_clamp_retry_after` P5.0 already built,
+reused here rather than duplicated), then try the stream again -- this
+*is* "polling every 60 s" (section 3), produced by the outer loop's own
+cadence, not a separate polling code path.
+
+**Classification, never executed here** (P5.2's job): a structurally
+malformed event or an unknown `CommandType` (both collapse into the same
+`pydantic.ValidationError` -- the command list is closed at the model
+level, principle 1) becomes a `RejectedCommand(id, reason)`, `id` recovered
+best-effort from the raw JSON if legible, `None` otherwise. A `Command`
+that parses fine but whose own `protocol_version` is newer than this
+agent's `PROTOCOL_VERSION` is also turned into a `RejectedCommand` (section
+18.2) -- `_classify` is shared by both the SSE and the `wait=0` path.
+
+**`Last-Event-ID` persisted eagerly, before yielding** (temp file + atomic
+`Path.replace`, same pattern as `agent.heartbeat_sender`'s buffer and
+`agent.loop.report_watchdog_state`) -- **decided**: this is a
+transport-level bookmark ("which events has this stream already
+delivered"), not an execution-safety mechanism; section 7's own "the agent
+remembers the last 200 ids" (P5.2's future `AgentState.executed_ids`) is
+what actually guards against ever *executing* a command twice. Persisting
+eagerly means a crash between receiving an event and finishing whatever is
+done with it re-receives that one event on reconnect -- it never silently
+drops a command by advancing the bookmark past one nothing ever actually
+saw. **The `wait=0` fallback never advances this bookmark at all** (there
+is nothing per-item to advance it *with* -- the fallback response is a
+plain `Command` list, no sequence numbers) -- harmless by the same
+reasoning: a still-pending command simply keeps reappearing on every poll
+until it is executed and reported, never silently lost.
+
+**`report_result(client, result, *, outbox_path)`** -- mirrors
+`agent.heartbeat_sender.send_heartbeat`'s own buffering shape: flushes any
+already-buffered results first (`_flush_outbox_if_any`), then posts
+`result`; a transport failure buffers it (capped at `MAX_OUTBOX_RESULTS`,
+200, oldest dropped first); an explicit refusal (`404`/`400`/`409`, a
+non-2xx that is *not* a transport failure) raises `CommandResultError`
+immediately, **not buffered** -- mirrors `HeartbeatAuthError`'s own "do not
+retry a rejection with the same content forever" reasoning. A buffered
+result the cloud *still* refuses on retry is dropped, logged, not kept
+forever either.
+
+### Tests
+
+`tests/test_fleet.py`: create -> pending -> delivered via SSE with the
+correct sequence `id:`/`data:` (driving `_stream_command_events` directly,
+see above for why not through `TestClient`'s own streaming transport);
+`Last-Event-ID` resume (both the SSE generator and the `wait=0` fallback,
+including a malformed header falling back to `0`); expired never delivered
+(injected clock); another apartment's commands never appear (SSE and
+`wait=0`); `wait=0` with nothing pending; unauthenticated -> `401`; result
+endpoint: wrong apartment -> `404`, path/body id mismatch -> `400`, double
+identical report -> `204`, double conflicting report -> `409`, stored
+fields verified directly against `CommandRecord`. `tests/test_storage.py`:
+`create_command` refuses unknown/retired apartments and `lines` on
+non-`fetch_logs`, stamps expiry/version/a fresh id; `pending_commands`
+scoping, expiry, delivered-marking, result-exclusion; `record_command_result`
+outcomes; migration `0009` up/down and `compare_metadata`.
+
+`tests/test_agent_commands_channel.py` (21 tests, real `fleet.app.app`,
+real TLS, `tests/tls_support.py`): holds an SSE connection and receives a
+command; `Last-Event-ID` resume across a fresh generator (a simulated agent
+restart); never sees another apartment's command; **the full stop/restart
+scenario** -- a real `uvicorn` server is stopped mid-stream
+(`timeout_graceful_shutdown=1`, needed so `.stop()` actually closes the
+in-flight connection instead of waiting forever for it to end on its own),
+the interrupted read is caught, the `wait=0` fallback is attempted (and
+also fails, server still down), and -- driven entirely by the injected
+`sleep=` callable, never a real wait -- the server comes back up inside
+that same callable and the stream resumes, delivering a command created
+while the server was down; a companion test (`_stream_once` monkeypatched
+to always fail) exercises the opposite split, stream down but the `wait=0`
+poll succeeding against the real, still-up server, including the real
+`Retry-After: 60` clamp. Malformed event, unknown command type, and a
+newer `protocol_version` are all surfaced as `RejectedCommand`, never a
+`Command`. `report_result`: success; failure -> outbox -> retried on next
+call; a pin mismatch delivers nothing (`tests.tls_support
+.run_recording_tls_server`, the `received` list stays empty); the outbox's
+own cap, transport-failure-during-flush, and drop-on-repeated-refusal
+branches. `agent/commands_channel.py` at 100% coverage.
+
+Full suite (fresh venv): **890 tests**, coverage **99%** (3585 statements,
+16 missed -- `agent/loop.py`'s still-deferred stage-2/24 command stubs and
+`fleet/admin.py`/`tools/check_image_config.py`'s own pre-existing single
+gaps, none of them touched by this package) -- identical across 3
+consecutive runs; `ruff check .` and `mypy .` / `mypy protocol fleet agent
+tools` both clean; `tests/test_agent_commands_channel.py` and
+`tests/test_fleet.py` run 5 times in a row with no flakiness. `watchdog/`:
+`go vet ./...` clean, `go test ./...` green (67 tests, unchanged by this
+package), `watchdog/check_contract.sh` passes (`protocol/` changed --
+`Command.protocol_version`; the watchdog's own state/health/LED file
+contract is untouched by that field).
+
+**Still missing, explicitly out of scope for this package, tracked here
+instead of invented:** P5.1b (UI buttons that call `Storage.create_command`)
+-- this package only builds and tests the storage function; command
+execution, id de-duplication, and expiry *checking on the agent side*
+(P5.2) -- `receive_commands` only ever yields items, nothing here executes
+anything; masking of `fetch_logs`/diagnostic-bundle content (P5.3).
+
 ## P5.0 second cross-review fix: FIFO/device/socket refused before `open`,
 not just symlink and mode (main session read-back) **SR**
 

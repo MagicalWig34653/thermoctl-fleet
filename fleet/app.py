@@ -20,7 +20,7 @@ import contextlib
 import logging
 import os
 import secrets
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -28,12 +28,13 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
+from sse_starlette.sse import EventSourceResponse
 
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
-from fleet.storage import Storage, get_storage, hash_token
+from fleet.storage import RecordCommandResultOutcome, Storage, get_storage, hash_token
 from fleet.ui_auth import resolve_client_ip
 from fleet.ui_routes import install_security_headers
 from fleet.ui_routes import router as ui_router
@@ -59,6 +60,24 @@ logger = logging.getLogger(__name__)
 # suggestion (60s).
 _ALARM_CHECK_INTERVAL_ENV = "FLEET_ALARM_CHECK_INTERVAL_S"
 _DEFAULT_ALARM_CHECK_INTERVAL_S = 60.0
+
+# P5.1, sections 3, 7: the SSE command stream (`commands_stream`) polls
+# `Storage.pending_commands` in a loop rather than pushing on write --
+# simplest thing that works, no pub/sub layer of its own. Configurable, not
+# hard-coded (CLAUDE.md); a short default keeps section 3's own "under a
+# second with an open connection" true in practice.
+_COMMANDS_POLL_INTERVAL_ENV = "FLEET_COMMANDS_POLL_INTERVAL_S"
+_DEFAULT_COMMANDS_POLL_INTERVAL_S = 1.0
+# The SSE `retry:` hint sent with every event (section 3: "reconnection ...
+# already fixed in the format") -- how long a client should wait before
+# reconnecting if the stream drops. Milliseconds, per the SSE spec.
+_COMMANDS_SSE_RETRY_MS_ENV = "FLEET_COMMANDS_SSE_RETRY_MS"
+_DEFAULT_COMMANDS_SSE_RETRY_MS = 5_000
+# `sse_starlette.EventSourceResponse`'s own keep-alive: a `: ping` comment
+# line sent on this cadence so an idle connection (no command pending) does
+# not look dead to an intermediary proxy.
+_COMMANDS_SSE_PING_INTERVAL_ENV = "FLEET_COMMANDS_SSE_PING_INTERVAL_S"
+_DEFAULT_COMMANDS_SSE_PING_INTERVAL_S = 15.0
 
 
 async def _alarm_check_loop(  # pragma: no cover
@@ -287,52 +306,220 @@ def receive_event(
     storage.save_event(apartment, event, datetime.now(UTC))
 
 
-@app.get("/v1/commands")
-def commands_stream(
-    wait: int = 1,
-    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
-) -> StreamingResponse:
-    """SSE stream for commands to an apartment (sections 3 and 7).
+def _last_event_id(request: Request) -> int:
+    """Parses the `Last-Event-ID` request header (section 3: "reconnection,
+    event numbering, and catch-up delivery are already fixed in the
+    format") into the sequence number to resume after.
 
-    `wait=0` is the fallback provided for in section 3 (a single poll instead of
-    an open connection). The token check (P1.1, sections 4, 18.1) is done:
-    `authenticated_apartment` is the apartment the presented token's hash
-    resolved to (see `fleet/auth.py`) -- there is no apartment in this address
-    to compare it against.
-
-    Still entirely missing: `Last-Event-ID` handling for reconnection, actually
-    writing `Command` events into the stream, and the expiry check on delivery
-    (section 7: a command that has passed its expiry is no longer delivered).
+    Absent (a fresh connection, or a client that does not support
+    resumption at all) or unparsable (a malformed or forged header --
+    CLAUDE.md security principle 5 applied to a client-supplied value, the
+    same reasoning `agent.registration._parse_and_clamp_retry_after`
+    already applies to a *server*-supplied one) both fall back to `0`,
+    meaning "everything still pending", never a crash or a 500 -- a client
+    with no valid resume point should simply see every pending command
+    again, not be refused.
     """
 
-    raise NotImplementedError(
-        f"SSE delivery of commands for apartment {authenticated_apartment!r} is "
-        "missing -- see docs/specification.md sections 3 and 7."
+    raw = request.headers.get("last-event-id")
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+async def _stream_command_events(
+    storage: Storage,
+    apartment: str,
+    after_sequence: int,
+    poll_interval_s: float,
+    retry_ms: int,
+    is_disconnected: Callable[[], Awaitable[bool]],
+) -> AsyncIterator[dict[str, object]]:
+    """The actual SSE event generator for `commands_stream`'s open-connection
+    case -- pulled out as a plain, directly testable module-level function
+    (not a closure inside the route) so a test can drive it with a fake
+    `is_disconnected` callable and a small number of iterations, without
+    going through a real ASGI/ASGI-test-client streaming round trip (which
+    a fully corked `EventSourceResponse` behind FastAPI's `TestClient` does
+    not read incrementally -- see `tests/test_fleet.py` for how this is
+    exercised).
+
+    One poll of `Storage.pending_commands` per loop iteration, yielding one
+    SSE event dict (`event`, `id`, `data`, `retry`) per pending command,
+    then `asyncio.sleep(poll_interval_s)` before the next poll -- see
+    `commands_stream`'s own docstring for the full reasoning.
+    """
+
+    sequence = after_sequence
+    while True:
+        if await is_disconnected():
+            return
+        pending = await asyncio.to_thread(
+            storage.pending_commands, apartment, sequence, datetime.now(UTC)
+        )
+        for item in pending:
+            sequence = item.sequence
+            yield {
+                "event": "message",
+                "id": str(item.sequence),
+                "data": item.command.model_dump_json(),
+                "retry": retry_ms,
+            }
+        await asyncio.sleep(poll_interval_s)
+
+
+@app.get("/v1/commands")
+async def commands_stream(
+    request: Request,
+    wait: int = 1,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """SSE stream for commands to an apartment (sections 3 and 7).
+
+    The token check (P1.1, sections 4, 18.1) is done: `authenticated_apartment`
+    is the apartment the presented token's hash resolved to (see
+    `fleet/auth.py`) -- there is no apartment in this address to compare it
+    against, and every read below is scoped to it
+    (`Storage.pending_commands`), so one apartment's commands are never
+    visible to another's token.
+
+    **`wait=0` -- the section-3 fallback, one-shot, not SSE.** "If the
+    connection cannot be held open ... the agent polls every 60 s via
+    `GET /v1/commands?wait=0`" -- **decided here:** the response is a plain
+    JSON list of `Command` objects (not a one-event SSE stream), documented
+    in `docs/STATUS.md`'s P5.1 section -- simpler for a polling client to
+    consume (`response.json()`, no SSE parser needed for the fallback path
+    at all) and there is no reconnection to number events for in a
+    one-shot response anyway. `Last-Event-ID` is still honoured for this
+    path (a polling client may still resume past what it already saw), and
+    every command returned here is marked delivered exactly like an SSE
+    delivery (`Storage.pending_commands`'s own `delivered_at` bookkeeping,
+    shared by both paths). The response also carries `Retry-After: 60`
+    (section 3's own poll cadence), the same convention `request_token_
+    challenge` already uses for its own 60 s poll interval.
+
+    **The open-connection case** writes one SSE event per pending command:
+    `id: <sequence>` (`Last-Event-ID` resumes from this on reconnection),
+    `data: <Command JSON>`, plus a `retry:` hint (section 3: "reconnection
+    ... already fixed in the format"). **Expired commands are never
+    delivered** (section 7) -- filtered inside `Storage.pending_commands`
+    itself, not here. The stream **polls storage at a small, configurable
+    interval** (`_COMMANDS_POLL_INTERVAL_ENV`) rather than busy-looping,
+    and ends cleanly on client disconnect (`request.is_disconnected()`,
+    checked before every poll -- `sse_starlette.EventSourceResponse` itself
+    also stops iterating the moment the underlying connection closes, this
+    check just avoids one needless poll in between). **Keep-alive
+    comments** (`: ping`) are `EventSourceResponse`'s own built-in
+    mechanism (`ping=`), not reimplemented here.
+    """
+
+    after_sequence = _last_event_id(request)
+    poll_interval_s = float(
+        os.environ.get(_COMMANDS_POLL_INTERVAL_ENV, _DEFAULT_COMMANDS_POLL_INTERVAL_S)
+    )
+    retry_ms = int(
+        os.environ.get(_COMMANDS_SSE_RETRY_MS_ENV, _DEFAULT_COMMANDS_SSE_RETRY_MS)
     )
 
+    if wait == 0:
+        pending = await asyncio.to_thread(
+            storage.pending_commands, authenticated_apartment, after_sequence, datetime.now(UTC)
+        )
+        return JSONResponse(
+            content=[jsonable_encoder(item.command) for item in pending],
+            # Section 3's own fallback cadence, documented the same way
+            # `request_token_challenge` already documents its own 60s poll
+            # interval via the same header -- `agent.commands_channel`
+            # honours this (clamped, never trusted as-is, the same
+            # reasoning `agent.registration._parse_and_clamp_retry_after`
+            # already applies to a server-supplied value).
+            headers={"Retry-After": "60"},
+        )
 
-@app.post("/v1/commands/{id}/result", status_code=204)
+    ping_interval_s = float(
+        os.environ.get(
+            _COMMANDS_SSE_PING_INTERVAL_ENV, _DEFAULT_COMMANDS_SSE_PING_INTERVAL_S
+        )
+    )
+    events = _stream_command_events(
+        storage,
+        authenticated_apartment,
+        after_sequence,
+        poll_interval_s,
+        retry_ms,
+        request.is_disconnected,
+    )
+    return EventSourceResponse(events, ping=ping_interval_s)
+
+
+# Section 7's own mapping from `Storage.record_command_result`'s outcome to
+# an HTTP status (see `RecordCommandResultOutcome`'s own docstring for what
+# each value means): `NOT_FOUND` -> 404 (unknown command id, or one that
+# belongs to a different apartment -- deliberately indistinguishable, see
+# `fleet/auth.py`'s "wrong token vs. unknown apartment" precedent);
+# `STORED`/`DUPLICATE_IDENTICAL` -> 204 (a plain retry after a lost response
+# must not become a permanent error for a well-behaved agent); `CONFLICT`
+# -> 409 (a second, *disagreeing* report for the same command id -- kept as
+# an error rather than silently overwritten, since the first report stays
+# authoritative).
+_COMMAND_RESULT_STATUS: dict[RecordCommandResultOutcome, int] = {
+    RecordCommandResultOutcome.NOT_FOUND: 404,
+    RecordCommandResultOutcome.STORED: 204,
+    RecordCommandResultOutcome.DUPLICATE_IDENTICAL: 204,
+    RecordCommandResultOutcome.CONFLICT: 409,
+}
+
+
+@app.post("/v1/commands/{id}/result")
 def receive_command_result(
     id: str,
     result: CommandResult,
+    response: Response,
     authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> None:
-    """Accepts the result of an executed command (section 7).
+    """Accepts the result of an executed command (section 7: "result via
+    `POST /v1/commands/{id}/result`, with duration and error text").
 
     The token check (P1.1, sections 4, 18.1) is done: `authenticated_apartment`
     is the apartment the presented token's hash resolved to (see
     `fleet/auth.py`).
 
-    Still missing: matching against the pending command id and that it
-    actually belongs to `authenticated_apartment`, storage. `id` from the path
-    and `result.id` will also still need to be checked against each other.
+    **The path `id` must equal `result.id`** -- checked here, before
+    `Storage.record_command_result` is ever called, `400` on a mismatch (a
+    caller bug, e.g. copy-pasted the wrong id into one of the two places),
+    not the ambiguous `404` that would otherwise result from looking up the
+    path id while reporting a result for a different one.
+
+    Every remaining outcome is `Storage.record_command_result`'s job (see
+    its own docstring and `_COMMAND_RESULT_STATUS` above for the exact
+    mapping): unknown command id or another apartment's command id -> 404;
+    a fresh result or an identical retry -> 204; a disagreeing second
+    report -> 409.
     """
 
-    raise NotImplementedError(
-        f"Storing the result for command {id!r} from apartment "
-        f"{authenticated_apartment!r} is missing -- see docs/specification.md "
-        "section 7."
-    )
+    if id != result.id:
+        raise HTTPException(
+            status_code=400,
+            detail="Path id and result.id must match.",
+        )
+
+    outcome = storage.record_command_result(id, authenticated_apartment, result, datetime.now(UTC))
+    if outcome is RecordCommandResultOutcome.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Unknown command.")
+    if outcome is RecordCommandResultOutcome.CONFLICT:
+        raise HTTPException(
+            status_code=409,
+            detail="A different result was already stored for this command.",
+        )
+    # STORED and DUPLICATE_IDENTICAL both answer 204 -- see
+    # `_COMMAND_RESULT_STATUS`'s own docstring for why a plain retry is not
+    # an error.
+    response.status_code = _COMMAND_RESULT_STATUS[outcome]
 
 
 # -----------------------------------------------------------------------------
