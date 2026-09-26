@@ -736,6 +736,13 @@ def apartment_edit_submit(
 # -----------------------------------------------------------------------------
 
 _FLEET_PUBLIC_URL_ENV = "FLEET_PUBLIC_URL"
+# Format (fixed by P5.0, docs/STATUS.md's own P5.0 section):
+# `sha256:<64 lowercase hex characters>` -- the SHA-256 digest of the fleet
+# server's own leaf certificate's raw DER bytes. This value is passed
+# through as an opaque string here (never parsed or validated fleet-side --
+# it is the *agent*'s pin to check, not this service's own), but must match
+# what `agent.transport.parse_certificate_fingerprint` accepts, or a
+# correctly-configured device would reject its own cloud.
 _FLEET_CERT_FINGERPRINT_ENV = "FLEET_CERT_FINGERPRINT"
 
 

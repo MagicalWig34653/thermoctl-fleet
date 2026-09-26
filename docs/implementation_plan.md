@@ -128,6 +128,15 @@ parallel with all other packages of the same stage.
   endpoint (fixture, no real service); the 240-entry buffer limit is
   demonstrated by a test.
 - **Parallel to:** P2.1, P2.2 (the other end of the line).
+- **Split by the project owner, 2026-09-26 (P5.0):** the transport half of
+  this package -- TLS pinning, device registration (Ed25519 + signed
+  challenge, P4.2b's device-side counterpart), token storage, and
+  `send_heartbeat` including catch-up buffering -- does **not** depend on
+  thermoctl's missing `/api/v1/health` and moved to P5.0 below, at the top
+  of step 5 (it needs no `GET /v1/commands` machinery either, but step 5 is
+  where the remaining, still-**SR**, agent packages live). What stays here,
+  still deferred: `collect_heartbeat` itself (reading thermoctl) -- no
+  stub or invented behaviour for it exists anywhere in this repository.
 - **Deferred (project owner, 2026-09-24):** until thermoctl provides
   `/api/v1/health` and `health.read` (section 10); no response format is
   invented in this repository.
@@ -384,6 +393,49 @@ surface each package touches changed, from `/v1/...` to `/ui/inventory/...`.
 ---
 
 ## Step 5 -- SSE channel and stage-1 commands **SR**
+
+### P5.0 -- Agent transport: pinned HTTPS client, device registration, token
+storage, heartbeat sending **SR**
+- **Goal:** the part of P2.3 that does not depend on thermoctl's missing
+  `/api/v1/health` (project owner, 2026-09-26): a pinned, always-verifying
+  HTTPS client (section 4 -- certificate verification never disabled, plus
+  fingerprint pinning as a second barrier); the device side of registration
+  (section 15.3 steps 1-3, Ed25519 + signed challenge exactly as P4.2b
+  defines it fleet-side); private-key and agent-token storage (mode 0600,
+  the private key never transmitted or logged, CLAUDE.md security
+  principle 3); and `send_heartbeat` itself, including local buffering and
+  one-batch catch-up delivery after an outage (section 5). `collect_heartbeat`
+  (reading thermoctl) stays deferred -- see P2.3 above -- and nothing here
+  is wired into a running main loop that would need it.
+- **Files:** `agent/transport.py` (pinned client), `agent/registration.py`
+  (registration client, key/token storage, local status file),
+  `agent/heartbeat_sender.py` (send + buffer), `agent/__main__.py` (`register`
+  subcommand), `agent/loop.py` (docstring updates only -- `collect_heartbeat`
+  and the main loop itself untouched), `pyproject.toml` (`cryptography`,
+  `httpcore` added to the `agent` extra), `fleet/ui_routes.py` (a
+  fingerprint-format comment only, no behaviour change).
+- **Section:** 3, 4, 5, 10, 14, 15.3, 18.1, 18.2, 19.5, 23.2.
+- **Acceptance:** full registration end-to-end against a real fleet app
+  over real TLS with a throwaway test CA (prepare via storage -> agent
+  registers -> confirm via storage -> agent polls `202` then gets the
+  token -> token file 0600 -> `send_heartbeat` -> `204`); a certificate
+  pin mismatch aborts the TLS handshake before any request byte (including
+  the bearer token) is ever sent, proven with a recording TLS server; an
+  untrusted CA is refused even with a matching pin (verification stays on);
+  `http://` URLs are refused before any connection is attempted; the
+  private key file is mode 0600 and never appears in a request body, a log
+  line, or the stored database; the heartbeat buffer is capped at
+  `protocol.heartbeat.MAX_CATCH_UP_HEARTBEATS` (240, oldest dropped first)
+  and flushed in one `POST /v1/heartbeats` batch on the next successful
+  contact; a `401`/`403` surfaces as an error instead of buffering forever;
+  an existing token means no re-registration (idempotent).
+- **Depends on:** P4.2b (the fleet-side registration endpoints this
+  package's client talks to).
+- **Read back by:** main session (pinned transport, private-key handling,
+  security principle 3).
+- [x] done -- see `docs/STATUS.md` for the pin format (`sha256:<hex>`),
+  exactly what the pin check guarantees relative to bytes on the wire, file
+  locations and modes, the poll interval, and the buffer rules.
 
 ### P5.1 -- SSE channel `GET /v1/commands`
 - **Goal:** implement `fleet/app.py::commands_stream` and

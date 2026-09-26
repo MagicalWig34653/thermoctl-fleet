@@ -42,6 +42,18 @@ fleet = [
 agent = [
     "httpx>=0.27",
     "httpx-sse>=0.4",
+    # P5.0 (sections 4, 14, 15.3): certificate-pinning transport
+    # (`agent/transport.py`) imports `httpcore` directly to reach the one
+    # constructor parameter (`network_backend=`) `httpx.HTTPTransport`
+    # itself does not expose -- previously only a transitive dependency of
+    # httpx, now declared explicitly since agent code imports it by name.
+    "httpcore>=1.0",
+    # Ed25519 key generation and signing for device registration
+    # (`agent/registration.py`) -- generated and kept on the device, never
+    # transmitted (CLAUDE.md security principle 3). The fleet side already
+    # depends on `cryptography` (P4.2b, above) for the verifying half of
+    # this same exchange.
+    "cryptography>=43",
 ]
 dev = [
     "pytest>=8.3",
