@@ -999,6 +999,7 @@ def replace_device_form(
 def replace_device_submit(
     request: Request,
     apartment_id: str,
+    expected_assignment_id: int = Form(...),
     target_state: str = Form(...),
     reason: str = Form(...),
     csrf_token: str = Form(...),
@@ -1009,7 +1010,17 @@ def replace_device_submit(
     assignment, sets the removed device's state, and revokes the
     apartment's agent token, all in one transaction
     (`Storage.remove_device`, see its own docstring for why an agent
-    request with the old token gets 403 immediately afterward)."""
+    request with the old token gets 403 immediately afterward).
+
+    `expected_assignment_id` -- a hidden field carrying the assignment id
+    the form was rendered against (`fleet.ui_inventory
+    .ReplaceDeviceView.current_assignment_id`), echoed back here and passed
+    straight through to `Storage.remove_device`'s own parameter of the same
+    name: a stale submit (someone else already replaced or removed the
+    device in the meantime) or a tampered value naming a different
+    assignment is refused there with a clear message, never silently acting
+    on whatever happens to be open now (main-session decision following the
+    confirm/remove race cross-review)."""
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
@@ -1044,6 +1055,7 @@ def replace_device_submit(
     try:
         storage.remove_device(
             apartment_id,
+            expected_assignment_id=expected_assignment_id,
             target_state=target_state,
             reason=reason.strip(),
             ui_username=authenticated.user.username,

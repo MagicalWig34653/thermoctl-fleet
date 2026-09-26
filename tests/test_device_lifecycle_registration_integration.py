@@ -400,12 +400,18 @@ def test_concurrent_confirm_racing_manual_reported_to_faulty_exactly_one_outcome
 # -- confirm_device's replace_previous path racing a concurrent remove_device ----
 
 
-def _setup_replace_previous_vs_remove(storage: Storage) -> None:
+def _setup_replace_previous_vs_remove(storage: Storage) -> int:
     """Shared fixture for the confirm/remove race tests below: apartment
     `house7-a03` currently has `sn-old` `in_service` (an open assignment,
     started 2026-01-01), and a second device `sn-new` sits `reported` with
     a confirmed-ready registration (`verif-abc`), ready for `confirm_device
-    (..., replace_previous=True)`."""
+    (..., replace_previous=True)`. Returns `sn-old`'s assignment's own id --
+    "the assignment the landlord's replace-device form was rendered
+    against" (`fleet.ui_inventory.ReplaceDeviceView.current_assignment_id`),
+    captured once here and threaded through every `_remove_sn_old` call
+    below, exactly the way the real form carries it as a hidden field
+    across the request/response round trip rather than re-reading it at
+    submit time."""
 
     _make_apartment(storage)
     _register_device(storage, "sn-old")
@@ -414,6 +420,10 @@ def _setup_replace_previous_vs_remove(storage: Storage) -> None:
     )
     _register_device(storage, "sn-new")
     _prepare_and_report(storage, device_id="sn-new")
+
+    assignment = storage.get_current_assignment("house7-a03")
+    assert assignment is not None
+    return assignment.id
 
 
 def _confirm_sn_new_replacing_sn_old(storage: Storage) -> str:
@@ -434,13 +444,19 @@ def _confirm_sn_new_replacing_sn_old(storage: Storage) -> str:
         return "confirm_failed"
 
 
-def _remove_sn_old(storage: Storage) -> str:
+def _remove_sn_old(storage: Storage, expected_assignment_id: int) -> str:
     """The `remove_device` side of the race, same "never let it escape"
-    convention as `_confirm_sn_new_replacing_sn_old` above."""
+    convention as `_confirm_sn_new_replacing_sn_old` above.
+    `expected_assignment_id` is always `sn-old`'s *original* assignment id
+    from `_setup_replace_previous_vs_remove` -- "the assignment the caller
+    actually saw" -- never re-read fresh at call time, exactly mirroring a
+    landlord's form submit against whatever was on the page when it was
+    opened."""
 
     try:
         storage.remove_device(
-            "house7-a03", target_state="faulty", reason="Gerätetausch (remove)",
+            "house7-a03", expected_assignment_id=expected_assignment_id,
+            target_state="faulty", reason="Gerätetausch (remove)",
             ui_username=USERNAME, now=datetime(2026, 1, 1, 1, tzinfo=UTC),
         )
         return "removed"
@@ -471,6 +487,21 @@ def _assert_confirm_remove_race_invariants(
       already read the assignment as still open) then affected zero rows
       and raised cleanly, rolling back before it ever touched the previous
       device, the token, or the new assignment.
+
+    A fourth, dangerous case this used to also route into `("confirmed",
+    "removed")` -- `confirm_device` fully replacing the device *before*
+    `remove_device` ever reads anything, `remove_device` then silently
+    acting on the apartment's new, unrelated open assignment -- is now
+    impossible: `remove_device` is only ever called here with `sn-old`'s
+    *original* assignment id (`expected_assignment_id`, see
+    `_remove_sn_old`), so once that assignment is no longer the apartment's
+    open one, `remove_device` refuses instead of acting on whatever is open
+    now (see `test_confirm_device_replace_previous_forced_confirm_wins_
+    first` below for this exact case, forced deterministically). That
+    refusal still folds into the `("confirmed", "remove_failed")` bucket
+    below, not a fourth outcome label -- `remove_device` failing cleanly,
+    having written nothing, looks identical here regardless of *why* its
+    guard tripped.
 
     Never both operations failing (one of them must always be the one that
     actually closes the row), and never any invariant below violated no
@@ -573,7 +604,7 @@ def test_confirm_device_replace_previous_races_a_concurrent_remove_device(
     deterministic tests below force each interleaving explicitly rather
     than relying on this real-thread race to happen to hit it."""
 
-    _setup_replace_previous_vs_remove(storage)
+    expected_assignment_id = _setup_replace_previous_vs_remove(storage)
 
     results: dict[str, str] = {}
     lock = threading.Lock()
@@ -584,7 +615,7 @@ def test_confirm_device_replace_previous_races_a_concurrent_remove_device(
             results["confirm"] = outcome
 
     def _remove() -> None:
-        outcome = _remove_sn_old(storage)
+        outcome = _remove_sn_old(storage, expected_assignment_id)
         with lock:
             results["remove"] = outcome
 
@@ -612,7 +643,7 @@ def test_confirm_device_replace_previous_forced_remove_wins_during_phase_gap(
     real comparison result unchanged, injects the pause at exactly that
     point without touching `confirm_device`/`remove_device` themselves."""
 
-    _setup_replace_previous_vs_remove(storage)
+    expected_assignment_id = _setup_replace_previous_vs_remove(storage)
 
     import hmac as hmac_module
 
@@ -622,7 +653,7 @@ def test_confirm_device_replace_previous_forced_remove_wins_during_phase_gap(
     def _compare_then_remove(a: str, b: str) -> bool:
         result: bool = real_compare_digest(a, b)
         if not removed_first:
-            removed_first.append(_remove_sn_old(storage))
+            removed_first.append(_remove_sn_old(storage, expected_assignment_id))
         return result
 
     monkeypatch.setattr(hmac_module, "compare_digest", _compare_then_remove)
@@ -637,29 +668,29 @@ def test_confirm_device_replace_previous_forced_remove_wins_during_phase_gap(
 def test_confirm_device_replace_previous_forced_confirm_wins_first(storage: Storage) -> None:
     """The symmetric forced ordering: `confirm_device` runs to full
     completion first (no injected pause needed -- there is nothing left to
-    race once it has already committed), and only then does `remove_device`
-    run.
+    race once it has already committed), and only then does the *stale*
+    `remove_device` call run -- with `sn-old`'s *original* assignment id,
+    exactly the one a landlord's already-open "Gerät ausbauen" page would
+    still carry as its hidden field, having no way to know a replacement
+    was confirmed for the very same apartment in the meantime.
 
-    **Not one of the three interleavings `_assert_confirm_remove_race_
-    invariants` covers -- a fourth, genuinely different case, confirmed
-    directly here rather than assumed:** once `confirm_device` has fully
-    committed, `sn-old`'s assignment is no longer open at all, so the later
-    `remove_device` call's own fresh lookup of "the apartment's currently
-    open assignment" (section 20.2's own "replace device" contract -- it
-    has no notion of *which* device the caller had in mind, only ever "the
-    one assigned right now") finds `sn-new`'s brand-new assignment instead
-    and removes *that* -- not a race at all by this point (both calls are
-    now fully sequential), and not a corruption: exactly one assignment
-    open then closed, exactly one device state change, exactly one token
-    revocation, all for `sn-new`, none of it touching `sn-old` a second
-    time. A landlord whose "remove device" request is this stale (issued
-    against a device already replaced by someone else in the meantime) gets
-    exactly what the request now means, not what it meant when the page was
-    loaded -- the same kind of UI-staleness concern
-    `test_remove_device_concurrent_double_removal_only_one_wins` already
-    accepts for a plain double removal, one level further along."""
+    **Main-session decision, following the cross-review of this race: this
+    is a real defect from the landlord's point of view, not just a
+    contract detail, and is now refused.** Before this fix,
+    `remove_device`'s own fresh lookup of "the apartment's currently open
+    assignment" had no notion of *which* device the caller had actually
+    seen -- once `confirm_device` has fully committed, `sn-old`'s
+    assignment is no longer open, so the stale `remove_device` call would
+    silently act on `sn-new`'s brand-new assignment instead: setting the
+    device the landlord never saw to `faulty`/`in_storage` and revoking the
+    token it had just obtained. `Storage.remove_device` now takes the
+    assignment id the caller expects (`expected_assignment_id`,
+    `fleet.ui_inventory.ReplaceDeviceView.current_assignment_id` carries it
+    as a hidden form field) and refuses outright once that assignment is no
+    longer the apartment's open one -- **before touching anything**, no
+    audit row, `sn-new` left exactly as `confirm_device` made it."""
 
-    _setup_replace_previous_vs_remove(storage)
+    expected_assignment_id = _setup_replace_previous_vs_remove(storage)
 
     confirm_outcome = _confirm_sn_new_replacing_sn_old(storage)
     assert confirm_outcome == "confirmed"
@@ -675,12 +706,11 @@ def test_confirm_device_replace_previous_forced_confirm_wins_first(storage: Stor
     )
     assert sn_old_closed_before == 1
 
-    remove_outcome = _remove_sn_old(storage)
-    assert remove_outcome == "removed"
+    remove_outcome = _remove_sn_old(storage, expected_assignment_id)
+    assert remove_outcome == "remove_failed"
 
-    # sn-old is untouched by the removal that follows -- it was already
-    # closed/repurposed by confirm_device, and remove_device's own fresh
-    # lookup never looks at it again.
+    # sn-old is untouched by the refused removal -- it was already
+    # closed/repurposed by confirm_device, no second "closed" row.
     sn_old_closed_after = [
         row
         for row in storage.list_audit_log_for_entity("assignment", "house7-a03:sn-old")
@@ -691,22 +721,24 @@ def test_confirm_device_replace_previous_forced_confirm_wins_first(storage: Stor
     assert old_device is not None
     assert old_device.state == "in_storage"  # confirm_device's own choice, never overwritten
 
-    # sn-new is the one actually removed: exactly one assignment closed for
-    # it, exactly one state change, exactly one token revocation, and the
-    # apartment ends up with no open assignment at all.
+    # sn-new -- the device the refused call would have wrongly touched --
+    # is completely untouched by it: still in_service, its own assignment
+    # still open, its own token still present, no audit row at all from
+    # the refused call.
     new_assignment_log = storage.list_audit_log_for_entity("assignment", "house7-a03:sn-new")
-    assert len([row for row in new_assignment_log if row.action == "closed"]) == 1
-    assert len([row for row in new_assignment_log if row.action == "assigned"]) == 1
+    assert all(row.action != "closed" for row in new_assignment_log)
     new_device_log = storage.list_audit_log_for_entity("device", "sn-new")
-    assert len([row for row in new_device_log if row.action == "state_changed"]) == 2
+    assert len([row for row in new_device_log if row.action == "state_changed"]) == 1
     new_device = storage.get_device("sn-new")
     assert new_device is not None
-    assert new_device.state == "faulty"  # remove_device's own target_state, applied to sn-new
+    assert new_device.state == "in_service"
 
     apartment_log = storage.list_audit_log_for_entity("apartment", "house7-a03")
-    assert len([row for row in apartment_log if row.action == "token_revoked"]) == 2
+    assert len([row for row in apartment_log if row.action == "token_revoked"]) == 1
     assert storage.get_apartment_token_hash("house7-a03") is None
-    assert storage.get_current_assignment("house7-a03") is None
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
+    assert current_assignment.device_id == "sn-new"
 
 
 # -- deterministic hits for the two guarded-UPDATE failure branches -------------

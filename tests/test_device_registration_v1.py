@@ -607,9 +607,11 @@ def test_token_after_remove_device_refused(client: TestClient, storage: Storage)
     _confirm(storage, public_key)
     challenge = _request_challenge(client, registration_id)
 
+    current_assignment = storage.get_current_assignment(APARTMENT)
+    assert current_assignment is not None
     storage.remove_device(
-        APARTMENT, target_state="in_storage", reason="Ausbau", ui_username=USERNAME,
-        now=datetime.now(UTC),
+        APARTMENT, expected_assignment_id=current_assignment.id, target_state="in_storage",
+        reason="Ausbau", ui_username=USERNAME, now=datetime.now(UTC),
     )
 
     signature = encode_bytes(
@@ -687,9 +689,11 @@ def test_issued_token_works_on_heartbeat_and_403_after_remove_device(
     )
     assert ok.status_code == 204
 
+    current_assignment = storage.get_current_assignment(APARTMENT)
+    assert current_assignment is not None
     storage.remove_device(
-        APARTMENT, target_state="in_storage", reason="Ausbau", ui_username=USERNAME,
-        now=datetime.now(UTC),
+        APARTMENT, expected_assignment_id=current_assignment.id, target_state="in_storage",
+        reason="Ausbau", ui_username=USERNAME, now=datetime.now(UTC),
     )
 
     forbidden = client.post(

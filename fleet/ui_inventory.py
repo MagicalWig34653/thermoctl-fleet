@@ -268,10 +268,19 @@ class ShelfDeviceRow:
 class ReplaceDeviceView:
     """"Gerät ausbauen / tauschen" (P4.3, section 20.2 device-swap steps
     1-2) -- everything `fleet/templates/ui/inventory_replace_device.html`
-    needs, already derived and German-rendered."""
+    needs, already derived and German-rendered.
+
+    `current_assignment_id` -- the apartment's open assignment's own row
+    id, rendered as a hidden form field and echoed back on submit
+    (`Storage.remove_device`'s own `expected_assignment_id`, main-session
+    decision following the confirm/remove race cross-review): this pins the
+    form to the *exact* assignment the landlord actually saw, so a stale
+    submit (someone else already replaced the device in the meantime) is
+    refused instead of silently acting on whatever is open now."""
 
     apartment_id: str
     apartment_label: str
+    current_assignment_id: int
     current_device_id: str
     current_device_model: str
     target_states: list[str]
@@ -435,9 +444,12 @@ def build_replace_device_view(storage: Storage, apartment_id: str) -> ReplaceDev
     apartment = storage.get_apartment(apartment_id)
     if apartment is None:
         return None
-    device = storage.get_current_device_for_apartment(apartment_id)
-    if device is None:
+    assignment = storage.get_current_assignment(apartment_id)
+    if assignment is None:
         return None
+    device = storage.get_device(assignment.device_id)
+    if device is None:
+        return None  # pragma: no cover -- an open assignment always names a registered device
 
     shelf = [
         ShelfDeviceRow(
@@ -453,6 +465,7 @@ def build_replace_device_view(storage: Storage, apartment_id: str) -> ReplaceDev
     return ReplaceDeviceView(
         apartment_id=apartment.id,
         apartment_label=apartment.label,
+        current_assignment_id=assignment.id,
         current_device_id=device.id,
         current_device_model=device.model,
         target_states=list(REMOVE_DEVICE_TARGET_STATES),
