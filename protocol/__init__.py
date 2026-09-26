@@ -40,8 +40,13 @@ from protocol.inventory import (
 )
 from protocol.registration import (
     AgentRegistrationFile,
+    RegistrationAccepted,
     RegistrationConfirmation,
     RegistrationRequest,
+    TokenChallenge,
+    TokenIssued,
+    TokenRequest,
+    verification_code_for,
 )
 from protocol.version import PROTOCOL_VERSION
 
@@ -65,13 +70,18 @@ __all__ = [
     "Heartbeat",
     "OpenFault",
     "Property",
+    "RegistrationAccepted",
     "RegistrationConfirmation",
     "RegistrationRequest",
     "ServiceState",
     "Services",
     "SystemState",
     "ThermoctlState",
+    "TokenChallenge",
+    "TokenIssued",
+    "TokenRequest",
     "UpdateWindow",
     "fault_event_from_event",
     "fault_kind_from_key",
+    "verification_code_for",
 ]

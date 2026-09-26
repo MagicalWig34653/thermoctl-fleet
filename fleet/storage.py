@@ -473,6 +473,47 @@ class DeviceRegistrationRecord(Base):
     # against this confirmed registration -- always `NULL` here, in this
     # package, since that package does not exist yet.
     token_issued_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    # -- P4.2b (Ed25519 + signed challenge, `0008_device_registration_tokens
+    #    .py`) -------------------------------------------------------------
+    # A random, unguessable id the *device* uses for
+    # `.../{registration_id}/challenge`/`.../token` instead of this row's
+    # own sequential `id` (see that migration's docstring for why). Assigned
+    # once by `Storage.assign_registration_external_id`, right after
+    # `record_device_report` accepts the device's report.
+    external_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True, index=True
+    )
+    # SHA-256 hash of the current token challenge's nonce -- never the nonce
+    # itself (mirrors `code_hash`). Overwritten by each new challenge; the
+    # previous nonce becomes worthless the moment a new one is issued.
+    token_nonce_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    token_nonce_expires_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    # Set atomically together with `token_issued_at` in the same guarded
+    # `UPDATE` (`Storage.issue_device_token`) -- "unexpired and unused" and
+    # "not already issued" are one database transaction, not two checks a
+    # race could split apart.
+    token_nonce_consumed_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
+
+class DeviceRegistrationThrottleRecord(Base):
+    __tablename__ = "device_registration_throttle"
+
+    # P4.2b's own per-IP throttle for the three `/v1/registration/...`
+    # endpoints -- a *sibling* table to `UiLoginThrottleRecord` (P3.0), not
+    # the same one: this table throttles three independent request kinds per
+    # IP (`purpose` -- see `fleet.app._REGISTRATION_THROTTLE_PURPOSES`), each
+    # with its own budget, so the primary key is the pair, not the IP alone
+    # (see `0008_device_registration_tokens.py`'s own docstring for why one
+    # shared budget across purposes would be wrong: the challenge endpoint's
+    # legitimate 60-second poll cadence needs a much larger budget than an
+    # actual registration-code guess does). Otherwise identical in shape and
+    # in its atomic reserve-then-verify technique to `UiLoginThrottleRecord`
+    # -- see `Storage.reserve_registration_throttle`.
+    ip: Mapped[str] = mapped_column(String(64), primary_key=True)
+    purpose: Mapped[str] = mapped_column(String(32), primary_key=True)
+    failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
 
 
 class InventoryAuditLogRecord(Base):
@@ -2318,6 +2359,484 @@ class Storage:
                 before={"invalidated_at": None},
                 after={"invalidated_at": normalized_now.isoformat()},
             )
+
+    # -- device-side registration: Ed25519 + signed challenge (P4.2b,
+    #    section 4, 14, 15.3) --------------------------------------------
+
+    # Work order's own "document the number" instruction, same reasoning as
+    # `_MAX_CONFIRMATION_ATTEMPTS` above: 5 minutes for a token challenge's
+    # nonce (P4.2b's own work order: "expiry 5 min").
+    _TOKEN_NONCE_VALID_MINUTES = 5
+
+    def get_device_id_for_registration_code(self, registration_code: str) -> str | None:
+        """Read-only lookup: which device does this registration code belong
+        to, **regardless of its current `used_at`/`invalidated_at`/
+        `confirmed_at` state** -- used by `fleet.app.report_device_
+        registration` only *after* `Storage.record_device_report` has
+        already returned `True` for this exact code, purely to resolve
+        which device's now-freshly-reported row should receive its
+        `external_id` next (`assign_registration_external_id`).
+
+        **Never an authorization check by itself** -- `record_device_
+        report`'s own atomic guarded `UPDATE` already was that check, before
+        this method is ever called; this is a plain indexed-hash lookup on
+        an already-known-valid code, same "an indexed equality lookup gives
+        an attacker no more than hash present or not" reasoning `fleet.auth
+        .require_apartment_token_by_hash`'s own docstring already applies to
+        a comparable lookup.
+        """
+
+        code_hash = hash_token(registration_code)
+        with self.session() as session:
+            record = session.scalar(
+                select(DeviceRegistrationRecord)
+                .where(DeviceRegistrationRecord.code_hash == code_hash)
+                .order_by(DeviceRegistrationRecord.id.desc())
+                .limit(1)
+            )
+            return record.device_id if record is not None else None
+
+    def reserve_registration_throttle(
+        self,
+        ip: str,
+        purpose: str,
+        now: datetime,
+        throttle_threshold: int,
+        throttle_window_s: float,
+        throttle_duration_s: float,
+    ) -> bool:
+        """**Reserve-then-verify** per-IP throttle for the three `/v1
+        /registration/...` endpoints (P4.2b's own work order: "checked
+        before any DB lookup of the code") -- the same atomic technique as
+        `reserve_ip_login_attempt` (P3.0 round 4), applied to a *sibling*
+        table keyed on `(ip, purpose)` instead of `ip` alone (see
+        `0008_device_registration_tokens.py`'s own docstring for why one
+        shared budget across the three endpoints would be wrong).
+        Unconditionally increments `(ip, purpose)`'s attempt counter --
+        before any registration/code lookup ever runs -- and returns
+        whether the resulting count is still within `throttle_threshold`.
+
+        See `reserve_ip_login_attempt`'s own docstring for the full
+        reasoning behind this exact "insert-or-ignore, then a single
+        guarded `UPDATE ... RETURNING`" technique and why it closes the
+        check-then-act race a separate read-then-write would leave open --
+        applies unchanged here, only the table and its key differ.
+        """
+
+        normalized_now = _naive_utc(now)
+        window_deadline = normalized_now - timedelta(seconds=throttle_window_s)
+        new_blocked_until = normalized_now + timedelta(seconds=throttle_duration_s)
+        fresh_window_over_threshold = 1 > throttle_threshold
+
+        with self.session() as session:
+            dialect = session.get_bind().dialect.name
+            insert_values: dict[str, object] = {
+                "ip": ip,
+                "purpose": purpose,
+                "failures": 0,
+                "window_started_at": normalized_now,
+                "blocked_until": None,
+            }
+            insert_statement: Any
+            if dialect == "sqlite":
+                insert_statement = _sqlite_dialect.insert(DeviceRegistrationThrottleRecord).values(
+                    **insert_values
+                )
+            elif dialect == "postgresql":  # pragma: no cover -- see `reserve_ip_login_attempt`
+                insert_statement = _postgresql_dialect.insert(
+                    DeviceRegistrationThrottleRecord
+                ).values(**insert_values)
+            else:  # pragma: no cover -- see `reserve_ip_login_attempt`
+                raise NotImplementedError(
+                    "Insert-or-ignore for the registration throttle table is not "
+                    f"implemented for the {dialect!r} SQLAlchemy dialect."
+                )
+            session.execute(
+                insert_statement.on_conflict_do_nothing(index_elements=["ip", "purpose"])
+            )
+
+            currently_blocked = and_(
+                DeviceRegistrationThrottleRecord.blocked_until.is_not(None),
+                DeviceRegistrationThrottleRecord.blocked_until > normalized_now,
+            )
+            window_lapsed = DeviceRegistrationThrottleRecord.window_started_at < window_deadline
+            crosses_threshold_in_place = (
+                DeviceRegistrationThrottleRecord.failures + 1
+            ) > throttle_threshold
+
+            new_failures = case(
+                (currently_blocked, DeviceRegistrationThrottleRecord.failures),
+                (window_lapsed, 1),
+                else_=DeviceRegistrationThrottleRecord.failures + 1,
+            )
+            new_window_started_at = case(
+                (currently_blocked, DeviceRegistrationThrottleRecord.window_started_at),
+                (window_lapsed, normalized_now),
+                else_=DeviceRegistrationThrottleRecord.window_started_at,
+            )
+            window_lapsed_blocks = new_blocked_until if fresh_window_over_threshold else None
+            new_blocked_until_expr = case(
+                (currently_blocked, DeviceRegistrationThrottleRecord.blocked_until),
+                (window_lapsed, window_lapsed_blocks),
+                (crosses_threshold_in_place, new_blocked_until),
+                else_=DeviceRegistrationThrottleRecord.blocked_until,
+            )
+
+            statement = (
+                update(DeviceRegistrationThrottleRecord)
+                .where(
+                    DeviceRegistrationThrottleRecord.ip == ip,
+                    DeviceRegistrationThrottleRecord.purpose == purpose,
+                )
+                .values(
+                    failures=new_failures,
+                    window_started_at=new_window_started_at,
+                    blocked_until=new_blocked_until_expr,
+                )
+                .returning(DeviceRegistrationThrottleRecord.failures)
+            )
+            row = session.execute(statement).first()
+            if row is None:  # pragma: no cover -- the insert above guarantees a row
+                return True
+            resulting_failures = row[0]
+            return bool(resulting_failures <= throttle_threshold)
+
+    def release_registration_throttle(self, ip: str, purpose: str, now: datetime) -> None:
+        """Gives back one reserved attempt slot for `(ip, purpose)` after a
+        request that turned out to be legitimate -- see `fleet.app` for
+        which outcome counts as "legitimate" for each of the three
+        endpoints (mirrors `release_ip_login_attempt`'s "a legitimate user
+        is not penalised for their successful attempt", applied here so a
+        real device's own repeated, expected traffic -- in particular the
+        challenge endpoint's documented 60-second poll while a registration
+        is still pending confirmation -- never accumulates against its own
+        budget). Same "floored at 0, safe against a missing or since-reset
+        row" semantics as `release_ip_login_attempt`; see that method's own
+        docstring.
+        """
+
+        del now
+        with self.session() as session:
+            session.execute(
+                update(DeviceRegistrationThrottleRecord)
+                .where(
+                    DeviceRegistrationThrottleRecord.ip == ip,
+                    DeviceRegistrationThrottleRecord.purpose == purpose,
+                )
+                .values(failures=func.max(DeviceRegistrationThrottleRecord.failures - 1, 0))
+            )
+
+    def assign_registration_external_id(
+        self, device_id: str, now: datetime
+    ) -> str | None:
+        """Assigns a random, unguessable `external_id` to `device_id`'s
+        active (reported, not invalidated/confirmed) registration, once,
+        right after `record_device_report` has accepted that device's
+        report -- called by `fleet.app.report_device_registration`
+        immediately after a successful `Storage.record_device_report` call.
+
+        **Idempotent, not merely "generate and overwrite":** if the active
+        registration already carries an `external_id` (a retried request
+        after the response was lost, for instance), the existing value is
+        returned unchanged rather than a fresh one being minted and the
+        previous value orphaned -- a device that never saw the first
+        response but did in fact register must still be able to resolve the
+        *same* `registration_id` it would have gotten the first time, not a
+        second, different one for the same underlying row.
+
+        Returns `None` if there is no active registration for this device
+        at all (should not happen right after a successful `record_device
+        _report` call in the same request, but this method makes no
+        assumption about being called only there).
+        """
+
+        normalized_now = _naive_utc(now)
+        candidate = secrets.token_urlsafe(24)
+        with self.session() as session:
+            registration = session.scalar(
+                select(DeviceRegistrationRecord).where(
+                    DeviceRegistrationRecord.device_id == device_id,
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.confirmed_at.is_(None),
+                )
+            )
+            if registration is None:
+                return None
+            if registration.external_id is not None:
+                return registration.external_id
+            # Guarded on `external_id IS NULL` even though this call already
+            # holds the row via a plain `SELECT` above -- two concurrent
+            # reports for the same device cannot both succeed
+            # (`record_device_report`'s own atomic `UPDATE ... WHERE used_at
+            # IS NULL` already guarantees only one caller ever reaches this
+            # method with a freshly-reported row), but this guard costs
+            # nothing and keeps the same "the check and the write must be
+            # the same statement" discipline as every other write in this
+            # module.
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(DeviceRegistrationRecord)
+                    .where(
+                        DeviceRegistrationRecord.id == registration.id,
+                        DeviceRegistrationRecord.external_id.is_(None),
+                    )
+                    .values(external_id=candidate)
+                ),
+            )
+            del normalized_now  # not needed for this write, kept for symmetry
+            if not result.rowcount:  # pragma: no cover
+                # Lost the race -- re-fetch whatever the winner actually
+                # stored. Unreachable without an artificial second writer
+                # between this call's own `SELECT` and `UPDATE`, the same
+                # class of narrow window `confirm_device`'s own phase-1/
+                # phase-2 rechecks document.
+                refreshed = session.get(DeviceRegistrationRecord, registration.id)
+                return refreshed.external_id if refreshed is not None else None
+            return candidate
+
+    def get_registration_by_external_id(
+        self, external_id: str
+    ) -> DeviceRegistrationRecord | None:
+        """Looks up a registration by its device-facing `external_id` (not
+        the row's own internal, sequential `id`) -- used by all three P4.2b
+        `/v1/registration/...` endpoints once a device has its
+        `registration_id` from `RegistrationAccepted`."""
+
+        with self.session() as session:
+            record = session.scalar(
+                select(DeviceRegistrationRecord).where(
+                    DeviceRegistrationRecord.external_id == external_id
+                )
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def issue_token_challenge(
+        self, external_id: str, nonce_hash: str, now: datetime
+    ) -> datetime | None:
+        """`POST /v1/registration/{registration_id}/challenge` (P4.2b, 15.3
+        step 2/4) -- issues a fresh, single-use nonce for a *confirmed*, not
+        invalidated, not-yet-token-issued registration, and returns its
+        expiry. The caller (`fleet.app.request_token_challenge`) generates
+        the raw nonce itself and passes only its hash here, mirroring
+        `prepare_device`'s own "the raw secret is generated by the caller,
+        only its hash is ever persisted" split -- see that method.
+
+        Returns `None` for: unknown `external_id`, not yet confirmed
+        (`fleet.app` turns this into the documented 202 "pending" response,
+        not a failure), invalidated, or a registration whose token was
+        already issued (no second challenge makes sense once the token
+        exchange is done) -- every one of these is deliberately
+        indistinguishable to the *storage* layer's return value; `fleet.app`
+        is the one place allowed to turn "not yet confirmed" into a
+        different status code than the other three, since that
+        differentiation is for the device's own polling loop, not an
+        information leak about *which* apartment a code belongs to (the
+        `external_id` itself carries no such information, unlike a
+        registration/verification code would).
+
+        **Overwrites any earlier nonce for this row unconditionally** --
+        "single-use" applied at the row level (see the migration's own
+        docstring): a device that lost a previous challenge's response and
+        asks again simply gets a new nonce; the old one silently stops
+        working, no separate invalidation step needed. The guard and the
+        write are the same `UPDATE ... WHERE ...` statement, so two
+        concurrent challenge requests for the same registration cannot
+        leave the row in an inconsistent nonce/expiry pair -- whichever
+        commits last simply wins, exactly the "single current nonce" model
+        this method promises.
+        """
+
+        normalized_now = _naive_utc(now)
+        new_expires_at = normalized_now + timedelta(minutes=self._TOKEN_NONCE_VALID_MINUTES)
+        with self.session() as session:
+            statement = (
+                update(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.external_id == external_id,
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.confirmed_at.is_not(None),
+                    DeviceRegistrationRecord.token_issued_at.is_(None),
+                )
+                .values(
+                    token_nonce_hash=nonce_hash,
+                    token_nonce_expires_at=new_expires_at,
+                    token_nonce_consumed_at=None,
+                )
+                .returning(DeviceRegistrationRecord.id)
+            )
+            row = session.execute(statement).first()
+            if row is None:
+                return None
+            return new_expires_at
+
+    def registration_status(self, external_id: str) -> str | None:
+        """Read-only classification of one registration for the challenge
+        endpoint's own status decision (`fleet.app.request_token_challenge`)
+        -- returns `"confirmed"`, `"pending"` (known, not yet confirmed, not
+        invalidated), or `None` (unknown, invalidated, or already
+        token-issued -- every one of these becomes the same uniform refusal
+        in `fleet.app`, see `issue_token_challenge`'s own docstring for why
+        they must not be distinguished any further than this)."""
+
+        with self.session() as session:
+            registration = session.scalar(
+                select(DeviceRegistrationRecord).where(
+                    DeviceRegistrationRecord.external_id == external_id
+                )
+            )
+            if (
+                registration is None
+                or registration.invalidated_at is not None
+                or registration.token_issued_at is not None
+            ):
+                return None
+            if registration.confirmed_at is not None:
+                return "confirmed"
+            return "pending"
+
+    def issue_device_token(
+        self,
+        external_id: str,
+        nonce: str,
+        now: datetime,
+    ) -> str | None:
+        """`POST /v1/registration/{registration_id}/token` (P4.2b, 15.3 step
+        2/4's "answers a signed challenge") -- the caller
+        (`fleet.app.request_device_token`) has **already verified the
+        Ed25519 signature** against the stored public key before ever
+        calling this method; this method only ever handles the *storage*
+        side of "nonce unexpired and unused, registration confirmed and not
+        invalidated, token not already issued, device still holds the open
+        assignment created at confirmation, apartment not retired" -- and
+        does all of it, plus the actual token generation and the apartment's
+        token-hash write, **in one transaction**, so a failure partway
+        through (or a lost race against a concurrent call) leaves nothing
+        applied.
+
+        Returns the raw token on success (stored nowhere in plain text
+        beyond this one return value -- only `fleet.storage.hash_token`'s
+        digest is ever persisted, on `ApartmentRecord.token_hash`, exactly
+        the pattern every other agent token in this codebase already
+        follows), or `None` for any refusal -- unknown `external_id`, wrong/
+        reused/expired nonce, not confirmed, invalidated, already issued, no
+        open assignment for the device against the confirmed apartment, or
+        a retired apartment. Every one of these is deliberately
+        indistinguishable to the caller (`fleet.app` turns `None` into one
+        uniform response), mirroring `record_device_report`'s own "every
+        failure looks the same" reasoning -- a wrong signature or a reused
+        nonce must not give an attacker any signal about *which* precondition
+        it tripped.
+
+        **Exactly one token per registration, proven under concurrency**
+        (`tests/test_device_registration_v1.py
+        ::test_concurrent_token_requests_exactly_one_token_wins`, 10
+        threads, 10 runs): the guard (`token_issued_at IS NULL`, alongside
+        every other precondition) is folded into the same `UPDATE ...
+        WHERE ...` that also **consumes the nonce** (`token_nonce_consumed_
+        at`) -- one statement, so "the nonce is still valid" and "no token
+        has been issued yet" are decided atomically together, not as two
+        separate checks a race could split apart. Only the request whose
+        `UPDATE` actually matches a row proceeds to generate and store a
+        token; every other concurrent caller (for the same registration, or
+        replaying the same nonce) affects zero rows and returns `None`.
+
+        **A device with no open assignment for the confirmed apartment (a
+        concurrent `remove_device` call, or the confirmed apartment having
+        been retired since) never gets a token**, checked as two correlated
+        `EXISTS` subqueries folded into the very same guarded `UPDATE`'s
+        `WHERE` clause -- not a separate read beforehand a race could
+        invalidate in the gap before the write (the same "the check and the
+        write must be the same statement" discipline `confirm_device`'s own
+        guarded writes already apply).
+        """
+
+        registration = self.get_registration_by_external_id(external_id)
+        if registration is None or registration.apartment_id is None:
+            return None
+
+        normalized_now = _naive_utc(now)
+        nonce_hash = hash_token(nonce)
+        device_id = registration.device_id
+        apartment_id = registration.apartment_id
+
+        raw_token = f"agent_{apartment_id}_{secrets.token_urlsafe(32)}"
+        token_hash = hash_token(raw_token)
+
+        open_assignment_exists = (
+            select(AssignmentRecord.id)
+            .where(
+                AssignmentRecord.device_id == device_id,
+                AssignmentRecord.apartment_id == apartment_id,
+                AssignmentRecord.ended_at.is_(None),
+            )
+            .exists()
+        )
+        apartment_not_retired = (
+            select(ApartmentRecord.id)
+            .where(
+                ApartmentRecord.id == apartment_id,
+                ApartmentRecord.state != "retired",
+            )
+            .exists()
+        )
+
+        with self.session() as session:
+            statement = (
+                update(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.id == registration.id,
+                    DeviceRegistrationRecord.confirmed_at.is_not(None),
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.token_issued_at.is_(None),
+                    DeviceRegistrationRecord.token_nonce_hash == nonce_hash,
+                    DeviceRegistrationRecord.token_nonce_consumed_at.is_(None),
+                    DeviceRegistrationRecord.token_nonce_expires_at.is_not(None),
+                    DeviceRegistrationRecord.token_nonce_expires_at > normalized_now,
+                    open_assignment_exists,
+                    apartment_not_retired,
+                )
+                .values(token_issued_at=normalized_now, token_nonce_consumed_at=normalized_now)
+                .returning(DeviceRegistrationRecord.id)
+            )
+            row = session.execute(statement).first()
+            if row is None:
+                return None
+
+            token_result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(ApartmentRecord)
+                    .where(ApartmentRecord.id == apartment_id, ApartmentRecord.state != "retired")
+                    .values(token_hash=token_hash)
+                ),
+            )
+            if not token_result.rowcount:
+                # The registration write above already required the
+                # apartment to be non-retired via `apartment_not_retired`;
+                # this would only fail if the apartment vanished or was
+                # retired in the narrow gap between that check and this
+                # write within the *same* transaction, which SQLite's own
+                # single-writer transaction model makes unreachable without
+                # an artificial second connection interleaved mid-statement.
+                raise ValueError(  # pragma: no cover -- see comment above
+                    f"Wohnung {apartment_id!r} wurde inzwischen anderweitig bearbeitet."
+                )
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username="agent:registration",
+                entity_type="device",
+                entity_id=device_id,
+                action="token_issued",
+                reason=None,
+                before={"token_issued_at": None},
+                after={"token_issued_at": normalized_now.isoformat()},
+            )
+
+        return raw_token
 
     def change_device_state(
         self,

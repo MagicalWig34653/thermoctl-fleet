@@ -30,6 +30,12 @@ fleet = [
     "pyotp>=2.9",
     "jinja2>=3.1",
     "python-multipart>=0.0.9",
+    # Device registration (P4.2b, sections 4/14/15.3): validating a device's
+    # Ed25519 **public** key and verifying its signature over the token
+    # challenge. Never used to *generate* or hold a private key in the cloud
+    # (CLAUDE.md security principle 3) -- that only ever happens in `agent/`
+    # (future P2.3), on the base station.
+    "cryptography>=43",
 ]
 # Device side: HTTP client for heartbeat/events, SSE client for the
 # command channel.

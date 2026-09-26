@@ -336,7 +336,17 @@ surface each package touches changed, from `/v1/...` to `/ui/inventory/...`.
 - **Depends on:** P4.2.
 - **Read back by:** main session (private-key handling, security
   principle 3).
-- [ ] not done.
+- [x] done -- decided by the project owner (2026-09-26): Ed25519 + a
+  signed server challenge, the verification code derived from the public
+  key's own fingerprint (`protocol.registration.verification_code_for`).
+  Three new agent-facing endpoints (`POST /v1/registration`, `.../{id}
+  /challenge`, `.../{id}/token`, `fleet/app.py`), purely additive protocol
+  models (`protocol/registration.py`: `RegistrationAccepted`,
+  `TokenChallenge`, `TokenRequest`, `TokenIssued`), migration `0008
+  _device_registration_tokens.py`. See `docs/STATUS.md` for the full flow,
+  the message format, the per-IP throttle (three independent purposes),
+  and the open points (token rotation, the agent side itself in P2.3, TLS
+  pinning on the agent).
 
 ### P4.3 -- Replace device, change state
 - **Goal:** UI routes under `/ui/inventory/apartments/{id}/replace-device`
