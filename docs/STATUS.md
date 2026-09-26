@@ -2,6 +2,265 @@
 
 Last updated: 2026-09-26.
 
+## Device-side registration: Ed25519 + signed challenge (P4.2b, sections 4,
+14, 15.3) **SR**
+
+**Decision by the project owner, 2026-09-26 (do not re-open, see this
+package's own work order):** device registration uses **Ed25519 and a
+signed server challenge**. The verification code shown on the device and in
+the fleet UI is **derived from the public key's own fingerprint**
+(`protocol.registration.verification_code_for`), so a substituted key
+always shows a different code -- P4.2's own confirmation step (constant-
+time comparison, `Storage.confirm_device`) is unchanged, only what value it
+is ever asked to compare against changed, from "whatever the device
+happened to send" to "a value nobody, including the device's own firmware
+bug, can pick". The apartment's agent token is issued **only** for a
+registration confirmed in the UI, bound to exactly the stored public key --
+never before that confirmation, never to a different key.
+
+**Flow (15.3 steps 2-4), device side simulated by `tests
+/test_device_registration_v1.py`'s own helpers (`cryptography`'s
+`Ed25519PrivateKey`, generated fresh per test, never a literal):**
+
+1. `POST /v1/registration` (`RegistrationRequest`) -- the device's one-time
+   registration code (from P4.2's "prepare") plus its own Ed25519 **public**
+   key. `fleet.app.report_device_registration` validates the key is a real
+   Ed25519 public key (`cryptography.hazmat.primitives.asymmetric.ed25519
+   .Ed25519PublicKey.from_public_bytes`, `fleet` extra only -- never
+   imported by `protocol/`), computes the verification code **server-side**
+   from the key (`verification_code_for`, never trusted from the caller --
+   there is no such field on `RegistrationRequest` to trust from in the
+   first place), and calls `Storage.record_device_report` (P4.2's own,
+   unchanged entry point). Success -> `201 RegistrationAccepted
+   {registration_id}` -- a random, unguessable id
+   (`Storage.assign_registration_external_id`, `secrets.token_urlsafe(24)`),
+   **never** the row's own sequential database id (would let a caller
+   enumerate other devices' in-progress registrations). **Every failure is
+   one uniform `400` response** (`_uniform_registration_failure`): unknown/
+   expired/invalidated/already-used code, a malformed or structurally
+   invalid public key, and a decommissioned device (P4.2's own guard) are
+   all indistinguishable.
+2. `POST /v1/registration/{registration_id}/challenge` -- the device's own
+   polling loop (section 3's own 60-second cadence, documented via a
+   `Retry-After: 60` header on the `202` response). Not yet confirmed ->
+   `202`, empty body. Confirmed -> `200 TokenChallenge {nonce, expires_at}`
+   -- a fresh, single-use nonce (>=32 raw bytes, `secrets.token_bytes`,
+   encoded per `protocol.registration`'s own convention), stored **hashed**
+   (`Storage.issue_token_challenge`), 5-minute expiry
+   (`Storage._TOKEN_NONCE_VALID_MINUTES`), overwriting any earlier nonce for
+   the same row (single active nonce per registration, the same "single-
+   use applied at the row level" reasoning as the registration code
+   itself). Unknown/invalidated/already-token-issued `registration_id` ->
+   the same uniform `404`-style refusal in all three cases.
+3. `POST /v1/registration/{registration_id}/token` (`TokenRequest{nonce,
+   signature}`) -- the device signs a **domain-separated** message,
+   `b"thermoctl-fleet/token/v1\0" + registration_id + b"\0" + nonce`, with
+   its Ed25519 private key (never leaves the device) and echoes the nonce
+   back alongside the signature. `fleet.app.request_device_token` verifies
+   the signature against the **stored** public key (never one the request
+   itself supplies) before ever touching storage; `Storage
+   .issue_device_token` then does everything else -- nonce consumption,
+   every remaining precondition (confirmed, not invalidated, token not
+   already issued, the device still holds the open assignment created at
+   confirmation, the apartment not retired), the actual token generation
+   (`agent_<apartment>_<random>`, >=32 bytes of entropy, section 4), and the
+   apartment's `token_hash` write -- **in one guarded transaction**, so a
+   failure or a lost race leaves nothing applied. Success -> `200
+   TokenIssued {token}`, returned **exactly once**; every other outcome
+   (wrong/malformed signature, a signature over a different registration id
+   or a stale/expired/reused nonce, a second attempt after success, no open
+   assignment, a retired apartment) is the **same uniform `404`-style
+   response**.
+
+**Encodings, documented once in `protocol/registration.py`'s own module
+docstring, used by both sides identically:** a raw Ed25519 public key (32
+bytes), a raw Ed25519 signature (64 bytes), and a raw nonce (>=32 bytes) are
+all base64url-encoded **without padding** (`encode_bytes`/`decode_bytes`,
+pure stdlib `base64`/`hashlib` -- `protocol/` stays pydantic+stdlib only,
+`cryptography` is never imported there, only in `fleet`'s own extra).
+`decode_bytes` reimplements `base64.urlsafe_b64decode`'s own `-`/`_`
+translation and calls `base64.b64decode(..., validate=True)` directly --
+plain `urlsafe_b64decode` does **not** itself validate and silently
+*discards* out-of-alphabet characters instead of rejecting them, which
+would have let a malformed string slip through as if properly encoded
+(caught while writing `tests/test_registration_protocol.py
+::test_decode_bytes_rejects_invalid_base64url`, not merely assumed correct).
+
+**`verification_code_for` (`protocol/registration.py`):** SHA-256 of the
+raw public-key bytes, truncated to the first 40 bits (5 bytes), rendered as
+8 Crockford-base32 symbols (no `I`/`L`/`O`/`U`, chosen so a human reading it
+off a small screen cannot confuse `0`/`O` or `1`/`I`/`L`), formatted
+`XXXX-XXXX`. **40 bits is enough for what this code actually has to do, not
+in general:** it is a human-eyeball comparison of two short strings shown on
+two screens at once, not the security boundary itself -- that is the signed
+challenge that follows *after* confirmation, verified against the exact key
+this code was derived from; a substituted key producing a colliding
+fingerprint (a 2**40 search) still cannot answer that challenge with the
+legitimate device's own private key. Deterministic, differs for different
+keys, format-tested directly (`tests/test_registration_protocol.py`).
+
+**Protocol additions, purely additive (section 18.2), `PROTOCOL_VERSION`
+**not** bumped** (the same section: a bump is only required for a changed
+field name, a changed required field, or a changed meaning of an existing
+field -- every change here is a brand-new model or a new pure function; no
+existing model's fields changed at all): `RegistrationAccepted
+{registration_id}`, `TokenChallenge{nonce, expires_at}`, `TokenRequest{nonce,
+signature}`, `TokenIssued{token}` (no `examples=`/default value on `token`
+-- CLAUDE.md: "no secrets in the repo, not even as a real-looking example
+value", applied to a field instead of a whole model this time).
+`tests/test_registration_protocol.py
+::test_no_protocol_model_field_name_ever_mentions_a_private_key` walks
+every field name of every Pydantic model importable from `protocol` (plus
+every model defined directly in `protocol.registration`) and asserts none
+contains "private" -- CLAUDE.md security principle 3, checked directly, not
+only argued.
+
+**Schema (`fleet/migrations/versions/0008_device_registration_tokens.py`,
+`down_revision` `"0007"`).** Four new, nullable columns on P4.2's own
+`device_registrations` table (`external_id` -- unique, indexed, the
+device-facing id described above; `token_nonce_hash`/`token_nonce_expires_
+at`/`token_nonce_consumed_at` -- the current challenge's nonce, hashed,
+never stored raw, mirroring `code_hash` exactly) and one new, sibling
+table, `device_registration_throttle` -- **not** the same table as P3.0's
+`ui_login_throttle`: this one throttles three *independent* request kinds
+per IP (see below), each needing its own budget, so its primary key is the
+pair `(ip, purpose)`, not the IP alone.
+
+**Per-IP throttle, reserve-then-verify (the exact P3.0 round-4 pattern,
+`Storage.reserve_registration_throttle`/`release_registration_throttle`),
+checked *before* any code/registration lookup, three independently
+configured "purposes":**
+
+| Purpose | Endpoint | Default threshold | Default window/block | Env vars |
+|---|---|---|---|---|
+| `register` | `POST /v1/registration` | 10 | 15 min / 15 min | `FLEET_REGISTRATION_THROTTLE_{THRESHOLD,WINDOW_S,DURATION_S}` |
+| `challenge` | `.../challenge` | **30** | 15 min / 15 min | `FLEET_REGISTRATION_CHALLENGE_THROTTLE_{THRESHOLD,WINDOW_S,DURATION_S}` |
+| `token` | `.../token` | 10 | 15 min / 15 min | `FLEET_REGISTRATION_TOKEN_THROTTLE_{THRESHOLD,WINDOW_S,DURATION_S}` |
+
+**Why the challenge endpoint's default is far more generous, not an
+oversight:** section 3's own 60-second poll cadence applies here too (a
+device waits for the landlord's UI confirmation by polling roughly once a
+minute) -- a tight, login-sized budget would let a legitimate, well-behaved
+device throttle *itself* purely by waiting. Every `200`/`202` response
+additionally **releases its own reservation** (`release_registration_
+throttle`, the same "give a legitimate attempt's budget back" reasoning
+P3.0's login throttle already established) -- in practice a well-behaved
+device never spends its budget down at all; only the uniform-refusal branch
+of each endpoint consumes it. Proven under real concurrent threads, not
+only argued: `tests/test_device_registration_v1.py
+::test_register_throttle_429_reserve_then_verify` (10 concurrent requests,
+threshold 3 -- exactly 3 reach the "unknown code" check, exactly 7 get
+`429` before any lookup at all) and `::test_challenge_throttle_429`.
+
+**Races/guards, proven under real threads, not only argued:**
+`tests/test_device_registration_v1.py
+::test_concurrent_token_requests_exactly_one_token_wins` (10 threads, one
+valid signature+nonce, re-run 10x during verification with no flake) --
+exactly one `200`, nine `404`; the nonce-consumption and the token-issuance
+guard are the *same* `UPDATE ... WHERE ...` statement
+(`Storage.issue_device_token`), so no two concurrent callers can both
+observe "still valid" for what turns out to be the second winner.
+`::test_token_after_remove_device_refused` -- a device racing (here:
+preceding) a `remove_device` call never gets a token, since the open-
+assignment `EXISTS` subquery is folded into that same guarded statement, not
+a separate read beforehand. `::test_challenge_after_invalidation_uniform_
+404` -- a manual transition out of `reported` (P4.2/P4.3's own registration-
+invalidation rule) makes a still-pending challenge unreachable. `::test_key_
+substitution_confirm_with_expected_code_fails` -- device B registering with
+device A's code produces a *different* stored verification code (derived
+from B's key), so confirming with the code that would have belonged to A's
+own key fails `confirm_device`'s existing constant-time comparison, exactly
+the substitution-detection property this package's whole design exists for.
+
+**Never logged, never stored raw, proven directly, not only by
+inspection:** `tests/test_device_registration_v1.py
+::test_raw_token_never_stored_or_logged` asserts the issued token is absent
+from `caplog`'s captured text *and* from the raw bytes of the SQLite file on
+disk -- only `hash_token`'s digest is ever persisted
+(`ApartmentRecord.token_hash`), the same pattern every other agent token in
+this codebase already follows. Registration codes, verification codes,
+nonces, and signatures are likewise never logged anywhere in `fleet/app.py`
+or `fleet/storage.py`'s new code. `Cache-Control: no-store` on all three
+endpoints' responses, success and failure alike.
+
+**`fleet` extra gained `cryptography>=43`** (`pyproject.toml`) -- validating
+a device's Ed25519 **public** key and verifying its signature; never used
+to *generate* or hold a private key anywhere in the cloud (CLAUDE.md
+security principle 3) -- that only ever happens in `agent/` (P2.3, still
+deferred). `protocol/` itself imports neither `cryptography` nor anything
+from `fleet`/`agent` -- verified by `protocol/registration.py`'s own module
+docstring reasoning and by every new function there being pure `base64`/
+`hashlib`.
+
+**Tests.** `tests/test_registration_protocol.py` (new, 15 tests): `encode_
+bytes`/`decode_bytes` round-trip, URL-safety, padding, and the invalid-
+base64url rejection above; `verification_code_for`'s determinism, format
+(Crockford alphabet, no `I`/`L`/`O`/`U`), and "differs for different keys";
+the new models' basic validation; the protocol-wide "no field ever
+mentions a private key" walk. `tests/test_device_registration_v1.py` (new,
+26 tests, against a real, migrated SQLite database and a real
+`TestClient(app)`): the full happy path end to end (register -> `202`
+before confirm -> UI confirm via `Storage.confirm_device` -> `200` challenge
+-> token -> a real `POST /v1/heartbeat` with the issued token -> `204`);
+wrong-length/not-base64/unknown/reused/invalidated registration codes, all
+uniform `400`s; the expired-code case at the storage level with an injected
+clock (mirroring P4.2's own convention for this class of test); the
+register/challenge throttles (concurrent and single-shot); challenge before
+confirm (`202`)/unknown (`404`)/after invalidation (`404`); wrong signature,
+signature over a different `registration_id` (domain separation), a stale
+(overwritten) nonce, a malformed (not base64) signature, and an expired
+nonce at the storage level with an injected clock -- all refused, no token;
+the concurrent-token-request race; token after `remove_device`; a second
+token attempt after success; the issued token working on a real heartbeat
+and getting `403` after `remove_device`; the raw-token-never-stored-or-
+logged proof; two direct `Storage` edge cases
+(`assign_registration_external_id`'s "no active registration"/idempotent-
+retry branches, `issue_token_challenge` after the token was already issued,
+`issue_device_token` for an unknown `external_id`) reached that no HTTP-
+level test could reach on its own. `fleet/app.py`, `fleet/storage.py`
+(P4.2b's own additions), and `protocol/registration.py` are all at 100%
+coverage for this round -- the two remaining `# pragma: no cover` lines in
+`fleet/storage.py`'s new code are the same class of narrow, single-writer-
+transaction race P4.2's own rechecks already document (an artificial second
+writer would be needed to hit them deterministically), not an untested real
+path.
+
+**Open points, left for later packages, not invented here:**
+
+- **Token rotation is not built.** `Storage.issue_device_token` refuses a
+  second call outright ("token already issued... a new device registration
+  is needed"); the specification's own "the cloud can issue a new token"
+  (section 4) needs a dedicated rotation flow for an *already*-in-service
+  apartment, which is out of this package's scope (P4.2b only ever issues
+  the *first* token for a freshly confirmed registration).
+- **The agent side (P2.3, still deferred) is not built here** -- key
+  generation, storing the private key on the base station, calling these
+  three endpoints, and persisting the issued token are all still to do
+  once thermoctl's own `/api/v1/health` exists (see P2.3's own entry in
+  `docs/implementation_plan.md`). This package's tests play the device's
+  role with a throwaway `cryptography.Ed25519PrivateKey` generated at
+  runtime, never a real agent.
+- **TLS certificate pinning on the agent (section 4: "the agent knows the
+  cloud's expected fingerprint... as a second barrier") is P2.3's job, not
+  this one.** `AgentRegistrationFile.certificate_fingerprint` already
+  exists (P4.2) for exactly this purpose; nothing in this package checks it
+  from the cloud side, since pinning is inherently a client-side (agent)
+  concern the cloud cannot enforce on itself.
+
+Verification (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"` -- SQLAlchemy 2.1.1, mypy 2.3.1, cryptography 50.0.1):
+`ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all clean;
+`python -m pytest -W ignore::ResourceWarning` (705 passed, 99% coverage
+overall, `fleet/app.py`/`fleet/storage.py`/`protocol/registration.py`/the
+new migration all at 100%); `test_concurrent_token_requests_exactly_one_
+token_wins` and `test_register_throttle_429_reserve_then_verify` each
+re-run 10x in a row, no flake. `watchdog/`: `go vet ./...` clean, `go test
+./...` green, `bash watchdog/check_contract.sh` passes (`protocol/`
+changed, so the Go track was run per this package's own verification
+instructions -- `watchdog/` itself was not touched, and the contract test
+does not exercise anything from `protocol/registration.py`, which never
+crosses into the watchdog's own state file).
+
 ## Cross-review integration: P4.2 x P4.3 device lifecycle (main session)
 
 P4.2 ("prepare device, confirm registration and assign") and P4.3 ("remove/

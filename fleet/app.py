@@ -19,20 +19,36 @@ import asyncio
 import contextlib
 import logging
 import os
+import secrets
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import Body, Depends, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
-from fleet.storage import Storage, get_storage
+from fleet.storage import Storage, get_storage, hash_token
+from fleet.ui_auth import resolve_client_ip
 from fleet.ui_routes import install_security_headers
 from fleet.ui_routes import router as ui_router
-from protocol import CommandResult, Event, Heartbeat
+from protocol import (
+    CommandResult,
+    Event,
+    Heartbeat,
+    RegistrationAccepted,
+    RegistrationRequest,
+    TokenChallenge,
+    TokenIssued,
+    TokenRequest,
+    verification_code_for,
+)
 from protocol.heartbeat import MAX_CATCH_UP_HEARTBEATS
+from protocol.registration import MIN_NONCE_BYTES, decode_bytes, encode_bytes
 from protocol.version import PROTOCOL_VERSION
 
 logger = logging.getLogger(__name__)
@@ -336,3 +352,382 @@ def receive_command_result(
 # add the remaining device-lifecycle UI routes (prepare/confirm/replace/
 # state) the same way, still under `/ui`, not `/v1`.
 # -----------------------------------------------------------------------------
+
+
+# -----------------------------------------------------------------------------
+# Device-side registration: Ed25519 + signed challenge (P4.2b, sections 4,
+# 14, 15.3). **The one deliberate exception to "inventory is `/ui` only"**
+# (see the comment block above) -- this is the *device's* own registration,
+# authenticated by the one-time registration code and, from the challenge
+# step on, by proof of possessing the corresponding private key, never by
+# the P3.0 UI session or the P1.1 apartment bearer token (the device has
+# neither yet). No bearer token is checked on any of these three endpoints
+# for exactly that reason -- the per-IP throttle below is the only defence
+# against abuse until a token exists.
+# -----------------------------------------------------------------------------
+
+_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
+
+# The three independent per-IP throttle "purposes" (P4.2b's own work order:
+# "reserve-then-verify ... checked before any DB lookup of the code" for
+# `/v1/registration`, "throttled per IP too" for the other two) -- see
+# `fleet/migrations/versions/0008_device_registration_tokens.py` for why
+# these do not share one budget.
+_THROTTLE_PURPOSE_REGISTER = "register"
+_THROTTLE_PURPOSE_CHALLENGE = "challenge"
+_THROTTLE_PURPOSE_TOKEN = "token"  # noqa: S105 -- a throttle "purpose" tag, not a secret
+
+# `POST /v1/registration`: an actual registration-code guess. Kept at the
+# same order of magnitude as the UI login throttle's own default
+# (`fleet.ui_auth`'s `FLEET_UI_IP_THROTTLE_THRESHOLD`, 5 per 15 min) but
+# slightly more generous (10) since a legitimate device may retry once after
+# a transient network failure without being mistaken for an attacker guessing
+# codes.
+_REGISTRATION_THROTTLE_THRESHOLD_ENV = "FLEET_REGISTRATION_THROTTLE_THRESHOLD"
+_DEFAULT_REGISTRATION_THROTTLE_THRESHOLD = 10
+_REGISTRATION_THROTTLE_WINDOW_S_ENV = "FLEET_REGISTRATION_THROTTLE_WINDOW_S"
+_DEFAULT_REGISTRATION_THROTTLE_WINDOW_S = 15 * 60.0
+_REGISTRATION_THROTTLE_DURATION_S_ENV = "FLEET_REGISTRATION_THROTTLE_DURATION_S"
+_DEFAULT_REGISTRATION_THROTTLE_DURATION_S = 15 * 60.0
+
+# `.../challenge`: **deliberately far more generous** than the other two --
+# section 3's own 60-second poll cadence applies here too (the work order's
+# own "the device polls; document the poll interval, e.g. 60 s"): a device
+# waiting for a landlord to confirm it in the UI polls this endpoint roughly
+# once a minute, so a 15-minute window sees on the order of 15 *legitimate*
+# calls even with nothing else going on. `Storage.release_registration_
+# throttle` additionally gives every `200`/`202` response's reservation
+# straight back (see `request_token_challenge` below), so in practice a
+# well-behaved device never spends down this budget at all -- the threshold
+# here only has to absorb the handful of calls between "poll" and "release",
+# not the device's entire polling lifetime, but is kept well above the
+# tighter default anyway as defence in depth for a client that is slow to
+# retry or briefly loses its response.
+_CHALLENGE_THROTTLE_THRESHOLD_ENV = "FLEET_REGISTRATION_CHALLENGE_THROTTLE_THRESHOLD"
+_DEFAULT_CHALLENGE_THROTTLE_THRESHOLD = 30
+_CHALLENGE_THROTTLE_WINDOW_S_ENV = "FLEET_REGISTRATION_CHALLENGE_THROTTLE_WINDOW_S"
+_DEFAULT_CHALLENGE_THROTTLE_WINDOW_S = 15 * 60.0
+_CHALLENGE_THROTTLE_DURATION_S_ENV = "FLEET_REGISTRATION_CHALLENGE_THROTTLE_DURATION_S"
+_DEFAULT_CHALLENGE_THROTTLE_DURATION_S = 15 * 60.0
+
+# `.../token`: an actual signature/nonce guess -- same tight default as
+# registration.
+# noqa: S105 below -- these are environment *variable names*, not secrets;
+# ruff's bandit-style heuristic flags them only because "TOKEN" appears in
+# the Python identifier.
+_TOKEN_THROTTLE_THRESHOLD_ENV = "FLEET_REGISTRATION_TOKEN_THROTTLE_THRESHOLD"  # noqa: S105
+_DEFAULT_TOKEN_THROTTLE_THRESHOLD = 10
+_TOKEN_THROTTLE_WINDOW_S_ENV = "FLEET_REGISTRATION_TOKEN_THROTTLE_WINDOW_S"  # noqa: S105
+_DEFAULT_TOKEN_THROTTLE_WINDOW_S = 15 * 60.0
+_TOKEN_THROTTLE_DURATION_S_ENV = "FLEET_REGISTRATION_TOKEN_THROTTLE_DURATION_S"  # noqa: S105
+_DEFAULT_TOKEN_THROTTLE_DURATION_S = 15 * 60.0
+
+
+def _registration_throttle_config(purpose: str) -> tuple[int, float, float]:
+    """`(threshold, window_s, duration_s)` for one throttle `purpose`,
+    each independently configurable via its own environment variable
+    (CLAUDE.md: "nothing hard-coded except the security principles")."""
+
+    if purpose == _THROTTLE_PURPOSE_CHALLENGE:
+        return (
+            int(
+                os.environ.get(
+                    _CHALLENGE_THROTTLE_THRESHOLD_ENV, _DEFAULT_CHALLENGE_THROTTLE_THRESHOLD
+                )
+            ),
+            float(
+                os.environ.get(
+                    _CHALLENGE_THROTTLE_WINDOW_S_ENV, _DEFAULT_CHALLENGE_THROTTLE_WINDOW_S
+                )
+            ),
+            float(
+                os.environ.get(
+                    _CHALLENGE_THROTTLE_DURATION_S_ENV, _DEFAULT_CHALLENGE_THROTTLE_DURATION_S
+                )
+            ),
+        )
+    if purpose == _THROTTLE_PURPOSE_TOKEN:
+        return (
+            int(os.environ.get(_TOKEN_THROTTLE_THRESHOLD_ENV, _DEFAULT_TOKEN_THROTTLE_THRESHOLD)),
+            float(os.environ.get(_TOKEN_THROTTLE_WINDOW_S_ENV, _DEFAULT_TOKEN_THROTTLE_WINDOW_S)),
+            float(
+                os.environ.get(_TOKEN_THROTTLE_DURATION_S_ENV, _DEFAULT_TOKEN_THROTTLE_DURATION_S)
+            ),
+        )
+    return (
+        int(
+            os.environ.get(
+                _REGISTRATION_THROTTLE_THRESHOLD_ENV, _DEFAULT_REGISTRATION_THROTTLE_THRESHOLD
+            )
+        ),
+        float(
+            os.environ.get(
+                _REGISTRATION_THROTTLE_WINDOW_S_ENV, _DEFAULT_REGISTRATION_THROTTLE_WINDOW_S
+            )
+        ),
+        float(
+            os.environ.get(
+                _REGISTRATION_THROTTLE_DURATION_S_ENV, _DEFAULT_REGISTRATION_THROTTLE_DURATION_S
+            )
+        ),
+    )
+
+
+def _enforce_registration_throttle(
+    storage: Storage, ip: str, purpose: str, now: datetime
+) -> None:
+    """Reserve-then-verify (P3.0's own pattern, `fleet.storage.Storage
+    .reserve_registration_throttle`) -- **checked before any DB lookup of
+    the registration/verification code itself** (work order's own explicit
+    instruction for `/v1/registration`, applied identically to the other
+    two endpoints here). `429`, not `403`/`404` -- this is explicitly a
+    rate limit, not an authorization or existence decision, and must say so
+    unambiguously to a well-behaved caller that simply needs to back off.
+    """
+
+    threshold, window_s, duration_s = _registration_throttle_config(purpose)
+    if not storage.reserve_registration_throttle(ip, purpose, now, threshold, window_s, duration_s):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many attempts. Please try again later.",
+            headers=_NO_STORE_HEADERS,
+        )
+
+
+def _uniform_registration_failure() -> HTTPException:
+    """`POST /v1/registration`'s one, indistinguishable failure response
+    (work order: "every failure is one uniform response") -- an unknown,
+    expired, invalidated, or already-used registration code, a malformed or
+    invalid public key, and a decommissioned device all end up here,
+    without exception, so an attacker probing this endpoint learns nothing
+    about *which* of those applies."""
+
+    return HTTPException(
+        status_code=400, detail="Registration failed.", headers=_NO_STORE_HEADERS
+    )
+
+
+def _uniform_registration_lookup_failure() -> HTTPException:
+    """The equivalent uniform refusal for `.../challenge` and `.../token`:
+    unknown, invalidated, or already-issued `registration_id`; not yet
+    confirmed is handled separately (a `202`, see `request_token_challenge`)
+    since that is meant for a well-behaved device's own polling loop, not an
+    error. For `.../token` this response also covers a wrong signature, a
+    wrong/expired/reused nonce, a device that no longer holds the open
+    assignment created at confirmation, and a retired apartment -- see
+    `fleet.storage.Storage.issue_device_token`'s own docstring for why none
+    of those is distinguished any further here either."""
+
+    return HTTPException(
+        status_code=404,
+        detail="Unknown, invalid, or already completed registration.",
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@app.post("/v1/registration", status_code=201, response_model=RegistrationAccepted)
+def report_device_registration(
+    payload: RegistrationRequest,
+    request: Request,
+    response: Response,
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> RegistrationAccepted:
+    """First contact of a freshly started device (15.3 step 2): the
+    one-time registration code from `agent-registration.json` plus the
+    device's own Ed25519 **public** key.
+
+    **The verification code is always computed here, server-side, from the
+    presented public key** (`protocol.registration.verification_code_for`)
+    -- **never** trusted from the caller (there is no such field on
+    `RegistrationRequest` to trust in the first place, by construction, not
+    only by convention): a substituted key therefore always produces a
+    *different* code than the legitimate device's, which is exactly what
+    lets the landlord's own eyeball comparison in the confirm UI (P4.2)
+    catch a substitution before anything is released to it.
+
+    **Every failure is the same response** (`_uniform_registration_failure`,
+    `400`) -- an unknown/expired/invalidated/already-used code, a
+    malformed or structurally invalid public key (wrong length, not valid
+    base64url, or a value `cryptography` itself refuses to load as an
+    Ed25519 public key), and a decommissioned device (`Storage
+    .record_device_report`'s own guard) are all indistinguishable to the
+    caller.
+
+    **Per-IP throttle checked first, before any code lookup at all**
+    (`_enforce_registration_throttle`) -- released again on success, so a
+    device that succeeds on a retry after one transient failure is not
+    penalised for it (mirrors the UI login throttle's own "give the
+    reservation back" reasoning).
+    """
+
+    response.headers.update(_NO_STORE_HEADERS)
+    ip = resolve_client_ip(request)
+    now = datetime.now(UTC)
+    _enforce_registration_throttle(storage, ip, _THROTTLE_PURPOSE_REGISTER, now)
+
+    try:
+        raw_public_key = decode_bytes(payload.public_key)
+        Ed25519PublicKey.from_public_bytes(raw_public_key)
+    except ValueError as error:
+        raise _uniform_registration_failure() from error
+
+    verification_code = verification_code_for(payload.public_key)
+    accepted = storage.record_device_report(
+        payload.registration_code, payload.public_key, verification_code, now
+    )
+    if not accepted:
+        raise _uniform_registration_failure()
+
+    device_id = storage.get_device_id_for_registration_code(payload.registration_code)
+    if device_id is None:
+        # Structurally unreachable: `record_device_report` just returned
+        # `True` for this exact code, which requires a matching row to
+        # exist -- kept as defense in depth, not because a real path here
+        # is known.
+        raise _uniform_registration_failure()  # pragma: no cover
+    external_id = storage.assign_registration_external_id(device_id, now)
+    if external_id is None:
+        raise _uniform_registration_failure()  # pragma: no cover -- see above
+
+    storage.release_registration_throttle(ip, _THROTTLE_PURPOSE_REGISTER, now)
+    return RegistrationAccepted(registration_id=external_id)
+
+
+@app.post("/v1/registration/{registration_id}/challenge", response_model=None)
+def request_token_challenge(
+    registration_id: str,
+    request: Request,
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """The device's own polling loop for "has the landlord confirmed me
+    yet?" (15.3 step 3/4). Section 3's own 60-second poll cadence applies
+    here too -- a well-behaved device calls this roughly once a minute while
+    waiting.
+
+    - **Not yet confirmed** -- `202`, empty body, `Retry-After: 60` (the
+      poll interval this endpoint expects, documented here rather than
+      merely assumed by the device).
+    - **Unknown, invalidated, or already token-issued `registration_id`** --
+      the uniform `404`-style refusal (`_uniform_registration_lookup_
+      failure`) -- deliberately the *same* response for all three reasons,
+      so this endpoint cannot be used to distinguish "never existed" from
+      "was invalidated" from "already has its token".
+    - **Confirmed** -- a fresh, single-use nonce (`TokenChallenge`, `200`)
+      the device must sign with its private key and echo back, together
+      with the signature, to `.../token`.
+
+    A `200`/`202` response releases this call's throttle reservation
+    (`_THROTTLE_PURPOSE_CHALLENGE`) -- only the uniform-refusal branch
+    consumes budget, so a legitimate device's expected, repeated polling
+    never accumulates against it (see that throttle's own env-var
+    docstring above).
+    """
+
+    ip = resolve_client_ip(request)
+    now = datetime.now(UTC)
+    _enforce_registration_throttle(storage, ip, _THROTTLE_PURPOSE_CHALLENGE, now)
+
+    status = storage.registration_status(registration_id)
+    if status is None:
+        raise _uniform_registration_lookup_failure()
+    if status == "pending":
+        storage.release_registration_throttle(ip, _THROTTLE_PURPOSE_CHALLENGE, now)
+        return Response(
+            status_code=202,
+            headers={**_NO_STORE_HEADERS, "Retry-After": "60"},
+        )
+
+    raw_nonce = secrets.token_bytes(MIN_NONCE_BYTES)
+    encoded_nonce = encode_bytes(raw_nonce)
+    nonce_hash = hash_token(encoded_nonce)
+    expires_at = storage.issue_token_challenge(registration_id, nonce_hash, now)
+    if expires_at is None:
+        # Lost a narrow race against invalidation/token-issuance between the
+        # status read above and this write -- same uniform refusal, not a
+        # distinct response.
+        raise _uniform_registration_lookup_failure()  # pragma: no cover
+
+    storage.release_registration_throttle(ip, _THROTTLE_PURPOSE_CHALLENGE, now)
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder(TokenChallenge(nonce=encoded_nonce, expires_at=expires_at)),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@app.post("/v1/registration/{registration_id}/token", response_model=None)
+def request_device_token(
+    registration_id: str,
+    payload: TokenRequest,
+    request: Request,
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> JSONResponse:
+    """Proof of private-key possession (15.3 step 2/4: "answers a signed
+    challenge") -- the last step before the apartment's own agent token is
+    ever released to this device.
+
+    `payload.signature` must verify, under the **stored** public key (never
+    a key the request itself supplies), over the domain-separated message
+    `b"thermoctl-fleet/token/v1\\0" + registration_id + b"\\0" + nonce` --
+    the domain prefix and the inclusion of `registration_id` mean a
+    signature produced for a different registration, or for any other
+    purpose this codebase might one day sign something for, can never be
+    replayed here.
+
+    Signature verification happens **before** `Storage.issue_device_token`
+    is ever called -- a wrong signature never touches the nonce/token
+    bookkeeping at all. Once verified, `Storage.issue_device_token` does
+    everything else (nonce consumption, every remaining precondition, the
+    actual token generation and storage) atomically -- see that method's
+    own docstring.
+
+    **Every failure is the same uniform `404`-style response**
+    (`_uniform_registration_lookup_failure`): unknown `registration_id`, not
+    yet confirmed, invalidated, a wrong or malformed signature, a wrong,
+    expired, or already-consumed nonce, a token already issued, no open
+    assignment for the device against the confirmed apartment, or a retired
+    apartment -- none of these is distinguished any further, so an attacker
+    learns nothing about which precondition their attempt failed.
+    """
+
+    ip = resolve_client_ip(request)
+    now = datetime.now(UTC)
+    _enforce_registration_throttle(storage, ip, _THROTTLE_PURPOSE_TOKEN, now)
+
+    registration = storage.get_registration_by_external_id(registration_id)
+    if (
+        registration is None
+        or registration.public_key is None
+        or registration.confirmed_at is None
+        or registration.invalidated_at is not None
+        or registration.token_issued_at is not None
+    ):
+        raise _uniform_registration_lookup_failure()
+
+    try:
+        raw_public_key = decode_bytes(registration.public_key)
+        raw_signature = decode_bytes(payload.signature)
+    except ValueError as error:
+        raise _uniform_registration_lookup_failure() from error
+
+    message = (
+        b"thermoctl-fleet/token/v1\0"
+        + registration_id.encode("utf-8")
+        + b"\0"
+        + payload.nonce.encode("utf-8")
+    )
+    try:
+        Ed25519PublicKey.from_public_bytes(raw_public_key).verify(raw_signature, message)
+    except (InvalidSignature, ValueError) as error:
+        raise _uniform_registration_lookup_failure() from error
+
+    token = storage.issue_device_token(registration_id, payload.nonce, now)
+    if token is None:
+        raise _uniform_registration_lookup_failure()
+
+    storage.release_registration_throttle(ip, _THROTTLE_PURPOSE_TOKEN, now)
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder(TokenIssued(token=token)),
+        headers=_NO_STORE_HEADERS,
+    )
