@@ -2093,8 +2093,36 @@ class Storage:
                     )
 
                 previous_device_id = previous_assignment.device_id
-                previous_assignment.ended_at = normalized_now
-                previous_assignment.reason = reason
+                # Re-fetch the previous device inside *this* transaction --
+                # cross-review integration note: between phase 1 (which
+                # never looked at the previous device at all) and this
+                # write, another route (P4.3's own "change state") could in
+                # principle have already moved it; there is nothing to
+                # re-validate about its *state* here (any prior state is
+                # simply overwritten by `previous_device_target_state`
+                # below, which is exactly what this step is for), but the
+                # assignment itself is only closed if it is still open --
+                # see the guarded `UPDATE` below, mirroring `Storage
+                # .remove_device`'s own "atomic close, not read-then-write"
+                # reasoning for the identical class of race (a concurrent
+                # `remove_device` call closing the very same assignment
+                # between this call's own phase 1 and this point).
+                result = cast(
+                    CursorResult[Any],
+                    session.execute(
+                        update(AssignmentRecord)
+                        .where(
+                            AssignmentRecord.id == previous_assignment.id,
+                            AssignmentRecord.ended_at.is_(None),
+                        )
+                        .values(ended_at=normalized_now, reason=reason)
+                    ),
+                )
+                if not result.rowcount:
+                    raise ValueError(
+                        f"Die bisherige Zuweisung von Wohnung {apartment_id!r} wurde "
+                        "inzwischen bereits anderweitig beendet."
+                    )
                 self._write_inventory_audit_log(
                     session,
                     ui_username=ui_user,
@@ -2161,8 +2189,47 @@ class Storage:
                 after={"device_id": device_id, "apartment_id": apartment_id},
             )
 
+            # **Cross-review integration fix (main session, 2026-09-26):**
+            # both writes below are now atomically *guarded* `UPDATE`s, not
+            # bare ORM attribute sets -- reproduced the bug this replaces
+            # directly, under real concurrent threads
+            # (`tests/test_device_lifecycle_registration_integration.py
+            # ::test_concurrent_confirm_racing_manual_reported_to_faulty_
+            # exactly_one_outcome`): a bare `device.state = "in_service"`/
+            # `registration.confirmed_at = ...` here only checks the
+            # device/registration's state *once*, at the top of this phase
+            # -- it does not re-verify anything at the actual moment of
+            # writing. A concurrent `change_device_state("reported" ->
+            # "faulty")` racing this call could commit its own device-state
+            # write and its own guarded registration-invalidation *between*
+            # this method's initial recheck and these two plain attribute
+            # writes (SQLite only serialises at the point of each
+            # transaction's *first* write statement, not at its first
+            # read) -- the observed result was a device left `in_service`
+            # whose own registration row was *also* `invalidated_at`-set,
+            # exactly the "never both" invariant this module's own
+            # docstring above promises. Guarding both writes with `WHERE`
+            # clauses that only match the still-expected prior state closes
+            # this: whichever transaction's guarded write actually commits
+            # first "wins" that row for real, and the loser's `UPDATE`
+            # affects zero rows and raises `ValueError` before writing
+            # anything else -- the same "the check and the write must be
+            # the same statement" reasoning this module already applies
+            # throughout (`record_ui_login_success`,
+            # `_record_wrong_verification_code_attempt`, `remove_device`).
             before_device_state = device.state
-            device.state = "in_service"
+            device_result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(DeviceRecord)
+                    .where(DeviceRecord.id == device_id, DeviceRecord.state == "reported")
+                    .values(state="in_service")
+                ),
+            )
+            if not device_result.rowcount:
+                raise ValueError(
+                    f"Gerät {device_id!r} wurde inzwischen anderweitig bearbeitet."
+                )
             self._write_inventory_audit_log(
                 session,
                 ui_username=ui_user,
@@ -2174,9 +2241,27 @@ class Storage:
                 after={"state": "in_service"},
             )
 
-            registration.confirmed_at = normalized_now
-            registration.confirmed_by = ui_user
-            registration.apartment_id = apartment_id
+            registration_result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(DeviceRegistrationRecord)
+                    .where(
+                        DeviceRegistrationRecord.id == registration_id,
+                        DeviceRegistrationRecord.invalidated_at.is_(None),
+                        DeviceRegistrationRecord.confirmed_at.is_(None),
+                    )
+                    .values(
+                        confirmed_at=normalized_now,
+                        confirmed_by=ui_user,
+                        apartment_id=apartment_id,
+                    )
+                ),
+            )
+            if not registration_result.rowcount:
+                raise ValueError(
+                    "Die Registrierung wurde inzwischen ungültig oder wurde bereits "
+                    "bestätigt."
+                )
 
             session.flush()
             session.refresh(device)
@@ -2278,6 +2363,17 @@ class Storage:
         `prepared`/`reported` or lands on `decommissioned` (or both, for
         `reported -> decommissioned`), so this single rule covers all of
         them without enumerating each pair separately.
+
+        **The device-state write itself is an atomically guarded `UPDATE`
+        (`WHERE id = <device> AND state = <the state just read>`), not a
+        bare ORM attribute set (cross-review integration fix, main
+        session, 2026-09-26)** -- the symmetric half of the same race
+        `confirm_device`'s own guarded writes now close (see that method's
+        docstring): a concurrent `confirm_device` call could move this
+        exact device to `in_service` in the gap between this method's own
+        read and write, and a bare, unconditional `record.state =
+        target_state` would silently overwrite that outcome regardless. A
+        lost race here raises `ValueError` (`retry`) instead.
         """
 
         if not reason.strip():
@@ -2293,7 +2389,19 @@ class Storage:
                 raise ValueError(error)
 
             before_state = record.state
-            record.state = target_state
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(DeviceRecord)
+                    .where(DeviceRecord.id == device_id, DeviceRecord.state == before_state)
+                    .values(state=target_state)
+                ),
+            )
+            if not result.rowcount:
+                raise ValueError(
+                    f"Gerät {device_id!r} wurde inzwischen anderweitig bearbeitet -- "
+                    "bitte erneut versuchen."
+                )
 
             self._write_inventory_audit_log(
                 session,

@@ -67,10 +67,11 @@ integration.py`, new):**
   allowed pairs, 38 refused, all 49 checked).
 - Leaving `reported` (manually, to `faulty`) invalidates the registration,
   so a later `confirm_device` call fails (the device is no longer
-  `reported`) and `record_device_report` with the *old* code also fails --
-  both against the same registration, both after nothing but a manual
-  state change touched it. Leaving `prepared` (to `in_storage`) invalidates
-  a still-unused code the same way. Decommissioning a `prepared` device
+  `reported`, checked before the registration itself ever is) and
+  `record_device_report` with the *old* code also fails -- both against
+  the same registration, both after nothing but a manual state change
+  touched it. Leaving `prepared` (to `in_storage`) invalidates a
+  still-unused code the same way. Decommissioning a `prepared` device
   makes its still-unused code unusable (`record_device_report` returns
   `False`), with both a `"registration_invalidated"` and a `"state_changed"`
   audit row to show for it. `registered -> faulty` (a device that was
@@ -80,23 +81,127 @@ integration.py`, new):**
   from the state-check above), and `record_device_report` refuses one even
   when the registration row itself was left untouched (its own independent
   `NOT EXISTS` guard, defense in depth on top of `change_device_state`'s
-  invalidation).
+  invalidation). A concurrent manual `reported -> faulty` racing a
+  `confirm_device` call with the correct code -- run 10x under real
+  threads -- always produces exactly one outcome: either the confirm wins
+  and ends with a device correctly `in_service` and a *not*-invalidated
+  registration (confirmed, not invalidated -- the two are mutually
+  exclusive terminal states for one registration row), or the manual state
+  change wins and the confirm correctly fails -- never both, never an
+  `in_service` device whose own registration row is also marked invalidated
+  (asserted explicitly every run).
+- A `sqlite_master` assertion
+  (`tests/test_device_lifecycle_registration_integration.py
+  ::test_migration_0007_partial_unique_index_carries_the_where_clause`)
+  that `ux_device_registrations_device_id_active` actually carries `WHERE
+  invalidated_at IS NULL AND confirmed_at IS NULL` in the stored schema --
+  mirrors P4.1's own equivalent assertion for the assignments indexes; the
+  existing concurrency tests already prove the index *behaves* as partial,
+  this additionally proves the stored schema says so, not just that test
+  data never happened to hit the non-partial case.
 
-**Open follow-up, not closed in this round:** a review pass over this
-integration surfaced further points -- a `sqlite_master` schema assertion
-for the new partial unique index, a race between `confirm_device`'s
-`replace_previous` path and a concurrent `remove_device`, an actual
-concurrency bug in how both `confirm_device` and `change_device_state`
-write their own rows, and P4.2b's own open points made explicit. See the
-follow-up commit's own STATUS.md entry (immediately below this one, same
-section) for all four.
+**Review suggestion, also fixed here: `confirm_device`'s `replace_previous`
+path closed the previous assignment via a bare ORM attribute set
+(`previous_assignment.ended_at = normalized_now`), not an atomically
+guarded `UPDATE`.** Harmless before P4.3 existed (nothing else could ever
+close that same assignment concurrently); **P4.3's own `remove_device` now
+can** -- a landlord confirming a replacement device for apartment X at the
+same moment as (or via a stale page, slightly after) someone else clicks
+"Gerät ausbauen/tauschen" for the very same apartment's *old* assignment
+would previously have let `confirm_device` silently re-close and re-audit
+an assignment `remove_device` had already closed and audited, without
+detecting the collision. Fixed: the close is now `UPDATE ... WHERE id =
+<this assignment> AND ended_at IS NULL`, exactly `remove_device`'s own
+"atomic close, not read-then-write" pattern; a lost race raises `ValueError`
+("wurde inzwischen bereits anderweitig beendet") instead of silently
+double-processing. `tests/test_device_lifecycle_registration_integration.py
+::test_confirm_device_replace_previous_races_a_concurrent_remove_device`
+proves it directly: `remove_device` and `confirm_device` (with
+`replace_previous=True` for the same apartment/previous device) run
+concurrently, real threads -- exactly one of the two "closes" the
+assignment; the other gets a clean `ValueError`, and the audit log has
+exactly one `"closed"` row for that assignment, never two.
+
+**P4.2b's own open points, made explicit here (not decided, not invented --
+this package's own boundary, restated so P4.2b's work order does not have
+to rediscover it by reading every method's docstring):**
+
+- **Rate limiting on the future `/v1/registration/...` report endpoint is
+  P4.2b's decision, not made here.** `Storage.record_device_report` itself
+  is already safe under concurrency (proven above and in P4.2's own
+  section) and already returns a uniform `False` for every failure reason,
+  but neither of those is a rate limit -- nothing here throttles how many
+  *distinct* codes an attacker may try per unit time against that future
+  endpoint (unlike the UI login path's per-IP throttle, P3.0). P4.2b should
+  decide whether/how to add one before that endpoint goes live.
+- **Verification-code derivation and entropy is P4.2b's decision, not
+  made here.** This package stores whatever string `record_device_report`
+  is given as `verification_code` and compares it in constant time; it does
+  not derive it, does not constrain its length or charset beyond the
+  column's own `String(64)` bound, and makes no claim about how much
+  entropy a "derived from the key fingerprint" value actually carries
+  against a brute-force *within* the 5-attempt budget. P4.2b's own work
+  order needs to size that derivation deliberately, not inherit a default
+  from this package.
+- **Token issuance must only ever happen for a confirmed, non-invalidated
+  registration bound to its stored public key -- not built here, stated as
+  the contract P4.2b must uphold.** `DeviceRegistrationRecord.token_issued_
+  at` exists and is always `NULL` in this package; P4.2b is the only future
+  code path expected to ever set it, and it must do so only after checking
+  `confirmed_at IS NOT NULL`, `invalidated_at IS NULL`, and that the
+  device's own subsequent request is signed by the exact key whose public
+  half is stored in `public_key` on that same row (the signed-challenge
+  step, section 15.3 step 2's "answers a signed challenge ... before ...
+  ever trusted for anything security-relevant") -- issuing a token off a
+  registration that was later invalidated (e.g. by a manual
+  `change_device_state` decommission, see above) or against a *different*
+  key than the one actually confirmed would defeat the entire point of
+  "only this confirmation releases the configuration -- bound to the key of
+  exactly this device" (15.3 step 3).
+
+**A second, genuine bug found while writing the concurrency test above, not
+only the one asked for -- both `confirm_device` and `change_device_state`
+wrote their own device's `state`/registration `confirmed_at` via bare ORM
+attribute sets, not atomically guarded `UPDATE`s.** Reproduced directly
+(`tests/test_device_lifecycle_registration_integration.py
+::test_concurrent_confirm_racing_manual_reported_to_faulty_exactly_one_
+outcome`, before the fix below): a device ended up `in_service` **and**
+its own registration row **also** `invalidated_at`-set at the same time --
+exactly the "never both" invariant this whole feature exists to prevent,
+because SQLite only serialises two concurrent write transactions at the
+point of each one's *first* write statement, not at its first *read* --
+a plain `record.state = "in_service"` (or `registration.confirmed_at =
+...`) written well after this method's own initial recheck can silently
+overwrite whatever a concurrent transaction committed in between, since
+nothing about that later write re-verifies the row is still in the state
+this method believes it is. **Fixed**: the device-state write and the
+registration-confirm write in `confirm_device`'s phase 2, and the
+device-state write in `change_device_state`, are now all atomically
+guarded `UPDATE ... WHERE <column> = <the value just read>` statements (the
+same "the check and the write must be the same statement" pattern this
+module already applies throughout -- `record_ui_login_success`,
+`_record_wrong_verification_code_attempt`, `remove_device`'s assignment
+close) -- a lost race now raises a clear `ValueError` instead of silently
+corrupting the row. Two further deterministic tests
+(`test_confirm_device_registration_claim_fails_if_invalidated_mid_call`,
+`test_change_device_state_guard_fails_if_state_changes_mid_call`) force
+each specific guard's own refusal branch via a same-transaction injected
+side effect (documented in each test's own docstring as the honest
+alternative to a genuinely concurrent write, which would simply deadlock
+against this call's own still-open write transaction) -- both guard
+branches are covered on every run, not only probabilistically across the
+real-thread race test's own repeated runs.
 
 Verification for this round (fresh venv, `python3.13 -m venv`,
 `pip install -e ".[dev,fleet,agent]"` -- SQLAlchemy 2.1.1, mypy 2.3.1):
 `ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all clean;
-`python -m pytest -W ignore::ResourceWarning` (659 passed, 99% coverage
+`python -m pytest -W ignore::ResourceWarning` (664 passed, 99% coverage
 overall, every touched file -- `fleet/storage.py`, `fleet/device_lifecycle
-.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py` -- at 100%).
+.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py` -- at 100%); every
+concurrency test in the suite (21 total: P4.2's four, P4.3's one, and this
+round's new ones -- the manual-transition-vs-confirm race, the
+replace_previous-vs-remove_device race, plus the two deterministic
+guard-branch tests) re-run 10x with no flake.
 
 ## Prepare device, confirm registration and assign (P4.2, sections 4, 15.3, 20.2, 20.3)
 
