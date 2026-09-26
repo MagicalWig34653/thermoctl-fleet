@@ -12,6 +12,7 @@ as a real-looking example value").
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 import threading
@@ -1878,9 +1879,12 @@ def test_remove_device_closes_assignment_sets_state_and_revokes_token(
 ) -> None:
     _make_apartment_with_device(storage)
     now = datetime(2026, 2, 1, tzinfo=UTC)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     assignment = storage.remove_device(
         "house7-a03",
+        expected_assignment_id=current_assignment.id,
         target_state="faulty",
         reason="Gerät defekt",
         ui_username="landlord",
@@ -1900,9 +1904,12 @@ def test_remove_device_closes_assignment_sets_state_and_revokes_token(
 
 def test_remove_device_to_in_storage(storage: Storage) -> None:
     _make_apartment_with_device(storage)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     storage.remove_device(
         "house7-a03",
+        expected_assignment_id=current_assignment.id,
         target_state="in_storage",
         reason="Wohnung aufgegeben",
         ui_username="landlord",
@@ -1918,9 +1925,12 @@ def test_remove_device_writes_audit_rows_for_assignment_device_and_token(
     storage: Storage,
 ) -> None:
     _make_apartment_with_device(storage)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     storage.remove_device(
         "house7-a03",
+        expected_assignment_id=current_assignment.id,
         target_state="faulty",
         reason="Gerät defekt",
         ui_username="landlord",
@@ -1945,12 +1955,93 @@ def test_remove_device_writes_audit_rows_for_assignment_device_and_token(
         assert entry.ui_username == "landlord"
 
 
+def test_remove_device_token_revoked_audit_row_before_json_reflects_an_actual_token(
+    storage: Storage,
+) -> None:
+    """Positive counterpart to the `had_token` fix (cross-review round 2):
+    `_make_apartment_with_device` gives the apartment a real token via
+    `set_apartment_token`, so the `token_revoked` audit row's own
+    `before_json` must say so -- `{"token_hash": "set"}`, not a hard-coded
+    claim that happens to be true here but was previously unconditional."""
+
+    _make_apartment_with_device(storage)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
+    assert storage.get_apartment_token_hash("house7-a03") is not None
+
+    storage.remove_device(
+        "house7-a03",
+        expected_assignment_id=current_assignment.id,
+        target_state="faulty",
+        reason="Gerät defekt",
+        ui_username="landlord",
+        now=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+
+    apartment_log = storage.list_audit_log_for_entity("apartment", "house7-a03")
+    token_revoked_entry = next(entry for entry in apartment_log if entry.action == "token_revoked")
+    assert token_revoked_entry.before_json is not None
+    assert token_revoked_entry.after_json is not None
+    assert json.loads(token_revoked_entry.before_json) == {"token_hash": "set"}
+    assert json.loads(token_revoked_entry.after_json) == {"token_hash": None}
+
+
+def test_remove_device_token_revoked_audit_row_before_json_reflects_no_token(
+    storage: Storage,
+) -> None:
+    """The other half: an apartment that never had a token (e.g. one whose
+    device reached `in_service` via `Storage.confirm_device` without
+    P4.2b's separate token-issuance endpoint ever having run) must not get
+    a `token_revoked` audit row falsely claiming `{"token_hash": "set"}` --
+    the exact bug found while investigating the confirm/remove race, fixed
+    in `Storage.remove_device`'s own `had_token` computation."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03", property_id=property_.id, label="A", floor=None, orientation=None,
+        state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+    storage.register_device(
+        "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-1")
+        assert record is not None
+        record.state = "in_service"
+    storage.create_assignment(
+        "sn-1", "house7-a03", datetime(2026, 1, 1, tzinfo=UTC), "Erstinbetriebnahme", "landlord"
+    )
+    assert storage.get_apartment_token_hash("house7-a03") is None
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
+
+    storage.remove_device(
+        "house7-a03",
+        expected_assignment_id=current_assignment.id,
+        target_state="faulty",
+        reason="Gerät defekt",
+        ui_username="landlord",
+        now=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+
+    apartment_log = storage.list_audit_log_for_entity("apartment", "house7-a03")
+    token_revoked_entry = next(entry for entry in apartment_log if entry.action == "token_revoked")
+    assert token_revoked_entry.before_json is not None
+    assert token_revoked_entry.after_json is not None
+    assert json.loads(token_revoked_entry.before_json) == {"token_hash": None}
+    assert json.loads(token_revoked_entry.after_json) == {"token_hash": None}
+
+
 def test_remove_device_rejects_an_unknown_target_state(storage: Storage) -> None:
     _make_apartment_with_device(storage)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     with pytest.raises(ValueError, match="Zielzustand"):
         storage.remove_device(
             "house7-a03",
+            expected_assignment_id=current_assignment.id,
             target_state="decommissioned",
             reason="Grund",
             ui_username="landlord",
@@ -1962,10 +2053,13 @@ def test_remove_device_rejects_an_unknown_target_state(storage: Storage) -> None
 
 def test_remove_device_rejects_an_empty_reason(storage: Storage) -> None:
     _make_apartment_with_device(storage)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     with pytest.raises(ValueError, match="reason"):
         storage.remove_device(
             "house7-a03",
+            expected_assignment_id=current_assignment.id,
             target_state="faulty",
             reason="   ",
             ui_username="landlord",
@@ -1979,6 +2073,7 @@ def test_remove_device_rejects_an_unknown_apartment(storage: Storage) -> None:
     with pytest.raises(ValueError, match="does not exist"):
         storage.remove_device(
             "unknown",
+            expected_assignment_id=1,
             target_state="faulty",
             reason="Grund",
             ui_username="landlord",
@@ -1998,6 +2093,7 @@ def test_remove_device_rejects_an_apartment_with_no_open_assignment(
     with pytest.raises(ValueError, match="no open assignment"):
         storage.remove_device(
             "house7-a03",
+            expected_assignment_id=1,
             target_state="faulty",
             reason="Grund",
             ui_username="landlord",
@@ -2032,10 +2128,13 @@ def test_remove_device_rolls_back_everything_if_a_step_fails(
         original(self, session, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(Storage, "_write_inventory_audit_log", _flaky)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     with pytest.raises(RuntimeError, match="forced failure"):
         storage.remove_device(
             "house7-a03",
+            expected_assignment_id=current_assignment.id,
             target_state="faulty",
             reason="Gerät defekt",
             ui_username="landlord",
@@ -2067,6 +2166,8 @@ def test_remove_device_concurrent_double_removal_only_one_wins(
     upgrade(url)
     storage = create_storage(url)
     _make_apartment_with_device(storage)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     results: list[object] = []
     errors: list[BaseException] = []
@@ -2075,6 +2176,7 @@ def test_remove_device_concurrent_double_removal_only_one_wins(
         try:
             storage.remove_device(
                 "house7-a03",
+                expected_assignment_id=current_assignment.id,
                 target_state="faulty",
                 reason="Concurrent removal",
                 ui_username="landlord",
@@ -2104,3 +2206,126 @@ def test_remove_device_concurrent_double_removal_only_one_wins(
     device = storage.get_device("sn-1")
     assert device is not None
     assert device.state == "faulty"
+
+
+# -- `expected_assignment_id`: `remove_device` acts only on the assignment the caller saw -
+
+
+def test_remove_device_rejects_a_stale_expected_assignment_id(storage: Storage) -> None:
+    """Main-session decision following the confirm/remove race cross-
+    review: a landlord's "remove device" form is rendered against a
+    specific assignment (`fleet.ui_inventory.ReplaceDeviceView
+    .current_assignment_id`); if that assignment is no longer the
+    apartment's open one by the time the form is submitted (someone else
+    already replaced or removed the device shown), `remove_device` must
+    refuse -- never silently act on whatever is open now."""
+
+    _make_apartment_with_device(storage)
+    stale_assignment = storage.get_current_assignment("house7-a03")
+    assert stale_assignment is not None
+
+    # The device gets replaced from under the stale form: closes the
+    # assignment the form still names, opens a new one for a different
+    # device.
+    storage.register_device(
+        "sn-2", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    with storage.session() as session:
+        record = session.get(DeviceRecord, "sn-2")
+        assert record is not None
+        record.state = "in_service"
+        old = session.get(AssignmentRecord, stale_assignment.id)
+        assert old is not None
+        old.ended_at = datetime(2026, 1, 15, tzinfo=UTC)
+    storage.create_assignment(
+        "sn-2", "house7-a03", datetime(2026, 1, 15, tzinfo=UTC), "Tausch", "landlord"
+    )
+
+    with pytest.raises(ValueError, match="Zuordnung hat sich inzwischen geändert"):
+        storage.remove_device(
+            "house7-a03",
+            expected_assignment_id=stale_assignment.id,
+            target_state="faulty",
+            reason="Ausbau (stale)",
+            ui_username="landlord",
+            now=datetime(2026, 1, 16, tzinfo=UTC),
+        )
+
+    # Nothing about the actual current state changed: sn-2 is still
+    # in_service, still has the apartment's (only) open assignment, and the
+    # token is untouched -- no audit row for this refused call.
+    device = storage.get_device("sn-2")
+    assert device is not None
+    assert device.state == "in_service"
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
+    assert current_assignment.device_id == "sn-2"
+    assert storage.get_apartment_token_hash("house7-a03") is not None
+    device_log = storage.list_audit_log_for_entity("device", "sn-2")
+    assert device_log == []
+
+
+def test_remove_device_rejects_an_expected_assignment_id_already_closed(
+    storage: Storage,
+) -> None:
+    """The simpler variant of the same guard: the exact assignment the
+    caller expected has since been closed outright (e.g. by a concurrent
+    `remove_device` call that already committed), and the apartment
+    currently has *no* open assignment at all -- refused as "no open
+    assignment", not silently treated as already-done."""
+
+    _make_apartment_with_device(storage)
+    assignment = storage.get_current_assignment("house7-a03")
+    assert assignment is not None
+
+    storage.remove_device(
+        "house7-a03",
+        expected_assignment_id=assignment.id,
+        target_state="faulty",
+        reason="Erste Entfernung",
+        ui_username="landlord",
+        now=datetime(2026, 1, 15, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="no open assignment"):
+        storage.remove_device(
+            "house7-a03",
+            expected_assignment_id=assignment.id,
+            target_state="faulty",
+            reason="Zweite Entfernung",
+            ui_username="landlord",
+            now=datetime(2026, 1, 16, tzinfo=UTC),
+        )
+
+
+def test_remove_device_rejects_an_expected_assignment_id_from_another_apartment(
+    storage: Storage,
+) -> None:
+    """Tamper case: a hidden `expected_assignment_id` field naming a
+    *different* apartment's (still open) assignment must not let a
+    `remove_device` call against this apartment succeed -- the lookup is
+    always "this apartment's current open assignment first, then compare",
+    never "does this id exist and is it open anywhere"."""
+
+    _make_apartment_with_device(storage, apartment_id="house7-a03", device_id="sn-1")
+    _make_apartment_with_device(storage, apartment_id="house9-b01", device_id="sn-2")
+
+    other_assignment = storage.get_current_assignment("house9-b01")
+    assert other_assignment is not None
+
+    with pytest.raises(ValueError, match="Zuordnung hat sich inzwischen geändert"):
+        storage.remove_device(
+            "house7-a03",
+            expected_assignment_id=other_assignment.id,
+            target_state="faulty",
+            reason="Tamper-Versuch",
+            ui_username="landlord",
+            now=datetime(2026, 1, 16, tzinfo=UTC),
+        )
+
+    # Neither apartment was touched.
+    assert storage.get_current_assignment("house7-a03") is not None
+    assert storage.get_current_assignment("house9-b01") is not None
+    assert storage.get_apartment_token_hash("house7-a03") is not None
+    assert storage.get_apartment_token_hash("house9-b01") is not None

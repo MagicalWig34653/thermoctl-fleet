@@ -1358,10 +1358,17 @@ def test_replace_device_submit_wrong_csrf_is_403(
 ) -> None:
     _make_apartment_with_device(storage)
     _login(client, password, totp_secret)
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     response = client.post(
         "/ui/inventory/apartments/house7-a03/replace-device",
-        data={"target_state": "faulty", "reason": "Grund", "csrf_token": "wrong"},
+        data={
+            "expected_assignment_id": str(current_assignment.id),
+            "target_state": "faulty",
+            "reason": "Grund",
+            "csrf_token": "wrong",
+        },
     )
 
     assert response.status_code == 403
@@ -1374,10 +1381,17 @@ def test_replace_device_submit_missing_reason_rerenders_with_a_message(
     csrf_token = _login_and_get_csrf(
         client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
     )
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     response = client.post(
         "/ui/inventory/apartments/house7-a03/replace-device",
-        data={"target_state": "faulty", "reason": "   ", "csrf_token": csrf_token},
+        data={
+            "expected_assignment_id": str(current_assignment.id),
+            "target_state": "faulty",
+            "reason": "   ",
+            "csrf_token": csrf_token,
+        },
     )
 
     assert response.status_code == 400
@@ -1392,10 +1406,17 @@ def test_replace_device_submit_rejects_an_over_length_reason(
     csrf_token = _login_and_get_csrf(
         client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
     )
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     response = client.post(
         "/ui/inventory/apartments/house7-a03/replace-device",
-        data={"target_state": "faulty", "reason": "R" * 501, "csrf_token": csrf_token},
+        data={
+            "expected_assignment_id": str(current_assignment.id),
+            "target_state": "faulty",
+            "reason": "R" * 501,
+            "csrf_token": csrf_token,
+        },
     )
 
     assert response.status_code == 400
@@ -1415,10 +1436,13 @@ def test_replace_device_submit_rejects_an_unknown_target_state_value(
     csrf_token = _login_and_get_csrf(
         client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
     )
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     response = client.post(
         "/ui/inventory/apartments/house7-a03/replace-device",
         data={
+            "expected_assignment_id": str(current_assignment.id),
             "target_state": "decommissioned",
             "reason": "Grund",
             "csrf_token": csrf_token,
@@ -1436,10 +1460,17 @@ def test_replace_device_submit_success_closes_assignment_and_revokes_token(
     csrf_token = _login_and_get_csrf(
         client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
     )
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
 
     response = client.post(
         "/ui/inventory/apartments/house7-a03/replace-device",
-        data={"target_state": "faulty", "reason": "Gerät defekt", "csrf_token": csrf_token},
+        data={
+            "expected_assignment_id": str(current_assignment.id),
+            "target_state": "faulty",
+            "reason": "Gerät defekt",
+            "csrf_token": csrf_token,
+        },
         follow_redirects=False,
     )
 
@@ -1490,9 +1521,16 @@ def test_replace_device_submit_old_token_gets_403_on_a_real_heartbeat(
     csrf_token = _login_and_get_csrf(
         client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
     )
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
     response = client.post(
         "/ui/inventory/apartments/house7-a03/replace-device",
-        data={"target_state": "faulty", "reason": "Gerät defekt", "csrf_token": csrf_token},
+        data={
+            "expected_assignment_id": str(current_assignment.id),
+            "target_state": "faulty",
+            "reason": "Gerät defekt",
+            "csrf_token": csrf_token,
+        },
         follow_redirects=False,
     )
     assert response.status_code == 303
@@ -1542,12 +1580,162 @@ def test_replace_device_submit_rejects_when_no_open_assignment(
 
     response = client.post(
         "/ui/inventory/apartments/house7-a03/replace-device",
-        data={"target_state": "faulty", "reason": "Grund", "csrf_token": csrf_token},
+        data={
+            "expected_assignment_id": "1",
+            "target_state": "faulty",
+            "reason": "Grund",
+            "csrf_token": csrf_token,
+        },
     )
 
     # 404s before `Storage.remove_device` even matters here -- there is no
     # assignment to close, per `build_replace_device_view`.
     assert response.status_code == 404
+
+
+def test_replace_device_submit_stale_form_is_refused(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Main-session decision following the confirm/remove race cross-
+    review: a landlord opens "Gerät ausbauen" while device `sn-1` is shown
+    (the hidden `expected_assignment_id` field carries *that* assignment's
+    id); before they submit, someone else replaces the apartment's device
+    with `sn-2` (a real `Storage.confirm_device(..., replace_previous=True)`
+    call, not a shortcut). The stale submit must be refused with a clear
+    message and must not touch `sn-2` -- not set it `faulty`/`in_storage`,
+    not write a second token-revoked audit row for the apartment -- an
+    action on a device the landlord never even saw."""
+
+    _make_apartment_with_device(storage, device_id="sn-1")
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+    stale_assignment = storage.get_current_assignment("house7-a03")
+    assert stale_assignment is not None
+
+    # Someone else confirms a replacement device for the very same
+    # apartment while the landlord's form is still open.
+    storage.register_device(
+        "sn-2", model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    raw_code = storage.prepare_device(
+        "sn-2", ui_username=USERNAME, confirmed_reset=False, now=datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    assert storage.record_device_report(
+        raw_code, "pubkey-sn-2", "verif-sn-2", datetime(2026, 1, 2, tzinfo=UTC)
+    )
+    storage.confirm_device(
+        "sn-2", "house7-a03", "verif-sn-2", ui_user=USERNAME, reason="Tausch",
+        replace_previous=True, previous_device_target_state="in_storage",
+        now=datetime(2026, 1, 2, 1, tzinfo=UTC),
+    )
+    assert storage.get_device("sn-2").state == "in_service"  # type: ignore[union-attr]
+    # confirm_device's own replace_previous step already revoked the old
+    # token (P4.2b's separate endpoint is the only thing that would issue
+    # sn-2 a new one, not exercised here) -- what must not happen is a
+    # *second* token-revoked audit row from the stale remove_device call.
+    token_revoked_rows_before = len(
+        [
+            entry
+            for entry in storage.list_audit_log_for_entity("apartment", "house7-a03")
+            if entry.action == "token_revoked"
+        ]
+    )
+    assert token_revoked_rows_before == 1
+
+    # The landlord's still-open, now-stale form is submitted -- its hidden
+    # field still names sn-1's own (by now closed) assignment.
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={
+            "expected_assignment_id": str(stale_assignment.id),
+            "target_state": "faulty",
+            "reason": "Ausbau (stale)",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Die Zuordnung hat sich inzwischen geändert" in response.text
+
+    # sn-2 -- the device the stale submit would have wrongly acted on -- is
+    # completely untouched: still in_service, its token unchanged, no new
+    # audit row for it.
+    new_device = storage.get_device("sn-2")
+    assert new_device is not None
+    assert new_device.state == "in_service"
+    token_revoked_rows_after = [
+        entry
+        for entry in storage.list_audit_log_for_entity("apartment", "house7-a03")
+        if entry.action == "token_revoked"
+    ]
+    assert len(token_revoked_rows_after) == 1
+    current_assignment = storage.get_current_assignment("house7-a03")
+    assert current_assignment is not None
+    assert current_assignment.device_id == "sn-2"
+    assert all(
+        entry.reason != "Ausbau (stale)"
+        for entry in storage.list_audit_log_for_entity("device", "sn-2")
+    )
+
+
+def test_replace_device_submit_missing_expected_assignment_id_rerenders_with_a_message(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Cross-review round 2 fix: a missing `expected_assignment_id` field
+    must rerender with the same "stale form" message, never FastAPI's raw
+    `422` -- `fleet.ui_routes.replace_device_submit` types the field
+    `str | None`, not `int`, for exactly this reason (see its own
+    docstring)."""
+
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={"target_state": "faulty", "reason": "Grund", "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    assert "Die Zuordnung hat sich inzwischen geändert" in response.text
+    assert storage.get_current_assignment("house7-a03") is not None
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_service"
+    assert storage.list_audit_log_for_entity("device", "sn-1") == []
+
+
+def test_replace_device_submit_non_integer_expected_assignment_id_rerenders_with_a_message(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """The same guard for a value that is present but does not parse as an
+    integer -- e.g. a tampered hidden field."""
+
+    _make_apartment_with_device(storage)
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/replace-device"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/replace-device",
+        data={
+            "expected_assignment_id": "not-a-number",
+            "target_state": "faulty",
+            "reason": "Grund",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Die Zuordnung hat sich inzwischen geändert" in response.text
+    assert storage.get_current_assignment("house7-a03") is not None
+    device = storage.get_device("sn-1")
+    assert device is not None
+    assert device.state == "in_service"
+    assert storage.list_audit_log_for_entity("device", "sn-1") == []
 
 
 def test_device_state_submit_wrong_csrf_is_403(

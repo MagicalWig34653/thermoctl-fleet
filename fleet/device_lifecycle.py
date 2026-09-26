@@ -133,6 +133,16 @@ REMOVE_DEVICE_TARGET_STATES: tuple[str, ...] = (
     DeviceLifecycle.IN_STORAGE.value,
 )
 
+# `Storage.remove_device`'s own `expected_assignment_id` guard (main-session
+# decision following the confirm/remove race cross-review) raises this
+# exact message whenever that id no longer names the apartment's current
+# open assignment -- kept here, not re-typed at each raise/re-render site,
+# so `fleet.storage`'s own `ValueError` and `fleet.ui_routes`'s malformed-
+# input re-render (a missing or non-integer `expected_assignment_id`, which
+# never reaches `Storage.remove_device` at all) show the landlord the exact
+# same text either way.
+STALE_ASSIGNMENT_MESSAGE = "Die Zuordnung hat sich inzwischen geändert -- bitte neu laden."
+
 _ALL_STATES = frozenset(state.value for state in DeviceLifecycle)
 
 
@@ -169,6 +179,7 @@ def allowed_manual_target_states(current: str) -> list[str]:
 __all__ = [
     "ALLOWED_MANUAL_DEVICE_TRANSITIONS",
     "REMOVE_DEVICE_TARGET_STATES",
+    "STALE_ASSIGNMENT_MESSAGE",
     "allowed_manual_target_states",
     "validate_manual_device_transition",
 ]

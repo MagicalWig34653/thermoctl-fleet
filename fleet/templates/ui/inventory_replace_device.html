@@ -20,6 +20,7 @@
 
 <form method="post" action="/ui/inventory/apartments/{{ view.apartment_id }}/replace-device">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="expected_assignment_id" value="{{ view.current_assignment_id }}">
     <label for="target_state">Zielzustand des ausgebauten Geräts
         <select id="target_state" name="target_state" required>
             {% for state in view.target_states %}

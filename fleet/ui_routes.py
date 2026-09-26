@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
+from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
 from fleet.storage import Storage, get_storage
 from fleet.ui_apartment import build_apartment_detail
 from fleet.ui_auth import (
@@ -1006,6 +1007,7 @@ def replace_device_form(
 def replace_device_submit(
     request: Request,
     apartment_id: str,
+    expected_assignment_id: str | None = Form(None),
     target_state: str = Form(...),
     reason: str = Form(...),
     csrf_token: str = Form(...),
@@ -1016,7 +1018,29 @@ def replace_device_submit(
     assignment, sets the removed device's state, and revokes the
     apartment's agent token, all in one transaction
     (`Storage.remove_device`, see its own docstring for why an agent
-    request with the old token gets 403 immediately afterward)."""
+    request with the old token gets 403 immediately afterward).
+
+    `expected_assignment_id` -- a hidden field carrying the assignment id
+    the form was rendered against (`fleet.ui_inventory
+    .ReplaceDeviceView.current_assignment_id`), echoed back here and passed
+    straight through to `Storage.remove_device`'s own parameter of the same
+    name: a stale submit (someone else already replaced or removed the
+    device in the meantime) or a tampered value naming a different
+    assignment is refused there with a clear message, never silently acting
+    on whatever happens to be open now (main-session decision following the
+    confirm/remove race cross-review).
+
+    **Typed `str | None`, not `int` (cross-review round 2 fix, same
+    reasoning as `fleet.ui_apartment.clamp_history_days`'s own docstring):
+    an `int`-typed `Form` parameter makes FastAPI/Pydantic reject a
+    missing or non-integer value with a raw `422` *before* this route body
+    ever runs** -- unlike `days` there is no sensible silent-fallback
+    default here (there is no "default assignment"), so a missing/malformed
+    value is instead treated as exactly the same "stale form" case
+    `Storage.remove_device` itself refuses: the same `400` re-render, the
+    same `fleet.device_lifecycle.STALE_ASSIGNMENT_MESSAGE` text, validated
+    in the same place and order as every other field below -- after the
+    CSRF check, same as `reason`/`target_state`."""
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
@@ -1042,6 +1066,15 @@ def replace_device_submit(
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    try:
+        parsed_expected_assignment_id = (
+            int(expected_assignment_id) if expected_assignment_id is not None else None
+        )
+    except ValueError:
+        parsed_expected_assignment_id = None
+    if parsed_expected_assignment_id is None:
+        return _error(STALE_ASSIGNMENT_MESSAGE)
+
     if not reason.strip():
         return _error("Ein Grund ist erforderlich.")
     length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
@@ -1051,6 +1084,7 @@ def replace_device_submit(
     try:
         storage.remove_device(
             apartment_id,
+            expected_assignment_id=parsed_expected_assignment_id,
             target_state=target_state,
             reason=reason.strip(),
             ui_username=authenticated.user.username,

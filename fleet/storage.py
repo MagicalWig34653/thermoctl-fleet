@@ -94,6 +94,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from fleet.device_lifecycle import (
     REMOVE_DEVICE_TARGET_STATES,
+    STALE_ASSIGNMENT_MESSAGE,
     validate_manual_device_transition,
 )
 from protocol import Event, Heartbeat, fault_kind_from_key
@@ -2942,6 +2943,7 @@ class Storage:
         self,
         apartment_id: str,
         *,
+        expected_assignment_id: int,
         target_state: str,
         reason: str,
         ui_username: str,
@@ -2963,13 +2965,37 @@ class Storage:
         leaves nothing applied (proven directly, not only argued, by
         `tests/test_storage.py::test_remove_device_rolls_back_everything_if_a_step_fails`).
 
+        **`expected_assignment_id` -- the assignment the caller actually
+        saw, main-session decision following the cross-review of the
+        confirm/remove race (see this file's own "Confirm/remove race"
+        STATUS.md section): this method must act only on the assignment
+        the landlord's form was rendered against, never on "whatever is
+        currently open for this apartment id".** Without this, a landlord
+        who opens "Gerät ausbauen" while device OLD is shown, and submits
+        after someone else has since confirmed a replacement device NEW for
+        the very same apartment, would silently remove NEW instead --
+        setting a device the landlord never saw to `faulty`/`in_storage`
+        and revoking the token it had just obtained. The route
+        (`fleet/ui_routes.py`) carries this as a hidden form field
+        (`fleet.ui_inventory.ReplaceDeviceView.current_assignment_id`),
+        populated from the exact same `Storage.get_current_assignment` call
+        that built the rest of the form; this method then requires it to
+        still be the apartment's open assignment before touching anything.
+        A mismatch (already closed, or the apartment now has a
+        *different* open assignment) -- or an `expected_assignment_id`
+        naming some other apartment's assignment entirely, whether stale or
+        tampered with -- is refused with the same clear message, before any
+        write, no audit row.
+
         Raises `ValueError` for: an unrecognised `target_state` (only
         `faulty`/`in_storage`, `fleet.device_lifecycle
         .REMOVE_DEVICE_TARGET_STATES`), an empty `reason`, an unknown
-        apartment, or an apartment with **no open assignment** (section
+        apartment, an apartment with **no open assignment** (section
         20.2's flow assumes exactly one active device -- "at most one" per
         the partial unique index, and here strictly one, since there is
-        nothing to remove otherwise).
+        nothing to remove otherwise), or `expected_assignment_id` not
+        matching the apartment's actual current open assignment (see
+        above).
 
         **Safe under a concurrent double removal, tested directly under
         real threads (`tests/test_storage.py
@@ -3019,6 +3045,13 @@ class Storage:
                 raise ValueError(
                     f"Apartment {apartment_id!r} has no open assignment to remove."
                 )
+            if open_assignment.id != expected_assignment_id:
+                # The apartment does have an open assignment, just not the
+                # one this call was told to act on -- someone else already
+                # replaced or removed the device the caller actually saw.
+                # Never silently act on whatever happens to be open now
+                # (see the docstring above).
+                raise ValueError(STALE_ASSIGNMENT_MESSAGE)
 
             # `Session.execute` is typed to return the generic `Result[Any]`
             # (no `rowcount`) even for a Core UPDATE, which always actually
@@ -3029,18 +3062,19 @@ class Storage:
                 session.execute(
                     update(AssignmentRecord)
                     .where(
-                        AssignmentRecord.id == open_assignment.id,
+                        AssignmentRecord.id == expected_assignment_id,
+                        AssignmentRecord.apartment_id == apartment_id,
                         AssignmentRecord.ended_at.is_(None),
                     )
                     .values(ended_at=now_naive, reason=reason)
                 ),
             )
             if not result.rowcount:
-                # Lost the race to a concurrent removal of the very same
-                # assignment -- see the docstring above.
-                raise ValueError(
-                    f"Apartment {apartment_id!r} has no open assignment to remove."
-                )
+                # Lost the race to a concurrent removal/replacement of the
+                # very same assignment between the read above and this
+                # guarded write -- same message, same "nothing touched"
+                # guarantee, see the docstring above.
+                raise ValueError(STALE_ASSIGNMENT_MESSAGE)
 
             device_id = open_assignment.device_id
             device = session.get(DeviceRecord, device_id)
@@ -3050,6 +3084,22 @@ class Storage:
 
             apartment = session.get(ApartmentRecord, apartment_id)
             assert apartment is not None  # checked above, same transaction
+            # **Invariant fix, found while investigating the confirm/remove
+            # race (main session):** whether there was actually a token to
+            # revoke must be read here, not assumed -- an apartment can
+            # reach an open assignment with `token_hash` already `NULL`
+            # (P4.2's `confirm_device` never issues a token itself, only
+            # P4.2b's separate `/v1/registration/.../token` endpoint does,
+            # and `confirm_device`'s own `replace_previous` path already
+            # clears `token_hash` as part of closing the *previous*
+            # assignment -- see that method's own token-revoke audit row,
+            # which already computes this correctly). A hard-coded
+            # `before={"token_hash": "set"}` would otherwise write a false
+            # audit claim ("a token was revoked") for an apartment that
+            # never had one, exactly the "audit rows claiming actions that
+            # did not happen" this package's own tests were asked to rule
+            # out. Mirrors `confirm_device`'s own `had_token` computation.
+            had_token = apartment.token_hash is not None
             apartment.token_hash = None
 
             self._write_inventory_audit_log(
@@ -3079,7 +3129,7 @@ class Storage:
                 entity_id=apartment_id,
                 action="token_revoked",
                 reason=reason,
-                before={"token_hash": "set"},
+                before={"token_hash": "set" if had_token else None},
                 after={"token_hash": None},
             )
 

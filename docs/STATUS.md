@@ -813,6 +813,265 @@ pre-existing gaps, not introduced by this task -- `main()` was already
 only exercised as an entry point, `# pragma: no cover`'d at its `if
 __name__` guard, same as before).
 
+## Confirm/remove race test flake: a legitimate third interleaving, not a race bug (main session)
+
+**Symptom.** `tests/test_device_lifecycle_registration_integration.py
+::test_confirm_device_replace_previous_races_a_concurrent_remove_device`
+(from the "Cross-review integration: P4.2 x P4.3" section below) failed
+intermittently -- reproduced at 11/500 (~2.2%) isolated runs of the exact
+scenario, in the same order of magnitude as the reported ~2/30 -- with
+`AssertionError: assert ['confirmed', 'removed'] in (['confirm_failed',
+'removed'], ['confirmed', 'remove_failed'])`: both the concurrent
+`confirm_device(replace_previous=True)` for a new device and `remove_device`
+of the apartment's current device succeeded, an outcome the test's own
+fixed two-outcome-label assertion forbade outright.
+
+**Diagnosis: (a), a legitimate interleaving the test forbade too strictly --
+not a race bug.** `Storage.remove_device` and `Storage.confirm_device`'s
+`replace_previous` path already race safely against each other over the
+*same* assignment row (the guarded `UPDATE ... WHERE id = <row> AND
+ended_at IS NULL` each uses). What the old assertion missed is a third,
+equally legitimate interleaving: `remove_device` can commit its **entire**
+transaction (closing the old assignment, moving the old device to its
+target state, revoking the token, three audit rows) before
+`confirm_device`'s own phase 2 ever reads the previous assignment at all.
+`confirm_device` then correctly finds **no** open assignment to replace (it
+was already closed) and proceeds exactly like an initial-commissioning
+confirm -- creating a fresh assignment for the new device outright. Both
+calls report success, and every invariant the test actually cares about
+still holds: the old assignment closed **exactly once** (never twice), the
+old device ends up in **the remover's** chosen target state (`faulty`),
+never overwritten by `confirm_device`'s own choice (`in_storage`), the
+apartment's token is revoked exactly once, the apartment ends with exactly
+one open assignment (the new device), the new device is `in_service` with a
+confirmed, non-invalidated registration, and no audit row claims a change
+that never happened. Verified directly across 500 runs of the raw scenario
+outside pytest (11 hits, `outcome distribution: {('confirm_failed',
+'removed'): 484, ('confirmed', 'remove_failed'): 5, ('confirmed',
+'removed'): 11}`), every one of the 11 "both succeed" hits showing
+identical, fully consistent state (`current_assignment=sn-new
+old_state=faulty new_state=in_service token_hash=None`, one `"closed"` row
+for the old assignment, one `"assigned"` row for the new one, zero
+`"closed"` rows for the new one).
+
+**Fix: the test now asserts invariants for all three legitimate
+interleavings, not two fixed outcome labels**
+(`_assert_confirm_remove_race_invariants`,
+`tests/test_device_lifecycle_registration_integration.py`), plus two new
+deterministic tests that force each interleaving explicitly instead of
+relying on real-thread timing to hit the rare one:
+`test_confirm_device_replace_previous_forced_remove_wins_during_phase_gap`
+(monkeypatches `hmac.compare_digest` -- the last call `confirm_device`'s
+phase 1 makes -- to run `remove_device` to completion as a side effect
+before returning the real comparison result, injecting the pause exactly at
+the phase 1/phase 2 boundary the P4.2 reviewer's own technique used
+elsewhere in this file) and
+`test_confirm_device_replace_previous_forced_confirm_wins_first` (plain
+sequential calls, no injection needed).
+
+**A fourth case, found while forcing "confirm fully before remove" -- first
+called a benign contract detail, then reclassified by the project owner as
+a real defect and fixed (main session, follow-up, 2026-09-27).** Once
+`confirm_device` has fully committed, the old device's assignment is no
+longer open at all; `remove_device`'s own lookup of "the apartment's
+currently open assignment" (section 20.2) then had no notion of *which*
+device the caller had actually seen, and would silently act on the
+apartment's now-current assignment -- the *new* device -- instead: setting
+a device the landlord never saw to `faulty`/`in_storage` and revoking the
+token it had just obtained. Concretely: the landlord opens "Gerät
+ausbauen" for apartment X while device OLD is shown; meanwhile a confirm
+assigns NEW; the landlord's stale submit then removes NEW. Initially
+argued (see the paragraph this replaces, still visible in git history) as
+"not a race by that point, not a corruption, the same class of UI-
+staleness this codebase already accepts for a plain double removal" -- the
+project owner's own read is sharper: a plain double removal ("remove
+whatever is open") and this case ("remove *this specific* device") are not
+the same class at all, since the landlord's form was rendered against a
+*specific* assignment, and section 20.3's own "every change to assignment,
+state, or token is logged: who, when, why" implies the "who" acted on what
+they actually saw, not on whatever the row happens to mean by the time the
+request lands.
+
+**Fix: `Storage.remove_device` takes a new required
+`expected_assignment_id: int` parameter and acts only on that exact
+assignment, never on "whatever is currently open for this apartment
+id".** Looks up the apartment's actual current open assignment first (as
+before), then requires it to still have `id == expected_assignment_id`
+before doing anything else; a mismatch -- already closed, or the apartment
+now has a *different* open assignment, or the id names some other
+apartment's assignment entirely (a tampered hidden field) -- is refused
+with `"Die Zuordnung hat sich inzwischen geändert -- bitte neu laden."`,
+before any write, no audit row (`fleet/storage.py`). The concurrent-
+double-removal guarded `UPDATE` (`tests/test_storage.py
+::test_remove_device_concurrent_double_removal_only_one_wins`) now also
+filters on `expected_assignment_id`/`apartment_id`, unchanged in effect
+since both racing calls already agree on the same id in that test.
+
+**Carried end-to-end through the UI, not only the storage layer:**
+`fleet.ui_inventory.ReplaceDeviceView` gained `current_assignment_id`
+(from `Storage.get_current_assignment`, the same call that already builds
+the rest of the form); `fleet/templates/ui/inventory_replace_device.html`
+carries it as a hidden `expected_assignment_id` field; `fleet/ui_routes.py
+::replace_device_submit` takes it as a required `Form(...)` int and passes
+it straight through to `Storage.remove_device`, surfacing a mismatch as the
+same `400` re-render every other validation error already uses.
+
+**Proven directly, not only argued:**
+`tests/test_storage.py::test_remove_device_rejects_a_stale_expected_
+assignment_id` (the device gets replaced from under a stale
+`expected_assignment_id`; refused, nothing touched, no audit row),
+`::test_remove_device_rejects_an_expected_assignment_id_already_closed`
+(the simpler already-closed variant), and `::test_remove_device_rejects_
+an_expected_assignment_id_from_another_apartment` (tamper case: a *still
+open* assignment belonging to a *different* apartment is refused, because
+the lookup is always "this apartment's current open assignment first,
+then compare id", never "does this id exist and is it open anywhere").
+`tests/test_ui_inventory.py::test_replace_device_submit_stale_form_is_
+refused` reproduces the landlord's exact scenario at the HTTP level: a
+form is opened, a real `confirm_device(..., replace_previous=True)` call
+replaces the device while it is still open, the stale submit gets `400`
+with the message above, and the replacement device is untouched (still
+`in_service`, exactly one `token_revoked` audit row -- confirm's own, not
+a second one from the refused removal).
+
+`tests/test_device_lifecycle_registration_integration.py
+::test_confirm_device_replace_previous_forced_confirm_wins_first` (the
+test that used to prove the old, now-rejected behaviour) is rewritten to
+prove the fix instead: `remove_device` is now called with `sn-old`'s
+*original* assignment id (captured once, before `confirm_device` ever
+runs -- exactly what a landlord's already-open page would still carry,
+having no way to know a replacement was confirmed in the meantime), and is
+refused; `sn-new` ends the test exactly as `confirm_device` left it
+(`in_service`, its own assignment still open, exactly one token
+revocation, no audit row from the refused call).
+`_assert_confirm_remove_race_invariants` (the three-interleaving helper
+covering the real thread race) is otherwise unchanged: with
+`expected_assignment_id` now pinned to the assignment the caller actually
+saw, the case that used to silently corrupt state now simply folds into
+the already-covered `("confirmed", "remove_failed")` outcome --
+`remove_device` failing cleanly, having written nothing, looks identical
+regardless of which of the two now-possible reasons (lost the race on the
+same row, or the assignment moved out from under it entirely) tripped its
+guard.
+
+**A real, if minor, invariant bug found and fixed along the way, unrelated
+to the race itself: `Storage.remove_device`'s own `token_revoked` audit row
+hard-coded `before={"token_hash": "set"}`, regardless of whether the
+apartment actually had a token.** `confirm_device`'s own token-revoke audit
+row already computes this correctly (`had_token = apartment.token_hash is
+not None`); `remove_device` did not, and this test's own fixture (an
+apartment created via `_make_apartment`, never given a token) exposed it
+directly -- a false audit claim ("a token was revoked") for an apartment
+that never had one, exactly the "audit rows claiming actions that did not
+happen" invariant this investigation was asked to check. Fixed in
+`fleet/storage.py`'s `remove_device` to mirror `confirm_device`'s own
+pattern; no existing test asserted the literal hard-coded value, so nothing
+else needed updating.
+
+**Sibling race tests checked for the same outcome-label-under-real-thread-
+race weakness, none needed hardening:**
+`tests/test_device_lifecycle_registration_integration.py
+::test_concurrent_confirm_racing_manual_reported_to_faulty_exactly_one_
+outcome` already asserts invariants conditionally, not fixed outcome
+labels. `tests/test_device_registration.py
+::test_confirm_device_concurrent_confirms_of_two_devices_for_one_apartment_
+exactly_one_wins` and `::test_confirm_device_concurrent_confirms_of_the_
+same_device_exactly_one_wins` assert `sorted(...) == [False, True]`, but
+unlike this package's own race, their "exactly one wins" is enforced
+structurally (the partial unique index on `assignments.apartment_id`, and a
+guarded `UPDATE ... WHERE state = 'reported'` against the identical device
+row for both threads) -- there is no code path by which a legitimate third
+outcome could occur, so the fixed assertion is not flaky by construction.
+`test_record_device_report_two_threads_same_code_exactly_one_wins` and
+`test_confirm_device_wrong_attempts_counter_atomic_under_concurrency` are
+likewise backed by a single atomically-guarded write each, not a
+race-with-multiple-legitimate-outcomes. All four re-run 50x with no flake.
+
+**Verification, initial round** (fresh venv, `python3.13 -m venv`, `pip
+install -e ".[dev,fleet,agent]"` -- SQLAlchemy 2.1.1, mypy 2.3.1): `ruff
+check .`, `mypy .`, `mypy protocol fleet agent tools` all clean; `python -m
+pytest -W ignore::ResourceWarning` (732 passed, 99% coverage overall) run
+3x with identical counts; the real-thread race test re-run 200x (0
+failures, down from ~2.2%/500 measured before the fix -- the fix did not
+change timing, only the assertion, so the *interleaving* still occurs at
+the same rate, it is simply no longer treated as a failure); both new
+deterministic tests and the two `test_device_registration.py` siblings
+each re-run 50x (0 failures).
+
+**Verification, follow-up round (`expected_assignment_id` fix, same fresh
+venv):** `ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all
+clean; `python -m pytest -W ignore::ResourceWarning` run 3x -- **736
+passed** each time, 99% coverage overall, every touched file
+(`fleet/storage.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py`) at
+100%; `TOTAL` missed-statement count was 21/21/22 across the three runs --
+the one-statement wobble is `fleet/storage.py:2271`
+(`confirm_device`'s own guarded-`UPDATE`-lost-the-race branch, pre-existing
+code from the P4.2 x P4.3 cross-review, not touched by this fix), only
+reachable via `test_concurrent_confirm_racing_manual_reported_to_faulty_
+exactly_one_outcome`'s real-thread race and therefore not hit on every
+single run by construction -- not a regression from this change. All five
+race tests re-run again on the final code: the real-thread race test 200x
+(0 failures), both deterministic tests and both
+`test_device_registration.py` siblings 50x each (0 failures).
+
+**Cross-review round 2: three follow-ups, all fixed here.**
+
+1. **The `fleet/storage.py:2271` coverage wobble above is now
+   deterministic, not scheduling luck.** New test
+   `test_confirm_device_device_state_guard_fails_if_state_changes_mid_call`
+   (`tests/test_device_lifecycle_registration_integration.py`, same
+   technique as `test_confirm_device_registration_claim_fails_if_
+   invalidated_mid_call` right below it, one guard earlier): the device is
+   moved out of `reported` *within the same transaction*, via
+   `Storage._write_inventory_audit_log`, at the moment the new
+   assignment's own `"assigned"` audit row is written -- strictly after
+   phase 2's own initial recheck already passed, strictly before the
+   device-guarded `UPDATE` this test targets ever runs. `confirm_device`
+   then fails cleanly (`"anderweitig bearbeitet"`) and rolls back
+   everything: device back to `reported`, no new assignment, no new audit
+   row beyond `prepare_device`'s own pre-existing `"prepared"` one, the
+   registration untouched. No `# pragma: no cover` needed -- this branch is
+   now exercised on every run.
+2. **A missing or non-integer `expected_assignment_id` used to fall
+   straight through to FastAPI's raw `422`, unlike every other field this
+   route validates.** `STALE_ASSIGNMENT_MESSAGE` moved from a private
+   `Storage` class attribute to a shared, public constant
+   (`fleet.device_lifecycle.STALE_ASSIGNMENT_MESSAGE`, the same "defined
+   once, used by both the storage layer and the route's own re-render"
+   pattern `validate_manual_device_transition`'s message already
+   established). `fleet/ui_routes.py::replace_device_submit` now types
+   `expected_assignment_id: str | None` (same reasoning as `fleet
+   .ui_apartment.clamp_history_days`'s own docstring for `days`), parses it
+   itself, and re-renders the same `400` with the same message on a
+   missing or unparseable value -- checked in the same place as
+   `reason`/`target_state`, after the CSRF check. Two new tests
+   (`tests/test_ui_inventory.py
+   ::test_replace_device_submit_missing_expected_assignment_id_rerenders_
+   with_a_message`, `::test_replace_device_submit_non_integer_expected_
+   assignment_id_rerenders_with_a_message`): both `400`, nothing changed,
+   no audit row.
+3. **Positive test for the `had_token` audit fix.** Two new
+   `tests/test_storage.py` tests assert the `token_revoked` row's
+   `before_json` directly: `{"token_hash": "set"}` for an apartment that
+   actually had one (`_make_apartment_with_device`'s own
+   `set_apartment_token`), `{"token_hash": null}` for one that never did
+   (built by hand, the same way `tests/test_ui_inventory.py
+   ::test_replace_device_submit_old_token_gets_403_on_a_real_heartbeat`
+   already reaches into `DeviceRecord.state` for a state P4.2/P4.2b give no
+   route to set yet).
+
+Verification for this round (same fresh venv): `ruff check .`, `mypy .`,
+`mypy protocol fleet agent tools` all clean; `python -m pytest -W
+ignore::ResourceWarning` run 3x -- **741 passed** every time, `TOTAL`
+missed-statement count **identical across all three runs** (2948
+statements, 21 missed, 99%), every touched file
+(`fleet/storage.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py`,
+`fleet/device_lifecycle.py`) at 100% -- the coverage wobble from the
+previous round is gone. Both real-thread race tests
+(`test_confirm_device_replace_previous_races_a_concurrent_remove_device`,
+`test_concurrent_confirm_racing_manual_reported_to_faulty_exactly_one_
+outcome`) re-run 200x each, 0 failures.
+
 ## `PROTOCOL_VERSION` bump to 2 for the P4.2b registration models (main
 session)
 
