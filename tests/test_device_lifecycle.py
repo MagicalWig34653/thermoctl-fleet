@@ -1,11 +1,14 @@
 """Tests the manual `DeviceLifecycle` transition table (P4.3,
 docs/specification.md section 20.1/20.2 -- a derived reading, see
 `fleet/device_lifecycle.py`'s own module docstring for the reasoning
-behind each of the five allowed pairs).
+behind each of the eleven allowed pairs -- the original five plus six more
+added by the P4.2 x P4.3 cross-review integration, see that module's own
+"Extended by ..." docstring section and `docs/STATUS.md`'s "Cross-review
+integration" section).
 
 Exhaustive: every one of the 7 x 7 = 49 possible `(current, target)` pairs
-is checked against the module's own explicit expectation, not just the five
-allowed ones and a token handful of refusals.
+is checked against the module's own explicit expectation, not just the
+eleven allowed ones and a token handful of refusals.
 """
 
 from __future__ import annotations
@@ -31,18 +34,25 @@ _EXPECTED_ALLOWED: frozenset[tuple[str, str]] = frozenset(
         ("registered", "decommissioned"),
         ("prepared", "decommissioned"),
         ("faulty", "decommissioned"),
+        # -- extended by P4.2 x P4.3 cross-review integration --
+        ("in_storage", "faulty"),
+        ("registered", "faulty"),
+        ("prepared", "in_storage"),
+        ("prepared", "faulty"),
+        ("reported", "faulty"),
+        ("reported", "decommissioned"),
     }
 )
 
 
-def test_the_five_allowed_pairs_match_the_derived_reading_exactly() -> None:
+def test_the_eleven_allowed_pairs_match_the_derived_reading_exactly() -> None:
     """Pins the module's own table against the work package's derived
     reading verbatim -- if this ever drifts, every other test in this file
     would still pass against the (now wrong) table, so the table itself
     must be pinned too."""
 
     assert ALLOWED_MANUAL_DEVICE_TRANSITIONS == _EXPECTED_ALLOWED
-    assert len(ALLOWED_MANUAL_DEVICE_TRANSITIONS) == 5
+    assert len(ALLOWED_MANUAL_DEVICE_TRANSITIONS) == 11
 
 
 @pytest.mark.parametrize(

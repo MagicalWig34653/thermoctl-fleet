@@ -1711,6 +1711,8 @@ def test_list_audit_log_for_entity_orders_newest_first(storage: Storage) -> None
 
 # -- change_device_state / remove_device (P4.3, section 20.1/20.2) -----------
 
+_CHANGE_STATE_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
 
 def _make_apartment_with_device(
     storage: Storage,
@@ -1764,7 +1766,9 @@ def test_change_device_state_faulty_to_in_storage(storage: Storage) -> None:
         assert record is not None
         record.state = "faulty"
 
-    storage.change_device_state("sn-1", "in_storage", "Geprüft, wiederverwendbar", "landlord")
+    storage.change_device_state(
+        "sn-1", "in_storage", "Geprüft, wiederverwendbar", "landlord", now=_CHANGE_STATE_NOW,
+    )
 
     device = storage.get_device("sn-1")
     assert device is not None
@@ -1781,7 +1785,9 @@ def test_change_device_state_writes_exactly_one_audit_row(storage: Storage) -> N
         assert record is not None
         record.state = "faulty"
 
-    storage.change_device_state("sn-1", "in_storage", "Geprüft", "landlord")
+    storage.change_device_state(
+        "sn-1", "in_storage", "Geprüft", "landlord", now=_CHANGE_STATE_NOW,
+    )
 
     log = storage.list_audit_log_for_entity("device", "sn-1")
     assert len(log) == 1
@@ -1792,7 +1798,9 @@ def test_change_device_state_writes_exactly_one_audit_row(storage: Storage) -> N
 
 def test_change_device_state_rejects_an_unknown_device(storage: Storage) -> None:
     with pytest.raises(ValueError, match="does not exist"):
-        storage.change_device_state("unknown", "in_storage", "Grund", "landlord")
+        storage.change_device_state(
+            "unknown", "in_storage", "Grund", "landlord", now=_CHANGE_STATE_NOW,
+        )
 
 
 def test_change_device_state_rejects_an_empty_reason(storage: Storage) -> None:
@@ -1806,7 +1814,9 @@ def test_change_device_state_rejects_an_empty_reason(storage: Storage) -> None:
         record.state = "faulty"
 
     with pytest.raises(ValueError, match="reason"):
-        storage.change_device_state("sn-1", "in_storage", "   ", "landlord")
+        storage.change_device_state(
+            "sn-1", "in_storage", "   ", "landlord", now=_CHANGE_STATE_NOW,
+        )
 
     device = storage.get_device("sn-1")
     assert device is not None
@@ -1821,7 +1831,9 @@ def test_change_device_state_rejects_a_disallowed_transition(storage: Storage) -
     # Freshly registered device -- state "registered".
 
     with pytest.raises(ValueError, match="nicht erlaubt"):
-        storage.change_device_state("sn-1", "in_storage", "Grund", "landlord")
+        storage.change_device_state(
+            "sn-1", "in_storage", "Grund", "landlord", now=_CHANGE_STATE_NOW,
+        )
 
     device = storage.get_device("sn-1")
     assert device is not None
@@ -1833,7 +1845,9 @@ def test_change_device_state_rejects_in_service_as_a_source(storage: Storage) ->
     _make_apartment_with_device(storage)
 
     with pytest.raises(ValueError, match="nicht erlaubt"):
-        storage.change_device_state("sn-1", "faulty", "Grund", "landlord")
+        storage.change_device_state(
+            "sn-1", "faulty", "Grund", "landlord", now=_CHANGE_STATE_NOW,
+        )
 
     device = storage.get_device("sn-1")
     assert device is not None
@@ -1845,10 +1859,14 @@ def test_change_device_state_decommissioned_is_terminal(storage: Storage) -> Non
         "sn-1", model="Pi 5", acquisition_date=date(2026, 1, 1),
         image_version="2026.1", watchdog_version="0.1.0",
     )
-    storage.change_device_state("sn-1", "decommissioned", "Ausgemustert", "landlord")
+    storage.change_device_state(
+        "sn-1", "decommissioned", "Ausgemustert", "landlord", now=_CHANGE_STATE_NOW,
+    )
 
     with pytest.raises(ValueError, match="Endzustand"):
-        storage.change_device_state("sn-1", "in_storage", "Grund", "landlord")
+        storage.change_device_state(
+            "sn-1", "in_storage", "Grund", "landlord", now=_CHANGE_STATE_NOW,
+        )
 
     device = storage.get_device("sn-1")
     assert device is not None

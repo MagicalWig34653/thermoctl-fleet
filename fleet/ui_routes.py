@@ -54,11 +54,13 @@ from fleet.ui_inventory import (
     MAX_PROPERTY_NAME_LENGTH,
     MAX_REASON_LENGTH,
     MAX_VERSION_LENGTH,
+    build_confirm_view,
     build_inventory_view,
     build_replace_device_view,
 )
 from fleet.ui_tasks import build_task_overview
 from protocol.inventory import ApartmentState
+from protocol.registration import AgentRegistrationFile
 
 logger = logging.getLogger(__name__)
 
@@ -716,6 +718,245 @@ def apartment_edit_submit(
     return RedirectResponse(url="/ui/inventory", status_code=303)
 
 
+# -----------------------------------------------------------------------------
+# "Vorbereiten"/"Bestätigen" (P4.2, section 20.2 steps 2/4, 15.3, 20.3) --
+# prepare a device (generate a one-time registration code, shown exactly
+# once), and confirm a `reported` device's verification code to release the
+# assignment. Device-side registration itself (Ed25519 + signed challenge)
+# is P4.2b, not this package -- see `fleet/storage.py`'s own "device
+# registration" section for the storage-level rules these routes are a thin
+# HTTP layer over.
+#
+# `agent-registration.json`'s address/fingerprint (section 15.3 step 1,
+# 19.5) come from two environment variables, **deliberately with no
+# default** (CLAUDE.md: "nothing hard-coded except the security
+# principles"; no plausible placeholder value for either exists that would
+# not itself look like a real deployment's configuration) -- if either is
+# unset, the result page shows a clear hint instead of inventing one.
+# -----------------------------------------------------------------------------
+
+_FLEET_PUBLIC_URL_ENV = "FLEET_PUBLIC_URL"
+_FLEET_CERT_FINGERPRINT_ENV = "FLEET_CERT_FINGERPRINT"
+
+
+@router.get("/inventory/devices/{device_id}/prepare", response_class=HTMLResponse)
+def device_prepare_form(
+    request: Request,
+    device_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """Renders the "Vorbereiten" form (P4.2, section 20.2 step 2) -- the
+    "Gerät wurde zurückgesetzt" checkbox is only shown/required for a
+    device currently `in_storage` (`Storage.prepare_device` enforces this
+    again itself; this is only the form's own rendering choice)."""
+
+    device = storage.get_device(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Unbekanntes Gerät.")
+
+    response = templates.TemplateResponse(
+        request,
+        "inventory_device_prepare.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "device": device,
+            "error": None,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/inventory/devices/{device_id}/prepare")
+def device_prepare_submit(
+    request: Request,
+    device_id: str,
+    confirmed_reset: str = Form(""),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Generates a fresh one-time registration code (`Storage
+    .prepare_device`) and renders the result page showing it **exactly
+    once** -- the code is never logged (this route logs nothing at all)
+    and never stored in plain text (only its hash, see `Storage
+    .prepare_device`'s own docstring). `confirmed_reset` is an HTML
+    checkbox, same convention as `apartment_edit_submit`'s `pilot_mode`
+    above: present means checked/`True`, absent means unchecked/`False`.
+    """
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    device = storage.get_device(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Unbekanntes Gerät.")
+
+    try:
+        raw_code = storage.prepare_device(
+            device_id,
+            ui_username=authenticated.user.username,
+            confirmed_reset=bool(confirmed_reset),
+            now=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        response = templates.TemplateResponse(
+            request,
+            "inventory_device_prepare.html",
+            {
+                "ui_session": authenticated,
+                "csrf_token": authenticated.session.csrf_token,
+                "device": device,
+                "error": str(exc),
+            },
+            status_code=400,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    fleet_address = os.environ.get(_FLEET_PUBLIC_URL_ENV)
+    certificate_fingerprint = os.environ.get(_FLEET_CERT_FINGERPRINT_ENV)
+    registration_file_json: str | None = None
+    if fleet_address and certificate_fingerprint:
+        registration_file_json = AgentRegistrationFile(
+            fleet_address=fleet_address,
+            certificate_fingerprint=certificate_fingerprint,
+            registration_code=raw_code,
+        ).model_dump_json(indent=2)
+
+    registration = storage.get_active_registration_for_device(device_id)
+    expires_at = registration.expires_at.isoformat() if registration is not None else ""
+
+    response = templates.TemplateResponse(
+        request,
+        "inventory_device_prepared.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "device_id": device_id,
+            "registration_code": raw_code,
+            "registration_file_json": registration_file_json,
+            "expires_at": expires_at,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _confirm_response(
+    request: Request,
+    storage: Storage,
+    authenticated: AuthenticatedUiSession,
+    *,
+    error: str | None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    view = build_confirm_view(storage)
+    response = templates.TemplateResponse(
+        request,
+        "inventory_device_confirm.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "rows": view.rows,
+            "apartments": view.apartments,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/inventory/devices/confirm", response_class=HTMLResponse)
+def device_confirm_list(
+    request: Request,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """"Bestätigen" (P4.2, section 20.2 step 4) -- every `reported` device,
+    with its display fingerprint and report time, **never its verification
+    code** (work order's explicit instruction -- see `fleet.ui_inventory
+    .build_confirm_view`'s own docstring)."""
+
+    return _confirm_response(request, storage, authenticated, error=None)
+
+
+@router.post("/inventory/devices/{device_id}/confirm")
+def device_confirm_submit(
+    request: Request,
+    device_id: str,
+    apartment_id: str = Form(...),
+    verification_code: str = Form(...),
+    reason: str = Form(...),
+    replace_previous: str = Form(""),
+    previous_device_target_state: str = Form(""),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Applies one device's confirmation form (P4.2, section 20.2 step 4,
+    15.3 step 3, 20.3) -- **every rule (wrong code, retired apartment,
+    "replace_previous" required, device already assigned elsewhere) is
+    enforced by `Storage.confirm_device` itself**, this route only turns
+    its `ValueError` into a re-rendered 400 with the message, the same
+    pattern every other form in this module already follows.
+    `replace_previous` is an HTML checkbox, same convention as `pilot_mode`/
+    `confirmed_reset` above."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    if not verification_code.strip():
+        return _confirm_response(
+            request, storage, authenticated, error="Bestätigungscode darf nicht leer sein.",
+            status_code=400,
+        )
+    if not reason.strip():
+        return _confirm_response(
+            request, storage, authenticated, error="Ein Grund ist erforderlich.",
+            status_code=400,
+        )
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        return _confirm_response(
+            request, storage, authenticated, error=length_error, status_code=400
+        )
+
+    try:
+        storage.confirm_device(
+            device_id,
+            apartment_id,
+            verification_code,
+            ui_user=authenticated.user.username,
+            reason=reason.strip(),
+            replace_previous=bool(replace_previous),
+            previous_device_target_state=previous_device_target_state or None,
+            now=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return _confirm_response(
+            request, storage, authenticated, error=str(exc), status_code=400
+        )
+
+    return RedirectResponse(url="/ui/inventory", status_code=303)
+
+
+# -----------------------------------------------------------------------------
+# "Gerät ausbauen/tauschen" and "Zustand ändern" (P4.3, section 20.1/20.2) --
+# remove/replace the device currently assigned to an apartment (closes the
+# assignment, revokes the apartment's token, sets the removed device's new
+# state, all in one transaction -- `Storage.remove_device`), and change a
+# device's state manually outside that flow (`Storage.change_device_state`,
+# `fleet.device_lifecycle`'s own transition table). Merged in here
+# alongside P4.2's routes above -- both packages extend
+# `fleet.ui_inventory`'s `ApartmentRow`/`DeviceRow` shapes rather than each
+# keeping a competing one, see that module's own "Merged with P4.3" note.
+# -----------------------------------------------------------------------------
+
+
 @router.get(
     "/inventory/apartments/{apartment_id}/replace-device", response_class=HTMLResponse
 )
@@ -832,6 +1073,14 @@ def device_state_submit(
     anything else, including every transition out of `in_service` (only
     "Gerät ausbauen/tauschen" -- `replace_device_submit` above -- may end
     an `in_service` device's state) and out of `decommissioned` (terminal).
+    **Cross-review integration (2026-09-26, main session):** a transition
+    that leaves `prepared`/`reported`, or that moves into `decommissioned`,
+    also invalidates the device's active registration in the same
+    transaction (`Storage.change_device_state`'s own updated docstring) --
+    a device manually reclassified away from an in-progress registration,
+    or permanently retired, must not leave a still-valid registration/
+    verification code pair around for `record_device_report`/
+    `confirm_device` to still honor.
     """
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
@@ -858,7 +1107,8 @@ def device_state_submit(
 
     try:
         storage.change_device_state(
-            device_id, target_state, reason.strip(), authenticated.user.username
+            device_id, target_state, reason.strip(), authenticated.user.username,
+            now=datetime.now(UTC),
         )
     except ValueError as exc:
         return _inventory_response(

@@ -81,11 +81,15 @@
         <a href="/ui/inventory?filter=in_storage">Im Lager</a>
         <a href="/ui/inventory?filter=faulty">Defekt</a>
     </nav>
+    <p><a href="/ui/inventory/devices/confirm">Geräteregistrierungen bestätigen</a></p>
     {% if view.devices_not_in_service %}
     <ul class="inventory-devices">
         {% for device in view.devices_not_in_service %}
         <li>{{ device.id }} ({{ device.model }}) – {{ device.state }}, seit {{ device.acquisition_date }},
             Image {{ device.image_version }}, Watchdog {{ device.watchdog_version }}
+            {% if device.prepare_href %}
+            &nbsp;<a href="{{ device.prepare_href }}">Vorbereiten</a>
+            {% endif %}
             {% if device.allowed_target_states %}
             <form method="post" action="{{ device.state_action_href }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

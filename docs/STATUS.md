@@ -2,6 +2,435 @@
 
 Last updated: 2026-09-26.
 
+## Cross-review integration: P4.2 x P4.3 device lifecycle (main session)
+
+P4.2 ("prepare device, confirm registration and assign") and P4.3 ("remove/
+replace device, change device state") were built in parallel on separate
+branches and merged together here. P4.3's own STATUS.md section already
+flagged the gap this closes: "decommissioning must also invalidate any
+pending registration ... not built here ... the main session should add
+this once both branches are merged together." This section is that
+hand-off, done.
+
+**Extended `ALLOWED_MANUAL_DEVICE_TRANSITIONS` (`fleet/device_lifecycle.py`),
+a further derived reading of section 20, not a specification quote** (see
+that module's own "Extended by P4.2/P4.3 cross-review integration"
+docstring section): six transitions beyond P4.3's original five --
+`in_storage -> faulty` (the symmetric counterpart P4.3 deliberately left
+out, no longer necessary to exclude now that the registration side effect
+below exists to invalidate anything "in progress"), `registered -> faulty`,
+`prepared -> in_storage`, `prepared -> faulty`, `reported -> faulty`, and
+`reported -> decommissioned`. Every other refusal from P4.3's original
+table (terminal `decommissioned`, no manual path into `prepared`/
+`reported`/`in_service`, `in_service` never a source) is unchanged.
+`tests/test_device_lifecycle.py::test_exhaustive_7x7_transition_table`'s
+independent expected set was updated to include exactly these eleven pairs,
+not the original five -- still parametrized over all 49, still asserting
+every non-listed pair is refused.
+
+**Every manual transition that leaves `prepared`/`reported`, or moves into
+`decommissioned`, invalidates the device's active registration in the same
+transaction as the state change, and audits it separately.**
+`Storage.change_device_state` (previously P4.3-only) now also calls a new
+`Storage._invalidate_active_registration` helper (P4.2's own transaction-
+scoped, audited invalidation pattern, reused rather than re-implemented)
+whenever `before_state in ("prepared", "reported") or target_state ==
+"decommissioned"` -- covers all eleven allowed transitions without
+enumerating each one, since every new transition satisfies at least one
+half of that condition (`reported -> decommissioned` satisfies both).
+Writes its own `"registration_invalidated"` audit row (`entity_type=
+"device"`), separate from the `"state_changed"` row the state change itself
+already writes -- two kinds of change, two rows, same reasoning
+`remove_device`'s own three-rows-for-three-changes convention already
+established. A no-op (nothing touched, nothing logged) when there is no
+active registration to invalidate in the first place (e.g. a `registered ->
+faulty` device that was never prepared).
+
+**`record_device_report` additionally refuses a `decommissioned` device**,
+folded into its own existing guarded `UPDATE` as a `NOT EXISTS` subquery on
+`devices.state`, not a separate check-then-act read -- defense in depth on
+top of `change_device_state`'s own invalidation (a registration should
+already be invalidated by the time a device reaches `decommissioned`, but a
+second, independent guard here means a future code path that somehow
+reaches `decommissioned` without going through `change_device_state` still
+cannot be reported against). `confirm_device` needed no equivalent change:
+its own rule 1 ("device must be `reported`, with an active registration")
+already refuses a `decommissioned` device structurally -- `decommissioned`
+is a different value than `reported`, and `change_device_state` always
+invalidates the active registration on that exact transition, so both
+halves of rule 1 already fail together.
+
+**Proven, not just argued (`tests/test_device_lifecycle_registration_
+integration.py`, new):**
+
+- `tests/test_device_lifecycle.py`'s exhaustive table test, updated (11
+  allowed pairs, 38 refused, all 49 checked).
+- Leaving `reported` (manually, to `faulty`) invalidates the registration,
+  so a later `confirm_device` call fails (the device is no longer
+  `reported`, checked before the registration itself ever is) and
+  `record_device_report` with the *old* code also fails -- both against
+  the same registration, both after nothing but a manual state change
+  touched it. Leaving `prepared` (to `in_storage`) invalidates a
+  still-unused code the same way. Decommissioning a `prepared` device
+  makes its still-unused code unusable (`record_device_report` returns
+  `False`), with both a `"registration_invalidated"` and a `"state_changed"`
+  audit row to show for it. `registered -> faulty` (a device that was
+  never even prepared) writes no spurious invalidation row -- there is
+  nothing to invalidate. Both `prepare_device` and `confirm_device` refuse
+  a `decommissioned` device outright (separate tests, not only inferred
+  from the state-check above), and `record_device_report` refuses one even
+  when the registration row itself was left untouched (its own independent
+  `NOT EXISTS` guard, defense in depth on top of `change_device_state`'s
+  invalidation). A concurrent manual `reported -> faulty` racing a
+  `confirm_device` call with the correct code -- run 10x under real
+  threads -- always produces exactly one outcome: either the confirm wins
+  and ends with a device correctly `in_service` and a *not*-invalidated
+  registration (confirmed, not invalidated -- the two are mutually
+  exclusive terminal states for one registration row), or the manual state
+  change wins and the confirm correctly fails -- never both, never an
+  `in_service` device whose own registration row is also marked invalidated
+  (asserted explicitly every run).
+- A `sqlite_master` assertion
+  (`tests/test_device_lifecycle_registration_integration.py
+  ::test_migration_0007_partial_unique_index_carries_the_where_clause`)
+  that `ux_device_registrations_device_id_active` actually carries `WHERE
+  invalidated_at IS NULL AND confirmed_at IS NULL` in the stored schema --
+  mirrors P4.1's own equivalent assertion for the assignments indexes; the
+  existing concurrency tests already prove the index *behaves* as partial,
+  this additionally proves the stored schema says so, not just that test
+  data never happened to hit the non-partial case.
+
+**Review suggestion, also fixed here: `confirm_device`'s `replace_previous`
+path closed the previous assignment via a bare ORM attribute set
+(`previous_assignment.ended_at = normalized_now`), not an atomically
+guarded `UPDATE`.** Harmless before P4.3 existed (nothing else could ever
+close that same assignment concurrently); **P4.3's own `remove_device` now
+can** -- a landlord confirming a replacement device for apartment X at the
+same moment as (or via a stale page, slightly after) someone else clicks
+"Gerät ausbauen/tauschen" for the very same apartment's *old* assignment
+would previously have let `confirm_device` silently re-close and re-audit
+an assignment `remove_device` had already closed and audited, without
+detecting the collision. Fixed: the close is now `UPDATE ... WHERE id =
+<this assignment> AND ended_at IS NULL`, exactly `remove_device`'s own
+"atomic close, not read-then-write" pattern; a lost race raises `ValueError`
+("wurde inzwischen bereits anderweitig beendet") instead of silently
+double-processing. `tests/test_device_lifecycle_registration_integration.py
+::test_confirm_device_replace_previous_races_a_concurrent_remove_device`
+proves it directly: `remove_device` and `confirm_device` (with
+`replace_previous=True` for the same apartment/previous device) run
+concurrently, real threads -- exactly one of the two "closes" the
+assignment; the other gets a clean `ValueError`, and the audit log has
+exactly one `"closed"` row for that assignment, never two.
+
+**P4.2b's own open points, made explicit here (not decided, not invented --
+this package's own boundary, restated so P4.2b's work order does not have
+to rediscover it by reading every method's docstring):**
+
+- **Rate limiting on the future `/v1/registration/...` report endpoint is
+  P4.2b's decision, not made here.** `Storage.record_device_report` itself
+  is already safe under concurrency (proven above and in P4.2's own
+  section) and already returns a uniform `False` for every failure reason,
+  but neither of those is a rate limit -- nothing here throttles how many
+  *distinct* codes an attacker may try per unit time against that future
+  endpoint (unlike the UI login path's per-IP throttle, P3.0). P4.2b should
+  decide whether/how to add one before that endpoint goes live.
+- **Verification-code derivation and entropy is P4.2b's decision, not
+  made here.** This package stores whatever string `record_device_report`
+  is given as `verification_code` and compares it in constant time; it does
+  not derive it, does not constrain its length or charset beyond the
+  column's own `String(64)` bound, and makes no claim about how much
+  entropy a "derived from the key fingerprint" value actually carries
+  against a brute-force *within* the 5-attempt budget. P4.2b's own work
+  order needs to size that derivation deliberately, not inherit a default
+  from this package.
+- **Token issuance must only ever happen for a confirmed, non-invalidated
+  registration bound to its stored public key -- not built here, stated as
+  the contract P4.2b must uphold.** `DeviceRegistrationRecord.token_issued_
+  at` exists and is always `NULL` in this package; P4.2b is the only future
+  code path expected to ever set it, and it must do so only after checking
+  `confirmed_at IS NOT NULL`, `invalidated_at IS NULL`, and that the
+  device's own subsequent request is signed by the exact key whose public
+  half is stored in `public_key` on that same row (the signed-challenge
+  step, section 15.3 step 2's "answers a signed challenge ... before ...
+  ever trusted for anything security-relevant") -- issuing a token off a
+  registration that was later invalidated (e.g. by a manual
+  `change_device_state` decommission, see above) or against a *different*
+  key than the one actually confirmed would defeat the entire point of
+  "only this confirmation releases the configuration -- bound to the key of
+  exactly this device" (15.3 step 3).
+
+**A second, genuine bug found while writing the concurrency test above, not
+only the one asked for -- both `confirm_device` and `change_device_state`
+wrote their own device's `state`/registration `confirmed_at` via bare ORM
+attribute sets, not atomically guarded `UPDATE`s.** Reproduced directly
+(`tests/test_device_lifecycle_registration_integration.py
+::test_concurrent_confirm_racing_manual_reported_to_faulty_exactly_one_
+outcome`, before the fix below): a device ended up `in_service` **and**
+its own registration row **also** `invalidated_at`-set at the same time --
+exactly the "never both" invariant this whole feature exists to prevent,
+because SQLite only serialises two concurrent write transactions at the
+point of each one's *first* write statement, not at its first *read* --
+a plain `record.state = "in_service"` (or `registration.confirmed_at =
+...`) written well after this method's own initial recheck can silently
+overwrite whatever a concurrent transaction committed in between, since
+nothing about that later write re-verifies the row is still in the state
+this method believes it is. **Fixed**: the device-state write and the
+registration-confirm write in `confirm_device`'s phase 2, and the
+device-state write in `change_device_state`, are now all atomically
+guarded `UPDATE ... WHERE <column> = <the value just read>` statements (the
+same "the check and the write must be the same statement" pattern this
+module already applies throughout -- `record_ui_login_success`,
+`_record_wrong_verification_code_attempt`, `remove_device`'s assignment
+close) -- a lost race now raises a clear `ValueError` instead of silently
+corrupting the row. Two further deterministic tests
+(`test_confirm_device_registration_claim_fails_if_invalidated_mid_call`,
+`test_change_device_state_guard_fails_if_state_changes_mid_call`) force
+each specific guard's own refusal branch via a same-transaction injected
+side effect (documented in each test's own docstring as the honest
+alternative to a genuinely concurrent write, which would simply deadlock
+against this call's own still-open write transaction) -- both guard
+branches are covered on every run, not only probabilistically across the
+real-thread race test's own repeated runs.
+
+Verification for this round (fresh venv, `python3.13 -m venv`,
+`pip install -e ".[dev,fleet,agent]"` -- SQLAlchemy 2.1.1, mypy 2.3.1):
+`ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all clean;
+`python -m pytest -W ignore::ResourceWarning` (664 passed, 99% coverage
+overall, every touched file -- `fleet/storage.py`, `fleet/device_lifecycle
+.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py` -- at 100%); every
+concurrency test in the suite (21 total: P4.2's four, P4.3's one, and this
+round's new ones -- the manual-transition-vs-confirm race, the
+replace_previous-vs-remove_device race, plus the two deterministic
+guard-branch tests) re-run 10x with no flake.
+
+## Prepare device, confirm registration and assign (P4.2, sections 4, 15.3, 20.2, 20.3)
+
+**Decisions by the project owner, 2026-09-26 (do not re-open, see this
+package's own work order):** device-side registration itself (Ed25519 key
+pair, the signed challenge that proves possession of the private key) is
+P4.2b, not this package -- this package only builds the storage-level state
+both P4.2b and the landlord-facing "prepare"/"confirm" UI forms act on, plus
+those two forms themselves (`/ui` routes, P3.0 login + CSRF, same as every
+other inventory action since P4.1). `protocol/` was not touched -- no new
+field was needed; the registration state lives entirely in `fleet/storage.py`
+and never crosses the wire as its own model. `fleet/auth.py`, `fleet
+/ui_auth.py`, `watchdog/`, and `protocol.commands.CommandType` are all
+untouched, per the work order's own constraint.
+
+**Schema (`fleet/migrations/versions/0007_device_registrations.py`,
+`down_revision` `"0006"`).** One new table, `device_registrations` --
+**one row per preparation cycle**, not one row per device, so the full
+history of every attempt stays queryable (via `inventory_audit_log` for the
+device-level actions, and directly on this table for the rest), never
+overwritten in place: `device_id` (no `ForeignKey`, mirroring
+`assignments.device_id`/`apartment_id`'s own established "plain indexed
+string column, not a declared FK" pattern from `0006_inventory.py`),
+`code_hash` (SHA-256 of the one-time registration code -- **the code itself
+is never stored**, mirroring `apartments.token_hash`/`hash_token` exactly),
+`created_at`/`expires_at` (24 hours, section 4), `used_at` (set once by
+`record_device_report`), `public_key`/`verification_code`/`reported_at`
+(filled together by `record_device_report` -- P4.2b's own entry point, see
+below), `confirmed_at`/`confirmed_by`/`apartment_id` (filled by
+`confirm_device`), `failed_confirmation_attempts` (incremented on a wrong
+verification code), `invalidated_at` (set either by a later `prepare_device`
+call superseding this row, or by `confirm_device` after the fifth wrong
+attempt), `token_issued_at` (filled by P4.2b once it actually issues a
+token against this confirmed registration -- always `NULL` in this package,
+since that package does not exist yet). **"At most one active preparation
+per device", enforced at the database level** (work order's own explicit
+instruction): a partial unique index on `device_id` `WHERE invalidated_at
+IS NULL AND confirmed_at IS NULL` -- "active" deliberately does *not* also
+exclude an expired-but-not-yet-invalidated row, since `prepare_device`
+always invalidates any earlier active row in the same transaction before
+inserting a new one, so this index never actually has to arbitrate between
+two rows both claiming to be current; expiry itself is checked at read time
+(`record_device_report`/`confirm_device`), the same "derived, not enforced
+via a background job" choice `HeartbeatRecord`'s "outdated version" flag
+already made (P1.3).
+
+**Storage (`fleet/storage.py`, new "-- device registration: prepare / report
+/ confirm --" section), all unit-tested directly against a real, migrated
+SQLite database, including under concurrency:**
+
+- **`prepare_device(device_id, *, ui_username, confirmed_reset, now)`** --
+  eligible from `registered` or `in_storage` only (any other state raises
+  `ValueError`); **`in_storage` additionally requires `confirmed_reset=True`**
+  (section 20.3 rule 2's "explicit confirmation" applied at the point a
+  device's slate is wiped for a new registration cycle -- the "Gerät wurde
+  zurückgesetzt" form checkbox, never silently assumed). Invalidates any
+  earlier active preparation for the device in the same transaction, moves
+  the device to `prepared`, and returns the raw registration code **exactly
+  once** -- only its SHA-256 hash is ever persisted.
+- **`record_device_report(registration_code, public_key, verification_code,
+  now)`** -- P4.2b's own entry point (15.3 step 2), **implemented here so
+  that package only has to add the HTTP/crypto layer on top**. One-time:
+  marks the code used, stores the public key and verification code, moves
+  the device to `reported`. **Every failure is indistinguishable to the
+  caller** (a plain `bool`) -- unknown, expired, invalidated, and
+  already-used codes all return `False`, never a message that could tell
+  an attacker which reason applies. **Atomic under concurrency**: the guard
+  (`used_at IS NULL`, not invalidated, not expired) is folded into the
+  `UPDATE ... WHERE ...` itself (mirroring `record_ui_login_success`'s "the
+  check and the write must be the same statement"), not a separate `SELECT`
+  beforehand -- proven with 8 threads reporting the same code concurrently:
+  exactly one gets `True`, the other seven `False`.
+- **`confirm_device(device_id, apartment_id, verification_code, *, ui_user,
+  reason, replace_previous, previous_device_target_state, now)`** -- "only
+  this confirmation releases the configuration" (15.3 step 3). Rules
+  enforced, in order: device must be `reported` with an active registration;
+  **verification code compared with `hmac.compare_digest`** (constant
+  time); apartment must exist and not be `retired`; **a device with an open
+  assignment elsewhere can never be confirmed** (checked explicitly, not
+  only relied upon via the partial unique index further down); if the
+  apartment already has an open assignment, confirmation requires
+  `replace_previous=True` **and** a valid `previous_device_target_state`
+  (`faulty` or `in_storage`) -- "never silently" (section 20.3 rule 1).
+  **A wrong verification code increments `failed_confirmation_attempts` and,
+  after the fifth wrong attempt (`Storage._MAX_CONFIRMATION_ATTEMPTS = 5`,
+  not specified numerically by the specification -- decided here, per the
+  work order's own "document the number" instruction), invalidates the
+  registration** -- the device must be prepared again. **That increment is
+  committed as its own, separate transaction** (`_record_wrong_verification_
+  code_attempt`), independent of the overall call's `ValueError` --
+  otherwise the counter's own commit would be rolled back by the same
+  `raise` it exists to survive. Proven atomic under 10 concurrent wrong
+  attempts against one registration: the counter reaches exactly 5, never
+  more, never fewer, and the registration is invalidated exactly once. Once
+  the code is right, **the rest of the confirmation happens in one
+  transaction**: closes the previous assignment (`ended_at`/`reason`), moves
+  the previous device to the chosen state, **revokes the apartment's token**
+  (`token_hash = NULL`, section 15.5's "its token expires"), creates the new
+  assignment (the P4.1 partial unique indexes are the database-level guard
+  against a double assignment), moves this device to `in_service`, and marks
+  the registration confirmed -- **every step audit-logged in that same
+  transaction**. Proven with a real `/v1/heartbeat` request using the old
+  (now revoked) token after a replace-previous confirm: 403, not just an
+  inspected column. Proven atomic under a genuine race, not only argued:
+  two `reported` devices confirmed concurrently to the same (so far
+  unassigned) apartment -- exactly one wins (the partial unique index on
+  `assignments.apartment_id` decides it at the new assignment's own insert,
+  caught as an `IntegrityError` turned `ValueError`), and the loser's own
+  transaction rolled back in full: device still `reported`, registration
+  still unconfirmed, no `state_changed` audit row written for it.
+- **`get_active_registration_for_device`**/**`get_current_assignment_for_
+  device`** -- small, direct read helpers the UI and `confirm_device` share.
+
+**A few defensive rechecks inside `confirm_device`'s second transaction
+(device/registration/apartment re-fetched and re-validated even though
+phase 1 already checked all three) are marked `# pragma: no cover`, each
+with its own comment explaining why**: they guard against a narrow race in
+the gap between this call's own read-only phase 1 and its write phase 2
+(e.g. a concurrent wrong-code attempt invalidating the registration, or an
+apartment retired mid-flight) that SQLite's own transaction timing makes
+impractical to hit deterministically without an artificially injected pause
+between the two phases -- CLAUDE.md's own "a line only reachable through an
+artificial construction" reasoning. The two *reachable* races (the wrong-
+verification-code counter, and two devices/the same device confirmed to one
+apartment concurrently) are proven with real concurrent threads, not
+skipped -- see above.
+
+**UI (`fleet/ui_routes.py`, `fleet/ui_inventory.py`, `fleet/templates/ui/
+inventory_device_{prepare,prepared,confirm}.html`), behind `require_ui_user`,
+CSRF-checked on every POST, `Cache-Control: no-store`, no inline
+style/script, the registration code never logged (checked directly via
+`caplog`) and never stored in plain text:**
+
+- **`GET`/`POST /ui/inventory/devices/{id}/prepare`** -- the "Vorbereiten"
+  form/result. The result page shows the raw code **exactly once**, plus the
+  content for `agent-registration.json` (section 15.3/19.5:
+  `protocol.registration.AgentRegistrationFile`'s `fleet_address`,
+  `certificate_fingerprint`, `registration_code`) -- **address and
+  fingerprint come from two new environment variables, `FLEET_PUBLIC_URL`
+  and `FLEET_CERT_FINGERPRINT`, deliberately with no default** (CLAUDE.md:
+  "nothing hard-coded"; no plausible placeholder exists that would not
+  itself look like a real deployment's configuration). If either is unset,
+  the page shows a clear German hint instead of inventing a value -- proven
+  by `tests/test_ui_device_registration.py
+  ::test_prepare_submit_without_fleet_env_vars_shows_a_hint`.
+  `fleet/inventory.html`'s device listing gained a "Vorbereiten" link per
+  eligible device (`registered`/`in_storage` only).
+- **`GET /ui/inventory/devices/confirm`** -- the "Bestätigen" listing:
+  every `reported` device, with a *display* fingerprint
+  (`fleet.ui_inventory._display_fingerprint`, `hashlib.sha256(public_key)`
+  truncated -- a human eyeball aid only, **never the actual security
+  check**, which is `confirm_device`'s own constant-time verification-code
+  comparison) and its report time -- **never the verification code itself**
+  (work order's explicit instruction). Each row's own inline form: apartment
+  select (retired apartments excluded, a UI convenience -- `confirm_device`
+  already refuses one anyway, offering it would only ever produce a failing
+  submission), verification-code input, `reason`, a `replace_previous`
+  checkbox, and a `previous_device_target_state` select (`in_storage`/
+  `faulty`).
+- **`POST /ui/inventory/devices/{id}/confirm`** -- applies one device's
+  confirmation. Every rule (wrong code, retired apartment, "replace_previous"
+  required, device already assigned elsewhere) is enforced by
+  `Storage.confirm_device` itself; this route only turns its `ValueError`
+  into a re-rendered 400 with the message, plus its own empty-code/empty-
+  reason/over-length-reason checks before ever calling `Storage`, the same
+  pattern every other form in `fleet/ui_routes.py` already follows.
+
+**Route naming deviates from `docs/implementation_plan.md`'s original
+sketch, noted there and here.** The plan first sketched
+`/ui/inventory/apartments/{id}/confirm-device`; the actual work order asked
+for a single listing of every `reported` device with one confirmation form
+each (a landlord does not necessarily know in advance which apartment a
+freshly reported device belongs to -- that is exactly what the form asks
+them to choose), which fits this package's own `/ui/inventory/devices/...`
+path (parallel to `.../devices/{id}/prepare`), not a per-apartment one.
+
+**Tests.** `tests/test_device_registration.py` (new, 35 tests, storage-level
+only, against a real, migrated SQLite database): every `prepare_device`/
+`record_device_report`/`confirm_device` rule named above, both the
+non-obvious concurrency proofs, the constant-time-compare check (`hmac
+.compare_digest` spied via `monkeypatch`), and one HTTP-level test
+(`test_confirm_device_with_replace_previous_revoked_token_gets_403_on_a_
+real_request`) that hits a real `/v1/heartbeat` with the just-revoked token.
+`tests/test_ui_device_registration.py` (new, 25 tests) -- auth/CSRF on every
+new route, the code-shown-once-and-never-logged proof, the env-var hint vs.
+content cases, wrong code/empty reason/over-length reason/apartment-already-
+assigned-without-replace all re-rendering with a 400 and a German message,
+successful prepare/confirm, XSS escaping, and the security headers
+(`Content-Security-Policy`, `X-Frame-Options`, `Referrer-Policy`,
+`Cache-Control: no-store`). `fleet/storage.py`, `fleet/ui_inventory.py`, and
+`fleet/ui_routes.py` are all at 100% coverage for this round (the handful of
+narrow-race defensive rechecks noted above are the only lines excluded, each
+with its own `# pragma: no cover` reason).
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+(553 passed, 99% coverage overall); the three concurrency tests
+(`test_record_device_report_two_threads_same_code_exactly_one_wins`,
+`test_confirm_device_wrong_attempts_counter_atomic_under_concurrency`,
+`test_confirm_device_concurrent_confirms_of_two_devices_for_one_apartment_
+exactly_one_wins`, and
+`test_confirm_device_concurrent_confirms_of_the_same_device_exactly_one_
+wins`) re-run 10x with no flake.
+
+**Open points, left for later packages, not invented here:**
+
+- **P4.2b** (device-side registration: Ed25519 key generation, the
+  `/v1/registration/...` endpoint group, the signed-challenge exchange that
+  actually issues a token and fills `DeviceRecord.public_key_fingerprint`/
+  `DeviceRegistrationRecord.token_issued_at`) is not built -- `Storage
+  .record_device_report` exists and is fully tested, but nothing calls it
+  yet except this package's own tests. P4.2b's own work order should read
+  this section before starting -- see also this file's "Cross-review
+  integration: P4.2 x P4.3" section above for the three points made
+  explicit for it (rate limiting, verification-code entropy, and the
+  confirmed-and-bound-key precondition for token issuance).
+- **P4.3** (replace device, change state) was built in parallel on its own
+  branch and merged separately (`docs/implementation_plan.md`) -- see that
+  package's own STATUS.md section below, and the "Cross-review
+  integration: P4.2 x P4.3" section above for how `change_device_state`'s
+  manual transitions now interact with this package's registration state
+  (invalidating it on the relevant transitions).
+- **No "resend"/"view again" for a prepared code that was lost before
+  reaching the device.** The only recovery path is re-preparing the device
+  (which invalidates the lost code and its own boot-partition write) --
+  matches section 4's "the code expires after first use or after 24 hours"
+  read literally: a lost-but-still-valid code is not a state this package
+  builds a recovery UI for, since the code itself was never persisted
+  anywhere to recover.
 ## Remove/replace device, change device state (P4.3, section 20.1-20.3)
 
 **Decisions by the project owner, 2026-09-26 (see this package's own work
@@ -19,7 +448,11 @@ device to an apartment -- only a link to P4.2's "Vorbereiten" route.
 1. **The manual `DeviceLifecycle` transition table (`fleet/device_lifecycle.py`,
    new module)** -- section 20 gives no explicit transition table; this is
    a **derived reading**, stated here so it does not stay an unstated
-   assumption:
+   assumption. **Superseded by the extended, eleven-pair table** this
+   package's own original five grew into -- see this file's "Cross-review
+   integration: P4.2 x P4.3" section (above, once both packages were
+   merged together) for the six additional pairs and why they were added;
+   the original five, as this package first built them, were:
 
    | From | To | Reasoning |
    |---|---|---|
@@ -30,7 +463,8 @@ device to an apartment -- only a link to P4.2's "Vorbereiten" route.
    | `faulty` | `decommissioned` | retiring a broken device outright, no reuse |
 
    Every other one of the 49 possible `(current, target)` pairs is
-   **refused**, in particular:
+   **refused** (38 of them, after the extension above; 44 in this
+   package's own original five-pair table), in particular:
    - `in_service -> *` is not in the table **at all** -- the only way out
      of `in_service` is `Storage.remove_device` (below), which closes the
      assignment, revokes the token, and sets the new state together,
@@ -132,17 +566,15 @@ no-store`, no inline style/script, German texts:**
   currently has a device assigned (`fleet.ui_inventory.ApartmentRow
   .replace_device_href`, `None` -- no link rendered -- otherwise).
 
-**Integration note for P4.2 (built in parallel, not yet merged at the time
-this package was written): decommissioning must also invalidate any
-pending registration.** The work package's own instruction: "if P4.2's
-table exists at merge time the main session will wire it; for now document
-that P4.2 must honour `decommissioned`." Not built here -- P4.2 owns its
-own registration-code table (migration `0007`) and did not exist in this
-worktree's branch history at the time P4.3 was implemented. `Storage
-.change_device_state`'s docstring and this note are the hand-off; the main
-session should add "decommissioning a device with a pending registration
-also invalidates that registration" to P4.2's own storage method, or add a
-narrow cross-check here, once both branches are merged together.
+**Integration note for P4.2, resolved.** This section originally read:
+"built in parallel, not yet merged at the time this package was written --
+decommissioning must also invalidate any pending registration ... not built
+here ... the main session should add this once both branches are merged
+together." **Done** -- see this file's "Cross-review integration: P4.2 x
+P4.3" section above: `Storage.change_device_state` now calls `Storage
+._invalidate_active_registration` whenever a transition leaves `prepared`/
+`reported` or lands on `decommissioned`, in the same transaction, with its
+own audit row.
 
 **Invariant checked directly, not just assumed: a `decommissioned` device
 has no open assignment, so there is no token to revoke via this path.**

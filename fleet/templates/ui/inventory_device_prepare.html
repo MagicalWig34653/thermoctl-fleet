@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}Gerät vorbereiten – thermoctl-fleet{% endblock %}
+
+{% block content %}
+{# "Vorbereiten" (P4.2, section 20.2 step 2) -- generates a one-time
+   registration code for one device. Already derived by
+   fleet/ui_routes.py::device_prepare_form/device_prepare_submit; this
+   template only iterates and prints. #}
+<h1>Gerät vorbereiten: {{ device.id }}</h1>
+
+{% if error %}
+<p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+<p>Modell: {{ device.model }}, Zustand: {{ device.state }}</p>
+
+<form method="post" action="/ui/inventory/devices/{{ device.id | urlpath }}/prepare">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% if device.state == "in_storage" %}
+    <label>
+        <input type="checkbox" name="confirmed_reset" value="1">
+        Gerät wurde zurückgesetzt (Werkseinstellungen)
+    </label>
+    {% endif %}
+    <button type="submit">Registrierungscode erzeugen</button>
+</form>
+
+<p><a href="/ui/inventory">Zurück zum Inventar</a></p>
+{% endblock %}

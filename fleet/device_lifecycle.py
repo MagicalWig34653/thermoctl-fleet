@@ -49,16 +49,63 @@ section in `docs/STATUS.md`):**
   apartment) is deliberately **not** built here -- the work package's own
   instruction: "belongs to P4.2 (it demands the 'reset' confirmation) --
   not here."
+
+**Extended by P4.2/P4.3 cross-review integration (main session, 2026-09-26,
+also a derived reading of section 20, not a specification quote):** six
+further transitions, all reachable manually before a device has ever been
+placed into service, or after a fault report that turns out to be
+permanent:
+
+- `in_storage -> faulty` -- the symmetric counterpart to `faulty ->
+  in_storage` above: a shelf device found faulty (a battery that will not
+  hold charge, discovered while checking replacement stock) moves the
+  other way too. Both directions are now offered, unlike the original
+  five's deliberate one-way-only choice -- the reasoning that ruled the
+  reverse direction out no longer applies once P4.2's registration state
+  exists to actually invalidate on this exact transition (see below):
+  there is nothing left "in progress" on an `in_storage` device that this
+  transition could silently orphan.
+- `registered -> faulty` -- a device that turns out to be faulty before it
+  was ever even prepared (arrives dead on delivery, fails a bench test).
+- `prepared -> in_storage`, `prepared -> faulty` -- a device prepared (a
+  registration code generated) but never actually deployed: put back on
+  the shelf unused, or found faulty before it ever got as far as
+  registering with the cloud.
+- `reported -> faulty` -- a device that registered with the cloud (15.3
+  step 2) but is discovered faulty before ever being confirmed to an
+  apartment (15.3 step 3) -- e.g. a hardware fault surfaces during the
+  window between the two.
+- `reported -> decommissioned` -- the same "decommission before it is ever
+  placed into an apartment" reasoning the original five already apply to
+  `registered`/`prepared`/`in_storage`/`faulty`, extended to `reported`
+  (a device could reach `reported` and simply never get confirmed, e.g.
+  the wrong device was ordered).
+
+**Every transition that leaves `prepared`/`reported`, and every transition
+into `decommissioned`, invalidates the device's active registration in the
+same transaction as the state change** (`Storage.change_device_state`,
+via `Storage._invalidate_active_registration`) -- a device manually
+reclassified away from an in-progress registration must not leave a
+still-valid registration/verification-code pair around that `Storage
+.record_device_report`/`confirm_device` would otherwise still honor for a
+device no longer in that state, and a decommissioned device (token
+revoked, "permanently out of circulation") must not remain reportable or
+confirmable at all. This module itself stays a pure transition *table* --
+it does not know about registrations; the invalidation rule lives entirely
+in `fleet/storage.py`, keyed off the same `(current, target)` pair this
+module already classifies.
 """
 
 from __future__ import annotations
 
 from protocol.inventory import DeviceLifecycle
 
-# The five manual transitions this package's reading of section 20.1/20.2
+# The eleven manual transitions this package's reading of section 20.1/20.2
 # derives -- see the module docstring for the reasoning behind each one and
 # for why every other one of the 49 possible pairs (including every pair
-# with `in_service` or `decommissioned` as the source) is refused.
+# with `in_service` or `decommissioned` as the source) is refused. The
+# original five (P4.3) plus six more (P4.2/P4.3 cross-review integration,
+# see the module docstring's own "Extended by ..." section).
 ALLOWED_MANUAL_DEVICE_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
     {
         (DeviceLifecycle.FAULTY.value, DeviceLifecycle.IN_STORAGE.value),
@@ -66,6 +113,13 @@ ALLOWED_MANUAL_DEVICE_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
         (DeviceLifecycle.REGISTERED.value, DeviceLifecycle.DECOMMISSIONED.value),
         (DeviceLifecycle.PREPARED.value, DeviceLifecycle.DECOMMISSIONED.value),
         (DeviceLifecycle.FAULTY.value, DeviceLifecycle.DECOMMISSIONED.value),
+        # -- extended by cross-review integration, 2026-09-26 --
+        (DeviceLifecycle.IN_STORAGE.value, DeviceLifecycle.FAULTY.value),
+        (DeviceLifecycle.REGISTERED.value, DeviceLifecycle.FAULTY.value),
+        (DeviceLifecycle.PREPARED.value, DeviceLifecycle.IN_STORAGE.value),
+        (DeviceLifecycle.PREPARED.value, DeviceLifecycle.FAULTY.value),
+        (DeviceLifecycle.REPORTED.value, DeviceLifecycle.FAULTY.value),
+        (DeviceLifecycle.REPORTED.value, DeviceLifecycle.DECOMMISSIONED.value),
     }
 )
 

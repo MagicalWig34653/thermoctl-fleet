@@ -47,10 +47,22 @@ module's own docstring); the "create property" form additionally shows a
 static German hint next to the free-text `notes` field, since a free-text
 column cannot structurally enforce what a landlord chooses to type into it
 the way a typed field can.
+
+**Merged with P4.3 (2026-09-26, cross-review integration).** This module
+now also renders P4.3's "Gerät ausbauen/tauschen" (device swap) and
+"change state" forms (`replace_device_href`/`device_state_href`,
+`ReplaceDeviceView`/`ShelfDeviceRow`, `build_replace_device_view`,
+`DeviceRow.allowed_target_states`/`state_action_href`) alongside P4.2's own
+"Vorbereiten"/"Bestätigen" forms -- both packages extend the same
+`ApartmentRow`/`DeviceRow` shapes rather than each keeping a competing one.
+`build_replace_device_view`'s own "if P4.2 has not merged yet, following
+that link 404s" note no longer applies -- P4.2 is merged, so the shelf link
+it produces (`device_prepare_href`) resolves to a real page now.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -125,10 +137,30 @@ def device_state_href(device_id: str) -> str:
 
 
 def device_prepare_href(device_id: str) -> str:
-    """P4.2's own "Vorbereiten" route -- only ever *linked* to here, never
-    called by this package (see `build_replace_device_view`'s docstring)."""
+    """"Vorbereiten" (P4.2, section 20.2 step 2) -- one action per eligible
+    device (`registered` or `in_storage`, see `_device_row` below), same
+    encoding convention as every other href in this module. Also linked
+    to from P4.3's "Gerät ausbauen/tauschen" shelf listing
+    (`build_replace_device_view`) for each replacement candidate."""
 
     return f"/ui/inventory/devices/{quote(device_id, safe='')}/prepare"
+
+
+def device_confirm_href(device_id: str) -> str:
+    """"Bestätigen" (P4.2, section 20.2 step 4, 15.3 step 3) -- the POST
+    target for one `reported` device's confirmation form."""
+
+    return f"/ui/inventory/devices/{quote(device_id, safe='')}/confirm"
+
+
+# Section 20.2 step 1/2: a device can be prepared straight from `registered`
+# (first-ever preparation) or from `in_storage` (the replacement-device
+# path) -- mirrors `Storage.prepare_device`'s own `_PREPARABLE_DEVICE_STATES`
+# exactly (restated here, not imported, the same "a migration/storage
+# module is not something this UI module imports its own constants back
+# from" separation `MAX_*_LENGTH` above already follows for `0006
+# _inventory.py`'s column lengths).
+_PREPARABLE_DEVICE_STATES = {DeviceLifecycle.REGISTERED.value, DeviceLifecycle.IN_STORAGE.value}
 
 
 @dataclass(frozen=True)
@@ -170,12 +202,46 @@ class DeviceRow:
     acquisition_date: str
     image_version: str
     watchdog_version: str
+    # `None` for a device not eligible to be prepared right now (P4.2,
+    # section 20.2 step 2) -- `fleet/templates/ui/inventory.html` only
+    # shows the "Vorbereiten" link when this is set.
+    prepare_href: str | None
     # P4.3: only the manual transitions `fleet.device_lifecycle` allows
     # *from this device's current state* -- an empty list (e.g. for a
     # `decommissioned` device, a terminal state) means the template renders
     # no state-change form at all for this row.
     allowed_target_states: list[str]
     state_action_href: str
+
+
+@dataclass(frozen=True)
+class ReportedDeviceRow:
+    """One `reported` device on the "Bestätigen" page (P4.2, section 20.2
+    step 4) -- **never the verification code itself** (work order's
+    explicit instruction: the code is compared, never displayed on this
+    listing), only a *display* fingerprint the landlord can eyeball
+    against what the device itself shows (see `_display_fingerprint`
+    below)."""
+
+    device_id: str
+    model: str
+    fingerprint: str
+    reported_at: str
+    confirm_href: str
+
+
+@dataclass(frozen=True)
+class ConfirmView:
+    """Everything `fleet/templates/ui/inventory_device_confirm.html` needs:
+    every `reported` device plus the apartments a landlord may confirm one
+    against. **Retired apartments are left out of this list** (a UI
+    convenience, decided while building this package -- `Storage
+    .confirm_device` already refuses a retired apartment on its own, but
+    offering it in the dropdown at all would only ever produce a failing
+    submission)."""
+
+    rows: list[ReportedDeviceRow]
+    apartments: list[ApartmentRecord]
 
 
 @dataclass(frozen=True)
@@ -238,9 +304,64 @@ def _device_row(device: DeviceRecord) -> DeviceRow:
         acquisition_date=device.acquisition_date.isoformat(),
         image_version=device.image_version,
         watchdog_version=device.watchdog_version,
+        prepare_href=(
+            device_prepare_href(device.id) if device.state in _PREPARABLE_DEVICE_STATES else None
+        ),
         allowed_target_states=allowed_manual_target_states(device.state),
         state_action_href=device_state_href(device.id),
     )
+
+
+def _display_fingerprint(public_key: str) -> str:
+    """A short, human-comparable fingerprint derived from the public key a
+    device reported (P4.2b, not this package, eventually fills `Device
+    Record.public_key_fingerprint` itself, only once the signed challenge
+    is verified) -- computed the same way `fleet.storage.hash_token` hashes
+    every other secret-shaped value in this codebase, truncated for
+    display. **This is a display aid only, never the actual security
+    check** (`Storage.confirm_device`'s constant-time verification-code
+    comparison is) -- it lets a landlord eyeball this against whatever the
+    device itself shows, nothing more."""
+
+    return hashlib.sha256(public_key.encode("utf-8")).hexdigest()[:16]
+
+
+def build_confirm_view(storage: Storage) -> ConfirmView:
+    """Everything the "Bestätigen" page (P4.2, section 20.2 step 4) needs:
+    every device currently `reported`, with its active registration's
+    display fingerprint and report time -- **never its verification code**
+    (work order's explicit instruction) -- plus every non-`retired`
+    apartment to offer in the form's dropdown."""
+
+    rows: list[ReportedDeviceRow] = []
+    for device in storage.list_devices():
+        if device.state != DeviceLifecycle.REPORTED.value:
+            continue
+        registration = storage.get_active_registration_for_device(device.id)
+        if registration is None or registration.public_key is None:
+            # Defensive only -- `record_device_report` never moves a device
+            # to `reported` without also filling these on the very same row
+            # (see that method's own docstring), so this branch should be
+            # unreachable in practice.
+            continue  # pragma: no cover -- see comment above
+        rows.append(
+            ReportedDeviceRow(
+                device_id=device.id,
+                model=device.model,
+                fingerprint=_display_fingerprint(registration.public_key),
+                reported_at=(
+                    registration.reported_at.isoformat() if registration.reported_at else ""
+                ),
+                confirm_href=device_confirm_href(device.id),
+            )
+        )
+
+    apartments = [
+        apartment
+        for apartment in storage.list_apartments()
+        if apartment.state != ApartmentState.RETIRED.value
+    ]
+    return ConfirmView(rows=rows, apartments=apartments)
 
 
 def build_inventory_view(storage: Storage, device_filter: str | None) -> InventoryView:
@@ -306,10 +427,10 @@ def build_replace_device_view(storage: Storage, apartment_id: str) -> ReplaceDev
     no assignment is made here** (project owner decision, 2026-09-26: "the
     new device of a swap always goes through P4.2's prepare/confirm flow --
     'no release without a confirmed verification code' (20.3) -- so this
-    work package never assigns a device to an apartment"). If P4.2 has not
-    merged yet, following that link 404s -- expected, not a bug in this
-    package (see `docs/STATUS.md`'s P4.3 section for the integration
-    note)."""
+    work package never assigns a device to an apartment"). P4.2 is merged
+    (see its own STATUS.md section), so this link now resolves to a real
+    page.
+    """
 
     apartment = storage.get_apartment(apartment_id)
     if apartment is None:
@@ -355,14 +476,18 @@ __all__ = [
     "MAX_REASON_LENGTH",
     "MAX_VERSION_LENGTH",
     "ApartmentRow",
+    "ConfirmView",
     "DeviceRow",
     "InventoryView",
     "PropertyGroup",
     "ReplaceDeviceView",
+    "ReportedDeviceRow",
     "ShelfDeviceRow",
     "apartment_href",
+    "build_confirm_view",
     "build_inventory_view",
     "build_replace_device_view",
+    "device_confirm_href",
     "device_prepare_href",
     "device_state_href",
     "inventory_edit_href",
