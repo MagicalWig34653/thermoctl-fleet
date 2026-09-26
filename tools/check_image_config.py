@@ -107,6 +107,15 @@ def check_watchdog_unit(path: Path) -> None:
         raise ImageError(f"{path}: watchdog unit is missing.")
 
 
+def check_leds_unit(path: Path) -> None:
+    """Checks that the status-LED program's systemd unit exists (P5.7,
+    section 23, "Decided afterward") -- same reasoning and same shape as
+    `check_watchdog_unit` above, for the separate program's own unit."""
+
+    if not path.is_file():
+        raise ImageError(f"{path}: thermoctl-leds unit is missing.")
+
+
 def check_agent_compose_file(path: Path) -> None:
     """Checks the fixed compose file the watchdog re-applies on every swap
     (P5.6, cross-review R5) -- not a real YAML parse (no third-party
@@ -134,6 +143,7 @@ def check_all(root: Path = IMAGE_DIR) -> None:
     check_udev_rule(common / "udev" / "99-zigbee-stick.rules")
     check_agent_registration_template(common / "agent-registration.empty.json")
     check_watchdog_unit(root.parent / "watchdog" / "thermoctl-watchdog.service")
+    check_leds_unit(root.parent / "watchdog" / "cmd" / "thermoctl-leds" / "thermoctl-leds.service")
     check_agent_compose_file(common / "agent-compose.yml")
 
 

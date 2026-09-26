@@ -24,7 +24,10 @@ Entirely missing:
 - a pi-gen configuration (a `config` file plus its own stage) that installs
   `image/common/packages.txt`, applies `image/common/udev/` and
   `image/common/unattended-upgrades/`, copies and enables the watchdog unit
-  from `../../watchdog/thermoctl-watchdog.service`, and places
+  from `../../watchdog/thermoctl-watchdog.service` and the status-LED
+  program's unit from
+  `../../watchdog/cmd/thermoctl-leds/thermoctl-leds.service` (section 23,
+  P5.7), and places
   `image/common/agent-registration.empty.json` on the boot partition as
   `agent-registration.json`,
 - preloading the agent container image (section 19.3),

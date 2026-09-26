@@ -18,6 +18,7 @@ from tools.check_image_config import (
     check_agent_compose_file,
     check_agent_registration_template,
     check_all,
+    check_leds_unit,
     check_package_list,
     check_udev_rule,
 )
@@ -67,6 +68,11 @@ def test_agent_registration_template_with_missing_field_is_rejected(
 
     with pytest.raises(ImageError):
         check_agent_registration_template(path)
+
+
+def test_leds_unit_missing_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ImageError):
+        check_leds_unit(tmp_path / "does-not-exist.service")
 
 
 def test_agent_compose_file_missing_is_rejected(tmp_path: Path) -> None:

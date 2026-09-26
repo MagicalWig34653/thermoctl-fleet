@@ -83,8 +83,15 @@ file's comment for the reasoning why it lives there and not in `pytest` or
   "Fallback without a proven revision").
 - `Reconcile` ties detecting the agent's end (step 3), starting what is
   needed (step 4), and the two functions above (step 5) into one pass, and
-  returns an `Outcome` -- the single hook P5.7 needs to drive `leds.go`
-  without touching this decision again. `desired == proven` skips the
+  returns an `Outcome`. **P5.7 (section 23) ended up not using this return
+  value**: the project owner decided afterward that the status LEDs are
+  driven by a separate small program, `cmd/thermoctl-leds/`, reading its
+  own local files (state file, health report, the P5.0 registration status
+  file, and a new agent-written status file) directly, rather than
+  observing this process's in-memory `Outcome` -- see that program's own
+  README section for the reasoning and `docs/STATUS.md`'s P5.7 entry.
+  `Outcome` stays as documentation of what one pass decided; nothing here
+  reads it back. `desired == proven` skips the
   await/rollback dance entirely: there is no different digest to fall back
   to, so the agent is simply started when stopped. A container already
   running the desired digest, but not yet proven, re-enters the
@@ -143,3 +150,59 @@ resuming mid-window.
 
 `check_contract.sh` and the state/health file format are unchanged by this
 task -- no new file, no new line in either format.
+
+## `cmd/thermoctl-leds/` -- the status LEDs (section 23, P5.7)
+
+**Not the watchdog itself.** The implementation plan originally had P5.7
+wire section 23's two LEDs directly into `watch.go`'s `Reconcile`, but the
+project owner decided afterward (2026-09-26, see
+`docs/specification.md` section 23's own "Decided afterward" paragraph)
+that they are driven by a **separate small program in this same module**
+instead: `cmd/thermoctl-leds/`, its own `go build ./cmd/thermoctl-leds`,
+its own systemd unit (`thermoctl-leds.service`, next to the binary's code,
+same placement convention as `thermoctl-watchdog.service`). Two reasons:
+the watchdog's own 300-line budget had only one line of headroom left
+after P5.6 (`docs/STATUS.md`), and -- the more important one -- a bug in
+LED-driving code must never be able to reach the process whose only job is
+swapping and rolling back the agent reliably. Building `.` in `watchdog/`
+still produces only the watchdog binary, unchanged; `cmd/thermoctl-leds`
+is a second, independent `main` package the same `go.mod` (no
+dependencies either) also covers.
+
+**Shared code:** `internal/ledsysfs` (`LedPresent`, `ApplyPattern`) is what
+used to be `watchdog/leds.go`/`leds_test.go`, moved -- not duplicated --
+into an internal package once the watchdog itself stopped needing it. The
+watchdog's own line count therefore **went down**, not merely "did not
+grow": removing `leds.go` (19 statement lines) and its test took the seven
+production files from **299** to **280** statement lines before
+`cmd/thermoctl-leds` added anything of its own (that program's files are
+no longer part of the watchdog's own budget at all, being a separate `go
+build` target) -- see `docs/STATUS.md`'s P5.7 entry for the exact
+before/after count of both programs.
+
+**Inputs, all local files, never a network:**
+
+- the watchdog's own state file and health report (unchanged formats,
+  `state.go`/`health.go` above) -- re-parsed by `cmd/thermoctl-leds/inputs
+  .go`'s own small copy of the key-value-line reader, not by importing
+  `state.go`/`health.go` directly: those live in `package main` at this
+  module's root, and a `main` package cannot be imported by another
+  program in the same module. Duplication forced by that package
+  boundary, not a shortcut -- kept to the same handful of lines the
+  original already was.
+- `agent/registration.py`'s `registration_status` file (P5.0): `status=`
+  drives the "waiting for assignment" fast blink.
+- a **new** agent-written status file for what only the agent can know --
+  format, staleness window, and precedence rules documented in
+  `cmd/thermoctl-leds/decide.go` and `docs/STATUS.md`'s P5.7 entry, and
+  written on the Python side by `agent.loop.report_led_status` (covered by
+  `tests/test_watchdog_contract.py` and this package's own
+  `check_contract.sh` extension).
+
+**Missing LED driver (section 23.3, "Raspberry Pi only"):** checked once
+at startup (`ledPresentEither`), same as the watchdog's own `LedPresent`
+used to be checked per call -- if neither of the two sysfs files exists at
+all, the program logs one line and exits cleanly (exit 0) instead of
+looping forever for nothing; `thermoctl-leds.service` uses
+`Restart=on-failure`, not `Restart=always`, so that clean exit is not
+treated as a crash to restart.

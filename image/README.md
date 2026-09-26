@@ -21,7 +21,11 @@ log-in-memory setting, and the empty `agent-registration.json` template for
 the boot partition. The watchdog's systemd unit is **not** duplicated here
 -- it lives with its code at
 [`../watchdog/thermoctl-watchdog.service`](../watchdog/thermoctl-watchdog.service)
-and is copied into both images at build time.
+and is copied into both images at build time. The status-LED program's own
+unit (section 23, P5.7) follows the same rule, next to *its* code at
+[`../watchdog/cmd/thermoctl-leds/thermoctl-leds.service`](../watchdog/cmd/thermoctl-leds/thermoctl-leds.service)
+-- both units are copied into both images the same way, at the same build
+step.
 
 **Why exactly these two targets and not Alpine:** Raspberry Pi OS *is*
 Debian. One recipe, two targets, one maintenance path -- the same package

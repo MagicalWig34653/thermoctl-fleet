@@ -30,6 +30,10 @@ Entirely missing:
   `../../watchdog/thermoctl-watchdog.service`, placing
   `agent-registration.empty.json` on the boot partition as
   `agent-registration.json`,
+  (the status-LED program's own unit, section 23/P5.7, is *not* enabled on
+  this target -- a mini PC has no 40-pin header, section 23.3, and the
+  program itself exits cleanly at startup if it were ever installed
+  anyway, so simply not shipping it here is the tidier choice),
 - the EFI boot partition and bootloader configuration,
 - preloading the agent container image,
 - compression, checksumming, connection to `v*` tags -- as with `image/pi/`.

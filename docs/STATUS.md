@@ -2,6 +2,176 @@
 
 Last updated: 2026-09-26.
 
+## P5.7 -- status LEDs as a separate program next to the watchdog (section 23)
+
+**Decision by the project owner, 2026-09-26 (do not re-open, see the task's
+own work order):** the two status LEDs are driven by a **separate, small
+Go program**, `watchdog/cmd/thermoctl-leds/`, in the same module as the
+watchdog but its own `go build` target -- **not** by the watchdog itself
+as the implementation plan originally had it (P5.6's own entry above,
+"P5.7 is next..."). Two reasons, both already in
+`docs/specification.md` section 23's own "Decided afterward" paragraph:
+P5.6's cross-review left the watchdog only **one line of headroom** before
+its 300-line budget (section 18.3), and -- the more important one -- a bug
+in LED-driving code must never be able to reach the one process whose job
+is swapping and rolling back the agent reliably.
+
+**Watchdog line count: went down, not just "did not grow".**
+`watchdog/leds.go`/`leds_test.go` (the still-unimplemented `LedSetPattern`
+stub from the scaffold) are gone from the watchdog's own package --
+**moved**, not duplicated, into `watchdog/internal/ledsysfs`
+(`LedPresent`, `ApplyPattern`, now actually implemented against the
+kernel `timer` trigger, section 23.1). The watchdog's own six production
+files (`main.go`, `watch.go`, `state.go`, `health.go`, `linefile.go`,
+`runtime.go` -- `leds.go` no longer one of them) are unchanged in content
+and went from **299 to 280 statement lines** purely by that removal,
+measured with the same command as P5.6's own count: `grep -v '^\s*//' <file>
+| grep -v '^\s*$' | wc -l`, summed. `go vet ./...` clean, `go test
+-count=1 ./...` green, `gofmt -l .` empty, `grep -c require go.mod` still
+`0`, `check_contract.sh` still passes (extended, see below).
+
+**`cmd/thermoctl-leds/` itself: 288 statement lines** across `main.go`
+(31), `loop.go` (65), `inputs.go` (130, after factoring the four
+`loadXxx` functions through a generic `loadOptional[T any]` the same way
+`watchdog/linefile.go::openAndParse` already does for the watchdog's own
+`LoadState`/`ReadHealth`), `decide.go` (62); plus `internal/ledsysfs`'s
+own **65** statement lines. None of this counts against the watchdog's
+300-line budget -- it is a separate binary, built with its own `go build
+./cmd/thermoctl-leds`, and the task set no line limit for it beyond
+"small", which this is, given four input file formats, precedence rules,
+and a staleness check to implement.
+
+**Inputs, all local files, no network (section 23.1's own "no single
+dependency" point applied here too):**
+
+1. The watchdog's own state file (`desired`, `since`) and health report
+   (`timestamp`, `digest`) -- unchanged formats, re-parsed by this
+   program's own small key-value-line reader (duplicated from
+   `watchdog/linefile.go`, not imported: `state.go`/`health.go` live in
+   `package main` at the watchdog's module root, and a `main` package
+   cannot be imported by a second program in the same module).
+2. P5.0's `registration_status` file (`agent/registration.py
+   ::_write_status`, branch `p5.0-agent-transport`, read there since main
+   does not have it yet): `status=waiting_for_assignment` drives LED 1's
+   fast blink (section 15.3's verification code step); any other value,
+   or the file's absence, does not.
+3. **New: the agent-written status file** for the three things only the
+   agent loop can know -- `agent.loop.report_led_status` (new function,
+   this task) writes it, line-based like the other three:
+   ```
+   timestamp=<unix seconds>
+   cloud_contact=ok|lost
+   fault=none|open
+   control=ok|stalled
+   ```
+   No fixed path is hard-coded in `report_led_status` itself (same rule as
+   `report_watchdog_state`/`report_health`); `cmd/thermoctl-leds`'s own
+   `-agent-status-file` flag defaults to `/run/thermoctl-agent-led-
+   status.env` -- under `/run/`, like the health report, because it is a
+   live status snapshot, not persisted state that should survive a reboot
+   stale.
+
+**Staleness (documented threshold: 3x the heartbeat interval, 120s ->
+360s, `cmd/thermoctl-leds`'s own `-stale-after` flag, overridable):**
+applies to the **two periodic reports** (health report, agent status
+file) via their own embedded `timestamp`, exactly the way
+`watchdog/watch.go::AwaitHealthReport` already reads the health report's
+timestamp against a deadline -- an aged-out report is treated as unknown,
+never as "still good": LED 1 falls back to slow blink ("not yet healthy"),
+LED 2 to slow blink as well (reusing its own "open fault" pattern as the
+more cautious of its three defined ones, since section 23.2 defines no
+fourth "unknown" pattern for LED 2 and falling back to "off" would itself
+read as a stale "no fault"). The watchdog's state file and P5.0's
+registration status file are **not** subject to this window: both change
+only on real transitions (a new desired digest; registered/assigned), not
+on a periodic cadence, so there is no heartbeat interval to measure their
+age against -- a device can sit in "waiting for assignment" for days
+without a fresh write and must still show the fast-blink pattern.
+
+**Precedence, most specific first:**
+
+- LED 1 (device, green): waiting-for-assignment overrides everything ->
+  agent not healthy (state/health missing, stale, wrong digest, or a
+  health report that predates the current desired revision, section
+  22.3's own "an older report does not count" read the same way here) or
+  agent-status unknown -> slow blink -> healthy but `cloud_contact=lost`
+  -> two short blinks -> otherwise steady on. "Agent healthy" is defined
+  identically to `AwaitHealthReport`'s own success condition
+  (`health.Digest == state.Desired && health.Timestamp >= state.Since`),
+  independently re-derived from the same two files rather than reading
+  the watchdog's in-memory `Outcome` (which is never persisted to disk,
+  and therefore not a "local file" input in the task's own sense).
+- LED 2 (system, yellow): agent-status unknown -> slow blink -> control
+  stalled -> steady on (ranked above a merely open fault, the more severe
+  condition) -> open fault -> slow blink -> otherwise off. Independent of
+  LED 1's registration/health state -- section 23.2's own table for LED 2
+  draws no such distinction.
+
+**"Two short blinks, pause" is an approximation, documented, not an
+oversight:** the kernel `timer` trigger exposes exactly one on/off period,
+not a sequence, so a true grouped double-flash would need either a
+software blink loop in this program (defeating the very reason section
+23.1 chose the kernel trigger: the display keeps blinking even if this
+program is briefly delayed) or the kernel's separate `pattern` trigger,
+whose presence is not guaranteed the way `timer`'s is. Implemented instead
+as a distinct rhythm (100ms on, 700ms off) that is clearly different by
+ear and eye from the continuous, even "fast blink" (100ms on, 100ms off,
+"waiting for assignment") -- `internal/ledsysfs`'s own test proves all
+three timer-driven patterns render distinguishable periods.
+
+**Missing LED driver (section 23.3, "Raspberry Pi only"):** checked once
+at startup (`ledPresentEither`), not on every poll -- if neither of the
+two sysfs brightness files exists, the program logs one line and exits
+cleanly (exit 0); `thermoctl-leds.service` uses `Restart=on-failure`
+rather than `Restart=always` so that clean exit is not treated as a crash
+worth restarting. A per-LED check (`ledsysfs.ApplyPattern`'s own
+`LedPresent` guard) still covers the case of only one of the two files
+existing.
+
+**Tests:** Go -- `internal/ledsysfs`: LED present/missing, unknown
+pattern rejected, off/steady-on write the right trigger+brightness, all
+three timer patterns write "timer" plus pairwise-distinct delay pairs.
+`cmd/thermoctl-leds`: every state of section 23.2's two tables via table
+tests (`decide_test.go`), precedence (waiting-for-assignment overriding
+health; control-stalled outranking open-fault), staleness (injected
+clock, `testNow`/`time.Unix` fixtures, no real sleeping), missing input
+files (`inputs_test.go`, `loadOptional` returns `nil, nil`), missing LED
+driver end to end (`loop_test.go`), a full healthy-device pass writing
+real sysfs file contents, and `-check-mode`'s own uppercase-key output
+(mirroring `watchdog/main.go::runCheckMode`). Python --
+`tests/test_watchdog_contract.py`: `report_led_status` writes all four
+fields, atomic write (no leftover `.tmp`), overwrite semantics.
+`watchdog/check_contract.sh` extended: Python writes the new file,
+`thermoctl-leds -check-mode` reads it back, values compared -- the same
+cross-language sequence as the state/health files, now covering three
+files and two Go binaries. `tools/check_image_config.py` gained
+`check_leds_unit` (mirrors `check_watchdog_unit`), `image/README.md`,
+`image/common/README.md`, `image/pi/README.md` note the second unit
+copied at build time next to the watchdog's; `image/x86/README.md` notes
+it is deliberately *not* enabled there (no 40-pin header, section 23.3).
+
+**CI (`.github/workflows/go.yml`):** the `build` job now also builds
+`cmd/thermoctl-leds` for `amd64`/`arm64` (`CGO_ENABLED=0`, static, with a
+checksum, same as the watchdog binary) and uploads it as its own
+artifact; `contract-test` builds both binaries via the extended
+`check_contract.sh`. No trigger paths changed (`watchdog/**` already
+covers the new `cmd/`/`internal/` subdirectories).
+
+**Verification:** `watchdog/`: `go vet ./...` clean, `go test -count=1
+./...` green across all three packages, `gofmt -l .` empty, `bash
+check_contract.sh` passes, `grep -c require go.mod` is `0`. Cross-compiled
+both binaries for `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0`
+directly (not only via CI) to confirm the build step CI will run.
+Root, fresh `python3.13 -m venv` + `pip install -e ".[dev,fleet,agent]"`:
+`ruff check .` clean, `mypy .` clean (61 source files), `python -m
+tools.check_image_config` passes, `python -m pytest -W
+ignore::ResourceWarning` **734 passed**, 99% overall coverage (the two
+newly-uncovered lines in `tools/check_image_config.py`, `main()`'s own
+body and one pre-existing branch of `check_watchdog_unit`, are unrelated
+pre-existing gaps, not introduced by this task -- `main()` was already
+only exercised as an entry point, `# pragma: no cover`'d at its `if
+__name__` guard, same as before).
+
 ## `PROTOCOL_VERSION` bump to 2 for the P4.2b registration models (main
 session)
 

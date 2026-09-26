@@ -19,7 +19,11 @@ its code at
 A copy in two places in the same repository would be exactly the kind of
 double maintenance this repository avoids everywhere else (see `README.md`,
 "One repository, two images"); the build step in `pi/` and `x86/` instead
-copies it from there into the image.
+copies it from there into the image. The status-LED program's unit
+(section 23, P5.7 -- a separate small program next to the watchdog, see
+`docs/specification.md` section 23's "Decided afterward") follows the
+same rule, with its code at
+[`../../watchdog/cmd/thermoctl-leds/thermoctl-leds.service`](../../watchdog/cmd/thermoctl-leds/thermoctl-leds.service).
 
 ## What else belongs in both images per section 19.3
 

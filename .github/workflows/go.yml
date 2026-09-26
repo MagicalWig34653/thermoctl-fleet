@@ -37,8 +37,12 @@ jobs:
 
   # Statically built (CGO_ENABLED=0), one binary each for arm64 and amd64,
   # with a checksum -- exactly the condition from section 18.3. Nothing is
-  # compiled on the device; these two files are what later goes into the
-  # prepared image (image/) (section 19.3, 19.4).
+  # compiled on the device; these files are what later goes into the
+  # prepared image (image/) (section 19.3, 19.4). thermoctl-leds (P5.7,
+  # section 23, "Decided afterward") is built the same way, from the same
+  # go.mod, as a second binary -- it lives in the same module but is not
+  # part of the watchdog's own 300-line budget (docs/STATUS.md's P5.7
+  # entry).
   build:
     runs-on: ubuntu-latest
     needs: check
@@ -59,20 +63,34 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: 0
         run: go build -o thermoctl-watchdog-${{ matrix.arch }} .
+      - env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: go build -o thermoctl-leds-${{ matrix.arch }} ./cmd/thermoctl-leds
       - run: sha256sum thermoctl-watchdog-${{ matrix.arch }} > thermoctl-watchdog-${{ matrix.arch }}.sha256
+      - run: sha256sum thermoctl-leds-${{ matrix.arch }} > thermoctl-leds-${{ matrix.arch }}.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: thermoctl-watchdog-${{ matrix.arch }}
           path: |
             watchdog/thermoctl-watchdog-${{ matrix.arch }}
             watchdog/thermoctl-watchdog-${{ matrix.arch }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thermoctl-leds-${{ matrix.arch }}
+          path: |
+            watchdog/thermoctl-leds-${{ matrix.arch }}
+            watchdog/thermoctl-leds-${{ matrix.arch }}.sha256
 
   # The cross-language contract test from section 18.3: Python writes the
   # state file (with the same code that later runs on the device --
   # agent.loop.report_watchdog_state), the built watchdog reads it in check
   # mode. See watchdog/check_contract.sh for the detailed sequence and its
   # comment for the reasoning why this is its own job and not pytest or
-  # go test alone.
+  # go test alone. Extended for P5.7: the script also builds
+  # cmd/thermoctl-leds and checks its reading of the new agent-written
+  # status file (agent.loop.report_led_status) the same way.
   contract-test:
     runs-on: ubuntu-latest
     needs: check
