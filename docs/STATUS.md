@@ -364,6 +364,26 @@ fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
 `fleet/storage.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py`,
 `fleet/app.py`, every migration -- at 100%).
 
+**Cross-review round 2 (2026-09-26) -- one gate failure, environment-
+dependent, fixed.** `fleet/migrations/versions/0006_inventory.py::downgrade`'s
+`tokenless_ids = connection.execute(...).scalars().all()` (added in round
+1's fix, see above) type-checked cleanly in the venv it was written in
+(SQLAlchemy 2.0.54) but failed `mypy .`/`mypy protocol fleet agent tools`
+in a fresh venv built against SQLAlchemy 2.1.1 (both mypy 2.3.1):
+`error: Need type annotation for "tokenless_ids" [var-annotated]` -- a
+newer `CursorResult.scalars().all()` return-type stub apparently no
+longer lets mypy infer the assignment target's type on its own. **Fixed
+with an explicit annotation**, `tokenless_ids: Sequence[str] = (...)`
+(`Sequence` was already imported in this module for the revision-id type
+hints) -- reproduced the failure first (temporarily reverting to the
+unannotated form against the same fresh venv, confirmed the exact error),
+then confirmed the fix resolves it. Re-verified in **two** environments
+this round, not just the one this package was developed in: this
+worktree's existing venv (Python 3.14.6, SQLAlchemy 2.0.54, mypy 2.3.1)
+and a genuinely fresh venv built the same way a reviewer would
+(`python3.13 -m venv ...`, `pip install -e ".[dev,fleet,agent]"` --
+Python 3.13.14, SQLAlchemy 2.1.1, mypy 2.3.1) -- both clean.
+
 **Open points, left for later packages, not invented here:**
 
 - **P4.2/P4.2b/P4.3** (prepare/confirm/replace/state, device-side Ed25519

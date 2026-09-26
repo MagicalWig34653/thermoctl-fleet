@@ -256,7 +256,7 @@ def downgrade() -> None:
     apartments_check = sa.table(
         "apartments", sa.column("id", sa.String()), sa.column("token_hash", sa.String())
     )
-    tokenless_ids = (
+    tokenless_ids: Sequence[str] = (
         connection.execute(
             sa.select(apartments_check.c.id).where(apartments_check.c.token_hash.is_(None))
         )
