@@ -1,0 +1,50 @@
+# Example unit for the status-LED program (section 23, "Decided
+# afterward" 2026-09-26). Shipped as part of the prepared system image
+# alongside ../../thermoctl-watchdog.service, same reasoning: updated via
+# the operating system's package management, NOT via the fleet service,
+# NOT a Docker container.
+#
+# Installation (example, not an automated tool -- same reasoning as
+# ../../thermoctl-watchdog.service, see docs/STATUS.md). Assumes the
+# binary built for the target architecture (CI, see
+# .github/workflows/go.yml) is already at
+# /usr/local/bin/thermoctl-leds:
+#   install -m 755 thermoctl-leds-<arch> /usr/local/bin/thermoctl-leds
+#   install -m 644 watchdog/cmd/thermoctl-leds/thermoctl-leds.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now thermoctl-leds.service
+
+[Unit]
+Description=thermoctl status LEDs (section 23, Raspberry Pi only, no network, no registry)
+# Deliberately independent of docker.service/thermoctl-watchdog.service:
+# this program only reads local files the watchdog and the agent already
+# maintain, and must keep working (or exit cleanly, section 23.3) no
+# matter what state either of those is in.
+After=network.target
+
+[Service]
+Type=simple
+# Statically built binary (CGO_ENABLED=0, matching the watchdog) -- no
+# runtime environment, no venv. Every flag has a sane on-device default
+# (see main.go); this line only needs to exist for systemd to have
+# something to start. On a device with no LED header at all (e.g. the
+# x86 image, section 23.3), the process checks once at startup and exits
+# 0 -- Restart=on-failure (not "always") means it then stays stopped
+# instead of restart-looping forever for nothing.
+ExecStart=/usr/local/bin/thermoctl-leds
+Restart=on-failure
+RestartSec=5
+# No network, as required by section 18.3's reasoning applied here too:
+# this program needs no network access to read local files or write to
+# sysfs.
+PrivateNetwork=true
+# Runs with only the rights needed to write the two sysfs files -- an
+# unprivileged user with write access to /sys/class/leds/thermoctl-*
+# (e.g. via a udev rule setting group ownership), not root. Which
+# concrete user/group that is depends on the prepared system image
+# (section 15.3) and is not fixed here, the same caveat
+# ../../thermoctl-watchdog.service documents for its own User=/Group=.
+User=thermoctl-leds
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from protocol import Command, CommandResult, DesiredState, Heartbeat
 
@@ -234,6 +235,63 @@ def report_health(path: Path, digest: str, version: str) -> None:
         f"timestamp={int(time.time())}",
         f"digest={digest}",
         f"version={version}",
+    ]
+
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temp.replace(path)
+
+
+def report_led_status(
+    path: Path,
+    *,
+    cloud_contact: Literal["ok", "lost"],
+    fault: Literal["none", "open"],
+    control: Literal["ok", "stalled"],
+) -> None:
+    """Writes the status-LED input file only the agent can know (section 23,
+    "Decided afterward" -- the LEDs themselves are driven by a separate small
+    Go program, `watchdog/cmd/thermoctl-leds/`, not by this module; this
+    function is only the agent-side half of that file's contract, the
+    counterpart of `report_watchdog_state`/`report_health` above).
+
+    The watchdog's own state file and health report already cover "which
+    digest, since when" and "is the right revision alive" -- neither one knows
+    whether the agent has reached the cloud lately, whether thermoctl has an
+    open fault, or whether its control loop has stopped deciding anything.
+    Those three are exactly what section 23.2's LED 2 (system, yellow) and the
+    "two short blinks" pattern of LED 1 (device, green) need, and only the
+    agent loop itself can observe them -- hence a fourth, small, line-based
+    file instead of extending either existing one (which `watchdog/state.go`/
+    `health.go` do not read, and should not have to: this file is
+    thermoctl-leds's concern only, never the watchdog's).
+
+    **Line-based, not JSON** -- the same reasoning as `report_watchdog_state`
+    and `report_health`, deliberately repeated in `watchdog/cmd
+    /thermoctl-leds/inputs.go`'s own docstring rather than only referenced:
+    `timestamp=` (Unix seconds, for `thermoctl-leds`'s own staleness check --
+    docs/STATUS.md's P5.7 entry documents the threshold), `cloud_contact=`
+    (`ok`/`lost`), `fault=` (`none`/`open`), `control=` (`ok`/`stalled`). The
+    three value fields are deliberately typed as `Literal` here rather than
+    plain `str`: this function is the only place that ever produces this
+    file's content, so a typo in a call site (e.g. `"lost "` with a trailing
+    space, or `"stale"` instead of `"stalled"`) is caught by mypy before it
+    ever reaches disk, rather than showing up as an silently-unrecognized
+    value on the Go side.
+
+    Written atomically (temporary file plus `Path.replace`), the same pattern
+    as `report_watchdog_state`/`report_health` -- `thermoctl-leds` must never
+    read a half-written file either. `timestamp` is set on **every** call,
+    not only when a value changes, so `thermoctl-leds`'s staleness check
+    measures how recently the agent last looked at its own state, not how
+    long ago some value last differed from the previous one.
+    """
+
+    lines = [
+        f"timestamp={int(time.time())}",
+        f"cloud_contact={cloud_contact}",
+        f"fault={fault}",
+        f"control={control}",
     ]
 
     temp = path.with_suffix(path.suffix + ".tmp")

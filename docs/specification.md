@@ -1238,6 +1238,14 @@ ladder, and it works without network, without a phone, and without logging in.
   must be routed onto free lines. Check once before buying which lines the chosen add-on
   actually uses -- datasheets are often silent about this.
 
+**Decided afterward (project owner, 2026-09-26):** the two LEDs are driven by a **separate,
+small program next to the watchdog** (`watchdog/cmd/thermoctl-leds/`), not by the watchdog
+itself as originally planned in the implementation plan. Reason: the watchdog's own line
+budget (section 18.3) has almost no headroom left, and a bug in the display code must never
+be able to disturb swapping or rolling back the agent -- the one thing the watchdog exists to
+do reliably. Nothing else in this section changes: same two sysfs files, same kernel `timer`
+trigger, same patterns, Raspberry Pi only.
+
 ### 23.4 Mobile connectivity on the Raspberry Pi: an add-on instead of a second device
 
 Where the apartment connects over mobile data, a Raspberry Pi needs **no separate LTE

@@ -25,11 +25,28 @@ Entirely missing:
 
 - an `mkosi.conf`/`debos` recipe file that carries out the same shared
   steps as `image/pi/`: installing `image/common/packages.txt`, applying
-  the udev rule and the `unattended-upgrades` configuration, copying and
-  enabling the watchdog unit from
+  the udev rule and the `unattended-upgrades` configuration, installing
+  `image/common/tmpfiles.d/thermoctl-agent.conf` (P5.7 hot-fix, needed on
+  this target too -- `/run/thermoctl-agent` is required by the agent
+  container's own bind mount regardless of whether the LED display is
+  present), copying and enabling the watchdog unit from
   `../../watchdog/thermoctl-watchdog.service`, placing
   `agent-registration.empty.json` on the boot partition as
   `agent-registration.json`,
+  (the status-LED program's own unit, section 23/P5.7, is *not* enabled on
+  this target -- a mini PC has no 40-pin header, section 23.3, and the
+  program itself exits cleanly at startup if it were ever installed
+  anyway, so simply not shipping it here is the tidier choice),
+- creates `/var/lib/thermoctl-watchdog` owned by the agent's own uid/gid
+  (P5.7 hot-fix round 2, `docs/STATUS.md`), e.g. `install -d -m 0755 -o
+  10002 -g 10002 /var/lib/thermoctl-watchdog`, and places the build-time
+  state file there (section 17, "Fallback without a proven revision") --
+  needed on this target too, regardless of the LED display's own absence,
+- writes `/etc/thermoctl-agent/.env` with `DOCKER_GID=$(getent group
+  docker | cut -d: -f3)` after `image/common/packages.txt`'s container
+  runtime package is installed (P5.7 hot-fix round 2) --
+  `agent-compose.yml`'s `group_add: ["${DOCKER_GID:?...}"]` reads this
+  file automatically and fails loud if it is missing,
 - the EFI boot partition and bootloader configuration,
 - preloading the agent container image,
 - compression, checksumming, connection to `v*` tags -- as with `image/pi/`.

@@ -564,6 +564,25 @@ storage, heartbeat sending **SR**
   `linefile.go`'s `openAndParse` and P5.6's own retiring of two
   redundant functions are the precedents to follow first.
 - **Depends on:** P5.6.
+- [x] done, **as a separate program, not inside the watchdog** -- decision
+  by the project owner, 2026-09-26 (see `docs/specification.md` section
+  23's own "Decided afterward" paragraph and `docs/STATUS.md`'s P5.7
+  entry for the full account): `watchdog/leds.go`/`leds_test.go` moved
+  (not duplicated) into `watchdog/internal/ledsysfs`, the watchdog's own
+  six production files went from 299 to **280** statement lines by that
+  removal alone, and a new, separate `go build` target
+  `watchdog/cmd/thermoctl-leds/` (288 statement lines, plus
+  `internal/ledsysfs`'s 65 -- neither counted against the watchdog's own
+  budget) reads the watchdog's state/health files, P5.0's registration
+  status file, and a new agent-written status file
+  (`agent.loop.report_led_status`, new) directly from disk, with its own
+  precedence and staleness rules (documented and tested, `decide_test.go`
+  covers every state of section 23.2's two tables). Same module, same
+  `go.mod` (still no `require`), own systemd unit, own CI build
+  (`amd64`/`arm64`, static, checksummed) and own contract-test extension
+  (`watchdog/check_contract.sh`). `go vet`/`go test -count=1 ./...` clean
+  across all three watchdog-module packages, `gofmt -l .` empty,
+  `tools/check_image_config.py` gained `check_leds_unit`.
 
 ---
 

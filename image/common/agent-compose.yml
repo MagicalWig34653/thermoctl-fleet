@@ -34,17 +34,83 @@ services:
     container_name: thermoctl-agent
     pull_policy: never
     restart: on-failure
+    # Same root cause as the volumes below, same round-2 hot fix
+    # (docs/STATUS.md): the agent runs as uid/gid 10002
+    # (docker/Dockerfile.agent), not root, but the host's Docker socket
+    # (bind-mounted below, section 13) is owned `root:docker 0660` -- an
+    # unprivileged uid with no group membership in the host's "docker"
+    # group cannot open it at all, no matter how the socket file itself
+    # is mounted. `group_add` puts the agent's process into that
+    # *numeric* host gid as a supplementary group inside the container
+    # (Docker's own container user stays uid 10002; this only adds a
+    # group, it does not change to root). `${DOCKER_GID:?...}` is
+    # deliberately unresolved here -- the actual gid is whatever the
+    # image build assigned the "docker" group when packages.txt's
+    # container-runtime package was installed (system-allocated, not a
+    # value this repository can pin), so it is supplied at image-build
+    # time via /etc/thermoctl-agent/.env (`DOCKER_GID=<gid>`, generated
+    # once with `getent group docker | cut -d: -f3` during the still-
+    # unimplemented build step, section 19.4/19.5 -- tracked in
+    # image/common/README.md) and picked up automatically by `docker
+    # compose` from that file (same directory as this one,
+    # /etc/thermoctl-agent/). Deliberately failing loud (`:?`, "no digest,
+    # no start" applied here too) rather than silently defaulting to a
+    # guessed gid, which could hand the agent a *different*, wrong
+    # group's privileges instead of merely failing to start.
+    #
+    # Security note (principle 5/6): membership in the host's "docker"
+    # group is, in practice, equivalent to root on the host -- anything
+    # this grants the agent is bounded only by security principle 2
+    # (hard-coded image sources) and principle 5 (every check lives in
+    # `agent/`, enforced there), exactly the same bound the Docker socket
+    # mount below already documents for itself. This does not widen that
+    # bound, it is what makes the socket mount actually usable by a
+    # non-root container in the first place.
+    group_add:
+      - "${DOCKER_GID:?DOCKER_GID is missing -- see image/common/README.md, generated at image build time from the host's docker group}"
     volumes:
-      # The state file the agent writes and the watchdog reads (section 17
-      # step 2) and the health report the agent writes regularly (section
-      # 22.3) -- same host paths as watchdog/thermoctl-watchdog.service's
-      # -file/-health-file flags, so both sides agree on one location
-      # without either hard-coding the other's.
-      - /var/lib/thermoctl-watchdog/state.env:/var/lib/thermoctl-watchdog/state.env
-      - /run/thermoctl-agent-health.env:/run/thermoctl-agent-health.env
+      # Directories, not individual files (P5.7 hot-fix, cross-review
+      # finding: this file originally bind-mounted state.env/health.env as
+      # single-file mounts, exactly like /run/thermoctl-agent-led-status
+      # .env would have been for P5.7's own new file -- and single-file
+      # bind mounts do not work for a file its writer replaces atomically,
+      # temp-file-plus-rename (agent/loop.py::report_watchdog_state/
+      # report_health/report_led_status all use this pattern, the same
+      # one the watchdog demands of its own state file). A rename only
+      # ever succeeds within the filesystem/directory it started in: with
+      # a single *file* bind-mounted, the temp file created next to it
+      # lives on the container's own private overlay filesystem, so the
+      # rename either fails outright (EBUSY) or "succeeds" locally and
+      # detaches the mount, leaving the host looking at a stale copy
+      # forever -- the watchdog and thermoctl-leds would then never see a
+      # real update, permanently reading a build-time snapshot. Mounting
+      # the *directory* that holds the file puts the temp file and the
+      # rename target on the same mounted filesystem, so the rename is an
+      # ordinary same-filesystem rename and actually reaches the host. See
+      # docs/STATUS.md's P5.7 hot-fix entry for the full account.
+      #
+      # /var/lib/thermoctl-watchdog: the state file (section 17 step 2),
+      # persistent -- the directory (and its state.env) already exists
+      # from image build time (section 17, "Fallback without a proven
+      # revision"), this mount only exposes it to the container too. That
+      # directory must be owned by the agent's own uid/gid (10002, see
+      # docker/Dockerfile.agent and image/common/tmpfiles.d
+      # /thermoctl-agent.conf's own comment) when the still-unimplemented
+      # image build step (section 19.4) creates it -- tracked as a TODO in
+      # image/common/README.md, not yet automated anywhere.
+      - /var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog
+      # /run/thermoctl-agent: the health report (section 22.3) and the new
+      # status-LED file (P5.7) -- both under /run/ deliberately (tmpfs,
+      # wiped on reboot, so neither can survive to cover for a freshly
+      # started, not-yet-healthy agent). Recreated on every boot by
+      # image/common/tmpfiles.d/thermoctl-agent.conf, installed as
+      # /etc/tmpfiles.d/thermoctl-agent.conf, *before* docker starts any
+      # container -- the directory must exist on the host before this
+      # mount can bind to it.
+      - /run/thermoctl-agent:/run/thermoctl-agent
       # Persistent agent data (registration, local keys, backup staging) --
       # section 15, survives a container swap the same way the state file
-      # does.
+      # does. Already a directory mount, unaffected by this fix.
       - /var/lib/thermoctl-agent:/var/lib/thermoctl-agent
       # The Docker socket: the agent itself reconciles the other three
       # services' desired state (section 13, thermoctl/zigbee2mqtt
@@ -54,4 +120,9 @@ services:
       # agent real power on the host; everything it can do with it is
       # bounded by security principle 2 (hard-coded sources) and principle
       # 5 (every check lives in agent/, enforced there), not by this file.
+      # This mount alone is not enough for the agent to actually use the
+      # socket, though: the socket itself is owned `root:docker 0660`, and
+      # the agent runs as unprivileged uid 10002 -- see this service's own
+      # `group_add` above for why that additionally requires the host's
+      # "docker" gid.
       - /var/run/docker.sock:/var/run/docker.sock

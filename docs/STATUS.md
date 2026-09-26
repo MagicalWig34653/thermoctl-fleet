@@ -367,6 +367,452 @@ separate, not-yet-built concern -- this package only reuses section 14's
 key, not for a WireGuard tunnel).
 
 
+## Cross-review hot fix, round 2: directories owned by root, and an agent with no access to the socket it was mounted for
+
+**Two further findings on the same fix (round 1, entry directly below),
+both reproduced by reading `docker/Dockerfile.agent` rather than assumed.**
+
+**Finding 1: the tmpfiles.d directory was owned by root.** Round 1 shipped
+`image/common/tmpfiles.d/thermoctl-agent.conf` as `d /run/thermoctl-agent
+0755 root root -`. `docker/Dockerfile.agent` runs the agent as an
+unprivileged, explicitly non-root user (`useradd --system --uid 10002
+agent`, `USER agent`) -- a root-owned, mode-0755 directory gives that uid
+read-and-execute access (list, traverse) but **no write permission at
+all**. Every one of the agent's atomic writes into that directory (the
+health report, the new LED status file) would therefore fail with
+`EACCES`, silently undoing the entire point of round 1's directory-mount
+fix: the directory would exist and be mountable, but the agent could never
+actually write into it. **Fix:** `docker/Dockerfile.agent` now pins the
+group explicitly too (`groupadd --system --gid 10002 agent`, then
+`useradd ... --uid 10002 --gid 10002 agent` -- previously only the uid was
+pinned, the gid was whatever `useradd` picked on its own, which is not
+guaranteed stable release to release); `thermoctl-agent.conf`'s entry is
+now `d /run/thermoctl-agent 0755 10002 10002 -`, and its own comment cross-
+references the Dockerfile line and explains *why* a plain name would not
+have worked (no `agent` user/group exists on the *host*, only inside the
+container -- the numeric id is the actual, and only, shared contract).
+`/var/lib/thermoctl-watchdog` needs the identical ownership for the
+identical reason (the agent writes `state.env` into it too) but has no
+tmpfiles.d entry of its own (created once at image build time, not
+recreated per boot, section 17 "Fallback without a proven revision") --
+that requirement is now a documented TODO in `image/common/README.md`
+instead, so the still-unimplemented build step (section 19.4) does not
+have to rediscover it the way this cross-review did.
+`tools/check_image_config.py::check_tmpfiles_entry` now parses the actual
+`d <path> <mode> <uid> <gid> <age>` line structurally (not a substring
+match, which could pass on "10002" appearing in the wrong field or a
+comment while the real uid/gid still said "root") and rejects anything
+other than `10002:10002`; four new tests in `tests/test_image_config.py`
+(owned by root, mismatched gid, too few fields, the correct ownership
+passing).
+
+**Finding 2: the agent had no access to the Docker socket it was mounted
+for.** `image/common/agent-compose.yml` bind-mounts `/var/run/docker.sock`
+so the agent can reconcile the other three services (section 13) -- but
+the socket is owned `root:docker 0660` on the host, and the agent's own
+uid 10002 is not a member of that group by default, and cannot be made one
+by anything baked into the *agent's own container image* (group
+membership for a host-socket permission has to come from the host, at
+runtime, not from `docker/Dockerfile.agent`). Without it, `agent-compose
+.yml`'s existing Docker-socket mount would have been present but useless:
+the agent could open the socket file (it is bind-mounted, so the path
+exists inside the container) but every actual call against it would be
+refused by the daemon's own permission check on the connecting process's
+group membership. **Fix, the simplest robust variant that keeps nothing
+per-host hard-coded in the repository:** `agent-compose.yml`'s `agent`
+service now declares `group_add: ["${DOCKER_GID:?...}"]` -- Compose's own
+supplementary-group mechanism, which adds the named *numeric* gid to the
+container's process without changing its uid away from 10002 or otherwise
+touching `docker/Dockerfile.agent`. The gid itself is intentionally left
+unresolved in the repository (`${DOCKER_GID:?message}` fails the `docker
+compose` invocation loud and immediately if unset, the same "no digest, no
+start" reasoning security principle 2 already applies elsewhere) -- the
+"docker" group's gid is whatever the image build's own package install
+assigned it (system-allocated, not a value this repository could pin
+without risking a silent mismatch against the real host), so it is
+resolved exactly once, by the still-unimplemented image build step
+(section 19.4), via `getent group docker | cut -d: -f3`, and written to
+`/etc/thermoctl-agent/.env` (`DOCKER_GID=<gid>`) -- the same directory as
+`compose.yml` itself, which `docker compose` reads a `.env` file from
+automatically, needing no change to how the watchdog invokes it
+(`watchdog/runtime.go`'s `cliRuntime.Start` passes no extra flag for
+this). Documented as a new TODO bullet in `image/common/README.md`,
+alongside the ownership one above. `tools/check_image_config
+.py::check_agent_compose_file` gained two more required substrings
+(`"group_add:"`, `"${DOCKER_GID:?"`), plus one new test asserting a
+compose file with every other requirement met but no `group_add` is still
+rejected. The security meaning is noted directly in the compose file's own
+comment: membership in the host's "docker" group is, in practice,
+equivalent to root on the host, bounded only by security principles 2 and
+5 -- the same bound the socket mount's own comment already stated, not
+widened by this fix, only made *usable* by an unprivileged container in
+the first place.
+
+**Cosmetic corrections, same pass:** round 1's entry (and
+`image/common/agent-compose.yml`'s own comment) cited "section 22.5" for
+the image-build-time state file guarantee; the actual source is section
+17's "Fallback without a proven revision" subsection (22.5 does not exist
+as a citation for this -- corrected in both places; the older,
+pre-existing citations of the same "22.5" mistake in `watchdog/state.go`,
+`watchdog/watch.go`, and `watchdog/README.md` predate this task and are
+out of scope for it, left alone rather than touched incidentally). Round
+1's own STATUS.md text said "six new tests" where it was actually four;
+corrected there, with a forward pointer to the further tests this round
+adds.
+
+**Verification (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`):** `ruff check .`, `mypy .` (61 source files),
+`mypy protocol fleet agent tools` (38 source files) all clean; `python -m
+tools.check_image_config` passes; `python -m pytest -W
+ignore::ResourceWarning` **744 passed**, TOTAL 2963 stmts / 21 miss = 99%
+overall coverage (the two remaining uncovered spots,
+`tools/check_image_config.py` lines 107 and 241-247, are the same
+pre-existing, unrelated gaps as both entries above --
+`check_watchdog_unit`'s untested branch and `main()`'s own body; every new
+assertion added across both rounds, including `check_tmpfiles_entry`'s
+ownership check, its too-few-fields guard, and `check_agent_compose_file`'s
+`group_add` check, is covered by its own dedicated test). `watchdog/`: this round
+touched no Go file at all (`docker/Dockerfile.agent`,
+`image/common/agent-compose.yml`, `image/common/tmpfiles.d
+/thermoctl-agent.conf`, `image/common/README.md`, `tools
+/check_image_config.py`, `tests/test_image_config.py`, `docs/STATUS.md`
+only) -- `go vet ./...` clean, `go test -count=1 ./...` green across all
+three packages (run three times in a row, no flake), `gofmt -l .` empty,
+`bash check_contract.sh` passes, `grep -c require go.mod` still `0`. Line
+counts unchanged from round 1: watchdog's own six files **280/300**;
+`cmd/thermoctl-leds` + `internal/ledsysfs` **353** combined.
+
+## Cross-review hot fix: P5.7's status file, and P5.6's compose file before it, bind-mounted single files instead of directories
+
+**The finding, stated plainly.** P5.7's own cross-review (2026-09-27)
+found that `/run/thermoctl-agent-led-status.env` (the new agent-written
+status file) was never mounted into the agent container at all in
+`image/common/agent-compose.yml` -- the agent would have written it into
+the container's own private `/run`, the host (and therefore
+`cmd/thermoctl-leds`, running on the host) would never see it, and every
+device would have permanently shown LED 1 slow-blinking ("not yet
+healthy") and LED 2 slow-blinking ("open fault"), regardless of the
+agent's real state. Chasing that finding to its root cause surfaced a
+second, wider one already sitting on `main`, from P5.6: the compose file's
+*existing* two volumes, `/var/lib/thermoctl-watchdog/state.env` and
+`/run/thermoctl-agent-health.env`, bind-mount **individual files**, not the
+directories that hold them. `agent.loop.report_watchdog_state` and
+`report_health` (P5.6) -- and `report_led_status` (P5.7) -- all write
+these files the same way: a temporary file next to the target, then
+`Path.replace` (a thin wrapper over `rename(2)`). A rename only ever
+succeeds within the filesystem/directory it started in. With the target
+bind-mounted as a single file, the temporary file the agent creates next
+to it lives on the *container's own* private overlay filesystem -- so the
+rename either fails outright (`EBUSY`, a single-file bind mount cannot be
+replaced by renaming a different inode onto it) or, depending on the
+container runtime and kernel, "succeeds" locally and silently detaches the
+mount, after which the host keeps looking at whatever snapshot happened to
+be there when the container started -- forever. Where the host file did
+not exist yet at all, Docker's own bind-mount behaviour additionally
+creates a **directory** at that path instead of a file, which would have
+made the agent's very first write fail outright with `IsADirectoryError`.
+In short: the state file and health report were *already* broken by this
+bug on `main` before this task started (P5.6's own tests never exercise
+the real compose file end to end, only the file format each side reads
+and writes -- exactly the gap a cross-review, not a unit test, is for),
+and P5.7's new file would have shipped with the identical bug on day one.
+
+**The fix: mount the two directories that hold these files, not the files
+themselves.** `image/common/agent-compose.yml` now bind-mounts:
+
+- `/var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog` (was
+  `.../state.env:.../state.env`) -- persistent, the directory (and its
+  `state.env`) already exists from image build time (section 17,
+  "Fallback without a proven revision"); this mount only exposes it to the
+  container too.
+- `/run/thermoctl-agent:/run/thermoctl-agent` (was
+  `/run/thermoctl-agent-health.env:/run/thermoctl-agent-health.env`) --
+  a new shared directory for **both** `/run`-resident files: the health
+  report (now `/run/thermoctl-agent/health.env`, was
+  `/run/thermoctl-agent-health.env`) and the new agent status file (now
+  `/run/thermoctl-agent/led-status.env`, was
+  `/run/thermoctl-agent-led-status.env`). One directory for both rather
+  than two, since both are tmpfs-resident, wiped-on-reboot, agent-written
+  live status files with the identical "must not survive as a stale
+  snapshot" reasoning (section 22.3) -- no reason to give them two mounts
+  where one does the same job.
+- `/var/lib/thermoctl-agent:/var/lib/thermoctl-agent` (unchanged --
+  already a directory mount, never affected by this bug).
+
+**A directory that does not yet exist on the host at boot time, for the
+`/run/` one:** new `image/common/tmpfiles.d/thermoctl-agent.conf`, a
+`systemd-tmpfiles` snippet installed as `/etc/tmpfiles.d/thermoctl-agent
+.conf` during image preparation (section 19.3) and applied by
+`systemd-tmpfiles-setup.service` during early boot, before `docker.service`
+starts any container -- the directory must exist on the host before the
+compose file's bind mount can attach to it. `/var/lib/thermoctl-watchdog`
+needs no such entry: it is persistent (`/var/lib`, not tmpfs) and already
+created once at image build time, per section 17 ("Fallback without a
+proven revision"). **Ownership: see the round-2 hot-fix entry directly
+below** -- this entry originally shipped the tmpfiles.d line as `d
+/run/thermoctl-agent 0755 root root -`, which a same-day re-review caught
+as wrong before this branch was ever merged.
+
+**Every default path updated to match:**
+`watchdog/cmd/thermoctl-leds/main.go`'s own flag defaults --
+`-health-file` from `/run/thermoctl-agent-health.env` to
+`/run/thermoctl-agent/health.env`, `-agent-status-file` from
+`/run/thermoctl-agent-led-status.env` to
+`/run/thermoctl-agent/led-status.env`; `-state-file` unchanged
+(`/var/lib/thermoctl-watchdog/state.env` -- only the *mount*, not the
+path, changed for that one). `watchdog/main.go` itself hard-codes no
+default paths (both its `-file`/`-health-file` flags default to `""`, set
+only via the systemd unit's `ExecStart`), so only
+`watchdog/thermoctl-watchdog.service` needed its `-health-file` argument
+updated the same way. `watchdog/cmd/thermoctl-leds/thermoctl-leds.service`
+passes no path flags at all (relies on `main.go`'s own defaults), so it
+needed no change. **Watchdog line count: unchanged at 280/300** -- only a
+string literal and a comment changed in `cmd/thermoctl-leds/main.go`,
+which is not one of the watchdog's own six counted files, and no line was
+added to or removed from any of those six.
+
+**`tools/check_image_config.py`, extended, not just documentation:**
+`check_agent_compose_file` now also asserts the two directory-mount lines
+are present *and* that the two old single-file-mount lines are **absent**
+-- checked both ways so a partial revert (the directory lines added back
+in without also removing the file-level ones, or vice versa) is still
+caught, not just a wholesale one. New `check_tmpfiles_entry` asserts
+`image/common/tmpfiles.d/thermoctl-agent.conf` exists and actually
+mentions `/run/thermoctl-agent` -- without it, the directory mount above
+has nothing to attach to before the agent container starts. Both wired
+into `check_all`. Four new tests in `tests/test_image_config.py`: directory
+mounts missing (rejected even with every other required substring
+present), single-file mounts present alongside the correct directory
+mounts (still rejected -- a partial revert), tmpfiles entry missing,
+tmpfiles entry present but naming the wrong directory. (Three more tests,
+for ownership, are added by the round-2 entry below.)
+
+**Python: a new test proving the invariant the whole fix depends on**,
+not just asserting the fix from the outside. `tests/test_watchdog_contract
+.py::test_atomic_writes_stay_within_the_target_directory` monkeypatches
+`pathlib.Path.replace` to record, for all three writers
+(`report_watchdog_state`, `report_health`, `report_led_status`), the
+parent directory of both the rename's source (the temp file) and its
+target (the real file) -- and asserts they are identical for every call.
+This is precisely the property a directory-level bind mount requires and
+a file-level one cannot provide: `rename(2)` only ever succeeds within one
+filesystem, so as long as the temp file and its target share a parent
+directory, mounting that one directory into the container is sufficient;
+if either writer ever changed to build its temp file's path differently
+(e.g. under a shared `/tmp`), this test would fail immediately rather than
+the bug resurfacing silently on a real device.
+
+**Why a unit test did not already catch this, and what would have:** every
+existing test (`tests/test_watchdog_contract.py`,
+`watchdog/check_contract.sh`) exercises the file format and the read/write
+contract directly against a plain temp directory -- correctly, since that
+directory is never bind-mounted in a test, single-file-mount-vs-directory
+-mount is not a distinction a test without a real Docker container can
+observe at all. `tools/check_image_config.py` was the right layer to add
+the missing check to instead: it already is the tool that reads
+`agent-compose.yml` as data and asserts properties about it (P5.6's own
+`check_agent_compose_file`), and cross-review -- reading the actual
+compose file end to end against what the agent actually does when it
+writes -- is what surfaced this, not a test that only exercises one side
+of the contract in isolation. This is the documented "no substitute for an
+actual build" gap `tools/check_image_config.py`'s own module docstring
+already names: a real end-to-end run (agent container actually writing
+through the actual bind mount) would need `image.yml`'s eventual real
+build (section 19.4, still not implemented, see `image/README.md`'s "State
+of this scaffold"), not this scaffold's plausibility check -- which now at
+least catches the specific regression this fix corrects.
+
+**Verification (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`):** `ruff check .`, `mypy .` (61 source files),
+`mypy protocol fleet agent tools` (38 source files) all clean; `python -m
+tools.check_image_config` passes; `python -m pytest -W
+ignore::ResourceWarning` **739 passed**, TOTAL 2955 stmts / 21 miss = 99%
+overall coverage (the newly-listed uncovered lines in
+`tools/check_image_config.py`, 107 and 194-200, are `check_watchdog_unit`'s
+pre-existing untested branch and `main()`'s own body -- the same
+pre-existing, unrelated gaps as before this hot fix, not the new
+`check_agent_compose_file`/`check_tmpfiles_entry` assertions, which are
+each directly covered by their own new test). `watchdog/`: `go vet ./...`
+clean, `go test -count=1 ./...` green across all three packages (run three
+times in a row, no flake), `gofmt -l .` empty, `bash check_contract.sh`
+passes (rebuilt against the corrected default paths), `grep -c require
+go.mod` still `0`. Line counts: watchdog's own six files unchanged at
+**280/300**; `cmd/thermoctl-leds` + `internal/ledsysfs` unchanged at
+**353** combined (not counted against the watchdog's budget).
+
+## P5.7 -- status LEDs as a separate program next to the watchdog (section 23)
+
+**Decision by the project owner, 2026-09-26 (do not re-open, see the task's
+own work order):** the two status LEDs are driven by a **separate, small
+Go program**, `watchdog/cmd/thermoctl-leds/`, in the same module as the
+watchdog but its own `go build` target -- **not** by the watchdog itself
+as the implementation plan originally had it (P5.6's own entry above,
+"P5.7 is next..."). Two reasons, both already in
+`docs/specification.md` section 23's own "Decided afterward" paragraph:
+P5.6's cross-review left the watchdog only **one line of headroom** before
+its 300-line budget (section 18.3), and -- the more important one -- a bug
+in LED-driving code must never be able to reach the one process whose job
+is swapping and rolling back the agent reliably.
+
+**Watchdog line count: went down, not just "did not grow".**
+`watchdog/leds.go`/`leds_test.go` (the still-unimplemented `LedSetPattern`
+stub from the scaffold) are gone from the watchdog's own package --
+**moved**, not duplicated, into `watchdog/internal/ledsysfs`
+(`LedPresent`, `ApplyPattern`, now actually implemented against the
+kernel `timer` trigger, section 23.1). The watchdog's own six production
+files (`main.go`, `watch.go`, `state.go`, `health.go`, `linefile.go`,
+`runtime.go` -- `leds.go` no longer one of them) are unchanged in content
+and went from **299 to 280 statement lines** purely by that removal,
+measured with the same command as P5.6's own count: `grep -v '^\s*//' <file>
+| grep -v '^\s*$' | wc -l`, summed. `go vet ./...` clean, `go test
+-count=1 ./...` green, `gofmt -l .` empty, `grep -c require go.mod` still
+`0`, `check_contract.sh` still passes (extended, see below).
+
+**`cmd/thermoctl-leds/` itself: 288 statement lines** across `main.go`
+(31), `loop.go` (65), `inputs.go` (130, after factoring the four
+`loadXxx` functions through a generic `loadOptional[T any]` the same way
+`watchdog/linefile.go::openAndParse` already does for the watchdog's own
+`LoadState`/`ReadHealth`), `decide.go` (62); plus `internal/ledsysfs`'s
+own **65** statement lines. None of this counts against the watchdog's
+300-line budget -- it is a separate binary, built with its own `go build
+./cmd/thermoctl-leds`, and the task set no line limit for it beyond
+"small", which this is, given four input file formats, precedence rules,
+and a staleness check to implement.
+
+**Inputs, all local files, no network (section 23.1's own "no single
+dependency" point applied here too):**
+
+1. The watchdog's own state file (`desired`, `since`) and health report
+   (`timestamp`, `digest`) -- unchanged formats, re-parsed by this
+   program's own small key-value-line reader (duplicated from
+   `watchdog/linefile.go`, not imported: `state.go`/`health.go` live in
+   `package main` at the watchdog's module root, and a `main` package
+   cannot be imported by a second program in the same module).
+2. P5.0's `registration_status` file (`agent/registration.py
+   ::_write_status`, branch `p5.0-agent-transport`, read there since main
+   does not have it yet): `status=waiting_for_assignment` drives LED 1's
+   fast blink (section 15.3's verification code step); any other value,
+   or the file's absence, does not.
+3. **New: the agent-written status file** for the three things only the
+   agent loop can know -- `agent.loop.report_led_status` (new function,
+   this task) writes it, line-based like the other three:
+   ```
+   timestamp=<unix seconds>
+   cloud_contact=ok|lost
+   fault=none|open
+   control=ok|stalled
+   ```
+   No fixed path is hard-coded in `report_led_status` itself (same rule as
+   `report_watchdog_state`/`report_health`); `cmd/thermoctl-leds`'s own
+   `-agent-status-file` flag defaults to `/run/thermoctl-agent/led-
+   status.env` -- under `/run/`, like the health report, because it is a
+   live status snapshot, not persisted state that should survive a reboot
+   stale. **Corrected by the hot-fix entry below** (originally
+   `/run/thermoctl-agent-led-status.env`, a single file rather than a path
+   inside the shared `/run/thermoctl-agent/` directory -- see that entry
+   for why this had to change before it ever reached a real device).
+
+**Staleness (documented threshold: 3x the heartbeat interval, 120s ->
+360s, `cmd/thermoctl-leds`'s own `-stale-after` flag, overridable):**
+applies to the **two periodic reports** (health report, agent status
+file) via their own embedded `timestamp`, exactly the way
+`watchdog/watch.go::AwaitHealthReport` already reads the health report's
+timestamp against a deadline -- an aged-out report is treated as unknown,
+never as "still good": LED 1 falls back to slow blink ("not yet healthy"),
+LED 2 to slow blink as well (reusing its own "open fault" pattern as the
+more cautious of its three defined ones, since section 23.2 defines no
+fourth "unknown" pattern for LED 2 and falling back to "off" would itself
+read as a stale "no fault"). The watchdog's state file and P5.0's
+registration status file are **not** subject to this window: both change
+only on real transitions (a new desired digest; registered/assigned), not
+on a periodic cadence, so there is no heartbeat interval to measure their
+age against -- a device can sit in "waiting for assignment" for days
+without a fresh write and must still show the fast-blink pattern.
+
+**Precedence, most specific first:**
+
+- LED 1 (device, green): waiting-for-assignment overrides everything ->
+  agent not healthy (state/health missing, stale, wrong digest, or a
+  health report that predates the current desired revision, section
+  22.3's own "an older report does not count" read the same way here) or
+  agent-status unknown -> slow blink -> healthy but `cloud_contact=lost`
+  -> two short blinks -> otherwise steady on. "Agent healthy" is defined
+  identically to `AwaitHealthReport`'s own success condition
+  (`health.Digest == state.Desired && health.Timestamp >= state.Since`),
+  independently re-derived from the same two files rather than reading
+  the watchdog's in-memory `Outcome` (which is never persisted to disk,
+  and therefore not a "local file" input in the task's own sense).
+- LED 2 (system, yellow): agent-status unknown -> slow blink -> control
+  stalled -> steady on (ranked above a merely open fault, the more severe
+  condition) -> open fault -> slow blink -> otherwise off. Independent of
+  LED 1's registration/health state -- section 23.2's own table for LED 2
+  draws no such distinction.
+
+**"Two short blinks, pause" is an approximation, documented, not an
+oversight:** the kernel `timer` trigger exposes exactly one on/off period,
+not a sequence, so a true grouped double-flash would need either a
+software blink loop in this program (defeating the very reason section
+23.1 chose the kernel trigger: the display keeps blinking even if this
+program is briefly delayed) or the kernel's separate `pattern` trigger,
+whose presence is not guaranteed the way `timer`'s is. Implemented instead
+as a distinct rhythm (100ms on, 700ms off) that is clearly different by
+ear and eye from the continuous, even "fast blink" (100ms on, 100ms off,
+"waiting for assignment") -- `internal/ledsysfs`'s own test proves all
+three timer-driven patterns render distinguishable periods.
+
+**Missing LED driver (section 23.3, "Raspberry Pi only"):** checked once
+at startup (`ledPresentEither`), not on every poll -- if neither of the
+two sysfs brightness files exists, the program logs one line and exits
+cleanly (exit 0); `thermoctl-leds.service` uses `Restart=on-failure`
+rather than `Restart=always` so that clean exit is not treated as a crash
+worth restarting. A per-LED check (`ledsysfs.ApplyPattern`'s own
+`LedPresent` guard) still covers the case of only one of the two files
+existing.
+
+**Tests:** Go -- `internal/ledsysfs`: LED present/missing, unknown
+pattern rejected, off/steady-on write the right trigger+brightness, all
+three timer patterns write "timer" plus pairwise-distinct delay pairs.
+`cmd/thermoctl-leds`: every state of section 23.2's two tables via table
+tests (`decide_test.go`), precedence (waiting-for-assignment overriding
+health; control-stalled outranking open-fault), staleness (injected
+clock, `testNow`/`time.Unix` fixtures, no real sleeping), missing input
+files (`inputs_test.go`, `loadOptional` returns `nil, nil`), missing LED
+driver end to end (`loop_test.go`), a full healthy-device pass writing
+real sysfs file contents, and `-check-mode`'s own uppercase-key output
+(mirroring `watchdog/main.go::runCheckMode`). Python --
+`tests/test_watchdog_contract.py`: `report_led_status` writes all four
+fields, atomic write (no leftover `.tmp`), overwrite semantics.
+`watchdog/check_contract.sh` extended: Python writes the new file,
+`thermoctl-leds -check-mode` reads it back, values compared -- the same
+cross-language sequence as the state/health files, now covering three
+files and two Go binaries. `tools/check_image_config.py` gained
+`check_leds_unit` (mirrors `check_watchdog_unit`), `image/README.md`,
+`image/common/README.md`, `image/pi/README.md` note the second unit
+copied at build time next to the watchdog's; `image/x86/README.md` notes
+it is deliberately *not* enabled there (no 40-pin header, section 23.3).
+
+**CI (`.github/workflows/go.yml`):** the `build` job now also builds
+`cmd/thermoctl-leds` for `amd64`/`arm64` (`CGO_ENABLED=0`, static, with a
+checksum, same as the watchdog binary) and uploads it as its own
+artifact; `contract-test` builds both binaries via the extended
+`check_contract.sh`. No trigger paths changed (`watchdog/**` already
+covers the new `cmd/`/`internal/` subdirectories).
+
+**Verification:** `watchdog/`: `go vet ./...` clean, `go test -count=1
+./...` green across all three packages, `gofmt -l .` empty, `bash
+check_contract.sh` passes, `grep -c require go.mod` is `0`. Cross-compiled
+both binaries for `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0`
+directly (not only via CI) to confirm the build step CI will run.
+Root, fresh `python3.13 -m venv` + `pip install -e ".[dev,fleet,agent]"`:
+`ruff check .` clean, `mypy .` clean (61 source files), `python -m
+tools.check_image_config` passes, `python -m pytest -W
+ignore::ResourceWarning` **734 passed**, 99% overall coverage (the two
+newly-uncovered lines in `tools/check_image_config.py`, `main()`'s own
+body and one pre-existing branch of `check_watchdog_unit`, are unrelated
+pre-existing gaps, not introduced by this task -- `main()` was already
+only exercised as an entry point, `# pragma: no cover`'d at its `if
+__name__` guard, same as before).
+
 ## `PROTOCOL_VERSION` bump to 2 for the P4.2b registration models (main
 session)
 
