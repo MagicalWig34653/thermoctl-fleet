@@ -8,7 +8,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 )
 
@@ -38,10 +37,5 @@ func ParseHealth(r io.Reader) (Health, error) {
 
 // ReadHealth opens path and parses it.
 func ReadHealth(path string) (Health, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return Health{}, err
-	}
-	defer file.Close()
-	return ParseHealth(file)
+	return openAndParse(path, ParseHealth)
 }

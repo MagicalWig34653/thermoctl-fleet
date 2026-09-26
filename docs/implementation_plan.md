@@ -461,6 +461,21 @@ surface each package touches changed, from `/v1/...` to `/ui/inventory/...`.
   count documented.
 - **Depends on:** nothing from step 5, separated by language -- can run in
   parallel with any Python package.
+- [x] done -- `AgentStopped`/`StartDigest`/`AwaitHealthReport`/
+  `RollBackToProven` implemented against a new `Runtime` interface
+  (`watchdog/runtime.go`), addressed only via `os/exec` (a plain `docker`
+  wrapper, `-runtime-bin`/`-runtime-container` flags), never a library --
+  `go.mod` still has no `require`. `Reconcile` (new) ties the four
+  together into one pass and returns an `Outcome` for P5.7. `main.go`'s
+  `runLoop` drives it on an interval, forever. No wall clock in tests:
+  `AwaitHealthReport`/`Reconcile` take a `sleep func(time.Duration)`
+  instead of `time.Sleep` directly. Production code (seven files, `main.go`
+  now includes `runtime.go`) at **299** statement lines (was 195; see
+  `docs/STATUS.md`) -- `openAndParse`, a small generic helper in
+  `linefile.go`, absorbed the `LoadState`/`ReadHealth` duplication the same
+  way `readKeyValueLines` did for parsing. `go vet ./...` clean, `go test
+  ./...` green (41 tests, up from 25), `check_contract.sh` unchanged and
+  passing, `gofmt -l .` empty.
 
 ### P5.7 -- Wire up the status display (section 23)
 - **Goal:** connect `watchdog/leds.go` (`LedSetPattern`) to the states from

@@ -25,7 +25,14 @@ After=network.target
 Type=simple
 # Statically built binary (CGO_ENABLED=0, section 18.3) -- no runtime
 # environment, no venv, no interpreter that could itself break.
-ExecStart=/usr/local/bin/thermoctl-watchdog
+# -file: the state file (section 17, step 2), written by the agent,
+# persisted across reboots. -health-file: the health report (section
+# 22.3), deliberately under /run/ -- in memory, empty after a reboot, so an
+# old report can never cover for a freshly started, not-yet-healthy agent.
+# -runtime-bin/-runtime-container default to "docker"/"thermoctl-agent"
+# (P5.6) -- only add them here if the prepared image uses a different
+# runtime or container name.
+ExecStart=/usr/local/bin/thermoctl-watchdog -file /var/lib/thermoctl-watchdog/state.env -health-file /run/thermoctl-agent-health.env
 Restart=always
 RestartSec=5
 # No network, as required by section 18.3: the watchdog needs no network

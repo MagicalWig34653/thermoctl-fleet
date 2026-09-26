@@ -2,6 +2,106 @@
 
 Last updated: 2026-09-26.
 
+## P5.6 -- watchdog main loop implemented (`watchdog/watch.go`, `main.go`)
+
+`AgentStopped`, `StartDigest`, `AwaitHealthReport`, `RollBackToProven` are
+now actually implemented (section 17, steps 3-6), no longer stubs -- the
+scaffold's own "everything here returns an error" note in `watch.go`'s
+module docstring is gone.
+
+**A new `Runtime` interface (`watchdog/runtime.go`), not a library.** The
+container runtime is addressed exclusively through `os/exec` (section
+18.3): `cliRuntime` wraps a configurable `docker`-compatible binary
+(`-runtime-bin`, default `docker`) and container name (`-runtime-container`,
+default `thermoctl-agent`) -- `Start` does `rm -f` then `run -d --name`,
+`Status` a single `inspect -f` printing running-state, image digest, and
+restart count in one call. `go.mod` still carries no `require` -- `grep -c
+require go.mod` is 0 (the file's own explanatory comment is not a
+dependency). Tests substitute a fake `Runtime` and never invoke `docker` at
+all.
+
+**No wall clock in tests, and no `Clock` type at all.** `AwaitHealthReport`
+and `Reconcile` (new, see below) take a plain `sleep func(time.Duration)`
+instead of calling `time.Sleep`, or wrapping it in an interface -- production
+passes `time.Sleep` itself as a function value, tests pass a no-op that
+only counts calls. The 10-minute deadline from section 17 step 5 is
+`maxHealthPolls`, a poll count (`10 * time.Minute / healthPollInterval`)
+rather than a wall-clock comparison, so `AwaitHealthReport` needs no notion
+of "now" at all -- only the number of times it has slept.
+
+**`Reconcile` (new) ties the four functions into one pass and returns an
+`Outcome`** (`OutcomeOK` / `OutcomeRolledBack`) -- the single hook P5.7
+needs to drive `leds.go` without touching this decision again per the
+task's own instruction. `desired == proven` skips the await/rollback dance
+entirely (nothing to swap between): the agent is simply restarted on the
+one digest that exists; if that single start itself fails, the failure is
+only reported, not rolled back into itself (there is nothing else to try).
+When `desired != proven` and the start succeeds, `AwaitHealthReport` is
+awaited; an empty returned reason means healthy, otherwise
+`RollBackToProven` is called with that reason. An empty `proven` is
+reported as an error and nothing is started, exactly as section 22.5
+("Fallback without a proven revision") describes it, unchanged from the
+existing behaviour.
+
+**Where the rollback reason goes: stderr, not a new file.** Decided in
+favour of stderr (captured by journald under the systemd unit) over a new
+line-based note file, because a single, one-shot diagnostic line is exactly
+what journald is for, and a third line-based file contract would need its
+own reader, its own test, and its own entry in `check_contract.sh` for a
+value nothing else in the system reads back programmatically. Neither the
+state file nor the health report gained a new line -- `check_contract.sh`
+is unchanged and still passes.
+
+**Line budget: 299 statement lines, up from 195** (`main.go`, `watch.go`,
+`state.go`, `health.go`, `leds.go`, `linefile.go`, plus the new
+`runtime.go` -- seven files now), measured with the same counting command
+as before: `grep -v '^\s*//' <file> | grep -v '^\s*$' | wc -l`, summed
+across the seven files (comments and blank lines excluded, matching
+section 18.3's redefined rule). Getting from an initial draft (over 350
+statement lines with a full `Clock` interface, three separate configurable
+shell-command flags, and a four-way `Outcome`) down to 299 took three
+rounds of trimming, documented here because the reasoning is the kind
+section 22's introduction asks to keep: (1) replacing `Clock`
+(interface with `Now`/`Sleep`) with a plain `sleep func(time.Duration)`
+parameter and expressing the deadline as a poll count removed the need for
+"now" anywhere in this package; (2) collapsing the three configurable
+shell-command strings (`start-cmd`/`status-cmd`/`restarts-cmd`, each a
+template with `{digest}` substitution) down to a plain `docker` wrapper
+taking only a binary name and a container name removed most of
+`runtime.go`; (3) `openAndParse`, a small generic helper added to
+`linefile.go` (`func openAndParse[T any](path string, parse func(io.Reader)
+(T, error)) (T, error)`), absorbed the "open, defer close, parse" shape
+`LoadState` and `ReadHealth` each repeated, the same reasoning that
+produced `readKeyValueLines` in the first place. `gofmt -l .` confirmed
+empty throughout -- a tempting further trick (writing `if err != nil {
+return err }` on one line to save two lines per guard clause) does not
+survive `gofmt`, which expands it back to three lines every time; verified
+directly before relying on it, and abandoned once disproved.
+
+**Tests: `go vet ./...` clean, `go test -count=1 ./...` green, 41 tests (up
+from 25)**, covering: the happy path (stopped agent, desired started,
+matching health report arrives, no rollback); a health report that never
+arrives (rollback after the full deadline, with the reason); a health
+report naming the wrong digest (treated as identically to missing, per
+section 22.3); a stale health report older than `since` (same treatment,
+section 22.2); three restarts in a row (immediate rollback, no waiting out
+the deadline); a runtime failure starting the desired digest (reported, no
+rollback, no crash, since `desired == proven` in that test); a runtime
+failure during an actual swap (rollback attempted); an empty `proven`
+during a swap (error, exactly one start attempt -- the failed one -- no
+fallback start); and the agent still running (nothing touched at all).
+`check_contract.sh` passes unchanged. `gofmt -l .` empty. Python side
+untouched by this task: `ruff check .` clean, `pytest
+tests/test_watchdog_contract.py` unchanged at 7 passed.
+
+**P5.7 is next, not part of this task:** `watchdog/leds.go` still has
+`LedSetPattern` unimplemented; the `Outcome` return value from `Reconcile`
+is this task's documented hook for it, deliberately coarse (two values) --
+P5.7's own acceptance criterion (a correct pattern per state) may need
+either a finer `Outcome`, or to read `Runtime.Status`/health directly
+itself for the LED-specific distinctions (starting vs. healthy vs. no
+cloud contact) that section 23.2 draws and `Reconcile`'s outcome does not.
+
 ## Cross-review hot fix: P4.2b accepted small-order Ed25519 keys (main
 session) **SR**
 
