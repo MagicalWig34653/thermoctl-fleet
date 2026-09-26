@@ -90,6 +90,10 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
+from fleet.device_lifecycle import (
+    REMOVE_DEVICE_TARGET_STATES,
+    validate_manual_device_transition,
+)
 from protocol import Event, Heartbeat, fault_kind_from_key
 from protocol.version import PROTOCOL_VERSION
 
@@ -1511,6 +1515,201 @@ class Storage:
             )
             session.expunge_all()
             return rows
+
+    def change_device_state(
+        self,
+        device_id: str,
+        target_state: str,
+        reason: str,
+        ui_username: str,
+    ) -> None:
+        """Applies the manual "change device state" form (P4.3, section
+        20.1) -- the *only* place `fleet/ui_routes.py` may change a
+        device's state outside the "Gerät ausbauen/tauschen" flow
+        (`remove_device`, below) or a P4.2/P4.2b prepare/confirm route.
+
+        Enforces `fleet.device_lifecycle.validate_manual_device_transition`
+        itself, not only trusting the caller to have checked it first --
+        defence in depth: a device's `state` is security-relevant (section
+        20.1's own table: `decommissioned` means "token revoked"), so this
+        method refuses exactly the same transitions the UI form's own
+        drop-down never offers, using the *same* table (see that module's
+        docstring), not a second, independently maintained one.
+
+        Raises `ValueError` for: an unknown device, an empty reason, or a
+        transition `validate_manual_device_transition` refuses (including
+        every transition out of `in_service` -- see that module's docstring
+        for why `remove_device` is the only way out of it -- and out of
+        `decommissioned`, which is terminal). Writes exactly one audit row,
+        in the same transaction as the state change.
+        """
+
+        if not reason.strip():
+            raise ValueError("A reason is required to change a device's state.")
+
+        with self.session() as session:
+            record = session.get(DeviceRecord, device_id)
+            if record is None:
+                raise ValueError(f"Device {device_id!r} does not exist.")
+
+            error = validate_manual_device_transition(record.state, target_state)
+            if error is not None:
+                raise ValueError(error)
+
+            before_state = record.state
+            record.state = target_state
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="device",
+                entity_id=device_id,
+                action="state_changed",
+                reason=reason,
+                before={"state": before_state},
+                after={"state": target_state},
+            )
+
+    def remove_device(
+        self,
+        apartment_id: str,
+        *,
+        target_state: str,
+        reason: str,
+        ui_username: str,
+        now: datetime,
+    ) -> AssignmentRecord:
+        """"Gerät ausbauen / tauschen" (P4.3, section 20.2 device-swap steps
+        1-2): closes the apartment's currently open assignment (`until` =
+        `now`, `reason` = the given reason -- overwriting the assignment's
+        own creation-time reason, since the work package's own wording
+        reads this as the *closing* reason: "close the open assignment
+        with until = now + reason"), sets the removed device's state to
+        `target_state` (`faulty` or `in_storage` -- section 20.2: "the old
+        one moves to faulty or in_storage"), and **revokes the apartment's
+        agent token** (`token_hash = NULL` -- section 20.2: "revokes the
+        old device's token", section 15.5) -- all three writes, **each with
+        its own audit-log row** (section 20.3: "every change to
+        assignment, state, or token is logged" -- three kinds of change,
+        three rows), in **one transaction**: a failure partway through
+        leaves nothing applied (proven directly, not only argued, by
+        `tests/test_storage.py::test_remove_device_rolls_back_everything_if_a_step_fails`).
+
+        Raises `ValueError` for: an unrecognised `target_state` (only
+        `faulty`/`in_storage`, `fleet.device_lifecycle
+        .REMOVE_DEVICE_TARGET_STATES`), an empty `reason`, an unknown
+        apartment, or an apartment with **no open assignment** (section
+        20.2's flow assumes exactly one active device -- "at most one" per
+        the partial unique index, and here strictly one, since there is
+        nothing to remove otherwise).
+
+        **Safe under a concurrent double removal, tested directly under
+        real threads (`tests/test_storage.py
+        ::test_remove_device_concurrent_double_removal_only_one_wins`):**
+        the assignment close is one atomic `UPDATE ... WHERE id = <this
+        row> AND ended_at IS NULL`, not a read-then-write -- the same
+        pattern `_insert_heartbeats_ignoring_conflicts` already established
+        for this class of race. Whichever of two concurrent calls' `UPDATE`
+        actually flips a row (`rowcount == 1`) is the one that proceeds to
+        touch the device/apartment/audit log; the loser's `UPDATE` affects
+        zero rows (SQLite serialises writers, so the second call's `UPDATE`
+        only runs once the first has already committed and already cleared
+        `ended_at IS NULL`) and raises `ValueError` before writing anything
+        else at all -- no double state change, no double token revocation,
+        no double audit row.
+        """
+
+        if target_state not in REMOVE_DEVICE_TARGET_STATES:
+            raise ValueError(
+                f"Unbekannter Zielzustand {target_state!r} -- nur "
+                f"{list(REMOVE_DEVICE_TARGET_STATES)} sind erlaubt."
+            )
+        if not reason.strip():
+            raise ValueError("A reason is required to remove a device.")
+
+        now_naive = _naive_utc(now)
+
+        with self.session() as session:
+            if session.get(ApartmentRecord, apartment_id) is None:
+                raise ValueError(f"Apartment {apartment_id!r} does not exist.")
+
+            open_assignment = session.scalar(
+                select(AssignmentRecord).where(
+                    AssignmentRecord.apartment_id == apartment_id,
+                    AssignmentRecord.ended_at.is_(None),
+                )
+            )
+            if open_assignment is None:
+                raise ValueError(
+                    f"Apartment {apartment_id!r} has no open assignment to remove."
+                )
+
+            # `Session.execute` is typed to return the generic `Result[Any]`
+            # (no `rowcount`) even for a Core UPDATE, which always actually
+            # returns a `CursorResult` at runtime -- narrowed explicitly,
+            # same as `reserve_ip_login_attempt` above.
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(AssignmentRecord)
+                    .where(
+                        AssignmentRecord.id == open_assignment.id,
+                        AssignmentRecord.ended_at.is_(None),
+                    )
+                    .values(ended_at=now_naive, reason=reason)
+                ),
+            )
+            if not result.rowcount:
+                # Lost the race to a concurrent removal of the very same
+                # assignment -- see the docstring above.
+                raise ValueError(
+                    f"Apartment {apartment_id!r} has no open assignment to remove."
+                )
+
+            device_id = open_assignment.device_id
+            device = session.get(DeviceRecord, device_id)
+            assert device is not None  # an assignment always names a registered device
+            before_device_state = device.state
+            device.state = target_state
+
+            apartment = session.get(ApartmentRecord, apartment_id)
+            assert apartment is not None  # checked above, same transaction
+            apartment.token_hash = None
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="assignment",
+                entity_id=f"{apartment_id}:{device_id}",
+                action="closed",
+                reason=reason,
+                before={"ended_at": None},
+                after={"ended_at": now_naive.isoformat()},
+            )
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="device",
+                entity_id=device_id,
+                action="state_changed",
+                reason=reason,
+                before={"state": before_device_state},
+                after={"state": target_state},
+            )
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="apartment",
+                entity_id=apartment_id,
+                action="token_revoked",
+                reason=reason,
+                before={"token_hash": "set"},
+                after={"token_hash": None},
+            )
+
+            session.refresh(open_assignment)
+            session.expunge(open_assignment)
+            return open_assignment
 
     # -- ui accounts / sessions (P3.0) -------------------------------------------
 

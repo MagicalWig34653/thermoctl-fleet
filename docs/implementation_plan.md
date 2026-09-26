@@ -345,6 +345,13 @@ surface each package touches changed, from `/v1/...` to `/ui/inventory/...`.
   for `STATUS.md`, not an invention of our own).
 - **Depends on:** P4.1.
 - **Parallel to:** P4.2.
+- [x] done -- see `docs/STATUS.md` for the derived transition table
+  (`fleet/device_lifecycle.py`, five manual transitions out of the 49
+  possible pairs), the "Gerät ausbauen/tauschen" flow
+  (`Storage.remove_device`: closes the assignment, sets the removed
+  device's state, revokes the apartment's token, all in one transaction),
+  and the P4.2 integration notes (the "prepare" link, decommissioning must
+  also invalidate a pending registration once P4.2's table exists).
 
 ---
 

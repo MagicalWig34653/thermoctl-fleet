@@ -40,6 +40,9 @@
                 keines zugewiesen
                 {% endif %}
                 &nbsp;<a href="{{ apartment.edit_href }}">Bearbeiten</a>
+                {% if apartment.replace_device_href %}
+                &nbsp;<a href="{{ apartment.replace_device_href }}">Gerät ausbauen/tauschen</a>
+                {% endif %}
             </li>
             {% endfor %}
         </ul>
@@ -61,6 +64,9 @@
                 <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
                 – {{ apartment.state }}
                 &nbsp;<a href="{{ apartment.edit_href }}">Bearbeiten</a>
+                {% if apartment.replace_device_href %}
+                &nbsp;<a href="{{ apartment.replace_device_href }}">Gerät ausbauen/tauschen</a>
+                {% endif %}
             </li>
             {% endfor %}
         </ul>
@@ -79,7 +85,24 @@
     <ul class="inventory-devices">
         {% for device in view.devices_not_in_service %}
         <li>{{ device.id }} ({{ device.model }}) – {{ device.state }}, seit {{ device.acquisition_date }},
-            Image {{ device.image_version }}, Watchdog {{ device.watchdog_version }}</li>
+            Image {{ device.image_version }}, Watchdog {{ device.watchdog_version }}
+            {% if device.allowed_target_states %}
+            <form method="post" action="{{ device.state_action_href }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <label>Neuer Zustand
+                    <select name="target_state" required>
+                        {% for target in device.allowed_target_states %}
+                        <option value="{{ target }}">{{ target }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>Grund
+                    <input type="text" name="reason" required>
+                </label>
+                <button type="submit">Zustand ändern</button>
+            </form>
+            {% endif %}
+        </li>
         {% endfor %}
     </ul>
     {% else %}
