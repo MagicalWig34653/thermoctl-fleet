@@ -2,6 +2,122 @@
 
 Last updated: 2026-09-26.
 
+## Confirm/remove race test flake: a legitimate third interleaving, not a race bug (main session)
+
+**Symptom.** `tests/test_device_lifecycle_registration_integration.py
+::test_confirm_device_replace_previous_races_a_concurrent_remove_device`
+(from the "Cross-review integration: P4.2 x P4.3" section below) failed
+intermittently -- reproduced at 11/500 (~2.2%) isolated runs of the exact
+scenario, in the same order of magnitude as the reported ~2/30 -- with
+`AssertionError: assert ['confirmed', 'removed'] in (['confirm_failed',
+'removed'], ['confirmed', 'remove_failed'])`: both the concurrent
+`confirm_device(replace_previous=True)` for a new device and `remove_device`
+of the apartment's current device succeeded, an outcome the test's own
+fixed two-outcome-label assertion forbade outright.
+
+**Diagnosis: (a), a legitimate interleaving the test forbade too strictly --
+not a race bug.** `Storage.remove_device` and `Storage.confirm_device`'s
+`replace_previous` path already race safely against each other over the
+*same* assignment row (the guarded `UPDATE ... WHERE id = <row> AND
+ended_at IS NULL` each uses). What the old assertion missed is a third,
+equally legitimate interleaving: `remove_device` can commit its **entire**
+transaction (closing the old assignment, moving the old device to its
+target state, revoking the token, three audit rows) before
+`confirm_device`'s own phase 2 ever reads the previous assignment at all.
+`confirm_device` then correctly finds **no** open assignment to replace (it
+was already closed) and proceeds exactly like an initial-commissioning
+confirm -- creating a fresh assignment for the new device outright. Both
+calls report success, and every invariant the test actually cares about
+still holds: the old assignment closed **exactly once** (never twice), the
+old device ends up in **the remover's** chosen target state (`faulty`),
+never overwritten by `confirm_device`'s own choice (`in_storage`), the
+apartment's token is revoked exactly once, the apartment ends with exactly
+one open assignment (the new device), the new device is `in_service` with a
+confirmed, non-invalidated registration, and no audit row claims a change
+that never happened. Verified directly across 500 runs of the raw scenario
+outside pytest (11 hits, `outcome distribution: {('confirm_failed',
+'removed'): 484, ('confirmed', 'remove_failed'): 5, ('confirmed',
+'removed'): 11}`), every one of the 11 "both succeed" hits showing
+identical, fully consistent state (`current_assignment=sn-new
+old_state=faulty new_state=in_service token_hash=None`, one `"closed"` row
+for the old assignment, one `"assigned"` row for the new one, zero
+`"closed"` rows for the new one).
+
+**Fix: the test now asserts invariants for all three legitimate
+interleavings, not two fixed outcome labels**
+(`_assert_confirm_remove_race_invariants`,
+`tests/test_device_lifecycle_registration_integration.py`), plus two new
+deterministic tests that force each interleaving explicitly instead of
+relying on real-thread timing to hit the rare one:
+`test_confirm_device_replace_previous_forced_remove_wins_during_phase_gap`
+(monkeypatches `hmac.compare_digest` -- the last call `confirm_device`'s
+phase 1 makes -- to run `remove_device` to completion as a side effect
+before returning the real comparison result, injecting the pause exactly at
+the phase 1/phase 2 boundary the P4.2 reviewer's own technique used
+elsewhere in this file) and
+`test_confirm_device_replace_previous_forced_confirm_wins_first` (plain
+sequential calls, no injection needed).
+
+**A fourth case, found while forcing "confirm fully before remove", is
+*not* part of this race and needed its own test, not a bugfix:** once
+`confirm_device` has fully committed, the old device's assignment is no
+longer open at all, so a `remove_device` call issued only afterward finds
+**the apartment's now-current** open assignment -- the *new* device -- and
+correctly removes *that* instead. Not a race by that point (both calls are
+fully sequential), and not a corruption: exactly one assignment closed,
+one state change, one token revocation, all for the new device, `sn-old`
+untouched a second time. This is `remove_device`'s documented contract
+("the apartment's currently open assignment", section 20.2) applied to a
+landlord's stale "remove device" request issued after someone else already
+replaced the device -- the same class of UI-staleness this codebase already
+accepts for a plain double removal, one step further along. Covered by
+`test_confirm_device_replace_previous_forced_confirm_wins_first`'s own
+assertions.
+
+**A real, if minor, invariant bug found and fixed along the way, unrelated
+to the race itself: `Storage.remove_device`'s own `token_revoked` audit row
+hard-coded `before={"token_hash": "set"}`, regardless of whether the
+apartment actually had a token.** `confirm_device`'s own token-revoke audit
+row already computes this correctly (`had_token = apartment.token_hash is
+not None`); `remove_device` did not, and this test's own fixture (an
+apartment created via `_make_apartment`, never given a token) exposed it
+directly -- a false audit claim ("a token was revoked") for an apartment
+that never had one, exactly the "audit rows claiming actions that did not
+happen" invariant this investigation was asked to check. Fixed in
+`fleet/storage.py`'s `remove_device` to mirror `confirm_device`'s own
+pattern; no existing test asserted the literal hard-coded value, so nothing
+else needed updating.
+
+**Sibling race tests checked for the same outcome-label-under-real-thread-
+race weakness, none needed hardening:**
+`tests/test_device_lifecycle_registration_integration.py
+::test_concurrent_confirm_racing_manual_reported_to_faulty_exactly_one_
+outcome` already asserts invariants conditionally, not fixed outcome
+labels. `tests/test_device_registration.py
+::test_confirm_device_concurrent_confirms_of_two_devices_for_one_apartment_
+exactly_one_wins` and `::test_confirm_device_concurrent_confirms_of_the_
+same_device_exactly_one_wins` assert `sorted(...) == [False, True]`, but
+unlike this package's own race, their "exactly one wins" is enforced
+structurally (the partial unique index on `assignments.apartment_id`, and a
+guarded `UPDATE ... WHERE state = 'reported'` against the identical device
+row for both threads) -- there is no code path by which a legitimate third
+outcome could occur, so the fixed assertion is not flaky by construction.
+`test_record_device_report_two_threads_same_code_exactly_one_wins` and
+`test_confirm_device_wrong_attempts_counter_atomic_under_concurrency` are
+likewise backed by a single atomically-guarded write each, not a
+race-with-multiple-legitimate-outcomes. All four re-run 50x with no flake.
+
+**Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"` -- SQLAlchemy 2.1.1, mypy 2.3.1): `ruff check .`,
+`mypy .`, `mypy protocol fleet agent tools` all clean; `python -m pytest -W
+ignore::ResourceWarning` (732 passed, 99% coverage overall) run 3x with
+identical counts; the real-thread race test re-run 200x (0 failures, down
+from ~2.2%/500 measured before the fix -- the fix did not change timing,
+only the assertion, so the *interleaving* still occurs at the same rate,
+it is simply no longer treated as a failure); both new deterministic tests
+and the two `test_device_registration.py` siblings each re-run 50x (0
+failures).
+
 ## `PROTOCOL_VERSION` bump to 2 for the P4.2b registration models (main
 session)
 

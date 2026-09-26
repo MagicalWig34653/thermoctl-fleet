@@ -3050,6 +3050,22 @@ class Storage:
 
             apartment = session.get(ApartmentRecord, apartment_id)
             assert apartment is not None  # checked above, same transaction
+            # **Invariant fix, found while investigating the confirm/remove
+            # race (main session):** whether there was actually a token to
+            # revoke must be read here, not assumed -- an apartment can
+            # reach an open assignment with `token_hash` already `NULL`
+            # (P4.2's `confirm_device` never issues a token itself, only
+            # P4.2b's separate `/v1/registration/.../token` endpoint does,
+            # and `confirm_device`'s own `replace_previous` path already
+            # clears `token_hash` as part of closing the *previous*
+            # assignment -- see that method's own token-revoke audit row,
+            # which already computes this correctly). A hard-coded
+            # `before={"token_hash": "set"}` would otherwise write a false
+            # audit claim ("a token was revoked") for an apartment that
+            # never had one, exactly the "audit rows claiming actions that
+            # did not happen" this package's own tests were asked to rule
+            # out. Mirrors `confirm_device`'s own `had_token` computation.
+            had_token = apartment.token_hash is not None
             apartment.token_hash = None
 
             self._write_inventory_audit_log(
@@ -3079,7 +3095,7 @@ class Storage:
                 entity_id=apartment_id,
                 action="token_revoked",
                 reason=reason,
-                before={"token_hash": "set"},
+                before={"token_hash": "set" if had_token else None},
                 after={"token_hash": None},
             )
 
