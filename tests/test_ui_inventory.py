@@ -51,6 +51,13 @@ def test_apartment_id_pattern_rejects_uppercase_and_special_characters() -> None
     assert not APARTMENT_ID_PATTERN.match("house7 a03")
 
 
+def test_apartment_id_pattern_rejects_a_leading_or_trailing_hyphen() -> None:
+    assert not APARTMENT_ID_PATTERN.match("-house7-a03")
+    assert not APARTMENT_ID_PATTERN.match("house7-a03-")
+    assert not APARTMENT_ID_PATTERN.match("-")
+    assert APARTMENT_ID_PATTERN.match("a")  # a single character is still valid
+
+
 def test_build_inventory_view_groups_apartments_by_property(storage: Storage) -> None:
     property_ = storage.create_property("House 7", "Sample Street 7")
     storage.create_apartment(
@@ -408,6 +415,153 @@ def test_create_property_success_redirects_and_persists(
     properties = storage.list_properties()
     assert len(properties) == 1
     assert properties[0].name == "House 7"
+
+
+def test_create_property_rejects_an_over_length_name(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Cross-review, 2026-09-26: bounded to the column's length
+    (`MAX_PROPERTY_NAME_LENGTH == 255`) before `Storage` ever sees it --
+    on PostgreSQL an over-length `VARCHAR` raises instead of truncating,
+    which SQLite (this test's own database) would otherwise hide."""
+
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/properties",
+        data={
+            "name": "A" * 256,
+            "address": "Sample Street 7",
+            "notes": "",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "255" in response.text
+    assert storage.list_properties() == []
+
+
+def test_create_apartment_rejects_an_over_length_id(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+    too_long_id = "a" * 129
+
+    response = client.post(
+        "/ui/inventory/apartments",
+        data={
+            "id": too_long_id,
+            "property_id": str(property_.id),
+            "label": "A",
+            "floor": "",
+            "orientation": "",
+            "heating_circuits": "1",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert storage.get_apartment(too_long_id) is None
+
+
+def test_create_apartment_rejects_an_over_length_label(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/apartments",
+        data={
+            "id": "house7-a03",
+            "property_id": str(property_.id),
+            "label": "A" * 256,
+            "floor": "",
+            "orientation": "",
+            "heating_circuits": "1",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert storage.get_apartment("house7-a03") is None
+
+
+def test_create_apartment_rejects_a_leading_hyphen_in_the_id(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/apartments",
+        data={
+            "id": "-house7-a03",
+            "property_id": str(property_.id),
+            "label": "A",
+            "floor": "",
+            "orientation": "",
+            "heating_circuits": "1",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert storage.get_apartment("-house7-a03") is None
+
+
+def test_register_device_rejects_an_over_length_model(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    csrf_token = _login_and_get_csrf(client, password, totp_secret)
+
+    response = client.post(
+        "/ui/inventory/devices",
+        data={
+            "id": "sn-1",
+            "model": "A" * 129,
+            "acquisition_date": "2026-01-01",
+            "image_version": "2026.1",
+            "watchdog_version": "0.1.0",
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    assert storage.get_device("sn-1") is None
+
+
+def test_apartment_edit_submit_rejects_an_over_length_reason(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03", property_id=property_.id, label="A", floor=None, orientation=None,
+        state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+    csrf_token = _login_and_get_csrf(
+        client, password, totp_secret, path="/ui/inventory/apartments/house7-a03/edit"
+    )
+
+    response = client.post(
+        "/ui/inventory/apartments/house7-a03/edit",
+        data={
+            "label": "A",
+            "floor": "",
+            "orientation": "",
+            "heating_circuits": "1",
+            "state": "occupied",
+            "reason": "R" * 501,
+            "csrf_token": csrf_token,
+        },
+    )
+
+    assert response.status_code == 400
+    apartment = storage.get_apartment("house7-a03")
+    assert apartment is not None
+    assert apartment.label == "A"
 
 
 def test_create_apartment_rejects_an_invalid_id_charset(
@@ -1055,6 +1209,25 @@ def test_xss_escaping_of_property_and_apartment_free_text_fields(
         state="occupied",
         heating_circuits=1,
         pilot_mode=False,
+    )
+
+    _login(client, password, totp_secret)
+    response = client.get("/ui/inventory")
+
+    assert marker not in response.text
+    assert "&lt;script&gt;" in response.text
+
+
+def test_xss_escaping_of_device_model_field(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    marker = "<script>alert(1)</script>"
+    storage.register_device(
+        "sn-1",
+        model=marker,
+        acquisition_date=date(2026, 1, 1),
+        image_version="2026.1",
+        watchdog_version="0.1.0",
     )
 
     _login(client, password, totp_secret)

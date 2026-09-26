@@ -17,11 +17,28 @@ P4.1, not re-opened here):** landlord inventory actions are server-rendered
 
 **The apartment id is permanent and validated here, not in `fleet/storage.py`**
 (section 20.1: "a permanent id, never changes"): `APARTMENT_ID_PATTERN`
-restricts it to lowercase letters, digits, and `-` (matching the
+restricts it to lowercase letters, digits, and internal `-` (matching the
 specification's own example, `house7-a03`) -- a UI-level decision about
 what a *human* may type into the "create apartment" form, kept separate
 from `Storage.create_apartment`'s own uniqueness guarantee (the primary
-key). There is deliberately no "edit id" path anywhere in this module.
+key). A leading or trailing `-` is rejected too (`house7-a03-` or
+`-house7-a03` would be a strange, easy-to-mistype id no legitimate value
+needs) -- not merely "no dashes at all", the pattern still allows any
+number of internal ones. There is deliberately no "edit id" path anywhere
+in this module.
+
+**Every form field is bounded to its column's length, checked here before
+`Storage` ever sees it** (cross-review, 2026-09-26): on SQLite an
+over-length `VARCHAR` is silently truncated, but "on PostgreSQL an
+over-length VARCHAR raises instead of truncating" -- a deployment that
+switches database engines must not discover this difference as a 500 in
+production. `_MAX_LENGTHS` below mirrors `fleet/migrations/versions/
+0006_inventory.py`'s own column definitions exactly (one source value per
+column, restated here since a migration module is not something this
+module imports from) -- `fleet/ui_routes.py` checks every free-text field
+against it and re-renders with the same graceful 400 message every other
+validation error gets, never a raised `DataError`/`IntegrityError` from
+the database layer.
 
 **Section 6/20.1 stays out.** No tenant name, no contact detail is read,
 shown, or collected anywhere in this module -- `protocol.inventory.Property
@@ -42,10 +59,29 @@ from fleet.storage import ApartmentRecord, DeviceRecord, PropertyRecord, Storage
 from protocol.inventory import ApartmentState, DeviceLifecycle
 
 # Section 20.1: "a permanent id (`house7-a03`, never changes)" -- restricted
-# to the charset that example itself uses. Non-empty (`+`, not `*`) and
-# lowercase only (a landlord typing `House7-A03` gets a validation message,
-# not two ids that differ only by case and confuse each other later).
-APARTMENT_ID_PATTERN = re.compile(r"^[a-z0-9-]+$")
+# to the charset that example itself uses. Non-empty and lowercase only (a
+# landlord typing `House7-A03` gets a validation message, not two ids that
+# differ only by case and confuse each other later); `-` is allowed only
+# between two alphanumeric characters, never leading or trailing (see the
+# module docstring).
+APARTMENT_ID_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+# Mirrors `fleet/migrations/versions/0006_inventory.py`'s column lengths --
+# one number per column, restated here (see the module docstring for why).
+# Checked in `fleet/ui_routes.py` before any value reaches `Storage`, so an
+# over-length value never reaches the database layer at all -- on
+# PostgreSQL, unlike SQLite, an over-length `VARCHAR` raises instead of
+# silently truncating.
+MAX_APARTMENT_ID_LENGTH = 128
+MAX_LABEL_LENGTH = 255
+MAX_FLOOR_LENGTH = 64
+MAX_ORIENTATION_LENGTH = 64
+MAX_PROPERTY_NAME_LENGTH = 255
+MAX_PROPERTY_ADDRESS_LENGTH = 255
+MAX_DEVICE_ID_LENGTH = 128
+MAX_DEVICE_MODEL_LENGTH = 128
+MAX_VERSION_LENGTH = 64
+MAX_REASON_LENGTH = 500
 
 # Section 20.1's own default for a *newly created* apartment -- an existing
 # tenancy is the common case a landlord is entering into this system for
@@ -203,6 +239,16 @@ __all__ = [
     "DEFAULT_APARTMENT_STATE",
     "FILTER_FAULTY",
     "FILTER_IN_STORAGE",
+    "MAX_APARTMENT_ID_LENGTH",
+    "MAX_DEVICE_ID_LENGTH",
+    "MAX_DEVICE_MODEL_LENGTH",
+    "MAX_FLOOR_LENGTH",
+    "MAX_LABEL_LENGTH",
+    "MAX_ORIENTATION_LENGTH",
+    "MAX_PROPERTY_ADDRESS_LENGTH",
+    "MAX_PROPERTY_NAME_LENGTH",
+    "MAX_REASON_LENGTH",
+    "MAX_VERSION_LENGTH",
     "ApartmentRow",
     "DeviceRow",
     "InventoryView",

@@ -140,11 +140,25 @@ it). Fixed by adding `Storage.get_apartment_label` (returns the row's
 `label`, or `None` for a genuinely unknown apartment -- `label` is
 `NOT NULL` for every row that exists, so `None` is unambiguous) and
 switching `build_apartment_detail`'s existence check to that, which
-doubles as the label to show alongside the id (see below). No new test
-regression exists for this, since the fix landed before any test could
-observe the bug -- covered going forward by every existing P3.2 test that
-now runs against apartments created via `Storage.create_apartment` instead
-of only `Storage.set_apartment_token`.
+doubles as the label to show alongside the id (see below).
+**Corrected (cross-review, 2026-09-26):** this section previously claimed
+the fix was "covered going forward by every existing P3.2 test" -- false,
+`tests/test_ui_apartment.py` still only ever calls
+`Storage.set_apartment_token` (which always creates a token), so no
+existing test actually exercises a token-less, `create_apartment`-created
+apartment through this route at all. Fixed with direct tests instead:
+`tests/test_storage.py
+::test_get_apartment_label_returns_the_label_for_a_token_less_apartment`
+(storage level: `get_apartment_token_hash` is `None`, `get_apartment_label`
+still resolves) and `tests/test_ui_apartment.py
+::test_apartment_created_via_inventory_without_a_token_is_200_not_404`
+(HTTP level: a `create_apartment`-created apartment renders 200, not 404,
+on `GET /ui/apartments/{id}`) -- both new, both actually exercise the
+token-less path this fix was for. `Storage.get_apartment_label` itself
+also gained its own direct unit tests
+(`test_get_apartment_label_returns_the_label_for_a_known_apartment`,
+`::test_get_apartment_label_returns_none_for_an_unknown_apartment`), not
+only incidental coverage via `build_apartment_detail`.
 
 **Apartment label shown alongside the id, "if cheap" (work package's own
 instruction).** `Storage.get_house_overview` now also selects `label` in
@@ -191,11 +205,14 @@ fleet-ui.css`), all behind `require_ui_user`, CSRF-checked on every POST,
 - `POST /ui/inventory/properties` -- create a property. No `reason`/audit
   log: a brand-new property changes no prior assignment, state, or token.
 - `POST /ui/inventory/apartments` -- create an apartment. The id is
-  validated against `APARTMENT_ID_PATTERN` (`^[a-z0-9-]+$`, matching the
-  specification's own example `house7-a03`) here, in the UI layer, kept
-  separate from `Storage.create_apartment`'s own uniqueness guarantee (the
-  primary key) -- **there is no field, on this form or any other, that
-  could ever change the id afterward.** `state` always starts at
+  validated against `APARTMENT_ID_PATTERN` (matching the specification's
+  own example `house7-a03`: lowercase letters, digits, and `-` only
+  between two alphanumeric characters -- **cross-review, 2026-09-26:** a
+  leading or trailing `-` is rejected too, not just disallowed characters)
+  here, in the UI layer, kept separate from `Storage.create_apartment`'s
+  own uniqueness guarantee (the primary key) -- **there is no field, on
+  this form or any other, that could ever change the id afterward.**
+  `state` always starts at
   `occupied` and `pilot_mode` always at `False` regardless of anything a
   form could otherwise carry (section 21.4: "a newly created apartment is
   never accidentally in pilot mode") -- both changeable only via the
@@ -234,28 +251,116 @@ also confirms every free-text field (property name/address/notes,
 apartment label/floor/orientation) is HTML-escaped, not merely absent of
 section-6 markers.
 
-**Tests.** `tests/test_storage.py` gained 26 new tests (82 total: migration
-up/down/backfill, every new `Storage` method, both partial unique indexes
-including the concurrency test above); `tests/test_ui_inventory.py` (new,
-44 tests) covers `fleet.ui_inventory.build_inventory_view` directly
+**Cross-review round 1 (2026-09-26) -- four fixes, all landed here, not
+deferred:**
+
+1. **`POST /v1/heartbeats` (the P2.1b catch-up batch endpoint) was missing
+   from the NULL-token-hash test group** -- the other three token-checked
+   endpoints (`POST /v1/heartbeat`, `POST /v1/events/{apartment}`,
+   `GET /v1/commands`, `POST /v1/commands/{id}/result`) each had one, this
+   one did not, purely an oversight, not a code gap (the same
+   `require_apartment_token_by_hash` dependency already covers it). Added:
+   `tests/test_fleet.py::test_null_token_hash_apartment_gets_403_on_heartbeats_batch`.
+
+2. **Downgrading past 0006 with a token-less apartment left a permanent,
+   orphaned `_alembic_tmp_apartments` table behind, on top of a raw,
+   unhelpful `IntegrityError`.** Reproduced: `token_hash` becoming `NOT
+   NULL` again requires every existing row to already have one; SQLite's
+   `batch_alter_table` implements this as "build a new table, copy every
+   row across, swap it in" -- the copy step is what actually violates the
+   new constraint, but only *after* the new table already exists, and
+   nothing in the failed migration ever gets to drop it again. **Decision
+   (main session): do not backfill a placeholder token to paper over
+   this** -- a synthetic, made-up hash written by a migration is exactly
+   the kind of artificial secret-shaped value CLAUDE.md's "no secrets in
+   the repo, not even as a real-looking example value" reasoning was meant
+   to rule out, database write or source-code literal alike. **Fixed with
+   an explicit pre-check**: `downgrade()` now queries for any apartment
+   with `token_hash IS NULL` *before* touching the schema at all, and
+   raises `RuntimeError` naming exactly which apartment id(s) block it --
+   nothing is created, nothing is touched, if any are found. Proven, not
+   just argued: `tests/test_storage.py
+   ::test_migration_0006_downgrade_refuses_when_an_apartment_has_no_token`
+   asserts the message, that no `_alembic_tmp_apartments` table exists
+   afterward, and that the schema and the apartment's own data are both
+   still intact at revision `0006`.
+
+3. **No length bounds on form input, anywhere.** On SQLite an over-length
+   `VARCHAR` is silently truncated; on PostgreSQL it raises -- a
+   deployment that switches engines would discover the difference as a
+   500 in production, not as a validation message. **Fixed:**
+   `fleet/ui_inventory.py` now defines one `MAX_*_LENGTH` constant per
+   column (mirroring `0006_inventory.py`'s own column definitions exactly,
+   restated since a migration module is not something this module
+   imports from), and every free-text field on every form (property
+   name/address; apartment id/label/floor/orientation; device id/model/
+   image version/watchdog version; the edit form's `reason`) is checked
+   against it before `Storage` ever sees the value, re-rendering with the
+   same graceful 400 message every other validation error already gets --
+   a new shared helper, `fleet.ui_routes._first_length_error`, checks a
+   list of `(field name, value, max length)` triples and returns the first
+   violation, or `None`. Tested: an over-length apartment id (129 chars,
+   past the column's 128), an over-length property name (256, past 255),
+   apartment label, device model, and the edit form's reason (501, past
+   500) each rejected with a 400 and nothing written --
+   `tests/test_ui_inventory.py
+   ::test_create_apartment_rejects_an_over_length_id` and five sibling
+   tests.
+
+**Also fixed, optional items from the same review:**
+
+- **A leading or trailing `-` in an apartment id is now rejected**
+  (`APARTMENT_ID_PATTERN` changed from `^[a-z0-9-]+$` to
+  `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`) -- `house7-a03-`/`-house7-a03` are
+  easy mistypes no legitimate id needs, and internal `-` (the actual
+  specification example, `house7-a03`) is still fully allowed. Tested at
+  both the pattern level (`tests/test_ui_inventory.py
+  ::test_apartment_id_pattern_rejects_a_leading_or_trailing_hyphen`) and
+  the HTTP level (`::test_create_apartment_rejects_a_leading_hyphen_in_the_id`).
+- **XSS escaping test added for the device `model` field**
+  (`tests/test_ui_inventory.py::test_xss_escaping_of_device_model_field`)
+  -- the existing XSS test only covered property/apartment free-text
+  fields, not a device's.
+- **A direct `sqlite_master` assertion for both partial unique indexes'
+  `WHERE` clause** (`tests/test_storage.py
+  ::test_migration_0006_partial_unique_indexes_carry_the_where_clause`) --
+  the existing concurrency test proves the indexes *behave* as partial
+  (a closed assignment does not block a new one), this additionally
+  proves the stored schema itself says `WHERE ended_at IS NULL`, not just
+  that the test data used elsewhere never happened to hit the
+  non-partial case.
+
+**Tests.** `tests/test_storage.py` gained 31 new tests (87 total: migration
+up/down/backfill, the refused-downgrade case and the `sqlite_master`
+partial-index check above, every new `Storage` method including
+`get_apartment_label`'s own direct tests, both partial unique indexes
+including the concurrency test); `tests/test_ui_inventory.py` (new, 52
+tests) covers `fleet.ui_inventory.build_inventory_view` directly
 (grouping, current-device lookup, both named filters, an unknown filter
 falling back to "no filter", a retired apartment still listed) and every
 route at the HTTP level, logging in via the real P3.0 flow: unauthenticated
 access redirecting (303) for the view and every POST; missing/wrong CSRF
 (403); every validation error (empty label, non-numeric/unknown property
 id, negative heating circuits, malformed date, duplicate ids, missing
-reason, unknown state) re-rendering with a German message (400), not a
-500 or a silent no-op; success writing the entity and, for the edit form,
-an audit entry with the acting username and reason; the `in_storage`/
-`faulty` filters; XSS escaping; the security headers. `tests/test_fleet.py`
-replaced its six removed-endpoint tests with
-`test_old_v1_inventory_routes_no_longer_exist` (parametrized over all six
-paths, asserts 404) and gained the six NULL-token-hash tests described
-above.
+reason, unknown state, a leading/trailing hyphen, every field's length
+bound) re-rendering with a German message (400), not a 500 or a silent
+no-op; success writing the entity and, for the edit form, an audit entry
+with the acting username and reason; the `in_storage`/`faulty` filters;
+XSS escaping (property/apartment free-text fields and the device `model`
+field); the security headers. `tests/test_fleet.py` (72 total) replaced
+its six removed-endpoint tests with `test_old_v1_inventory_routes_no_
+longer_exist` (parametrized over all six paths, asserts 404) and gained
+seven NULL-token-hash tests: one per token-checked endpoint (`POST
+/v1/heartbeat`, `POST /v1/heartbeats`, `POST /v1/events/{apartment}`,
+`GET /v1/commands`, `POST /v1/commands/{id}/result` -- five, including
+the batch endpoint added in cross-review round 1 below) plus two direct
+storage-level tests. `tests/test_ui_apartment.py`
+(43 total) gained
+`test_apartment_created_via_inventory_without_a_token_is_200_not_404`.
 
 Verification for this round: `ruff check .`, `mypy .`, `mypy protocol
 fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
-(478 passed, 99% coverage overall, every P4.1 file --
+(493 passed, 99% coverage overall, every P4.1 file --
 `fleet/storage.py`, `fleet/ui_inventory.py`, `fleet/ui_routes.py`,
 `fleet/app.py`, every migration -- at 100%).
 

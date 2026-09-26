@@ -618,6 +618,39 @@ def test_unknown_apartment_is_404_with_the_same_layout(
     assert "Das Haus" in response.text  # base.html's own nav entry
 
 
+def test_apartment_created_via_inventory_without_a_token_is_200_not_404(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Cross-review, 2026-09-26 (P4.1): an apartment created through the
+    "Inventar" view's `Storage.create_apartment` (no device confirmed yet,
+    hence no token -- P4.1's own "an apartment exists before any device is
+    confirmed") genuinely exists and must render normally here, never
+    404 -- this is the regression `Storage.get_apartment_label` (P4.1) was
+    introduced to fix in `build_apartment_detail`'s existence check, which
+    used to be `get_apartment_token_hash(...) is None` and would have
+    wrongly 404'd this exact apartment."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        APARTMENT,
+        property_id=property_.id,
+        label="3. OG links",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+    assert storage.get_apartment_token_hash(APARTMENT) is None  # genuinely token-less
+
+    _login(client, password, totp_secret)
+    response = client.get(f"/ui/apartments/{APARTMENT}")
+
+    assert response.status_code == 200
+    assert "Noch keine Daten." in response.text  # never reported, but not unknown
+    assert "nicht bekannt" not in response.text  # never the "unknown apartment" message
+
+
 def test_every_section_renders_from_real_stored_data(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:

@@ -984,6 +984,32 @@ def test_migration_0006_upgrade_creates_the_new_tables(tmp_path: object) -> None
     }
 
 
+def test_migration_0006_partial_unique_indexes_carry_the_where_clause(
+    tmp_path: object,
+) -> None:
+    """Direct `sqlite_master` inspection (not only behavioral tests): both
+    partial unique indexes from section 20.3 must actually be *partial* --
+    `WHERE ended_at IS NULL` -- in the schema SQLite stored, not merely
+    behave that way by coincidence of the test data used elsewhere."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_storage(url).engine
+
+    with engine.connect() as connection:
+        rows = connection.exec_driver_sql(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            "AND name IN ('ux_assignments_apartment_id_open', 'ux_assignments_device_id_open')"
+        ).fetchall()
+
+    indexes = {name: sql for name, sql in rows}
+    assert set(indexes) == {"ux_assignments_apartment_id_open", "ux_assignments_device_id_open"}
+    for sql in indexes.values():
+        assert sql is not None
+        assert "WHERE" in sql
+        assert "ended_at IS NULL" in sql
+
+
 def test_migration_0006_downgrade_removes_the_new_tables_and_columns(tmp_path: object) -> None:
     url = _database_url(tmp_path)
     upgrade(url)
@@ -1002,6 +1028,49 @@ def test_migration_0006_downgrade_removes_the_new_tables_and_columns(tmp_path: o
     # Round trip.
     upgrade(url)
     assert "properties" in set(inspect(create_storage(url).engine).get_table_names())
+
+
+def test_migration_0006_downgrade_refuses_when_an_apartment_has_no_token(
+    tmp_path: object,
+) -> None:
+    """Cross-review, 2026-09-26: downgrading past 0006 while an apartment
+    still has `token_hash IS NULL` used to raise a raw `IntegrityError`
+    from *inside* SQLite's batch-alter table rebuild, after already
+    creating `_alembic_tmp_apartments` -- which then stayed behind
+    permanently, since the failing statement was never reached to drop it
+    again. Fixed with an explicit pre-check: a clear `RuntimeError` naming
+    the offending apartment id(s), raised *before* `batch_alter_table` (or
+    any other schema change) runs at all, so nothing is touched -- no
+    placeholder token is ever inserted to work around it (main-session
+    decision)."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="A",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    with pytest.raises(RuntimeError, match="house7-a03"):
+        downgrade(url, "0005")
+
+    engine = create_storage(url).engine
+    tables = set(inspect(engine).get_table_names())
+    assert "_alembic_tmp_apartments" not in tables
+    # Schema and data both still intact at 0006 -- nothing was touched.
+    assert "properties" in tables
+    assert "devices" in tables
+    apartment = storage.get_apartment("house7-a03")
+    assert apartment is not None
+    assert apartment.label == "A"
 
 
 def test_migration_0006_backfills_a_legacy_apartment_row(tmp_path: object) -> None:
@@ -1165,6 +1234,60 @@ def test_create_apartment_rejects_a_duplicate_id(storage: Storage) -> None:
 
 def test_get_apartment_returns_none_for_an_unknown_id(storage: Storage) -> None:
     assert storage.get_apartment("unknown") is None
+
+
+def test_get_apartment_label_returns_the_label_for_a_known_apartment(
+    storage: Storage,
+) -> None:
+    """Cross-review, 2026-09-26: this method has its own contract (used by
+    `fleet.ui_apartment.build_apartment_detail` as the "does this apartment
+    exist" check, since `token_hash` can no longer serve that purpose --
+    see `0006_inventory.py`'s docstring) and needed a test of its own, not
+    only incidental coverage via that caller."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a03",
+        property_id=property_.id,
+        label="3. OG links",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    assert storage.get_apartment_label("house7-a03") == "3. OG links"
+
+
+def test_get_apartment_label_returns_none_for_an_unknown_apartment(
+    storage: Storage,
+) -> None:
+    assert storage.get_apartment_label("unknown") is None
+
+
+def test_get_apartment_label_returns_the_label_for_a_token_less_apartment(
+    storage: Storage,
+) -> None:
+    """The exact case this method was introduced for: an apartment created
+    via `create_apartment` (no token yet, P4.1's own "an apartment exists
+    before any device is confirmed") must still resolve as "exists",
+    unlike the `get_apartment_token_hash`-based check this replaced."""
+
+    property_ = storage.create_property("House 7", "Sample Street 7")
+    storage.create_apartment(
+        "house7-a04",
+        property_id=property_.id,
+        label="4. OG rechts",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+    assert storage.get_apartment_token_hash("house7-a04") is None
+    assert storage.get_apartment_label("house7-a04") == "4. OG rechts"
 
 
 def test_list_apartments_by_property(storage: Storage) -> None:

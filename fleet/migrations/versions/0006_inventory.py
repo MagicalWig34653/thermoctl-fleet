@@ -95,6 +95,36 @@ semantics) already behave correctly for a `NULL` token_hash without any
 code change -- confirmed, not merely assumed, by new tests in
 `tests/test_fleet.py`.
 
+**`downgrade()` refuses instead of inventing a placeholder token (cross-
+review, 2026-09-26).** Going back to `0005` needs `token_hash NOT NULL`
+again -- exactly the constraint this migration's own `upgrade()` relaxed.
+An apartment created through `create_apartment` (P4.1's whole point: "an
+apartment exists before any device is confirmed") may genuinely have no
+token at all, and there is no real value to put there: a synthetic,
+made-up hash would be an artificial secret-shaped value invented by a
+migration, not a real token any agent could ever present, and CLAUDE.md's
+"no secrets in the repo, not even as a real-looking example value"
+reasoning applies just as much to a database write as to a source-code
+literal. **`downgrade()` therefore checks first**, before touching the
+table at all: if any apartment still has `token_hash IS NULL`, it raises
+`RuntimeError` naming exactly which ids, and never runs
+`batch_alter_table` (which drops into SQLite's "create a new table, copy
+the rows, swap it in" rebuild) at all. Reproduced without this check
+(cross-review): the `INSERT INTO _alembic_tmp_apartments ... SELECT ...`
+copy step itself violated the new `NOT NULL` constraint, but only *after*
+SQLite had already created `_alembic_tmp_apartments` -- the failed
+`batch_alter_table` block left that temporary table behind permanently,
+on top of raising an unhelpful raw `IntegrityError`. The pre-check makes
+the whole operation atomic in the way that matters for an operator: either
+the downgrade fully succeeds, or nothing at all is touched and the error
+says exactly which apartments block it (assign a real device/token to
+each first, then retry -- not something this migration can do on an
+operator's behalf). `tests/test_storage.py
+::test_migration_0006_downgrade_refuses_when_an_apartment_has_no_token`
+proves both halves: the clear message, and that the schema and data are
+completely unchanged afterward (`_alembic_tmp_apartments` does not exist,
+the apartment row is still there at revision `0006`).
+
 Revision ID: 0006
 Revises: 0005
 Create Date: 2026-09-26
@@ -218,6 +248,31 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Cross-review, 2026-09-26: check *before* touching the table at all --
+    # see the module docstring's "downgrade() refuses instead of inventing
+    # a placeholder token" section for why, and for the temp-table-left-
+    # behind bug this replaces.
+    connection = op.get_bind()
+    apartments_check = sa.table(
+        "apartments", sa.column("id", sa.String()), sa.column("token_hash", sa.String())
+    )
+    tokenless_ids = (
+        connection.execute(
+            sa.select(apartments_check.c.id).where(apartments_check.c.token_hash.is_(None))
+        )
+        .scalars()
+        .all()
+    )
+    if tokenless_ids:
+        raise RuntimeError(
+            "Downgrade past 0006 requires every apartment to have a "
+            "token_hash (this migration's own upgrade() made that column "
+            f"nullable); {len(tokenless_ids)} apartment(s) without one: "
+            f"{', '.join(tokenless_ids)}. No placeholder token is inserted "
+            "here -- assign a real device/token to each apartment first, "
+            "then retry the downgrade."
+        )
+
     op.drop_index("ix_apartments_property_id", table_name="apartments")
 
     with op.batch_alter_table("apartments") as batch_op:

@@ -44,6 +44,16 @@ from fleet.ui_house import build_house_overview
 from fleet.ui_inventory import (
     APARTMENT_ID_PATTERN,
     DEFAULT_APARTMENT_STATE,
+    MAX_APARTMENT_ID_LENGTH,
+    MAX_DEVICE_ID_LENGTH,
+    MAX_DEVICE_MODEL_LENGTH,
+    MAX_FLOOR_LENGTH,
+    MAX_LABEL_LENGTH,
+    MAX_ORIENTATION_LENGTH,
+    MAX_PROPERTY_ADDRESS_LENGTH,
+    MAX_PROPERTY_NAME_LENGTH,
+    MAX_REASON_LENGTH,
+    MAX_VERSION_LENGTH,
     build_inventory_view,
 )
 from fleet.ui_tasks import build_task_overview
@@ -323,6 +333,24 @@ def tasks(
 # -----------------------------------------------------------------------------
 
 
+def _first_length_error(*fields: tuple[str, str, int]) -> str | None:
+    """`fields` is `(german_field_name, value, max_length)` triples, checked
+    in order -- returns the first "too long" message, or `None` if every
+    field fits. Cross-review, 2026-09-26: every free-text field is bounded
+    to its column's length here, before `Storage` ever sees it -- "on
+    PostgreSQL an over-length VARCHAR raises instead of truncating"
+    (unlike SQLite, which the test suite runs against), so a value that
+    fits in this repository's own tests could still 500 in a PostgreSQL
+    deployment without this check. Mirrors the other validation errors in
+    this file: a message, re-rendered with a 400, never a raised
+    `DataError`/`IntegrityError` from the database layer."""
+
+    for name, value, max_length in fields:
+        if len(value) > max_length:
+            return f"{name} darf höchstens {max_length} Zeichen lang sein."
+    return None
+
+
 def _inventory_response(
     request: Request,
     storage: Storage,
@@ -392,6 +420,16 @@ def create_property_submit(
             status_code=400,
         )
 
+    length_error = _first_length_error(
+        ("Name", name.strip(), MAX_PROPERTY_NAME_LENGTH),
+        ("Adresse", address.strip(), MAX_PROPERTY_ADDRESS_LENGTH),
+    )
+    if length_error is not None:
+        return _inventory_response(
+            request, storage, authenticated, device_filter=None, error=length_error,
+            status_code=400,
+        )
+
     storage.create_property(name.strip(), address.strip(), notes.strip() or None)
     return RedirectResponse(url="/ui/inventory", status_code=303)
 
@@ -429,12 +467,20 @@ def create_apartment_submit(
 
     if not APARTMENT_ID_PATTERN.match(id):
         error = (
-            "Die Wohnungs-ID darf nur Kleinbuchstaben, Ziffern und '-' enthalten "
-            "und darf nicht leer sein."
+            "Die Wohnungs-ID darf nur Kleinbuchstaben, Ziffern und '-' "
+            "(nicht am Anfang oder Ende) enthalten und darf nicht leer sein."
         )
+    elif len(id) > MAX_APARTMENT_ID_LENGTH:
+        error = f"Die Wohnungs-ID darf höchstens {MAX_APARTMENT_ID_LENGTH} Zeichen lang sein."
     elif not label.strip():
         error = "Bezeichnung darf nicht leer sein."
     else:
+        error = _first_length_error(
+            ("Bezeichnung", label.strip(), MAX_LABEL_LENGTH),
+            ("Etage", floor.strip(), MAX_FLOOR_LENGTH),
+            ("Ausrichtung", orientation.strip(), MAX_ORIENTATION_LENGTH),
+        )
+    if error is None:
         try:
             parsed_property_id = int(property_id)
         except ValueError:
@@ -508,6 +554,18 @@ def register_device_submit(
             authenticated,
             device_filter=None,
             error="Alle Felder außer dem Anschaffungsdatum sind Pflichtfelder.",
+            status_code=400,
+        )
+
+    length_error = _first_length_error(
+        ("Seriennummer / Hardware-ID", id.strip(), MAX_DEVICE_ID_LENGTH),
+        ("Modell", model.strip(), MAX_DEVICE_MODEL_LENGTH),
+        ("Image-Version", image_version.strip(), MAX_VERSION_LENGTH),
+        ("Watchdog-Version", watchdog_version.strip(), MAX_VERSION_LENGTH),
+    )
+    if length_error is not None:
+        return _inventory_response(
+            request, storage, authenticated, device_filter=None, error=length_error,
             status_code=400,
         )
 
@@ -628,6 +686,14 @@ def apartment_edit_submit(
         return _error("Ungültiger Zustand.")
     if not reason.strip():
         return _error("Ein Grund ist erforderlich.")
+    length_error = _first_length_error(
+        ("Bezeichnung", label.strip(), MAX_LABEL_LENGTH),
+        ("Etage", floor.strip(), MAX_FLOOR_LENGTH),
+        ("Ausrichtung", orientation.strip(), MAX_ORIENTATION_LENGTH),
+        ("Grund", reason.strip(), MAX_REASON_LENGTH),
+    )
+    if length_error is not None:
+        return _error(length_error)
     try:
         parsed_heating_circuits = int(heating_circuits)
         if parsed_heating_circuits < 0:

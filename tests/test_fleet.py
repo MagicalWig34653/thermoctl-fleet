@@ -1023,6 +1023,19 @@ def test_null_token_hash_apartment_gets_403_on_heartbeat(
     assert response.status_code == 403
 
 
+def test_null_token_hash_apartment_gets_403_on_heartbeats_batch(
+    client: TestClient, storage: Storage
+) -> None:
+    _create_apartment_without_a_token(storage, APARTMENT)
+    heartbeat = dict(HEARTBEAT_EXAMPLE)
+
+    response = client.post(
+        "/v1/heartbeats", json=[heartbeat], headers=_bearer("agent_house7-a03_anything")
+    )
+
+    assert response.status_code == 403
+
+
 def test_null_token_hash_apartment_gets_403_on_event(
     client: TestClient, storage: Storage
 ) -> None:
