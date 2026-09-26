@@ -33,6 +33,7 @@ from fleet.ui_apartment import (
 )
 from fleet.ui_auth import generate_totp_secret, hash_password
 from protocol import Heartbeat
+from protocol.version import PROTOCOL_VERSION
 
 USERNAME = "landlord"
 APARTMENT = "house7-a03"
@@ -55,7 +56,7 @@ def _make_heartbeat(
     reachable: bool = True,
     thermoctl_version: str = "0.9.5",
     agent_version: str = "0.1.0",
-    protocol_version: int = 1,
+    protocol_version: int = PROTOCOL_VERSION,
     open_faults: list[dict[str, str]] | None = None,
 ) -> Heartbeat:
     return Heartbeat.model_validate(
@@ -408,7 +409,7 @@ def test_battery_signal_version_system_and_control_fields(storage: Storage) -> N
     assert detail.zigbee_bridge == "connected"
     assert detail.agent_version == "0.2.1"
     assert detail.thermoctl_version == "0.9.5"
-    assert detail.protocol_version == 1
+    assert detail.protocol_version == PROTOCOL_VERSION
     assert detail.outdated is False
     assert detail.memory_free_percent == 41
     assert detail.disk_free_percent == 68

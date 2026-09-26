@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -43,4 +44,18 @@ func parseOptionalTimestamp(value, fieldName, file string) (int64, error) {
 		return 0, fmt.Errorf("%s: %q is not a Unix timestamp: %w", file, fieldName, err)
 	}
 	return timestamp, nil
+}
+
+// openAndParse opens path and hands it to parse -- the shared "open, defer
+// close, parse" shape behind LoadState and ReadHealth, factored out here for
+// the same reason readKeyValueLines was: without it, the 300-line limit
+// would count this twice.
+func openAndParse[T any](path string, parse func(io.Reader) (T, error)) (T, error) {
+	var zero T
+	file, err := os.Open(path)
+	if err != nil {
+		return zero, err
+	}
+	defer file.Close()
+	return parse(file)
 }

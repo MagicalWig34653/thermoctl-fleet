@@ -208,6 +208,288 @@ separate, not-yet-built concern -- this package only reuses section 14's
 key, not for a WireGuard tunnel).
 
 
+## `PROTOCOL_VERSION` bump to 2 for the P4.2b registration models (main
+session)
+
+**Decision by the project owner (2026-09-26):** section 18.2's "a number
+that increases with every change to the models" is read **literally** --
+every change to the models, including purely additive ones, bumps it. The
+four models P4.2b added (`RegistrationAccepted`, `TokenChallenge`,
+`TokenRequest`, `TokenIssued`) therefore bump `PROTOCOL_VERSION` from 1 to
+**2**, reversing the "not bumped" call made at the time (still recorded,
+now marked superseded, in this file's P4.2b section below and in
+`protocol/registration.py`'s module docstring). The compatibility rules of
+18.2 are unchanged: the fleet still accepts an older version and flags it
+"outdated" rather than rejecting it, the agent still rejects only commands
+of a newer version, and a field is still only ever added.
+
+**Effect:** agents reporting `protocol_version` 1 now show as "outdated
+version" on "Das Haus" and "Eine Wohnung", and get an update task on
+"Aufgaben" -- expected, not a regression; no agent is deployed yet, so
+nothing currently reporting is affected. `docs/specification.md` 18.2 gets
+a short "Decided afterward" paragraph stating this; nothing else in the
+spec changes. Tests that hard-coded a literal `1` as the *current* protocol
+version's default (`tests/test_ui_apartment.py`, `tests/test_ui_tasks.py`,
+`tests/test_ui_house.py`, each a `_make_heartbeat` helper's
+`protocol_version` default) were changed to default to the
+`protocol.version.PROTOCOL_VERSION` constant instead -- those tests do not
+care about the outdated flag and would otherwise have started asserting
+"outdated" apartments as "fine" ones by accident. Tests that hard-code `1`
+to deliberately represent an *older* agent (e.g.
+`tests/test_ui_apartment.py::test_outdated_protocol_version_is_flagged`,
+several inline heartbeat JSON bodies in HTTP-level tests unrelated to the
+outdated flag) were left as literal `1`, now a real older version rather
+than a merely hypothetical one. `tests/test_protocol.py
+::test_heartbeat_with_lower_protocol_version_is_accepted`'s docstring
+("`PROTOCOL_VERSION` is currently 1 -- there is no real older version yet
+to test against") was rewritten to use the now-real older version 1
+instead of modelling a hypothetical future one.
+
+## Cross-review fixes: P5.6 registry path, resumability, manifest digests
+
+Five findings from P5.6's own cross-review (R1-R5) plus one further,
+deeper finding from the main session's read-back (the state file's digest
+is a *registry manifest* digest, not a local image ID) -- all fixed in the
+same worktree, one commit, before P5.6 merges.
+
+**R1/R5 -- `docker run` without `--pull=never` could reach a registry, and
+had no restart policy at all.** Both traced back to the same root cause:
+`Start` ran the digest directly (`docker run -d --name thermoctl-agent
+<digest>`), a command with no volumes, no environment, and -- the sharper
+problem -- no restart policy, so Docker never counted a restart and
+"the container restarted three times in a row" (section 17 step 5) could
+never actually trigger. **Decided (main session): the agent's real run
+configuration lives in a fixed compose file shipped with the system
+image**, `image/common/agent-compose.yml` -- `pull_policy: never` (R1) and
+`restart: on-failure` (so `RestartCount` means something, and Docker does
+not fight the watchdog by resurrecting a container the agent stopped
+*itself* to swap). `watchdog/runtime.go`'s `cliRuntime.Start` now does
+exactly two things, no more: tag the digest locally (no network), then
+`docker compose -f <fixed path> up -d --pull never --force-recreate agent`
+(`--pull never` again, belt and suspenders with the file's own
+`pull_policy`). The compose file is never sent by the cloud -- section 13's
+"no arbitrary compose files" is about what the cloud may hand the agent,
+not about this one fixed file baked into the image like
+`thermoctl-watchdog.service`. New flag `-runtime-compose` (default
+`/etc/thermoctl-agent/compose.yml`); the container name is no longer a
+flag at all (`agentContainerName` constant, fixed by the compose file's
+own `container_name` -- two places to keep in sync by hand was worse than
+one fixed name). `tools/check_image_config.py` gained
+`check_agent_compose_file` (plausibility only, no YAML parser pulled in:
+checks the handful of substrings that would silently defeat R1/R5 if
+lost).
+
+**R4 -- a digest was never validated before reaching argv.** A value
+starting with `-` would have been parsed as a command-line option, not an
+image reference. Fixed with `digestPattern` (`^sha256:[0-9a-f]{64}$`),
+checked in `Start` before anything is even tagged.
+
+**R2 -- resumability: a watchdog restart mid-swap could never roll back an
+unhealthy revision.** `Reconcile` used to treat "the agent is running" as
+"nothing to do", full stop -- if the watchdog itself died and restarted
+while a new, still-unproven digest was running, it would see that digest
+running and return OK forever, never checking whether it had actually
+proved itself within the deadline. Fixed by anchoring `AwaitHealthReport`'s
+deadline to the state file's own `since` (`time.Unix(s.Since,
+0).Add(10*time.Minute)`, section 22.2) instead of to whenever the call
+happened to start, and by having `Reconcile` re-enter the await/rollback
+path whenever the running digest already equals `desired` but `desired !=
+proven` -- resuming with whatever time is actually left, immediate
+rollback if the deadline has already passed. `now func() time.Time` joins
+`sleep` as an injected parameter (still no `Clock` type, still no real
+wait in tests).
+
+**R3 -- `runtime.go` had no tests at all.** Fixed with `execCommand`, a
+package variable standing in for `exec.Command` (`var execCommand =
+exec.Command`) that tests swap for a recording fake -- the exact argv
+`Start`/`Status` build is asserted directly (in particular that `--pull
+never` is present, and that every refused digest -- empty, `-rm`, wrong
+length, non-hex, or already carrying a repo prefix -- never reaches
+`execCommand` at all), without ever touching Docker.
+
+**Deeper finding, main session (read while fixing R1-R5): `desired`/
+`proven` are registry *manifest* digests, not local image IDs.** Section
+13's desired state carries `"digest": "sha256:..."` -- the manifest digest
+the agent already checked against the hard-coded sources (security
+principle 2) before ever writing the state file. `docker inspect -f
+'{{.Image}}'` reports something else entirely: the *local image ID* (a
+content hash of the image config), a different value for the same image.
+Worse, `docker tag sha256:<manifest digest> ...` does not resolve at all --
+only `<repo>@sha256:<manifest digest>` does, and only for an image the
+agent actually pulled by digest (so it carries that reference in its
+`RepoDigests`). Both `Start` (tagging) and `Status` (comparing the running
+digest against `s.Desired`) were wrong as originally written.
+
+**Fixed: a new `-runtime-repo` flag** (default
+`ghcr.io/magicalwig34653/thermoctl-agent`) **-- the agent's own hard-coded
+image source (security principle 2), never the cloud's to name**, only a
+flag default the operator confirms matches `agent/`'s own source list
+before shipping an image. `Start` now tags `<repo>@<digest>` (still no
+network -- `docker tag` only ever resolves something already local, it
+just needed the right reference shape). `Status` now does two `inspect`
+calls where it used to do one: the container's running state, restart
+count, and local image ID, then (`cliRuntime.repoDigest`) `docker image
+inspect -f '{{range .RepoDigests}}{{.}} {{end}}' <image ID>` on that ID,
+matching entries against `<repo>@` and returning the manifest digest after
+the `@`. No matching entry (an image pulled by tag, or from an unrelated
+source) reports an empty digest, which `Reconcile` already treats as
+"something other than desired is running" -- never a false positive match.
+**Contract clarification for P5.4 (agent-side desired-state
+reconciliation), not yet built:** the agent must pull the agent image by
+digest (`<repo>@sha256:...`), not by tag, or the running container will
+have no matching `RepoDigests` entry and the watchdog can never confirm it
+is healthy.
+
+**Line budget: three named functions retired, none of the four required
+capabilities lost.** `AgentStopped` and `StartDigest` -- both from the
+original P5.6 task -- are gone as separate package-level functions.
+Neither survived as *dead* code: `Reconcile` needed the running digest in
+the same `Status` call `AgentStopped` would have made on its own (a
+second, redundant call to check only the boolean half of the same answer
+would have cost more, not less), and `StartDigest` had exactly one call
+site once `Reconcile` existed. Both bodies are inlined at that one call
+site instead, with a comment at each pointing to why. The underlying
+capabilities (section 17 steps 3 and 4) are unchanged and still fully
+exercised -- by `Reconcile`'s own test suite now, where before they had
+their own direct tests. This was not a line-count-first decision: it was
+the reviewer's own two suggested savings (collapsing `Reconcile`'s final
+return, reusing `parseOptionalTimestamp` in `ParseHealth`) plus real
+restructuring (the deadline-as-poll-count trick from before this round
+had to be reverted for R2's sake, which cost lines back) that made it
+necessary to look for more, and these two really were dead weight by the
+time `Reconcile` existed. Documented here in the spirit of section 22's
+introduction, in case a later reader wonders where they went.
+
+Measured with the same counting command as before: `grep -v '^\s*//'
+<file> | grep -v '^\s*$' | wc -l`, summed across the seven production
+files. **299 statement lines** (unchanged from before this round, net: R1
+-5's compose/argv rework and the manifest-digest fix added real weight,
+`repoDigest` alone is new; removing the two dead functions and the
+reviewer's two suggested savings paid for almost all of it). Per file:
+`main.go` 55, `watch.go` 66, `state.go` 39, `health.go` 27, `leds.go` 19,
+`linefile.go` 47, `runtime.go` 46. **1 line of headroom before 300** --
+P5.7 (LED wiring) will need to trim further, not just add; `linefile.go`'s
+`openAndParse` and this round's dead-function removal are the two
+precedents to follow first.
+
+**Tests: `go vet ./...` clean, `go test -count=1 ./...` green three runs
+in a row, no flake, 46 tests** (up from 41: three `AgentStopped`/
+`StartDigest`-specific tests retired along with the functions, replaced by
+one `Reconcile`-level status-error test, against eight new ones -- R3's
+`runtime.go` argv tests (none existed before this round at all: refusing
+every kind of bad digest, tagging `<repo>@<digest>`, `--pull never`
+present, resolving a manifest digest out of `RepoDigests`, and reporting
+"" on no match), plus R2's two resumed-mid-swap `Reconcile` tests and two
+more `AwaitHealthReport` deadline-anchoring tests). `check_contract.sh`
+passes unchanged -- neither the state
+file nor the health report format changed. `gofmt -l .` empty. Python
+side: `ruff check .` clean; `python -m tools.check_image_config` passes
+(new `check_agent_compose_file`); `pytest tests/test_watchdog_contract.py
+tests/test_image_config.py` 15 passed (up from 13: two new compose-file
+plausibility tests).
+
+## P5.6 -- watchdog main loop implemented (`watchdog/watch.go`, `main.go`)
+
+`AgentStopped`, `StartDigest`, `AwaitHealthReport`, `RollBackToProven` are
+now actually implemented (section 17, steps 3-6), no longer stubs -- the
+scaffold's own "everything here returns an error" note in `watch.go`'s
+module docstring is gone.
+
+**A new `Runtime` interface (`watchdog/runtime.go`), not a library.** The
+container runtime is addressed exclusively through `os/exec` (section
+18.3): `cliRuntime` wraps a configurable `docker`-compatible binary
+(`-runtime-bin`, default `docker`) and container name (`-runtime-container`,
+default `thermoctl-agent`) -- `Start` does `rm -f` then `run -d --name`,
+`Status` a single `inspect -f` printing running-state, image digest, and
+restart count in one call. `go.mod` still carries no `require` -- `grep -c
+require go.mod` is 0 (the file's own explanatory comment is not a
+dependency). Tests substitute a fake `Runtime` and never invoke `docker` at
+all.
+
+**No wall clock in tests, and no `Clock` type at all.** `AwaitHealthReport`
+and `Reconcile` (new, see below) take a plain `sleep func(time.Duration)`
+instead of calling `time.Sleep`, or wrapping it in an interface -- production
+passes `time.Sleep` itself as a function value, tests pass a no-op that
+only counts calls. The 10-minute deadline from section 17 step 5 is
+`maxHealthPolls`, a poll count (`10 * time.Minute / healthPollInterval`)
+rather than a wall-clock comparison, so `AwaitHealthReport` needs no notion
+of "now" at all -- only the number of times it has slept.
+
+**`Reconcile` (new) ties the four functions into one pass and returns an
+`Outcome`** (`OutcomeOK` / `OutcomeRolledBack`) -- the single hook P5.7
+needs to drive `leds.go` without touching this decision again per the
+task's own instruction. `desired == proven` skips the await/rollback dance
+entirely (nothing to swap between): the agent is simply restarted on the
+one digest that exists; if that single start itself fails, the failure is
+only reported, not rolled back into itself (there is nothing else to try).
+When `desired != proven` and the start succeeds, `AwaitHealthReport` is
+awaited; an empty returned reason means healthy, otherwise
+`RollBackToProven` is called with that reason. An empty `proven` is
+reported as an error and nothing is started, exactly as section 22.5
+("Fallback without a proven revision") describes it, unchanged from the
+existing behaviour.
+
+**Where the rollback reason goes: stderr, not a new file.** Decided in
+favour of stderr (captured by journald under the systemd unit) over a new
+line-based note file, because a single, one-shot diagnostic line is exactly
+what journald is for, and a third line-based file contract would need its
+own reader, its own test, and its own entry in `check_contract.sh` for a
+value nothing else in the system reads back programmatically. Neither the
+state file nor the health report gained a new line -- `check_contract.sh`
+is unchanged and still passes.
+
+**Line budget: 299 statement lines, up from 195** (`main.go`, `watch.go`,
+`state.go`, `health.go`, `leds.go`, `linefile.go`, plus the new
+`runtime.go` -- seven files now), measured with the same counting command
+as before: `grep -v '^\s*//' <file> | grep -v '^\s*$' | wc -l`, summed
+across the seven files (comments and blank lines excluded, matching
+section 18.3's redefined rule). Getting from an initial draft (over 350
+statement lines with a full `Clock` interface, three separate configurable
+shell-command flags, and a four-way `Outcome`) down to 299 took three
+rounds of trimming, documented here because the reasoning is the kind
+section 22's introduction asks to keep: (1) replacing `Clock`
+(interface with `Now`/`Sleep`) with a plain `sleep func(time.Duration)`
+parameter and expressing the deadline as a poll count removed the need for
+"now" anywhere in this package; (2) collapsing the three configurable
+shell-command strings (`start-cmd`/`status-cmd`/`restarts-cmd`, each a
+template with `{digest}` substitution) down to a plain `docker` wrapper
+taking only a binary name and a container name removed most of
+`runtime.go`; (3) `openAndParse`, a small generic helper added to
+`linefile.go` (`func openAndParse[T any](path string, parse func(io.Reader)
+(T, error)) (T, error)`), absorbed the "open, defer close, parse" shape
+`LoadState` and `ReadHealth` each repeated, the same reasoning that
+produced `readKeyValueLines` in the first place. `gofmt -l .` confirmed
+empty throughout -- a tempting further trick (writing `if err != nil {
+return err }` on one line to save two lines per guard clause) does not
+survive `gofmt`, which expands it back to three lines every time; verified
+directly before relying on it, and abandoned once disproved.
+
+**Tests: `go vet ./...` clean, `go test -count=1 ./...` green, 41 tests (up
+from 25)**, covering: the happy path (stopped agent, desired started,
+matching health report arrives, no rollback); a health report that never
+arrives (rollback after the full deadline, with the reason); a health
+report naming the wrong digest (treated as identically to missing, per
+section 22.3); a stale health report older than `since` (same treatment,
+section 22.2); three restarts in a row (immediate rollback, no waiting out
+the deadline); a runtime failure starting the desired digest (reported, no
+rollback, no crash, since `desired == proven` in that test); a runtime
+failure during an actual swap (rollback attempted); an empty `proven`
+during a swap (error, exactly one start attempt -- the failed one -- no
+fallback start); and the agent still running (nothing touched at all).
+`check_contract.sh` passes unchanged. `gofmt -l .` empty. Python side
+untouched by this task: `ruff check .` clean, `pytest
+tests/test_watchdog_contract.py` unchanged at 7 passed.
+
+**P5.7 is next, not part of this task:** `watchdog/leds.go` still has
+`LedSetPattern` unimplemented; the `Outcome` return value from `Reconcile`
+is this task's documented hook for it, deliberately coarse (two values) --
+P5.7's own acceptance criterion (a correct pattern per state) may need
+either a finer `Outcome`, or to read `Runtime.Status`/health directly
+itself for the LED-specific distinctions (starting vs. healthy vs. no
+cloud contact) that section 23.2 draws and `Reconcile`'s outcome does not.
+
+## Cross-review hot fix: P4.2b accepted small-order Ed25519 keys (main
+session) **SR**
 
 **The finding, stated plainly.** P4.2b's own cross-review (2026-09-26)
 reproduced, end to end, that the signed challenge P4.2b's whole design
@@ -430,11 +712,14 @@ fingerprint (a 2**40 search) still cannot answer that challenge with the
 legitimate device's own private key. Deterministic, differs for different
 keys, format-tested directly (`tests/test_registration_protocol.py`).
 
-**Protocol additions, purely additive (section 18.2), `PROTOCOL_VERSION`
-**not** bumped** (the same section: a bump is only required for a changed
-field name, a changed required field, or a changed meaning of an existing
-field -- every change here is a brand-new model or a new pure function; no
-existing model's fields changed at all): `RegistrationAccepted
+**Protocol additions, purely additive (section 18.2).** `PROTOCOL_VERSION`
+was *not* bumped at the time this section was originally written (the
+argument then: a bump is only required for a changed field name, a changed
+required field, or a changed meaning of an existing field -- every change
+here is a brand-new model or a new pure function; no existing model's
+fields changed at all). **Superseded, see "`PROTOCOL_VERSION` bump to 2"
+below: the project owner has since read section 18.2 literally, and these
+four models are exactly what bumped it to 2.** `RegistrationAccepted
 {registration_id}`, `TokenChallenge{nonce, expires_at}`, `TokenRequest{nonce,
 signature}`, `TokenIssued{token}` (no `examples=`/default value on `token`
 -- CLAUDE.md: "no secrets in the repo, not even as a real-looking example
@@ -1898,28 +2183,104 @@ itself (a landlord bringing batteries to a visit that actually needed a
 different fix). Left out; if a future package wants to surface it, it
 should get its own task group, not this one.
 
-**Apartments already flagged on "Das Haus" are skipped here entirely --
-decided while building this package, the work package's own "decide,
-document" instruction.** `fleet.ui_tasks._eligible` excludes:
+**Superseded by P3.4a below (project owner decision, 2026-09-26) -- kept
+here only as history.** ~~Apartments already flagged on "Das Haus" are
+skipped here entirely -- decided while building this package, the work
+package's own "decide, document" instruction.~~ `fleet.ui_tasks._eligible`
+used to exclude:
 
 - apartments that have **never reported** (`ApartmentOverview.latest is
   None`) -- there is no heartbeat to read a battery/fault/version value
   from in the first place, so there is structurally nothing to compute a
-  task from, not merely nothing worth showing.
-- apartments with a currently **open "not reporting" alarm**
+  task from, not merely nothing worth showing. **Unchanged by P3.4a.**
+- ~~apartments with a currently **open "not reporting" alarm**
   (`ApartmentOverview.open_alarm is not None`) -- already the single most
   urgent line on "Das Haus" (P3.1's category 0, ranked above everything
   else); a battery percentage, fault, or version read from a heartbeat that
   stopped updating the moment the apartment went silent is stale by
   definition and would duplicate an already-surfaced, more urgent problem
   under a less urgent heading instead of adding a genuinely new piece of
-  work to schedule.
+  work to schedule.~~ **Reversed by P3.4a: this made a genuinely still-open
+  task (a weak battery, an open fault) disappear from the one list people
+  actually work from at exactly the moment the apartment went silent --
+  when a landlord investigating the silence could also act on it.**
 
-Tested directly: `tests/test_ui_tasks.py::
-test_apartment_with_open_not_reporting_alarm_excluded_from_every_group`
-builds an apartment with a very low battery, an old open fault, *and* an
-open "not reporting" alarm, and asserts it appears in none of the three
-groups despite otherwise qualifying for all three.
+## P3.4a -- keep tasks of silent apartments, marked stale (2026-09-26)
+
+**Project owner decision, 2026-09-26.** An apartment with an open "not
+reporting" alarm now **stays** in every task group its last known
+heartbeat still qualifies it for, instead of being excluded from all three
+wholesale. The exact motivating example: apartment 7 last reported battery
+5% and a fault open 3 h, then went silent -- it used to vanish from
+"Aufgaben" entirely, although both tasks almost certainly still applied.
+An apartment that has **never** reported (no heartbeat at all) stays
+excluded, unchanged -- there is structurally nothing to compute a task
+from in that case, a different situation from "last known data now stale."
+
+**What changed (`fleet/ui_tasks.py`):**
+
+- `_eligible` now only checks `overview.latest is not None` -- the
+  "not reporting" alarm check is removed from it.
+- `_stale_hint(now, overview)` returns `None` for a fresh apartment, or a
+  literal German sentence for one with a currently open "not reporting"
+  alarm, naming both the age of the heartbeat the row's value was read
+  from and how long the alarm has been open (e.g. "Wohnung meldet sich
+  nicht (seit 2 Std.) -- Stand der letzten Meldung vor 3 Std."). Text, not
+  colour alone (accessibility) -- the work package's explicit requirement.
+- `BatteryTask`/`UpdateTask`/`FaultTask` each gained `stale: bool` and
+  `stale_hint: str | None`, set by `_battery_task`/`_update_task`/
+  `_fault_task` from `overview.open_alarm is not None` and `_stale_hint`.
+- **Fault age for a stale row is still measured against `now`, not against
+  the heartbeat's own `received_at`** -- unchanged from P3.4, just now
+  reachable for a stale row too: section 8's "Fault open: ... longer than
+  2 h" is a rule about how long the fault has actually been open in
+  wall-clock time. A fault already 3 h old at last contact, apartment
+  silent for 3 h since, is 6 h open *now*, not merely 3 h -- showing the
+  smaller number would understate exactly the entry this group exists to
+  surface.
+- **Sorting is unchanged, and `stale` is deliberately not part of any sort
+  key** -- decided while building this package. For the battery round in
+  particular, the percentage itself remains the more useful ordering
+  signal for someone about to do a battery round: an apartment at 3%
+  that has since gone silent is not a *lower* priority than a fresh one at
+  15%, arguably a higher one (nobody has been able to check on it since).
+  Segregating stale rows to the bottom of each group would bury exactly
+  the entries this decision was made to keep visible; a stale row sorts
+  exactly where its value places it, just carrying the extra flag/hint.
+
+**Template/CSS (`fleet/templates/ui/tasks.html`,
+`fleet/static/ui/fleet-ui.css`):** a stale `<li>` gets a `task-list__stale`
+class (CSS-only, a dashed border) plus a second line,
+`<span class="task-list__stale-hint">`, printing `task.stale_hint`
+verbatim -- the hint is literal text, present in the markup regardless of
+whether the CSS marker renders, per the work package's own accessibility
+requirement ("text, not colour alone"). No inline `style`/`script`
+anywhere, same constraint every other `/ui` template in this repository
+already follows.
+
+**Tests.** `tests/test_ui_tasks.py::
+test_apartment_with_open_not_reporting_alarm_keeps_its_tasks_marked_stale`
+replaces the old exclusion test with the exact example from the work
+package (battery 5%, a fault open 3 h before going silent, then an open
+"not reporting" alarm): both the battery round and the fault entry are
+still present, both `stale`, both hints contain the heartbeat age and
+"meldet sich nicht", and the fault's `since_text` is measured against
+`now` (6 h, not the 3 h visible in the heartbeat).
+`test_fresh_apartment_rows_are_not_marked_stale` checks `stale is False`/
+`stale_hint is None` for an ordinary apartment.
+`test_silent_apartment_with_fine_values_has_no_task` checks a silent
+apartment whose values do not cross any threshold still yields no task --
+staleness keeps an already-qualifying row, it never invents one.
+`test_never_reported_apartment_excluded_from_every_group` (kept from P3.4,
+unchanged) still asserts the never-reported case is excluded.
+`test_tasks_view_marks_a_stale_row_with_text_not_colour_alone` is the
+HTTP-level check: the `task-list__stale` class, the `task-list__stale-hint`
+span, the literal "Wohnung meldet sich nicht" text, and no inline
+`style`/`script` anywhere on the page.
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+(728 passed, 99% coverage overall, `fleet/ui_tasks.py` at 100%).
 
 **No acknowledge/confirm mechanism exists, on purpose -- open point, not
 built here.** The work package's own instruction: an "acknowledge" action on

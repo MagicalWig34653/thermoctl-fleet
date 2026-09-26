@@ -1,4 +1,4 @@
-""""Aufgaben" -- section 9's third view (P3.4): "what is due: battery
+""""Aufgaben" -- section 9's third view (P3.4/P3.4a): "what is due: battery
 rounds, updates, unconfirmed faults -- the list people actually work from."
 
 Builds the German-language view model `fleet/templates/ui/tasks.html`
@@ -10,19 +10,46 @@ you need"). Deliberately its own module, next to `fleet/ui_house.py`, not
 folded into `fleet/ui_routes.py` (thin HTTP layer) or into `ui_house.py`
 itself (a different view, its own sorting/grouping rules).
 
-**Apartments already flagged on "Das Haus" are skipped here, decided while
-building this package (the work package left it open, "decide, document"):**
-an apartment that has **never reported** (`ApartmentOverview.latest is
-None`) has no heartbeat to read a battery/fault/version value from in the
-first place, and an apartment with a currently **open "not reporting"
-alarm** (`ApartmentOverview.open_alarm is not None`) is already the single
-most urgent line on "Das Haus" -- listing its (necessarily stale, from
-before it went silent) battery/fault/version state here as a separate task
-would duplicate a problem the landlord is already looking at under a
-different, less urgent heading, and a fault or battery value that stopped
-updating when the apartment went silent is not itself a fresh piece of work
-to schedule. Both cases are structurally excluded by `_eligible` below, not
-by an extra query.
+**P3.4a (project owner decision, 2026-09-26): a silent apartment keeps its
+tasks, marked stale -- superseding P3.4's original exclusion below.** P3.4
+excluded any apartment with a currently open "not reporting" alarm from
+every group, reasoning that its last-known battery/fault/version values
+were stale by definition and would duplicate the alarm already shown on
+"Das Haus". In practice this made a real, still-applicable task (a weak
+battery, an open fault) disappear from the one list people actually work
+from the moment the apartment went silent -- exactly when a landlord
+visiting to investigate the silence could also bring batteries or check the
+fault. Decided instead: an apartment with an open "not reporting" alarm
+**stays** in every task group its last known heartbeat still qualifies it
+for, each such row carrying a `stale` flag, the age of the underlying
+heartbeat, and how long the alarm has been open, rendered as a literal
+German hint (`fleet/templates/ui/tasks.html`, e.g. "... Wohnung meldet sich
+nicht"), not colour alone (accessibility). An apartment that has **never**
+reported (`ApartmentOverview.latest is None`) stays excluded -- there is no
+heartbeat to read a battery/fault/version value from in the first place, so
+there is structurally nothing to compute a task from, not merely nothing
+worth showing; this part of `_eligible` is unchanged from P3.4.
+
+**Fault age for a stale row is still measured against `now`, not against
+the heartbeat's own `received_at`** (`_fault_overdue`/`_fault_task` below,
+unchanged from P3.4): section 8's "Fault open: ... longer than 2 h" is a
+rule about how long the fault has been open in wall-clock time, not about
+how fresh the report reading it came from is -- a fault that was already
+9 h old at last contact and the apartment has been silent for another 3 h
+since is 12 h open now, and showing it as merely "9 h" would understate
+exactly the entry this group exists to surface. The heartbeat's own age is
+carried separately (`stale_hint`, see below), so both numbers are visible
+without conflating them.
+
+**Sorting is unchanged; stale rows sort together with fresh ones, not
+after them (decided while building this package).** For the battery round,
+the percentage itself is the more useful ordering signal for someone
+about to do a battery round -- a apartment at 3% that has since gone quiet
+is not a *lower* priority than a fresh one at 15%, it is arguably a higher
+one (nobody has been able to check on it since). Segregating stale rows to
+the bottom would bury exactly the entries this decision was made to keep
+visible. `stale` is therefore not part of any group's sort key, only a
+per-row flag the template renders a hint from.
 
 **Three thresholds, each a named constant citing its own row of section 8's
 alarm table (`docs/specification.md`) -- no threshold invented beyond what
@@ -104,6 +131,8 @@ class BatteryTask:
     apartment_href: str
     battery_percent: int
     last_contact_text: str
+    stale: bool
+    stale_hint: str | None
 
 
 @dataclass(frozen=True)
@@ -112,6 +141,8 @@ class UpdateTask:
     apartment_href: str
     agent_version: str
     thermoctl_version: str
+    stale: bool
+    stale_hint: str | None
 
 
 @dataclass(frozen=True)
@@ -121,6 +152,8 @@ class FaultTask:
     kind_label: str
     zone: str
     since_text: str
+    stale: bool
+    stale_hint: str | None
 
 
 @dataclass(frozen=True)
@@ -145,10 +178,29 @@ def _apartment_href(apartment_id: str) -> str:
 
 
 def _eligible(overview: ApartmentOverview) -> bool:
-    """Apartments already surfaced on "Das Haus" are not repeated here --
-    see this module's own docstring for the full reasoning."""
+    """P3.4a: only "never reported" excludes an apartment now -- an open
+    "not reporting" alarm no longer does (see this module's own docstring
+    for the superseded P3.4 reasoning and the 2026-09-26 decision)."""
 
-    return overview.latest is not None and overview.open_alarm is None
+    return overview.latest is not None
+
+
+def _stale_hint(now: datetime, overview: ApartmentOverview) -> str | None:
+    """`None` for a fresh apartment. For one with a currently open "not
+    reporting" alarm (P2.2), a literal German hint -- not colour alone
+    (accessibility) -- carrying both the age of the heartbeat the row's
+    value was read from and how long the alarm has been open, per the
+    2026-09-26 decision (see this module's own docstring)."""
+
+    if overview.open_alarm is None:
+        return None
+    assert overview.latest is not None  # _eligible already checked this
+    heartbeat_age = _relative_duration(now, overview.latest.received_at)
+    alarm_age = _relative_duration(now, overview.open_alarm.raised_at)
+    return (
+        f"Wohnung meldet sich nicht (seit {alarm_age}) -- "
+        f"Stand der letzten Meldung vor {heartbeat_age}"
+    )
 
 
 def _battery_task(overview: ApartmentOverview, now: datetime) -> BatteryTask | None:
@@ -161,10 +213,12 @@ def _battery_task(overview: ApartmentOverview, now: datetime) -> BatteryTask | N
         apartment_href=_apartment_href(overview.apartment_id),
         battery_percent=battery_percent,
         last_contact_text=f"vor {_relative_duration(now, overview.latest.received_at)}",
+        stale=overview.open_alarm is not None,
+        stale_hint=_stale_hint(now, overview),
     )
 
 
-def _update_task(overview: ApartmentOverview) -> UpdateTask | None:
+def _update_task(overview: ApartmentOverview, now: datetime) -> UpdateTask | None:
     assert overview.latest is not None  # _eligible already checked this
     if not overview.latest.outdated:
         return None
@@ -174,6 +228,8 @@ def _update_task(overview: ApartmentOverview) -> UpdateTask | None:
         apartment_href=_apartment_href(overview.apartment_id),
         agent_version=heartbeat.agent,
         thermoctl_version=heartbeat.thermoctl.version,
+        stale=overview.open_alarm is not None,
+        stale_hint=_stale_hint(now, overview),
     )
 
 
@@ -194,12 +250,17 @@ def _overdue_faults(
 
 
 def _fault_task(overview: ApartmentOverview, fault: OpenFault, now: datetime) -> FaultTask:
+    # `since_text` is measured against `now`, not against the heartbeat's own
+    # `received_at`, even for a stale row -- see this module's own docstring
+    # ("Fault age for a stale row is still measured against `now`").
     return FaultTask(
         apartment_id=overview.apartment_id,
         apartment_href=_apartment_href(overview.apartment_id),
         kind_label=FAULT_KIND_LABELS[fault.kind],
         zone=fault.zone,
         since_text=f"seit {_relative_duration(now, fault.since)}",
+        stale=overview.open_alarm is not None,
+        stale_hint=_stale_hint(now, overview),
     )
 
 
@@ -217,7 +278,7 @@ def build_task_overview(storage: Storage, now: datetime) -> TaskOverview:
         key=lambda task: (task.battery_percent, task.apartment_id),
     )
     updates = sorted(
-        (task for task in (_update_task(overview) for overview in eligible) if task),
+        (task for task in (_update_task(overview, now) for overview in eligible) if task),
         key=lambda task: task.apartment_id,
     )
     overdue_faults = sorted(

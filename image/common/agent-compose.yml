@@ -1,0 +1,57 @@
+# Fixed run configuration for the agent container (section 17, 18.3;
+# cross-review R5 on P5.6). Shipped as part of the prepared system image at
+# /etc/thermoctl-agent/compose.yml (the watchdog's -runtime-compose
+# default, see watchdog/main.go) -- NOT sent by the cloud. Section 13
+# forbids the agent from executing "arbitrary compose files" the cloud
+# hands it; this is the opposite of that: one fixed file, baked into the
+# image like thermoctl-watchdog.service, that only ever changes with an
+# image update.
+#
+# The watchdog itself never edits this file. Its only two commands
+# (watchdog/runtime.go, cliRuntime.Start) are:
+#   docker tag <digest> thermoctl-agent:current
+#   docker compose -f <this file> up -d --pull never --force-recreate agent
+# -- i.e. it always (re)starts exactly this one named service, on whichever
+# digest was just locally tagged. It never edits, generates, or otherwise
+# reasons about compose files.
+#
+# pull_policy: never (also passed again on the command line, belt and
+# suspenders, cross-review R1): the image must already be present locally,
+# tagged there by the agent after checking its digest against the
+# hard-coded sources (security principle 2) -- if it is not, this refuses
+# to start rather than reaching for a registry, which the watchdog must
+# never be able to do (security principle 6).
+#
+# restart: on-failure, not unless-stopped: the agent stops *itself*
+# deliberately when swapping (section 17 step 3, a clean exit) -- Docker
+# must not fight the watchdog by bringing the old container back on its
+# own. A crash (non-zero exit) of the *new* revision, however, must count
+# toward "the container restarted three times in a row" (section 17 step
+# 5), which only happens if Docker is the one restarting it.
+services:
+  agent:
+    image: thermoctl-agent:current
+    container_name: thermoctl-agent
+    pull_policy: never
+    restart: on-failure
+    volumes:
+      # The state file the agent writes and the watchdog reads (section 17
+      # step 2) and the health report the agent writes regularly (section
+      # 22.3) -- same host paths as watchdog/thermoctl-watchdog.service's
+      # -file/-health-file flags, so both sides agree on one location
+      # without either hard-coding the other's.
+      - /var/lib/thermoctl-watchdog/state.env:/var/lib/thermoctl-watchdog/state.env
+      - /run/thermoctl-agent-health.env:/run/thermoctl-agent-health.env
+      # Persistent agent data (registration, local keys, backup staging) --
+      # section 15, survives a container swap the same way the state file
+      # does.
+      - /var/lib/thermoctl-agent:/var/lib/thermoctl-agent
+      # The Docker socket: the agent itself reconciles the other three
+      # services' desired state (section 13, thermoctl/zigbee2mqtt
+      # /mosquitto) by talking to the *host's* Docker daemon -- it manages
+      # containers, so it needs the same daemon the watchdog and the host
+      # both use, not a nested one. This is the one mount that hands the
+      # agent real power on the host; everything it can do with it is
+      # bounded by security principle 2 (hard-coded sources) and principle
+      # 5 (every check lives in agent/, enforced there), not by this file.
+      - /var/run/docker.sock:/var/run/docker.sock

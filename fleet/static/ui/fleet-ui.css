@@ -228,6 +228,25 @@ ul.task-list {
     padding: 0.5rem 0.75rem;
 }
 
+/* A stale row (P3.4a, decision 2026-09-26): the apartment's underlying
+ * heartbeat/fault value is real but read while it was last reachable, the
+ * apartment now has an open "not reporting" alarm. The dashed border is a
+ * secondary cue only -- `.task-list__stale-hint`'s literal German text
+ * ("... Wohnung meldet sich nicht") is what actually carries the meaning,
+ * per this package's own accessibility requirement (text, not colour
+ * alone).
+ */
+.task-list li.task-list__stale {
+    border-style: dashed;
+}
+
+.task-list__stale-hint {
+    display: inline-block;
+    margin-top: 0.25rem;
+    font-size: 0.9em;
+    opacity: 0.8;
+}
+
 /* "Inventar" (P4.1) -- properties, apartments, devices. A quiet view, per
  * section 20.4 ("the questions that are not urgent") -- no colour coding,
  * plain lists and cards, same as "Aufgaben"'s task list above.

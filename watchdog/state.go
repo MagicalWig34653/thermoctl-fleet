@@ -10,7 +10,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"os"
 )
 
 // State is the parsed content of the state file. Desired: the digest already
@@ -59,10 +58,5 @@ func ParseState(r io.Reader) (State, error) {
 
 // LoadState opens path and parses it. No network, no registry.
 func LoadState(path string) (State, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return State{}, err
-	}
-	defer file.Close()
-	return ParseState(file)
+	return openAndParse(path, ParseState)
 }

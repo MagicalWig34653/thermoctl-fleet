@@ -28,6 +28,7 @@ from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from fleet.ui_house import FAULT_KIND_LABELS, build_house_overview
 from protocol import FaultKind, Heartbeat
+from protocol.version import PROTOCOL_VERSION
 
 USERNAME = "landlord"
 APARTMENT_A = "house7-a03"
@@ -43,7 +44,7 @@ def _make_heartbeat(
     reachable: bool = True,
     thermoctl_version: str = "0.9.5",
     agent_version: str = "0.1.0",
-    protocol_version: int = 1,
+    protocol_version: int = PROTOCOL_VERSION,
     open_faults: list[dict[str, str]] | None = None,
 ) -> Heartbeat:
     return Heartbeat.model_validate(
@@ -242,12 +243,15 @@ def test_ordering_across_all_five_categories_and_the_id_tie_break(
     prove the apartment-id tie-break, and asserts the exact resulting
     order.
 
-    `PROTOCOL_VERSION` is bumped to 2 (same technique as
-    `tests/test_storage.py`'s outdated-flag tests) so that "outdated" can be
-    expressed with a still-valid (`>=1`) heartbeat `protocol_version` --
-    every apartment that must *not* count as outdated is given
-    `protocol_version=2` explicitly instead of relying on the (now
-    superseded) default of 1.
+    `PROTOCOL_VERSION` is pinned to 2 here via monkeypatch (same technique as
+    `tests/test_storage.py`'s outdated-flag tests), independent of the real
+    constant's current value (also 2, since the P4.2b registration models),
+    so that "outdated" can be expressed with a still-valid (`>=1`) heartbeat
+    `protocol_version` -- every apartment that must *not* count as outdated
+    is given `protocol_version=2` explicitly instead of relying on
+    `_make_heartbeat`'s own default (which tracks the real `PROTOCOL_VERSION`
+    and would silently stop proving anything the day these two happen to
+    diverge again).
     """
 
     monkeypatch.setattr(storage_module, "PROTOCOL_VERSION", 2)

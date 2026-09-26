@@ -15,6 +15,7 @@ import pytest
 from tools.check_image_config import (
     IMAGE_DIR,
     ImageError,
+    check_agent_compose_file,
     check_agent_registration_template,
     check_all,
     check_package_list,
@@ -66,3 +67,24 @@ def test_agent_registration_template_with_missing_field_is_rejected(
 
     with pytest.raises(ImageError):
         check_agent_registration_template(path)
+
+
+def test_agent_compose_file_missing_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ImageError):
+        check_agent_compose_file(tmp_path / "does-not-exist.yml")
+
+
+def test_agent_compose_file_without_pull_policy_never_is_rejected(
+    tmp_path: Path,
+) -> None:
+    # Cross-review R1: a missing "pull_policy: never" is exactly the gap
+    # that would let a missing image be fetched from a registry.
+    path = tmp_path / "agent-compose.yml"
+    path.write_text(
+        "services:\n  agent:\n    image: thermoctl-agent:current\n"
+        "    restart: on-failure\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_agent_compose_file(path)
