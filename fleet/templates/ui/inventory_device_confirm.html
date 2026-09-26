@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}Geräteregistrierung bestätigen – thermoctl-fleet{% endblock %}
+
+{% block content %}
+{# "Bestätigen" (P4.2, section 20.2 step 4, 15.3 step 3, 20.3) -- every
+   device currently "reported", with its display fingerprint and report
+   time, never its verification code (see
+   fleet/ui_inventory.py::build_confirm_view's own docstring). Already
+   derived; this template only iterates and prints. #}
+<h1>Geräteregistrierung bestätigen</h1>
+
+{% if error %}
+<p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+{% if rows %}
+{% for row in rows %}
+<article class="inventory-property">
+    <h2>{{ row.device_id }} ({{ row.model }})</h2>
+    <p>Schlüssel-Fingerabdruck (zum Abgleich mit der Geräteanzeige): {{ row.fingerprint }}</p>
+    <p>Gemeldet: {{ row.reported_at }}</p>
+    <form method="post" action="{{ row.confirm_href }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="apartment_id_{{ row.device_id }}">Wohnung
+            <select id="apartment_id_{{ row.device_id }}" name="apartment_id" required>
+                {% for apartment in apartments %}
+                <option value="{{ apartment.id }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label for="verification_code_{{ row.device_id }}">Bestätigungscode (vom Gerät angezeigt)
+            <input type="text" id="verification_code_{{ row.device_id }}" name="verification_code" required>
+        </label>
+        <label for="reason_{{ row.device_id }}">Grund
+            <input type="text" id="reason_{{ row.device_id }}" name="reason" required>
+        </label>
+        <label>
+            <input type="checkbox" name="replace_previous" value="1">
+            Bisheriges Gerät der Wohnung ersetzen (falls dort bereits eines aktiv ist)
+        </label>
+        <label for="previous_device_target_state_{{ row.device_id }}">
+            Zielzustand für das bisherige Gerät (nur bei Ersetzen)
+            <select id="previous_device_target_state_{{ row.device_id }}"
+                    name="previous_device_target_state">
+                <option value="in_storage">Im Lager</option>
+                <option value="faulty">Defekt</option>
+            </select>
+        </label>
+        <button type="submit">Bestätigen und zuweisen</button>
+    </form>
+</article>
+{% endfor %}
+{% else %}
+<p>Keine Geräte warten auf Bestätigung.</p>
+{% endif %}
+
+<p><a href="/ui/inventory">Zurück zum Inventar</a></p>
+{% endblock %}

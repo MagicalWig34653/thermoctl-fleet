@@ -53,8 +53,10 @@ per `CLAUDE.md`.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+import secrets
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -399,6 +401,74 @@ class AssignmentRecord(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
     reason: Mapped[str] = mapped_column(String(500), nullable=False)
+
+
+class DeviceRegistrationRecord(Base):
+    __tablename__ = "device_registrations"
+    __table_args__ = (
+        # "At most one active (not invalidated, not expired, not confirmed)
+        # preparation per device" (P4.2 work order) -- "active" here means
+        # `invalidated_at IS NULL AND confirmed_at IS NULL`, deliberately
+        # *not* also excluding an expired-but-not-yet-invalidated row (see
+        # `0007_device_registrations.py`'s own docstring for why that is
+        # still correct): `Storage.prepare_device` always invalidates any
+        # earlier active row for the same device, in the same transaction,
+        # before inserting the new one, so this index never actually has to
+        # arbitrate between two rows a caller believed were both "current".
+        Index(
+            "ux_device_registrations_device_id_active",
+            "device_id",
+            unique=True,
+            sqlite_where=text("invalidated_at IS NULL AND confirmed_at IS NULL"),
+            postgresql_where=text("invalidated_at IS NULL AND confirmed_at IS NULL"),
+        ),
+    )
+
+    # Section 4/15.3/20.3 -- one row per preparation cycle, not one per
+    # device (see the migration's own docstring for why: the full history
+    # of every attempt stays queryable via `inventory_audit_log`, not
+    # overwritten in place).
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Deliberately no `ForeignKey` (mirrors `AssignmentRecord.device_id`/
+    # `apartment_id` above -- this codebase's established pattern for a
+    # cross-entity reference between these particular tables).
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # SHA-256 hash of the one-time registration code -- never the code
+    # itself, mirroring `ApartmentRecord.token_hash`/`hash_token` exactly
+    # (see `Storage.prepare_device`).
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    # Section 4: "the code expires after first use or after 24 hours".
+    expires_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    # Set once by `Storage.record_device_report` -- a code with `used_at`
+    # already set can never be exchanged again (one-time, section 4).
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    # Filled by `record_device_report` (P4.2b's own entry point, see the
+    # migration's docstring) -- the device's Ed25519 **public** key
+    # (CLAUDE.md security principle 3: never a private key).
+    public_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The verification code P4.2b derives from the key fingerprint and the
+    # device itself displays (15.3 step 2/3) -- compared in constant time by
+    # `Storage.confirm_device`, never logged.
+    verification_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reported_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    # Filled by `Storage.confirm_device` -- "only this confirmation releases
+    # the configuration" (15.3 step 3).
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    confirmed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    apartment_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # Incremented atomically on a wrong verification code; invalidated once
+    # this reaches `Storage._MAX_CONFIRMATION_ATTEMPTS` (documented there).
+    failed_confirmation_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    # Set either by a later `prepare_device` call superseding this row, or
+    # by `confirm_device` after the final wrong attempt.
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    # Filled by P4.2b once it actually issues the apartment's agent token
+    # against this confirmed registration -- always `NULL` here, in this
+    # package, since that package does not exist yet.
+    token_issued_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
 
 
 class InventoryAuditLogRecord(Base):
@@ -1511,6 +1581,581 @@ class Storage:
             )
             session.expunge_all()
             return rows
+
+    def get_current_assignment_for_device(self, device_id: str) -> AssignmentRecord | None:
+        """The currently open assignment (`ended_at IS NULL`) for
+        `device_id`, or `None` -- the reverse lookup of `get_current_
+        assignment` (by apartment). Used by `confirm_device` (P4.2, section
+        20.3 rule 2: "a device belongs to at most one apartment ... a
+        device with an open assignment elsewhere can never be confirmed")
+        as an explicit, defensive check *before* ever attempting the new
+        assignment insert -- the partial unique index on `assignments
+        .device_id` would already refuse a second open row for the same
+        device at the database level, but this lets the caller report a
+        specific, meaningful error instead of a generic "already assigned"
+        `IntegrityError`-turned-`ValueError`.
+        """
+
+        with self.session() as session:
+            record = session.scalar(
+                select(AssignmentRecord).where(
+                    AssignmentRecord.device_id == device_id,
+                    AssignmentRecord.ended_at.is_(None),
+                )
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    # -- device registration: prepare / report / confirm (P4.2, section 4,
+    #    15.3, 20.2, 20.3) --------------------------------------------------
+    #
+    # Device-side registration (Ed25519 key pair, the signed challenge that
+    # proves possession of the private key) is P4.2b, not built here -- see
+    # `fleet/migrations/versions/0007_device_registrations.py`'s own
+    # docstring. This section implements the three storage-level steps the
+    # work order asks for: `prepare_device` (landlord presses "prepare"),
+    # `record_device_report` (P4.2b's own entry point -- implemented here so
+    # that package only has to add the HTTP/crypto layer on top), and
+    # `confirm_device` ("only this confirmation releases the configuration",
+    # 15.3 step 3).
+
+    # Section 4: "the code expires ... after 24 hours".
+    _REGISTRATION_CODE_VALID_HOURS = 24
+
+    # Not specified numerically by the specification -- decided here, per
+    # the work order's own "document the number" instruction: after this
+    # many wrong verification-code attempts, the registration is
+    # invalidated and the device must be prepared again (a fresh code *and*
+    # a fresh verification code, since both come from the same preparation
+    # cycle). Closes the brute-force window a short, human-typed/read
+    # verification code would otherwise leave open indefinitely against one
+    # single preparation.
+    _MAX_CONFIRMATION_ATTEMPTS = 5
+
+    _PREPARABLE_DEVICE_STATES = ("registered", "in_storage")
+
+    def prepare_device(
+        self,
+        device_id: str,
+        *,
+        ui_username: str,
+        confirmed_reset: bool,
+        now: datetime,
+    ) -> str:
+        """"Press "prepare"" (20.2 step 2) -- generates a fresh, single-use
+        registration code, invalidates any earlier active preparation for
+        this device, and moves the device to `prepared`. Returns the raw
+        code **exactly once** -- only its SHA-256 hash is ever stored (see
+        `DeviceRegistrationRecord.code_hash`), the same "no secrets in the
+        repo, not even in the database" reasoning `ApartmentRecord
+        .token_hash`/`hash_token` already apply to the agent token.
+
+        **Eligible states: `registered` or `in_storage`** (section 20.2
+        step 1 / the replacement-device path) -- any other state raises
+        `ValueError`. **For `in_storage`, `confirmed_reset` must be `True`**
+        (section 20.3 rule 2's "the service demands an explicit
+        confirmation" applied here, at the point a device's slate is wiped
+        for a new registration cycle: the "Gerät wurde zurückgesetzt" form
+        checkbox, never silently assumed) -- `registered` needs no such
+        confirmation, since a device that has never been assigned has
+        nothing on it to reset in the first place.
+
+        Invalidating any earlier active preparation happens in the same
+        transaction as the new insert, so the partial unique index
+        (`ux_device_registrations_device_id_active`) never has to arbitrate
+        between two rows both claiming to be "the current one" for this
+        device.
+        """
+
+        raw_code = secrets.token_urlsafe(32)
+        code_hash = hash_token(raw_code)
+        normalized_now = _naive_utc(now)
+
+        with self.session() as session:
+            device = session.get(DeviceRecord, device_id)
+            if device is None:
+                raise ValueError(f"Gerät {device_id!r} ist unbekannt.")
+            if device.state not in self._PREPARABLE_DEVICE_STATES:
+                raise ValueError(
+                    f"Gerät {device_id!r} kann im Zustand {device.state!r} nicht "
+                    "vorbereitet werden."
+                )
+            if device.state == "in_storage" and not confirmed_reset:
+                raise ValueError(
+                    "Für ein Gerät im Lager muss bestätigt werden, dass es "
+                    "zurückgesetzt wurde, bevor es erneut vorbereitet werden kann."
+                )
+
+            # Invalidate any earlier active (non-invalidated, unconfirmed)
+            # preparation for this device -- section 20.3's "it must have
+            # been reset beforehand" reasoning, applied to *preparation*
+            # itself: re-preparing a device makes its previous code
+            # worthless immediately, not merely superseded by a newer one
+            # that happens to also be valid.
+            session.execute(
+                update(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.device_id == device_id,
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.confirmed_at.is_(None),
+                )
+                .values(invalidated_at=normalized_now)
+            )
+
+            session.add(
+                DeviceRegistrationRecord(
+                    device_id=device_id,
+                    code_hash=code_hash,
+                    created_at=normalized_now,
+                    expires_at=normalized_now
+                    + timedelta(hours=self._REGISTRATION_CODE_VALID_HOURS),
+                )
+            )
+
+            before_state = device.state
+            device.state = "prepared"
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="device",
+                entity_id=device_id,
+                action="prepared",
+                reason=None,
+                before={"state": before_state},
+                after={"state": device.state},
+            )
+
+        return raw_code
+
+    def get_active_registration_for_device(
+        self, device_id: str
+    ) -> DeviceRegistrationRecord | None:
+        """The most recent non-invalidated, unconfirmed registration for
+        `device_id`, or `None` -- at most one exists at a time, enforced by
+        `ux_device_registrations_device_id_active`. Used both by the
+        "Bestätigen" UI listing (P4.2) and by `confirm_device` itself."""
+
+        with self.session() as session:
+            record = session.scalar(
+                select(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.device_id == device_id,
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.confirmed_at.is_(None),
+                )
+                .order_by(DeviceRegistrationRecord.id.desc())
+                .limit(1)
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def record_device_report(
+        self,
+        registration_code: str,
+        public_key: str,
+        verification_code: str,
+        now: datetime,
+    ) -> bool:
+        """P4.2b's own entry point (15.3 step 2: "the agent ... registers
+        with the cloud using the registration code and its public key, and
+        displays a ... verification code") -- **implemented here, not in
+        P4.2b**, per the work order, so that package only has to add the
+        HTTP/crypto layer on top of this.
+
+        One-time: marks the code used, stores the public key and the
+        (device-derived) verification code, and moves the device to
+        `reported` -- but only if the code is known, unexpired, not
+        invalidated, and not already used. **Every failure looks the same
+        to the caller** (a plain `False`, work order's own instruction:
+        "any failure is indistinguishable to the caller") -- an unknown
+        code, an expired one, an invalidated one, and one already used all
+        return `False`, never a distinguishing exception or message that
+        could help an attacker learn which reason applies.
+
+        **Atomic under concurrency** (work order: "two threads reporting
+        with the same code -> exactly one wins"): the guard (`used_at IS
+        NULL`, not invalidated, not expired) is folded into the `UPDATE
+        ... WHERE ...` statement itself, not a separate `SELECT`
+        beforehand -- mirrors `Storage.record_ui_login_success`'s own "the
+        check and the write must be the same statement" reasoning. Only
+        the request whose `UPDATE` actually matches a row gets the device
+        id back; every other concurrent caller for the same code affects
+        zero rows and gets `False`.
+        """
+
+        code_hash = hash_token(registration_code)
+        normalized_now = _naive_utc(now)
+        with self.session() as session:
+            statement = (
+                update(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.code_hash == code_hash,
+                    DeviceRegistrationRecord.used_at.is_(None),
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.confirmed_at.is_(None),
+                    DeviceRegistrationRecord.expires_at > normalized_now,
+                )
+                .values(
+                    used_at=normalized_now,
+                    public_key=public_key,
+                    verification_code=verification_code,
+                    reported_at=normalized_now,
+                )
+                .returning(DeviceRegistrationRecord.device_id)
+            )
+            row = session.execute(statement).first()
+            if row is None:
+                return False
+            device_id = row[0]
+            session.execute(
+                update(DeviceRecord).where(DeviceRecord.id == device_id).values(state="reported")
+            )
+            return True
+
+    def _record_wrong_verification_code_attempt(
+        self, registration_id: int, now: datetime
+    ) -> None:
+        """Atomically increments `failed_confirmation_attempts` for one
+        registration row and invalidates it once `_MAX_CONFIRMATION_
+        ATTEMPTS` is reached. Committed as **its own transaction**,
+        independent of whatever the caller (`confirm_device`) does next --
+        the whole point of this counter is that it survives the overall
+        call still failing/raising, the same reason `Storage
+        .record_ui_login_failure` cannot be folded into a transaction that
+        might itself roll back.
+
+        Concurrent wrong attempts against the same registration must not
+        lose an increment to a race: the `UPDATE ... SET failed_
+        confirmation_attempts = failed_confirmation_attempts + 1` reads the
+        pre-update row for its own right-hand side (the same "`SET`
+        clauses evaluate against the row as it was before this statement"
+        property `record_ui_login_failure`'s own docstring relies on), not
+        a Python read-modify-write.
+        """
+
+        normalized_now = _naive_utc(now)
+        with self.session() as session:
+            statement = (
+                update(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.id == registration_id,
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.confirmed_at.is_(None),
+                )
+                .values(
+                    failed_confirmation_attempts=(
+                        DeviceRegistrationRecord.failed_confirmation_attempts + 1
+                    )
+                )
+                .returning(DeviceRegistrationRecord.failed_confirmation_attempts)
+            )
+            row = session.execute(statement).first()
+            if row is None:
+                return
+            if row[0] >= self._MAX_CONFIRMATION_ATTEMPTS:
+                session.execute(
+                    update(DeviceRegistrationRecord)
+                    .where(DeviceRegistrationRecord.id == registration_id)
+                    .values(invalidated_at=normalized_now)
+                )
+
+    def confirm_device(
+        self,
+        device_id: str,
+        apartment_id: str,
+        verification_code: str,
+        *,
+        ui_user: str,
+        reason: str,
+        replace_previous: bool,
+        previous_device_target_state: str | None,
+        now: datetime,
+    ) -> DeviceRecord:
+        """"Assign" (20.2 step 4, 15.3 step 3) -- "only this confirmation
+        releases the configuration -- bound to the key of exactly this
+        device." Raises `ValueError` (message meant to be shown to the
+        landlord as-is, mirroring every other validation error in this
+        module) for any rule violation; returns the now-`in_service`
+        device on success.
+
+        **Rules enforced, in order:**
+
+        1. The device must be `reported`, with an active (non-invalidated,
+           unconfirmed, unexpired) registration that actually carries a
+           reported public key/verification code (`record_device_report`
+           already guarantees this for a `reported` device, checked again
+           here defensively).
+        2. **The verification code is compared in constant time**
+           (`hmac.compare_digest`) -- a wrong code does **not** yet raise
+           here; see below for why the increment happens first, as its own
+           committed transaction.
+        3. The apartment must exist and must not be `retired`.
+        4. **A device with an open assignment elsewhere can never be
+           confirmed** (section 20.3 rule 2) -- checked explicitly (not
+           only relied upon via the partial unique index further down) so
+           this specific case gets its own message.
+        5. If the apartment already has an open assignment, confirmation
+           requires `replace_previous=True` -- "never silently" (section
+           20.3 rule 1) -- **and** a valid `previous_device_target_state`
+           (`faulty` or `in_storage`, the form's own explicit choice for
+           where the replaced device goes).
+
+        **A wrong verification code is handled outside this method's own
+        transaction** (see `_record_wrong_verification_code_attempt`):
+        incrementing `failed_confirmation_attempts` (and invalidating the
+        registration on the fifth) must survive even though this call
+        overall still raises `ValueError` -- committing that increment
+        inside the same transaction this method's own `with self.session()`
+        block would otherwise roll back on the `raise` would discard
+        exactly the audit trail the counter exists to keep. Everything
+        *after* a correct code -- closing the previous assignment (with
+        `until`/reason), moving the previous device to the requested state,
+        revoking the apartment's token, creating the new assignment, moving
+        this device to `in_service`, and marking the registration confirmed
+        -- happens in **one** transaction (this method's own `with self
+        .session()` block): a failure partway through (e.g. the new
+        assignment's insert losing a concurrent race to the partial unique
+        index) rolls back every one of those steps together, not just the
+        one that failed. Every step that changes something is audit-logged
+        in that same transaction (section 20.3: "every change to
+        assignment, state, or token is logged: who, when, why").
+        """
+
+        if not reason.strip():
+            raise ValueError("Ein Grund ist erforderlich.")
+
+        normalized_now = _naive_utc(now)
+
+        # Phase 1: read-only validation, plus the verification-code
+        # comparison -- see the docstring above for why a wrong code's
+        # attempt-counter increment must not share this method's main
+        # transaction.
+        with self.session() as session:
+            device = session.get(DeviceRecord, device_id)
+            if device is None:
+                raise ValueError(f"Gerät {device_id!r} ist unbekannt.")
+            if device.state != "reported":
+                raise ValueError(
+                    f"Gerät {device_id!r} hat sich nicht gemeldet oder ist bereits "
+                    "zugewiesen."
+                )
+
+            registration = session.scalar(
+                select(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.device_id == device_id,
+                    DeviceRegistrationRecord.invalidated_at.is_(None),
+                    DeviceRegistrationRecord.confirmed_at.is_(None),
+                )
+                .order_by(DeviceRegistrationRecord.id.desc())
+                .limit(1)
+            )
+            if registration is None or registration.verification_code is None:
+                raise ValueError(
+                    f"Für Gerät {device_id!r} liegt keine offene Registrierung vor."
+                )
+            if normalized_now >= registration.expires_at:
+                raise ValueError("Die Registrierung ist abgelaufen.")
+
+            apartment = session.get(ApartmentRecord, apartment_id)
+            if apartment is None:
+                raise ValueError(f"Wohnung {apartment_id!r} ist unbekannt.")
+            if apartment.state == "retired":
+                raise ValueError(f"Wohnung {apartment_id!r} ist stillgelegt.")
+
+            if (
+                session.scalar(
+                    select(AssignmentRecord).where(
+                        AssignmentRecord.device_id == device_id,
+                        AssignmentRecord.ended_at.is_(None),
+                    )
+                )
+                is not None
+            ):
+                raise ValueError(
+                    f"Gerät {device_id!r} ist bereits einer anderen Wohnung zugewiesen."
+                )
+
+            code_matches = hmac.compare_digest(registration.verification_code, verification_code)
+            registration_id = registration.id
+
+        if not code_matches:
+            self._record_wrong_verification_code_attempt(registration_id, normalized_now)
+            raise ValueError("Falscher Bestätigungscode.")
+
+        # Phase 2: the actual, atomic state change.
+        with self.session() as session:
+            device = session.get(DeviceRecord, device_id)
+            if device is None or device.state != "reported":
+                # Defense-in-depth, same reasoning as the registration/
+                # apartment rechecks further below: two concurrent confirms
+                # of the *same* device (proven safe by `tests
+                # /test_device_registration.py
+                # ::test_confirm_device_concurrent_confirms_of_the_same_
+                # device_exactly_one_wins`) are, in practice, decided by the
+                # partial unique index on the new assignment's own insert
+                # a few lines down, not by this read winning or losing a
+                # race against the other thread's write -- SQLite's own
+                # transaction timing makes this exact window (a `session
+                # .get` here landing strictly *after* another thread's full
+                # commit) too narrow to hit deterministically without an
+                # artificially injected pause between phase 1 and phase 2.
+                raise ValueError(  # pragma: no cover -- see comment above
+                    f"Gerät {device_id!r} wurde inzwischen anderweitig bearbeitet."
+                )
+            registration = session.get(DeviceRegistrationRecord, registration_id)
+            if (
+                registration is None
+                or registration.invalidated_at is not None
+                or registration.confirmed_at is not None
+            ):
+                # Defense-in-depth for a narrow race: a concurrent wrong-
+                # code confirm attempt against the *same* registration
+                # (`_record_wrong_verification_code_attempt`, its own,
+                # independently committed transaction, see above) could
+                # invalidate it in the gap between this call's own phase 1
+                # and phase 2 without ever touching `device.state` -- the
+                # `device.state != "reported"` recheck above would not
+                # catch that specific case. Deterministically hitting this
+                # exact interleaving needs an artificial pause injected
+                # between the two phases (CLAUDE.md: "a line only reachable
+                # through an artificial construction"); the phase 1 check
+                # and the two independent concurrency tests
+                # (`tests/test_device_registration.py`, wrong-attempt
+                # counter and same-apartment-two-devices) already prove the
+                # underlying atomic building blocks this defends on top of.
+                raise ValueError(  # pragma: no cover -- see comment above
+                    "Die Registrierung wurde inzwischen ungültig oder wurde bereits "
+                    "bestätigt."
+                )
+            apartment = session.get(ApartmentRecord, apartment_id)
+            if apartment is None:
+                # Same reasoning as the registration recheck above -- the
+                # apartment could only disappear between phase 1 and phase
+                # 2 via a raw deletion this codebase's own `Storage` never
+                # performs (section 20.3: "an apartment is not deleted, it
+                # is retired") -- structurally unreachable via any public
+                # method, kept only as defense-in-depth.
+                raise ValueError(f"Wohnung {apartment_id!r} ist unbekannt.")  # pragma: no cover
+            if apartment.state == "retired":
+                # Reachable only if a concurrent `update_apartment` retires
+                # the apartment in the exact gap between phase 1 and phase
+                # 2 -- the same class of narrow, artificial-to-construct
+                # race as the registration recheck above.
+                raise ValueError(  # pragma: no cover -- see comment above
+                    f"Wohnung {apartment_id!r} ist stillgelegt."
+                )
+
+            previous_assignment = session.scalar(
+                select(AssignmentRecord).where(
+                    AssignmentRecord.apartment_id == apartment_id,
+                    AssignmentRecord.ended_at.is_(None),
+                )
+            )
+            if previous_assignment is not None:
+                if not replace_previous:
+                    raise ValueError(
+                        f"Wohnung {apartment_id!r} hat bereits ein aktives Gerät -- "
+                        "Ersetzen muss ausdrücklich bestätigt werden."
+                    )
+                if previous_device_target_state not in ("faulty", "in_storage"):
+                    raise ValueError(
+                        "Ungültiger Zielzustand für das bisherige Gerät (nur "
+                        "'faulty' oder 'in_storage')."
+                    )
+
+                previous_device_id = previous_assignment.device_id
+                previous_assignment.ended_at = normalized_now
+                previous_assignment.reason = reason
+                self._write_inventory_audit_log(
+                    session,
+                    ui_username=ui_user,
+                    entity_type="assignment",
+                    entity_id=f"{apartment_id}:{previous_device_id}",
+                    action="closed",
+                    reason=reason,
+                    before={"ended_at": None},
+                    after={"ended_at": normalized_now.isoformat()},
+                )
+
+                previous_device = session.get(DeviceRecord, previous_device_id)
+                if previous_device is not None:
+                    before_previous_state = previous_device.state
+                    previous_device.state = previous_device_target_state
+                    self._write_inventory_audit_log(
+                        session,
+                        ui_username=ui_user,
+                        entity_type="device",
+                        entity_id=previous_device_id,
+                        action="state_changed",
+                        reason=reason,
+                        before={"state": before_previous_state},
+                        after={"state": previous_device_target_state},
+                    )
+
+                had_token = apartment.token_hash is not None
+                apartment.token_hash = None
+                self._write_inventory_audit_log(
+                    session,
+                    ui_username=ui_user,
+                    entity_type="apartment",
+                    entity_id=apartment_id,
+                    action="token_revoked",
+                    reason=reason,
+                    before={"token_hash": "set" if had_token else None},
+                    after={"token_hash": None},
+                )
+
+            new_assignment = AssignmentRecord(
+                device_id=device_id,
+                apartment_id=apartment_id,
+                started_at=normalized_now,
+                ended_at=None,
+                reason=reason,
+            )
+            session.add(new_assignment)
+            try:
+                session.flush()
+            except IntegrityError as error:
+                session.rollback()
+                raise ValueError(
+                    f"Wohnung {apartment_id!r} oder Gerät {device_id!r} hat "
+                    "bereits eine offene Zuweisung."
+                ) from error
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_user,
+                entity_type="assignment",
+                entity_id=f"{apartment_id}:{device_id}",
+                action="assigned",
+                reason=reason,
+                before=None,
+                after={"device_id": device_id, "apartment_id": apartment_id},
+            )
+
+            before_device_state = device.state
+            device.state = "in_service"
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_user,
+                entity_type="device",
+                entity_id=device_id,
+                action="state_changed",
+                reason=reason,
+                before={"state": before_device_state},
+                after={"state": "in_service"},
+            )
+
+            registration.confirmed_at = normalized_now
+            registration.confirmed_by = ui_user
+            registration.apartment_id = apartment_id
+
+            session.flush()
+            session.refresh(device)
+            session.expunge(device)
+            return device
 
     # -- ui accounts / sessions (P3.0) -------------------------------------------
 

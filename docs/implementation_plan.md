@@ -302,6 +302,17 @@ surface each package touches changed, from `/v1/...` to `/ui/inventory/...`.
   attempt without a confirmed verification code fails; a double assignment
   fails).
 - **Depends on:** P4.1.
+- [x] done -- built as `GET/POST /ui/inventory/devices/{id}/prepare` and
+  `GET /ui/inventory/devices/confirm` + `POST /ui/inventory/devices/{id}
+  /confirm` (a devices-list-then-confirm page, not a per-apartment
+  `.../apartments/{id}/confirm-device` route as first sketched here -- the
+  actual work order asked for a listing of every `reported` device with one
+  confirmation form each, which fits the `/devices/...` path this package
+  already uses for "prepare", not `/apartments/...`). Registration state
+  (`fleet/migrations/versions/0007_device_registrations.py`,
+  `Storage.prepare_device`/`record_device_report`/`confirm_device`) and the
+  UI are both this package's own work -- see `docs/STATUS.md` for the full
+  writeup, the 24h/5-attempts limits, and what P4.2b must still do.
 
 ### P4.2b -- Device-side registration (Ed25519 + signed challenge) **SR**
 - **Goal:** the device side of section 15.3 step 2/4: a freshly started

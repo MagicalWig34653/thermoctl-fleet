@@ -2,6 +2,230 @@
 
 Last updated: 2026-09-26.
 
+## Prepare device, confirm registration and assign (P4.2, sections 4, 15.3, 20.2, 20.3)
+
+**Decisions by the project owner, 2026-09-26 (do not re-open, see this
+package's own work order):** device-side registration itself (Ed25519 key
+pair, the signed challenge that proves possession of the private key) is
+P4.2b, not this package -- this package only builds the storage-level state
+both P4.2b and the landlord-facing "prepare"/"confirm" UI forms act on, plus
+those two forms themselves (`/ui` routes, P3.0 login + CSRF, same as every
+other inventory action since P4.1). `protocol/` was not touched -- no new
+field was needed; the registration state lives entirely in `fleet/storage.py`
+and never crosses the wire as its own model. `fleet/auth.py`, `fleet
+/ui_auth.py`, `watchdog/`, and `protocol.commands.CommandType` are all
+untouched, per the work order's own constraint.
+
+**Schema (`fleet/migrations/versions/0007_device_registrations.py`,
+`down_revision` `"0006"`).** One new table, `device_registrations` --
+**one row per preparation cycle**, not one row per device, so the full
+history of every attempt stays queryable (via `inventory_audit_log` for the
+device-level actions, and directly on this table for the rest), never
+overwritten in place: `device_id` (no `ForeignKey`, mirroring
+`assignments.device_id`/`apartment_id`'s own established "plain indexed
+string column, not a declared FK" pattern from `0006_inventory.py`),
+`code_hash` (SHA-256 of the one-time registration code -- **the code itself
+is never stored**, mirroring `apartments.token_hash`/`hash_token` exactly),
+`created_at`/`expires_at` (24 hours, section 4), `used_at` (set once by
+`record_device_report`), `public_key`/`verification_code`/`reported_at`
+(filled together by `record_device_report` -- P4.2b's own entry point, see
+below), `confirmed_at`/`confirmed_by`/`apartment_id` (filled by
+`confirm_device`), `failed_confirmation_attempts` (incremented on a wrong
+verification code), `invalidated_at` (set either by a later `prepare_device`
+call superseding this row, or by `confirm_device` after the fifth wrong
+attempt), `token_issued_at` (filled by P4.2b once it actually issues a
+token against this confirmed registration -- always `NULL` in this package,
+since that package does not exist yet). **"At most one active preparation
+per device", enforced at the database level** (work order's own explicit
+instruction): a partial unique index on `device_id` `WHERE invalidated_at
+IS NULL AND confirmed_at IS NULL` -- "active" deliberately does *not* also
+exclude an expired-but-not-yet-invalidated row, since `prepare_device`
+always invalidates any earlier active row in the same transaction before
+inserting a new one, so this index never actually has to arbitrate between
+two rows both claiming to be current; expiry itself is checked at read time
+(`record_device_report`/`confirm_device`), the same "derived, not enforced
+via a background job" choice `HeartbeatRecord`'s "outdated version" flag
+already made (P1.3).
+
+**Storage (`fleet/storage.py`, new "-- device registration: prepare / report
+/ confirm --" section), all unit-tested directly against a real, migrated
+SQLite database, including under concurrency:**
+
+- **`prepare_device(device_id, *, ui_username, confirmed_reset, now)`** --
+  eligible from `registered` or `in_storage` only (any other state raises
+  `ValueError`); **`in_storage` additionally requires `confirmed_reset=True`**
+  (section 20.3 rule 2's "explicit confirmation" applied at the point a
+  device's slate is wiped for a new registration cycle -- the "Gerät wurde
+  zurückgesetzt" form checkbox, never silently assumed). Invalidates any
+  earlier active preparation for the device in the same transaction, moves
+  the device to `prepared`, and returns the raw registration code **exactly
+  once** -- only its SHA-256 hash is ever persisted.
+- **`record_device_report(registration_code, public_key, verification_code,
+  now)`** -- P4.2b's own entry point (15.3 step 2), **implemented here so
+  that package only has to add the HTTP/crypto layer on top**. One-time:
+  marks the code used, stores the public key and verification code, moves
+  the device to `reported`. **Every failure is indistinguishable to the
+  caller** (a plain `bool`) -- unknown, expired, invalidated, and
+  already-used codes all return `False`, never a message that could tell
+  an attacker which reason applies. **Atomic under concurrency**: the guard
+  (`used_at IS NULL`, not invalidated, not expired) is folded into the
+  `UPDATE ... WHERE ...` itself (mirroring `record_ui_login_success`'s "the
+  check and the write must be the same statement"), not a separate `SELECT`
+  beforehand -- proven with 8 threads reporting the same code concurrently:
+  exactly one gets `True`, the other seven `False`.
+- **`confirm_device(device_id, apartment_id, verification_code, *, ui_user,
+  reason, replace_previous, previous_device_target_state, now)`** -- "only
+  this confirmation releases the configuration" (15.3 step 3). Rules
+  enforced, in order: device must be `reported` with an active registration;
+  **verification code compared with `hmac.compare_digest`** (constant
+  time); apartment must exist and not be `retired`; **a device with an open
+  assignment elsewhere can never be confirmed** (checked explicitly, not
+  only relied upon via the partial unique index further down); if the
+  apartment already has an open assignment, confirmation requires
+  `replace_previous=True` **and** a valid `previous_device_target_state`
+  (`faulty` or `in_storage`) -- "never silently" (section 20.3 rule 1).
+  **A wrong verification code increments `failed_confirmation_attempts` and,
+  after the fifth wrong attempt (`Storage._MAX_CONFIRMATION_ATTEMPTS = 5`,
+  not specified numerically by the specification -- decided here, per the
+  work order's own "document the number" instruction), invalidates the
+  registration** -- the device must be prepared again. **That increment is
+  committed as its own, separate transaction** (`_record_wrong_verification_
+  code_attempt`), independent of the overall call's `ValueError` --
+  otherwise the counter's own commit would be rolled back by the same
+  `raise` it exists to survive. Proven atomic under 10 concurrent wrong
+  attempts against one registration: the counter reaches exactly 5, never
+  more, never fewer, and the registration is invalidated exactly once. Once
+  the code is right, **the rest of the confirmation happens in one
+  transaction**: closes the previous assignment (`ended_at`/`reason`), moves
+  the previous device to the chosen state, **revokes the apartment's token**
+  (`token_hash = NULL`, section 15.5's "its token expires"), creates the new
+  assignment (the P4.1 partial unique indexes are the database-level guard
+  against a double assignment), moves this device to `in_service`, and marks
+  the registration confirmed -- **every step audit-logged in that same
+  transaction**. Proven with a real `/v1/heartbeat` request using the old
+  (now revoked) token after a replace-previous confirm: 403, not just an
+  inspected column. Proven atomic under a genuine race, not only argued:
+  two `reported` devices confirmed concurrently to the same (so far
+  unassigned) apartment -- exactly one wins (the partial unique index on
+  `assignments.apartment_id` decides it at the new assignment's own insert,
+  caught as an `IntegrityError` turned `ValueError`), and the loser's own
+  transaction rolled back in full: device still `reported`, registration
+  still unconfirmed, no `state_changed` audit row written for it.
+- **`get_active_registration_for_device`**/**`get_current_assignment_for_
+  device`** -- small, direct read helpers the UI and `confirm_device` share.
+
+**A few defensive rechecks inside `confirm_device`'s second transaction
+(device/registration/apartment re-fetched and re-validated even though
+phase 1 already checked all three) are marked `# pragma: no cover`, each
+with its own comment explaining why**: they guard against a narrow race in
+the gap between this call's own read-only phase 1 and its write phase 2
+(e.g. a concurrent wrong-code attempt invalidating the registration, or an
+apartment retired mid-flight) that SQLite's own transaction timing makes
+impractical to hit deterministically without an artificially injected pause
+between the two phases -- CLAUDE.md's own "a line only reachable through an
+artificial construction" reasoning. The two *reachable* races (the wrong-
+verification-code counter, and two devices/the same device confirmed to one
+apartment concurrently) are proven with real concurrent threads, not
+skipped -- see above.
+
+**UI (`fleet/ui_routes.py`, `fleet/ui_inventory.py`, `fleet/templates/ui/
+inventory_device_{prepare,prepared,confirm}.html`), behind `require_ui_user`,
+CSRF-checked on every POST, `Cache-Control: no-store`, no inline
+style/script, the registration code never logged (checked directly via
+`caplog`) and never stored in plain text:**
+
+- **`GET`/`POST /ui/inventory/devices/{id}/prepare`** -- the "Vorbereiten"
+  form/result. The result page shows the raw code **exactly once**, plus the
+  content for `agent-registration.json` (section 15.3/19.5:
+  `protocol.registration.AgentRegistrationFile`'s `fleet_address`,
+  `certificate_fingerprint`, `registration_code`) -- **address and
+  fingerprint come from two new environment variables, `FLEET_PUBLIC_URL`
+  and `FLEET_CERT_FINGERPRINT`, deliberately with no default** (CLAUDE.md:
+  "nothing hard-coded"; no plausible placeholder exists that would not
+  itself look like a real deployment's configuration). If either is unset,
+  the page shows a clear German hint instead of inventing a value -- proven
+  by `tests/test_ui_device_registration.py
+  ::test_prepare_submit_without_fleet_env_vars_shows_a_hint`.
+  `fleet/inventory.html`'s device listing gained a "Vorbereiten" link per
+  eligible device (`registered`/`in_storage` only).
+- **`GET /ui/inventory/devices/confirm`** -- the "Bestätigen" listing:
+  every `reported` device, with a *display* fingerprint
+  (`fleet.ui_inventory._display_fingerprint`, `hashlib.sha256(public_key)`
+  truncated -- a human eyeball aid only, **never the actual security
+  check**, which is `confirm_device`'s own constant-time verification-code
+  comparison) and its report time -- **never the verification code itself**
+  (work order's explicit instruction). Each row's own inline form: apartment
+  select (retired apartments excluded, a UI convenience -- `confirm_device`
+  already refuses one anyway, offering it would only ever produce a failing
+  submission), verification-code input, `reason`, a `replace_previous`
+  checkbox, and a `previous_device_target_state` select (`in_storage`/
+  `faulty`).
+- **`POST /ui/inventory/devices/{id}/confirm`** -- applies one device's
+  confirmation. Every rule (wrong code, retired apartment, "replace_previous"
+  required, device already assigned elsewhere) is enforced by
+  `Storage.confirm_device` itself; this route only turns its `ValueError`
+  into a re-rendered 400 with the message, plus its own empty-code/empty-
+  reason/over-length-reason checks before ever calling `Storage`, the same
+  pattern every other form in `fleet/ui_routes.py` already follows.
+
+**Route naming deviates from `docs/implementation_plan.md`'s original
+sketch, noted there and here.** The plan first sketched
+`/ui/inventory/apartments/{id}/confirm-device`; the actual work order asked
+for a single listing of every `reported` device with one confirmation form
+each (a landlord does not necessarily know in advance which apartment a
+freshly reported device belongs to -- that is exactly what the form asks
+them to choose), which fits this package's own `/ui/inventory/devices/...`
+path (parallel to `.../devices/{id}/prepare`), not a per-apartment one.
+
+**Tests.** `tests/test_device_registration.py` (new, 35 tests, storage-level
+only, against a real, migrated SQLite database): every `prepare_device`/
+`record_device_report`/`confirm_device` rule named above, both the
+non-obvious concurrency proofs, the constant-time-compare check (`hmac
+.compare_digest` spied via `monkeypatch`), and one HTTP-level test
+(`test_confirm_device_with_replace_previous_revoked_token_gets_403_on_a_
+real_request`) that hits a real `/v1/heartbeat` with the just-revoked token.
+`tests/test_ui_device_registration.py` (new, 25 tests) -- auth/CSRF on every
+new route, the code-shown-once-and-never-logged proof, the env-var hint vs.
+content cases, wrong code/empty reason/over-length reason/apartment-already-
+assigned-without-replace all re-rendering with a 400 and a German message,
+successful prepare/confirm, XSS escaping, and the security headers
+(`Content-Security-Policy`, `X-Frame-Options`, `Referrer-Policy`,
+`Cache-Control: no-store`). `fleet/storage.py`, `fleet/ui_inventory.py`, and
+`fleet/ui_routes.py` are all at 100% coverage for this round (the handful of
+narrow-race defensive rechecks noted above are the only lines excluded, each
+with its own `# pragma: no cover` reason).
+
+Verification for this round: `ruff check .`, `mypy .`, `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+(553 passed, 99% coverage overall); the three concurrency tests
+(`test_record_device_report_two_threads_same_code_exactly_one_wins`,
+`test_confirm_device_wrong_attempts_counter_atomic_under_concurrency`,
+`test_confirm_device_concurrent_confirms_of_two_devices_for_one_apartment_
+exactly_one_wins`, and
+`test_confirm_device_concurrent_confirms_of_the_same_device_exactly_one_
+wins`) re-run 10x with no flake.
+
+**Open points, left for later packages, not invented here:**
+
+- **P4.2b** (device-side registration: Ed25519 key generation, the
+  `/v1/registration/...` endpoint group, the signed-challenge exchange that
+  actually issues a token and fills `DeviceRecord.public_key_fingerprint`/
+  `DeviceRegistrationRecord.token_issued_at`) is not built -- `Storage
+  .record_device_report` exists and is fully tested, but nothing calls it
+  yet except this package's own tests. P4.2b's own work order should read
+  this section before starting.
+- **P4.3** (replace device, change state) is being built in parallel on its
+  own branch and does not touch `0007_device_registrations.py` -- it adds
+  its own routes to `fleet/ui_routes.py`/`fleet/ui_inventory.py`, merged
+  separately.
+- **No "resend"/"view again" for a prepared code that was lost before
+  reaching the device.** The only recovery path is re-preparing the device
+  (which invalidates the lost code and its own boot-partition write) --
+  matches section 4's "the code expires after first use or after 24 hours"
+  read literally: a lost-but-still-valid code is not a state this package
+  builds a recovery UI for, since the code itself was never persisted
+  anywhere to recover.
+
 ## Inventory foundation + "Inventar" view (P4.1, section 20, absorbs P3.3)
 
 **Decisions by the project owner, 2026-09-26 (do not re-open, see this
