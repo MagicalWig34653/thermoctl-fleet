@@ -2,6 +2,133 @@
 
 Last updated: 2026-09-26.
 
+## Cross-review hot fix: P4.2b accepted small-order Ed25519 keys (main
+session) **SR**
+
+**The finding, stated plainly.** P4.2b's own cross-review (2026-09-26)
+reproduced, end to end, that the signed challenge P4.2b's whole design
+exists to require ("answers a signed challenge ... before ... ever trusted
+for anything security-relevant", 15.3 step 2/4) could be passed **with no
+private key at all**. `cryptography.hazmat.primitives.asymmetric.ed25519
+.Ed25519PublicKey.from_public_bytes` loads `bytes(32)` (32 zero bytes)
+without error -- that library performs no subgroup/canonicity validation on
+a presented public key, by its own documented design, leaving that entirely
+to the application -- and `.verify(bytes(64), message)` (an all-zero
+"signature") against that "key" then **succeeds for a nontrivial fraction
+of arbitrary messages** (the main session measured 4 of 20; the reviewer
+measured 20-60% across runs; this module's own test measures it directly
+against 30 messages and asserts it is nonzero, so the underlying behaviour
+stays proven, not merely remembered). `bytes(32)` happens to be the
+canonical encoding of one of Ed25519's eight points of *order dividing 8*
+(a "small-order"/"torsion" point) -- for such a key, EdDSA's own cofactored
+verification equation is satisfied by a large fraction of arbitrary
+signature/message pairs, algebraically, independent of any private key.
+Concretely, the attack the reviewer walked end to end: register a device
+with `public_key = bytes(32)` (wins whatever registration-code race an
+attacker needs to win in the first place, no different from any other
+substitution attempt P4.2b was built to catch) -- its verification code
+looks like any other, since `verification_code_for` is a plain hash of
+whatever bytes it is given, canonical or not -- confirm it in the UI like
+any other device, request a challenge, and answer it with an all-zero
+signature. A real apartment agent token came back. **This is exactly the
+substitution P4.2b's signed-challenge step was built to make impossible**,
+defeated by a class of input neither this package's original tests nor its
+own review happened to try.
+
+**Fix: `fleet/ed25519_checks.py` (new module, pure Python integers,
+stdlib-only -- no `cryptography` import, kept separate from `protocol/`
+for the same reason the original package's own arithmetic-adjacent
+functions live in `fleet/`, not `protocol/`).** Implements RFC 8032 section
+5.1.3's point decoding *exactly as specified*, including both canonicity
+checks that section explicitly calls for (`y >= p`; `x == 0` with the sign
+bit set) and, critically, the section's own further recommendation ("some
+implementations additionally check that the resulting point is not one of
+these [eight] points") that P4.2b's original implementation had not applied
+at all: `is_low_order_point` computes `[8]P` via three point doublings (the
+curve's cofactor) and rejects if the result is the identity -- this is the
+one check that actually catches `bytes(32)` (a canonical, on-curve,
+order-4 point) and every other one of the eight. The signature's own two
+halves get the equivalent treatment (`reject_malleable_signature`): `R`
+(the first 32 bytes) through the identical point-decode-and-low-order
+check, and `S` (the scalar half) rejected unless strictly less than the
+group order `L` (RFC 8032's own "S < L" cofactored-verification
+requirement -- the other classical Ed25519 malleability defense, distinct
+from but adjacent to the low-order-point issue: without it, `S' = S + L`
+verifies identically to `S`).
+
+**Applied in two places, `fleet/app.py`:** `report_device_registration`
+(`POST /v1/registration`) rejects a low-order presented public key
+*before* `record_device_report` ever stores it -- the same uniform `400`
+as every other registration failure, so an attacker learns nothing new.
+`request_device_token` (`POST /v1/registration/{id}/token`) re-checks the
+**stored** key (defense in depth: a low-order key must never reach
+`.verify(...)` even if it had somehow been stored by some path other than
+this package's own registration endpoint) and validates both signature
+halves, all before `Ed25519PublicKey.from_public_bytes(...).verify(...)`
+is ever called -- the same uniform `404`-style refusal as every other
+token-endpoint failure.
+
+**Tests, proving the fix and the original finding both, not only
+arguing them.** `tests/test_ed25519_checks.py` (new, 18 tests): all eight
+of Ed25519's small-order points, in their *canonical* encodings --
+**derived programmatically inside the test file** via an independent point-
+addition/scalar-multiplication implementation (never hand-copied hex from a
+paper, which would itself have been exactly the kind of single-wrong-digit
+transcription risk this fix exists to avoid), each individually confirmed
+low-order *and* rejected; the specific literature-cited vectors (the
+all-zero key, the identity `01 00...00`, and `ec ff...ff 7f`, i.e. `y =
+p-1`, matching the exact value the reviewer's own finding cited); two
+non-canonical `y >= p` encodings; 200 freshly generated real
+`cryptography.Ed25519PrivateKey` public keys, asserted to **all** pass (no
+false positives -- the fix must reject only the degenerate cases, never a
+genuine key); a real signature passing the malleability check unchanged;
+an all-zero signature rejected via its low-order `R`; an `S == L` and an
+`S` far above `L` both rejected; and
+`test_all_zero_key_and_all_zero_signature_reproduces_the_finding`, which
+first *reproduces* the underlying `cryptography` behaviour directly (so
+this test would itself fail loudly, not silently pass, if a future
+`cryptography` release changed that behaviour) and then confirms both new
+checks refuse the pair. `tests/test_device_registration_v1.py` gained two
+end-to-end regression tests:
+`test_register_low_order_public_key_uniform_failure` (the `POST
+/v1/registration` refusal, nothing stored, the registration code stays
+usable) and `test_zero_key_and_zero_signature_attack_never_yields_a_token`
+(the reviewer's own full attack, replayed against the real endpoints end to
+end -- registration refused, and, as defense in depth, a low-order key
+inserted directly via `Storage` still cannot obtain a token through
+`request_device_token`'s own independent re-check). `fleet/ed25519_checks
+.py` is at 100% coverage -- its two truly unreachable lines (`_mod_
+inverse`'s zero-denominator guard, reached only if Ed25519's own `d` were
+not a non-square mod `p`, which is exactly the algebraic property that
+makes this curve's addition law "complete" in the first place) are
+`# pragma: no cover` with that reasoning, not silently excluded.
+
+**Open point this fix surfaces, not decided here (P2.3, still
+deferred):** the agent side must generate its own Ed25519 key pair only
+through a proper, audited library (`cryptography`'s own `Ed25519PrivateKey
+.generate()`, or an equivalent) -- never construct or accept a "key" from
+anywhere else (a config default, a fixture, an all-zero placeholder during
+early bring-up) that could turn out to be low-order. Symmetrically, the
+agent itself must never *accept* a low-order key or signature from
+anywhere it might one day receive one (e.g. if a future WireGuard-adjacent
+key-exchange path reused this class of arithmetic) -- this package's own
+fix protects the cloud side of *this* exchange; P2.3's own work order
+should read this section before assuming Ed25519 handling is "already
+solved" by P4.2b.
+
+Verification (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"` -- SQLAlchemy 2.1.1, mypy 2.3.1, cryptography
+50.0.1): `ruff check .`, `mypy .`, `mypy protocol fleet agent tools` all
+clean; `python -m pytest -W ignore::ResourceWarning` (**725 passed**, 99%
+coverage overall, `fleet/app.py`/`fleet/storage.py`/`fleet/ed25519_checks
+.py`/`protocol/registration.py` all at 100%);
+`test_concurrent_token_requests_exactly_one_token_wins` and
+`test_register_throttle_429_reserve_then_verify` each re-run 10x in a row,
+no flake. `watchdog/`: `go vet ./...` clean, `go test ./...` green, `bash
+watchdog/check_contract.sh` passes (re-run for completeness; this fix
+touches no `protocol/` field, only adds a new `fleet/`-internal module and
+two call sites).
+
 ## Device-side registration: Ed25519 + signed challenge (P4.2b, sections 4,
 14, 15.3) **SR**
 

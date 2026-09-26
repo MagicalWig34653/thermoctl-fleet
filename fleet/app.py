@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
+from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
 from fleet.storage import Storage, get_storage, hash_token
 from fleet.ui_auth import resolve_client_ip
 from fleet.ui_routes import install_security_headers
@@ -548,10 +549,15 @@ def report_device_registration(
     **Every failure is the same response** (`_uniform_registration_failure`,
     `400`) -- an unknown/expired/invalidated/already-used code, a
     malformed or structurally invalid public key (wrong length, not valid
-    base64url, or a value `cryptography` itself refuses to load as an
-    Ed25519 public key), and a decommissioned device (`Storage
-    .record_device_report`'s own guard) are all indistinguishable to the
-    caller.
+    base64url, a value `cryptography` itself refuses to load as an Ed25519
+    public key, **or a validly-encoded but small-order/degenerate curve
+    point**, `fleet.ed25519_checks.reject_low_order_public_key` -- see that
+    module's own docstring for the finding this specific check exists to
+    close: a naive verifier accepts an all-zero-ish signature against one of
+    Ed25519's eight low-order public keys for a nontrivial fraction of
+    messages, with no private key involved at all), and a decommissioned
+    device (`Storage.record_device_report`'s own guard) are all
+    indistinguishable to the caller.
 
     **Per-IP throttle checked first, before any code lookup at all**
     (`_enforce_registration_throttle`) -- released again on success, so a
@@ -568,6 +574,7 @@ def report_device_registration(
     try:
         raw_public_key = decode_bytes(payload.public_key)
         Ed25519PublicKey.from_public_bytes(raw_public_key)
+        reject_low_order_public_key(raw_public_key)
     except ValueError as error:
         raise _uniform_registration_failure() from error
 
@@ -683,7 +690,12 @@ def request_device_token(
 
     **Every failure is the same uniform `404`-style response**
     (`_uniform_registration_lookup_failure`): unknown `registration_id`, not
-    yet confirmed, invalidated, a wrong or malformed signature, a wrong,
+    yet confirmed, invalidated, a wrong or malformed signature, **a
+    small-order/degenerate stored public key or signature `R`/`S` half**
+    (`fleet.ed25519_checks.reject_low_order_public_key`/`reject_malleable_
+    signature` -- defense in depth on top of `report_device_registration`'s
+    own check of the same key at registration time, plus the signature's
+    own halves, which that earlier check could never have seen), a wrong,
     expired, or already-consumed nonce, a token already issued, no open
     assignment for the device against the confirmed apartment, or a retired
     apartment -- none of these is distinguished any further, so an attacker
@@ -707,6 +719,14 @@ def request_device_token(
     try:
         raw_public_key = decode_bytes(registration.public_key)
         raw_signature = decode_bytes(payload.signature)
+        # Defense in depth (cross-review, 2026-09-26): `report_device_
+        # registration` already refuses a low-order public key at
+        # registration time, but this stored key is re-checked here too --
+        # a second, independent guard, exactly the same "belt and braces"
+        # reasoning `record_device_report`'s own decommissioned-device
+        # subquery already applies elsewhere in this package.
+        reject_low_order_public_key(raw_public_key)
+        reject_malleable_signature(raw_signature)
     except ValueError as error:
         raise _uniform_registration_lookup_failure() from error
 

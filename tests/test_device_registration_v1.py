@@ -246,6 +246,79 @@ def test_register_not_base64_public_key_uniform_failure(
     assert response.json() == {"detail": "Registration failed."}
 
 
+def test_register_low_order_public_key_uniform_failure(
+    client: TestClient, storage: Storage
+) -> None:
+    """Cross-review finding (2026-09-26): a validly-*encoded*, validly
+    *cryptography*-loadable but small-order (degenerate) Ed25519 public
+    key must be refused here, the same uniform `400` as every other
+    registration failure -- `fleet.ed25519_checks.reject_low_order_public_
+    key` is what actually catches `bytes(32)` (one of Ed25519's eight
+    low-order points), which `Ed25519PublicKey.from_public_bytes` alone
+    does not."""
+
+    _register_device(storage)
+    raw_code = storage.prepare_device(
+        DEVICE, ui_username=USERNAME, confirmed_reset=False, now=datetime.now(UTC)
+    )
+    response = client.post(
+        "/v1/registration",
+        json={"registration_code": raw_code, "public_key": encode_bytes(bytes(32))},
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Registration failed."}
+    # Nothing was stored for the (still valid, unused) code.
+    device = storage.get_device(DEVICE)
+    assert device is not None
+    assert device.state == "prepared"
+
+
+def test_zero_key_and_zero_signature_attack_never_yields_a_token(
+    client: TestClient, storage: Storage
+) -> None:
+    """The end-to-end reproduction of the cross-review finding: an
+    attacker who wins the registration-code race with the degenerate
+    all-zero "public key" and later presents an all-zero "signature" must
+    never receive a token -- not at registration (rejected immediately,
+    `test_register_low_order_public_key_uniform_failure` above already
+    proves this in isolation), and, as defense in depth, not even if a
+    low-order key had somehow made it into storage: `request_device_token`
+    re-checks the *stored* key and the presented signature's own halves
+    before ever calling `.verify(...)`."""
+
+    _register_device(storage)
+    _make_apartment(storage)
+    raw_code = storage.prepare_device(
+        DEVICE, ui_username=USERNAME, confirmed_reset=False, now=datetime.now(UTC)
+    )
+    zero_key = encode_bytes(bytes(32))
+
+    registration_response = client.post(
+        "/v1/registration", json={"registration_code": raw_code, "public_key": zero_key}
+    )
+    assert registration_response.status_code == 400
+
+    # Defense in depth: even if a low-order key had already been stored by
+    # some other path (bypassing `report_device_registration`'s own check),
+    # the token endpoint's independent re-check must still refuse it.
+    now = datetime.now(UTC)
+    assert storage.record_device_report(raw_code, zero_key, verification_code_for(zero_key), now)
+    external_id = storage.assign_registration_external_id(DEVICE, now)
+    assert external_id is not None
+    _confirm(storage, zero_key)
+
+    challenge = client.post(f"/v1/registration/{external_id}/challenge")
+    assert challenge.status_code == 200
+    nonce = challenge.json()["nonce"]
+
+    token_response = client.post(
+        f"/v1/registration/{external_id}/token",
+        json={"nonce": nonce, "signature": encode_bytes(bytes(64))},
+    )
+    assert token_response.status_code == 404
+    assert storage.get_apartment_token_hash(APARTMENT) is None
+
+
 def test_register_unknown_code_uniform_failure(client: TestClient, storage: Storage) -> None:
     _, public_key = _keypair()
     response = client.post(
