@@ -32,6 +32,7 @@ from fleet.ui_tasks import (
     build_task_overview,
 )
 from protocol import Heartbeat
+from protocol.version import PROTOCOL_VERSION
 
 USERNAME = "landlord"
 APARTMENT_A = "house7-a03"
@@ -45,7 +46,7 @@ def _make_heartbeat(
     *,
     thermoctl_version: str = "0.9.5",
     agent_version: str = "0.1.0",
-    protocol_version: int = 1,
+    protocol_version: int = PROTOCOL_VERSION,
     weakest_battery_percent: int = 62,
     silent_devices: int = 0,
     open_faults: list[dict[str, str]] | None = None,

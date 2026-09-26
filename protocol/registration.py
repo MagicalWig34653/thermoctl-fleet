@@ -61,15 +61,18 @@ with no `examples=`/default -- the same reasoning applied to a field instead
 of a whole model, since this one field's only job *is* to carry that secret
 over the wire, once, from cloud to device.
 
-**`PROTOCOL_VERSION` is not bumped for this addition (section 18.2).** Every
-change here is a brand-new model (`RegistrationAccepted`, `TokenChallenge`,
-`TokenRequest`, `TokenIssued`) or a new, pure function
-(`encode_bytes`/`decode_bytes`/`verification_code_for`) -- section 18.2 only
-requires a bump for "a field name, a required field, or the meaning of an
-existing field" changing; nothing about `AgentRegistrationFile`,
-`RegistrationRequest`, or `RegistrationConfirmation` changed at all, and a
-wholly new model that an older agent simply never sends/receives cannot
-itself break that older agent's own understanding of the fields it does use.
+**`PROTOCOL_VERSION` is bumped to 2 for this addition (project owner
+decision, 2026-09-26 -- see `protocol/version.py` and docs/specification.md
+18.2's "Decided afterward" paragraph).** Section 18.2's "a number that
+increases with every change to the models" is read literally: the four new
+models here (`RegistrationAccepted`, `TokenChallenge`, `TokenRequest`,
+`TokenIssued`) are a change to the models, full stop, even though nothing
+about `AgentRegistrationFile`, `RegistrationRequest`, or
+`RegistrationConfirmation` changed and even though an older agent that never
+sends/receives these four simply never notices them. The compatibility
+rules of 18.2 are unaffected by this bump: the fleet still accepts an older
+`protocol_version` and flags it "outdated" rather than rejecting it, and a
+field is still only ever added, never repurposed.
 """
 
 from __future__ import annotations
