@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import signal
+import socket
 import stat
 import threading
 import typing
@@ -562,6 +565,107 @@ def test_read_private_file_closes_a_toctou_gap_with_o_nofollow(tmp_path: Path) -
     path.symlink_to(target)
 
     with pytest.raises(InsecureKeyFileError):
+        _read_private_file(path)
+
+
+class _AlarmGuard:
+    """A hard timeout via `signal.alarm` -- the same tool the reviewer used
+    to reproduce the FIFO hang this fix closes. If `_read_private_file`
+    regressed back to blocking on a FIFO, this turns an indefinite test
+    hang into a clean, fast `TimeoutError` instead."""
+
+    def __init__(self, seconds: int) -> None:
+        self._seconds = seconds
+        self._previous_handler: object = None
+
+    def __enter__(self) -> _AlarmGuard:
+        def _on_alarm(signum: int, frame: object) -> None:
+            raise TimeoutError("blocked past the alarm guard -- likely a FIFO hang")
+
+        self._previous_handler = signal.signal(signal.SIGALRM, _on_alarm)
+        signal.alarm(self._seconds)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, self._previous_handler)  # type: ignore[arg-type]
+
+
+def test_read_private_file_refuses_a_fifo_quickly_not_a_hang(tmp_path: Path) -> None:
+    """Cross-review finding: a FIFO created at the key/token path with mode
+    0600 passed the symlink and mode checks alone, and `os.open(...,
+    O_RDONLY)` on it then **blocked forever** waiting for a writer
+    (reproduced by the reviewer with a 5s alarm) -- `stat.S_ISREG` in
+    `_assert_safe_private_file` refuses it before any `open` call at all,
+    so this must return well within the alarm guard's timeout, not hang."""
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = data_dir / "device_private_key.pem"
+    os.mkfifo(path, 0o600)
+
+    with _AlarmGuard(5), pytest.raises(InsecureKeyFileError, match="not a regular file"):
+        _read_private_file(path)
+
+
+def test_load_or_create_private_key_refuses_a_directory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = data_dir / "device_private_key.pem"
+    path.mkdir()
+    path.chmod(0o600)
+
+    with _AlarmGuard(5), pytest.raises(InsecureKeyFileError, match="not a regular file"):
+        load_or_create_private_key(data_dir)
+
+
+def test_read_private_file_refuses_a_unix_domain_socket(tmp_path: Path) -> None:
+    # `AF_UNIX` socket paths are limited to ~104-108 bytes on most
+    # platforms -- pytest's own nested `tmp_path` is routinely longer than
+    # that, so this test binds under a short-lived directory directly
+    # under `/tmp` instead of `tmp_path`.
+    import tempfile
+
+    short_dir = tempfile.mkdtemp(dir="/tmp")
+    try:
+        path = Path(short_dir) / "k"
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(str(path))
+            path.chmod(0o600)
+            with (
+                _AlarmGuard(5),
+                pytest.raises(InsecureKeyFileError, match="not a regular file"),
+            ):
+                _read_private_file(path)
+        finally:
+            sock.close()
+    finally:
+        path_obj = Path(short_dir) / "k"
+        if path_obj.exists():
+            path_obj.unlink()
+        os.rmdir(short_dir)
+
+
+def test_read_private_file_post_open_fstat_check_catches_a_toctou_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directly exercises the second, `fstat`-on-the-open-fd defense in
+    `_read_private_file` (belt and braces on top of the `lstat` pre-check
+    in `_assert_safe_private_file`) by monkeypatching that pre-check into a
+    no-op -- simulating a path that was a regular file at `lstat` time but
+    a FIFO by the time `open` actually ran (the TOCTOU race the two checks
+    together are meant to close, not practical to reproduce with real
+    timing). Guarded with the same alarm as the plain FIFO test."""
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = data_dir / "device_private_key.pem"
+    os.mkfifo(path, 0o600)
+
+    monkeypatch.setattr("agent.registration._assert_safe_private_file", lambda _path: None)
+
+    with _AlarmGuard(5), pytest.raises(InsecureKeyFileError, match="not a regular file"):
         _read_private_file(path)
 
 

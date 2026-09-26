@@ -163,10 +163,21 @@ def _write_private_file(path: Path, data: bytes) -> None:
 
 
 def _assert_safe_private_file(path: Path) -> None:
-    """Refuses to proceed if `path` is a symlink, or a regular file whose
-    mode is wider than 0600 -- see `InsecureKeyFileError`. Checked via
-    `lstat` (does **not** follow a symlink itself) before the file is ever
-    opened for reading."""
+    """Refuses to proceed if `path` is a symlink, is not a **regular**
+    file (a FIFO, a socket, a character/block device, or a directory --
+    see `InsecureKeyFileError`), or is a regular file whose mode is wider
+    than 0600. Checked via `lstat` (does **not** follow a symlink itself,
+    and does not open anything) before the file is ever opened for
+    reading.
+
+    **Why the file-type check, found in cross-review:** a FIFO created at
+    this path with mode 0600 would pass a symlink check and a mode check
+    alone, and then `os.open(..., O_RDONLY)` on it **blocks forever**
+    waiting for a writer to open the other end -- reproduced by the
+    reviewer with a 5-second alarm. `stat.S_ISREG` closes this: a FIFO (or
+    a socket, or a device node) is refused right here, before any `open`
+    call is made at all.
+    """
 
     file_stat = path.lstat()
     if stat.S_ISLNK(file_stat.st_mode):
@@ -174,6 +185,12 @@ def _assert_safe_private_file(path: Path) -> None:
             f"{path} is a symlink -- refusing to load it as a private key/token "
             "file. Remove it and let the agent recreate a regular file, or "
             "replace it with a real file at mode 0600 by hand."
+        )
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise InsecureKeyFileError(
+            f"{path} is not a regular file -- refusing to load it as a private "
+            "key/token file. Remove it and let the agent recreate a regular "
+            "file, or replace it with a real file at mode 0600 by hand."
         )
     mode = stat.S_IMODE(file_stat.st_mode)
     if mode != 0o600:
@@ -188,15 +205,32 @@ def _read_private_file(path: Path) -> bytes:
     """Reads a private key or token file, refusing anything but a regular
     file at mode exactly 0600 (`_assert_safe_private_file`, checked via
     `lstat` first) -- and, since a check followed by a separate open is
-    itself a TOCTOU gap, also opens with `O_NOFOLLOW`, which turns a
-    symlink swapped in between the check and this call into a loud
-    `OSError` (`ELOOP`) instead of silently following it."""
+    itself a TOCTOU gap (the path could be replaced between the `lstat`
+    above and the `open` below), two further defenses close it:
+
+    1. `O_NOFOLLOW` turns a symlink swapped in during that gap into a loud
+       `OSError` (`ELOOP`) instead of silently following it.
+    2. `O_NONBLOCK` means opening a FIFO (or certain devices) swapped in
+       during that gap **returns immediately instead of blocking forever**
+       -- opening a regular file is unaffected by this flag (POSIX defines
+       `O_NONBLOCK` as meaningful only for FIFOs and some device files), so
+       this is free for the normal case. Whatever `open` *did* end up
+       looking at is then checked again via `fstat` on the resulting file
+       descriptor itself (not the path a second time, which would reopen
+       the same race) -- a non-regular file that still slipped through
+       both the `lstat` pre-check and `O_NOFOLLOW` is caught here, before a
+       single byte is ever read from it.
+    """
 
     _assert_safe_private_file(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        size = os.fstat(fd).st_size
-        return os.read(fd, size)
+        fd_stat = os.fstat(fd)
+        if not stat.S_ISREG(fd_stat.st_mode):
+            raise InsecureKeyFileError(
+                f"{path} is not a regular file -- refusing to read it."
+            )
+        return os.read(fd, fd_stat.st_size)
     finally:
         os.close(fd)
 

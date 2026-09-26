@@ -1,6 +1,50 @@
 # Status
 
-Last updated: 2026-09-26.
+Last updated: 2026-09-27.
+
+## P5.0 second cross-review fix: FIFO/device/socket refused before `open`,
+not just symlink and mode (main session read-back) **SR**
+
+Re-review of the fix below found one more reproduced gap: `_assert_safe
+_private_file` checked for a symlink and for mode 0600, but not for the
+file *type* -- a **FIFO** created at the private-key or token path with
+mode 0600 passes both of those checks, and the subsequent
+`os.open(path, O_RDONLY | O_NOFOLLOW)` then **blocks forever** waiting for
+a writer to open the other end of the pipe (the reviewer reproduced this
+directly, with a 5-second `signal.alarm` guard).
+
+**Fixed with two layers**, not one:
+
+1. `_assert_safe_private_file` now also checks `stat.S_ISREG(...)` via the
+   same `lstat` call already used for the symlink/mode checks -- a FIFO, a
+   socket, a character/block device, or a directory at this path is
+   refused right here, before any `open` call is attempted at all.
+2. **Extra safety against the TOCTOU race between that `lstat` and the
+   `open` a few lines later** (the path could in principle be replaced in
+   between): `_read_private_file` now opens with `O_NONBLOCK` in addition
+   to `O_NOFOLLOW` (a no-op for a regular file -- POSIX defines it as
+   meaningful only for FIFOs and some device files, so opening a FIFO that
+   slipped in during the race returns immediately instead of blocking),
+   and re-checks `stat.S_ISREG` a second time via `fstat` on the now-open
+   file descriptor itself (not the path again, which would just reopen the
+   same race) before a single byte is read.
+
+**Tests** (`tests/test_agent_registration.py`): a 0600 FIFO, guarded by the
+same kind of `signal.alarm`-based timeout the reviewer used
+(`_AlarmGuard`, 5 s) so a regression here fails fast and loud instead of
+hanging the test suite; a directory at the key path; a Unix domain socket
+(bound under a short-lived `/tmp` directory directly, since `AF_UNIX` path
+lengths are far shorter than pytest's own nested `tmp_path`); and one test
+that monkeypatches `_assert_safe_private_file` itself into a no-op to
+exercise the second, `fstat`-on-the-open-fd defense in `_read_private_file`
+directly and independently of the `lstat` pre-check (the TOCTOU race the
+two layers together close is not practical to reproduce with real timing).
+`agent/registration.py` back to 100% covered.
+
+**Verification after this fix** (fresh venv): `ruff check .`, `mypy .`,
+`mypy protocol fleet agent tools` all clean; full suite passed with the
+same `TOTAL` coverage as the previous round (see below for the exact
+count from this run).
 
 ## P5.0 cross-review fixes: Retry-After clamping, CLI exception handling,
 file-tampering checks (main session read-back) **SR**
