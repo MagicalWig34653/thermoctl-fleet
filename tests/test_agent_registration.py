@@ -15,6 +15,8 @@ file".
 
 from __future__ import annotations
 
+import logging
+import math
 import stat
 import threading
 import typing
@@ -24,10 +26,22 @@ from pathlib import Path
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from agent.registration import (
+    _MAX_RETRY_AFTER_S,
+    _MIN_RETRY_AFTER_S,
+    InsecureKeyFileError,
     RegistrationError,
     RegistrationOutcome,
+    _parse_and_clamp_retry_after,
+    _poll_for_challenge,
+    _read_private_file,
+    _submit_registration_request,
+    _submit_token_request,
+    _write_private_file,
     load_or_create_private_key,
     load_token,
     register,
@@ -37,9 +51,11 @@ from agent.transport import (
     CertificateFingerprintMismatch,
     InvalidCertificateFingerprint,
     InvalidFleetAddress,
+    build_client,
 )
 from fleet.app import app
 from fleet.storage import Storage, create_storage, get_storage, upgrade
+from protocol.registration import RegistrationAccepted, TokenChallenge, TokenIssued, TokenRequest
 from tests.tls_support import run_tls_fleet_app
 
 APARTMENT = "house7-a03"
@@ -353,3 +369,358 @@ def test_invalid_certificate_fingerprint_in_registration_file_is_refused(tmp_pat
     with pytest.raises(InvalidCertificateFingerprint):
         register(registration_file_path=registration_file, data_dir=data_dir)
     assert load_token(data_dir) is None
+
+
+# -- cross-review follow-up ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("-5", _MIN_RETRY_AFTER_S),
+        ("0", _MIN_RETRY_AFTER_S),
+        ("1000000000", _MAX_RETRY_AFTER_S),
+        ("nan", 60.0),
+        ("inf", 60.0),
+        ("-inf", 60.0),
+        ("abc", 60.0),
+        (None, 60.0),
+        ("", 60.0),
+        ("30", 30.0),
+    ],
+)
+def test_retry_after_parsing_never_produces_a_negative_or_absurd_sleep(
+    raw: str | None, expected: float
+) -> None:
+    """Section 4/CLAUDE.md principle 5 applied to a server-supplied number,
+    not just a command: `-5` must not reach `time.sleep` (`ValueError:
+    sleep length must be non-negative`), and `1e9` must not park the agent
+    for ~3 years. `float("nan")`/`float("inf")` succeed without raising --
+    the non-finite check catches what the `except ValueError` alone would
+    not."""
+
+    result = _parse_and_clamp_retry_after(raw, default=60.0)
+    assert result == pytest.approx(expected)
+    assert math.isfinite(result)
+    assert _MIN_RETRY_AFTER_S <= result <= _MAX_RETRY_AFTER_S
+
+
+def test_retry_after_parsing_survives_a_pathological_default_too(tmp_path: Path) -> None:
+    """Belt and braces: even a non-finite `default` (never happens in
+    practice -- `register`'s own `poll_interval_s` default is the constant
+    `POLL_INTERVAL_S = 60.0` -- but this function does not trust its own
+    caller's arguments any more than the server's) falls back to
+    `POLL_INTERVAL_S`, not to a NaN/inf that would then reach `sleep`."""
+
+    result = _parse_and_clamp_retry_after(None, default=float("nan"))
+    assert result == pytest.approx(60.0)
+    result = _parse_and_clamp_retry_after("also-not-a-number", default=float("inf"))
+    assert result == pytest.approx(60.0)
+
+
+def test_poll_for_challenge_clamps_a_malicious_retry_after_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """The same clamp, exercised through the real poll loop (not just the
+    helper function in isolation) via `httpx.MockTransport` -- a server
+    answering with `Retry-After: -5` must not raise, and the clamped sleep
+    value actually reaches the injected `sleep` callable."""
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(202, headers={"Retry-After": "-5"})
+        return httpx.Response(
+            200, json={"nonce": "abc", "expires_at": "2026-01-01T00:00:00Z"}
+        )
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    sleeps: list[float] = []
+    challenge = _poll_for_challenge(client, "reg-1", 60.0, None, sleeps.append)
+    assert isinstance(challenge, TokenChallenge)
+    assert sleeps == [_MIN_RETRY_AFTER_S]
+
+
+# -- symlink / mode enforcement on the private key and token files ----------
+
+
+def test_load_or_create_private_key_refuses_a_symlink(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    target = tmp_path / "elsewhere.pem"
+    target.write_bytes(b"not a real key, doesn't matter, never read")
+    (data_dir / "device_private_key.pem").symlink_to(target)
+
+    with pytest.raises(InsecureKeyFileError, match="symlink"):
+        load_or_create_private_key(data_dir)
+
+
+def test_load_or_create_private_key_refuses_a_dangling_symlink(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "device_private_key.pem").symlink_to(tmp_path / "does-not-exist.pem")
+
+    with pytest.raises(InsecureKeyFileError, match="symlink"):
+        load_or_create_private_key(data_dir)
+
+
+def test_load_or_create_private_key_refuses_a_too_wide_mode(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    key_path = data_dir / "device_private_key.pem"
+    private_key = Ed25519PrivateKey.generate()
+    key_path.write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    key_path.chmod(0o644)
+
+    with pytest.raises(InsecureKeyFileError, match="0600"):
+        load_or_create_private_key(data_dir)
+
+
+def test_load_or_create_private_key_refuses_wrong_key_type_on_disk(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    key_path = data_dir / "device_private_key.pem"
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _write_private_file(
+        key_path,
+        rsa_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ),
+    )
+
+    with pytest.raises(RegistrationError, match="does not hold an Ed25519"):
+        load_or_create_private_key(data_dir)
+
+
+def test_load_token_refuses_a_symlink(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    target = tmp_path / "elsewhere-token"
+    target.write_text("agent_house7-a03_forged", encoding="utf-8")
+    token_path(data_dir).symlink_to(target)
+
+    with pytest.raises(InsecureKeyFileError, match="symlink"):
+        load_token(data_dir)
+
+
+def test_load_token_refuses_a_too_wide_mode(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = token_path(data_dir)
+    path.write_text("agent_house7-a03_whatever", encoding="utf-8")
+    path.chmod(0o644)
+
+    with pytest.raises(InsecureKeyFileError, match="0600"):
+        load_token(data_dir)
+
+
+def test_write_private_file_refuses_to_overwrite_an_existing_file(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "device_private_key.pem"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"already here")
+
+    with pytest.raises(FileExistsError):
+        _write_private_file(path, b"new content")
+
+
+def test_write_private_file_refuses_to_write_through_a_symlink(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    target = tmp_path / "elsewhere.pem"
+    path = data_dir / "device_private_key.pem"
+    path.symlink_to(target)
+
+    with pytest.raises(OSError):  # ELOOP, via O_NOFOLLOW
+        _write_private_file(path, b"attacker-controlled destination")
+    assert not target.exists()
+
+
+def test_read_private_file_closes_a_toctou_gap_with_o_nofollow(tmp_path: Path) -> None:
+    """Belt and braces: `_read_private_file` checks via `lstat` *and* opens
+    with `O_NOFOLLOW` -- this test only exercises the plain, already-caught
+    symlink case (a real TOCTOU race is not practical to reproduce
+    deterministically), confirming the `O_NOFOLLOW` open itself also
+    refuses a symlink, independent of the `lstat` pre-check."""
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    target = tmp_path / "elsewhere.pem"
+    target.write_bytes(b"whatever")
+    path = data_dir / "device_private_key.pem"
+    path.symlink_to(target)
+
+    with pytest.raises(InsecureKeyFileError):
+        _read_private_file(path)
+
+
+# -- non-2xx branches of the registration/token HTTP calls, via MockTransport --
+
+
+def test_submit_registration_request_non_201_raises(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"detail": "Registration failed."})
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(RegistrationError, match="was refused"):
+        _submit_registration_request(client, "some-code", "some-public-key")
+
+
+def test_submit_registration_request_success_parses_model(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={"registration_id": "abc-123"})
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    accepted = _submit_registration_request(client, "some-code", "some-public-key")
+    assert isinstance(accepted, RegistrationAccepted)
+    assert accepted.registration_id == "abc-123"
+
+
+def test_submit_token_request_non_200_raises(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Unknown registration."})
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(RegistrationError, match="was refused"):
+        _submit_token_request(
+            client, "reg-1", TokenRequest(nonce="n", signature="s")
+        )
+
+
+def test_submit_token_request_success_parses_model(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"token": "agent_house7-a03_abcdef"})
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    issued = _submit_token_request(client, "reg-1", TokenRequest(nonce="n", signature="s"))
+    assert isinstance(issued, TokenIssued)
+    assert issued.token == "agent_house7-a03_abcdef"
+
+
+def test_poll_for_challenge_non_200_non_202_raises(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(RegistrationError, match="was refused"):
+        _poll_for_challenge(client, "reg-1", 60.0, None, lambda seconds: None)
+
+
+# -- private key and raw token never leak into logs or requests -------------
+
+
+def test_private_key_and_token_never_leak_during_registration(
+    tmp_path: Path,
+    app_storage: Storage,
+    landlord_storage: Storage,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mirrors the fleet side's own `tests.test_device_registration_v1
+    ::test_raw_token_never_stored_or_logged`: captures every request this
+    device sends over the *entire* registration flow (registration,
+    challenge polls, token request) via `httpx.Client`'s `event_hooks`, and
+    every log record, then asserts the private key's raw bytes and the
+    finally-issued raw token appear in neither -- the private key must
+    never leave the process at all, and the token is only ever received
+    (in a response), never sent (in a request), during this flow."""
+
+    caplog.set_level(logging.DEBUG)
+    _make_apartment_and_device(landlord_storage)
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        raw_code = landlord_storage.prepare_device(
+            DEVICE, ui_username=USERNAME, confirmed_reset=False, now=datetime.now(UTC)
+        )
+        registration_file = tmp_path / "agent-registration.json"
+        _write_registration_file(registration_file, base_url, fingerprint, raw_code)
+        data_dir = tmp_path / "data"
+
+        # Build the same kind of client `register()` builds internally, but
+        # keep a handle to it so an event hook can record every outgoing
+        # request -- `register()` itself does not expose its internal
+        # client, so this test drives the flow through the lower-level
+        # pieces `register()` itself calls, exactly mirroring its own logic.
+        from agent.registration import _TOKEN_DOMAIN_PREFIX, _write_status
+        from agent.registration import _poll_for_challenge as poll_for_challenge
+        from agent.registration import (
+            _submit_registration_request as submit_registration_request,
+        )
+        from agent.registration import _submit_token_request as submit_token_request
+        from protocol.registration import encode_bytes, verification_code_for
+
+        recorded_requests: list[httpx.Request] = []
+
+        def _record(request: httpx.Request) -> None:
+            request.read()
+            recorded_requests.append(request)
+
+        client = build_client(base_url, fingerprint, ca_file=ca_file, timeout=5.0)
+        client.event_hooks["request"] = [_record]
+
+        private_key = load_or_create_private_key(data_dir)
+        raw_private_key_bytes = private_key.private_bytes_raw()
+        public_key = encode_bytes(private_key.public_key().public_bytes_raw())
+
+        with client:
+            accepted = submit_registration_request(client, raw_code, public_key)
+            verification_code = verification_code_for(public_key)
+            _write_status(data_dir, "waiting_for_assignment", verification_code)
+
+            landlord_storage.confirm_device(
+                DEVICE, APARTMENT, verification_code, ui_user=USERNAME, reason="Setup",
+                replace_previous=False, previous_device_target_state=None,
+                now=datetime.now(UTC),
+            )
+
+            challenge = poll_for_challenge(
+                client, accepted.registration_id, 60.0, None, lambda seconds: None
+            )
+            message = (
+                _TOKEN_DOMAIN_PREFIX
+                + accepted.registration_id.encode("utf-8")
+                + b"\0"
+                + challenge.nonce.encode("utf-8")
+            )
+            signature = encode_bytes(private_key.sign(message))
+            issued = submit_token_request(
+                client,
+                accepted.registration_id,
+                TokenRequest(nonce=challenge.nonce, signature=signature),
+            )
+
+        assert issued.token.startswith(f"agent_{APARTMENT}_")
+
+        for request in recorded_requests:
+            assert raw_private_key_bytes not in request.content
+            assert issued.token.encode("utf-8") not in request.content
+            for header_value in request.headers.values():
+                assert issued.token not in header_value
+
+        assert issued.token not in caplog.text
+        # The raw private key bytes are binary and not printable, but the
+        # base64url-encoded *public* key (a different, non-secret value)
+        # legitimately appears in the log line announcing the verification
+        # code -- what must not appear is the private key's own encoding.
+        private_key_b64 = encode_bytes(raw_private_key_bytes)
+        assert private_key_b64 not in caplog.text

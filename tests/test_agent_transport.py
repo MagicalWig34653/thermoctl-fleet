@@ -112,3 +112,17 @@ def test_fingerprint_for_certificate_matches_parse(tmp_path: Path) -> None:
     fingerprint = fingerprint_for_certificate(cert_der)
     assert fingerprint.startswith("sha256:")
     assert parse_certificate_fingerprint(fingerprint) == fingerprint.split(":", 1)[1]
+
+
+def test_client_close_without_context_manager_closes_the_pool(tmp_path: Path) -> None:
+    """`_PinnedTransport.close()` is reachable via `httpx.Client.close()`
+    called directly (not only via `with client: ...`, which goes through
+    `__enter__`/`__exit__` instead) -- exercised explicitly here since none
+    of this module's other tests call it that way."""
+
+    with run_recording_tls_server(tmp_path) as (base_url, ca_file, fingerprint, received):
+        client = build_client(base_url, fingerprint, ca_file=ca_file, timeout=5.0)
+        response = client.post("/v1/heartbeat", json={"x": 1})
+        assert response.status_code == 204
+        client.close()
+        assert len(received) == 1

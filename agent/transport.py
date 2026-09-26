@@ -235,7 +235,13 @@ class _PinningNetworkBackend(httpcore.NetworkBackend):
         path: str,
         timeout: float | None = None,
         socket_options: typing.Iterable[typing.Any] | None = None,
-    ) -> httpcore.NetworkStream:
+    ) -> httpcore.NetworkStream:  # pragma: no cover -- unreachable: `build_client`
+        # never passes `uds=` to `httpcore.ConnectionPool`, and nothing else
+        # in this module ever constructs a unix-socket URL, so `httpcore`
+        # has no path that calls this method. Kept, not deleted, so a
+        # future accidental `uds=` usage fails loudly instead of silently
+        # falling through to `NetworkBackend`'s own default (which raises
+        # `NotImplementedError` anyway, just with a less specific message).
         raise NotImplementedError(
             "unix sockets are never used by this agent -- only https:// to the "
             "fleet server."

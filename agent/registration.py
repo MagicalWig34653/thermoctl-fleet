@@ -49,7 +49,9 @@ always-verifying HTTPS client (section 4). Nothing in this module ever sets
 from __future__ import annotations
 
 import logging
+import math
 import os
+import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -98,12 +100,35 @@ _STATUS_FILENAME = "registration_status"
 # expectation, "a well-behaved device calls this roughly once a minute").
 POLL_INTERVAL_S = 60.0
 
+# CLAUDE.md security principle 5 applied to a value the *cloud* supplies,
+# not just to a command: the agent does not blindly trust the server's
+# `Retry-After` even over a pinned, verified connection -- a compromised or
+# merely buggy fleet server could otherwise crash this client
+# (`time.sleep(-5)` raises `ValueError`) or park it for years
+# (`time.sleep(99999999)`). Every parsed value is clamped into
+# `[_MIN_RETRY_AFTER_S, _MAX_RETRY_AFTER_S]` before it is ever handed to
+# `sleep`.
+_MIN_RETRY_AFTER_S = 1.0
+_MAX_RETRY_AFTER_S = 300.0
+
 
 class RegistrationError(Exception):
     """Raised for anything the server sends that this client refuses to
     accept: a non-2xx status this flow does not otherwise handle, or (via
     the underlying `pydantic.ValidationError`, left uncaught) a response
     that does not match the expected model at all."""
+
+
+class InsecureKeyFileError(RegistrationError):
+    """Raised by `_read_private_file` when the private-key or token file on
+    disk is a symlink, or has a mode wider than 0600 -- refuses to load it
+    rather than silently following the link or tightening the mode itself.
+    Both are exactly the kind of local tampering CLAUDE.md security
+    principle 3 (the private key must never leak) cares about: a symlink
+    could point this "private key" read at an attacker-chosen file, and a
+    mode wider than 0600 means another local user or group can already read
+    it. A subclass of `RegistrationError`, so `agent.__main__`'s existing
+    catch-all for registration failures already covers it."""
 
 
 @dataclass(frozen=True)
@@ -113,15 +138,65 @@ class RegistrationOutcome:
 
 
 def _write_private_file(path: Path, data: bytes) -> None:
-    """Writes `data` to `path` at mode 0600 from the first byte on --
-    `os.open` with the mode already set, not `write_bytes` followed by a
-    separate `chmod` (which would leave a window, however short, where the
-    file exists at the umask's default mode)."""
+    """Writes `data` to a **new** file at `path`, at mode 0600 from the
+    first byte on -- `os.open` with the mode already set, not `write_bytes`
+    followed by a separate `chmod` (which would leave a window, however
+    short, where the file exists at the umask's default mode).
+
+    `O_EXCL`: both callers (a freshly generated private key, a freshly
+    issued token) only ever call this for a path they have already
+    established does not exist yet -- `O_EXCL` turns "it exists after all"
+    (a stale leftover, or a race) into a loud `FileExistsError` instead of
+    silently overwriting whatever is there.
+
+    `O_NOFOLLOW`: refuses to write through a symlink planted at `path` by
+    another local user/process -- raises `OSError` (`ELOOP`) instead of
+    following it to wherever it points.
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _assert_safe_private_file(path: Path) -> None:
+    """Refuses to proceed if `path` is a symlink, or a regular file whose
+    mode is wider than 0600 -- see `InsecureKeyFileError`. Checked via
+    `lstat` (does **not** follow a symlink itself) before the file is ever
+    opened for reading."""
+
+    file_stat = path.lstat()
+    if stat.S_ISLNK(file_stat.st_mode):
+        raise InsecureKeyFileError(
+            f"{path} is a symlink -- refusing to load it as a private key/token "
+            "file. Remove it and let the agent recreate a regular file, or "
+            "replace it with a real file at mode 0600 by hand."
+        )
+    mode = stat.S_IMODE(file_stat.st_mode)
+    if mode != 0o600:
+        raise InsecureKeyFileError(
+            f"{path} has mode {oct(mode)}, expected 0600 -- refusing to load it. "
+            "Fix the mode by hand (`chmod 0600`); this is not corrected "
+            "automatically."
+        )
+
+
+def _read_private_file(path: Path) -> bytes:
+    """Reads a private key or token file, refusing anything but a regular
+    file at mode exactly 0600 (`_assert_safe_private_file`, checked via
+    `lstat` first) -- and, since a check followed by a separate open is
+    itself a TOCTOU gap, also opens with `O_NOFOLLOW`, which turns a
+    symlink swapped in between the check and this call into a loud
+    `OSError` (`ELOOP`) instead of silently following it."""
+
+    _assert_safe_private_file(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        size = os.fstat(fd).st_size
+        return os.read(fd, size)
     finally:
         os.close(fd)
 
@@ -147,8 +222,13 @@ def load_or_create_private_key(data_dir: Path) -> Ed25519PrivateKey:
     write the file."""
 
     path = data_dir / _PRIVATE_KEY_FILENAME
-    if path.exists():
-        pem = path.read_bytes()
+    # `is_symlink()` also catches a *dangling* symlink, which `exists()`
+    # alone (it follows the link) would miss -- either way, a symlink at
+    # this path is routed into `_read_private_file`, which raises the
+    # clear `InsecureKeyFileError` from `_assert_safe_private_file` rather
+    # than falling through to "generate a new key here".
+    if path.exists() or path.is_symlink():
+        pem = _read_private_file(path)
         key = serialization.load_pem_private_key(pem, password=None)
         if not isinstance(key, Ed25519PrivateKey):
             raise RegistrationError(f"{path} does not hold an Ed25519 private key.")
@@ -173,9 +253,9 @@ def load_token(data_dir: Path) -> str | None:
     completed registration yet."""
 
     path = token_path(data_dir)
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return None
-    return path.read_text(encoding="utf-8").strip()
+    return _read_private_file(path).decode("utf-8").strip()
 
 
 def _store_token(data_dir: Path, token: str) -> None:
@@ -236,18 +316,9 @@ def register(
         ca_file=ca_file,
     )
     with client:
-        response = client.post(
-            "/v1/registration",
-            json={
-                "registration_code": registration_file.registration_code,
-                "public_key": public_key,
-            },
+        accepted = _submit_registration_request(
+            client, registration_file.registration_code, public_key
         )
-        if response.status_code != 201:
-            raise RegistrationError(
-                f"POST /v1/registration was refused: {response.status_code} {response.text}"
-            )
-        accepted = RegistrationAccepted.model_validate(response.json())
 
         verification_code = verification_code_for(public_key)
         logger.info(
@@ -269,21 +340,75 @@ def register(
         )
         signature = encode_bytes(private_key.sign(message))
         token_request = TokenRequest(nonce=challenge.nonce, signature=signature)
-        token_response = client.post(
-            f"/v1/registration/{accepted.registration_id}/token",
-            json=token_request.model_dump(mode="json"),
-        )
-        if token_response.status_code != 200:
-            raise RegistrationError(
-                f"POST .../token was refused: {token_response.status_code} "
-                f"{token_response.text}"
-            )
-        issued = TokenIssued.model_validate(token_response.json())
+        issued = _submit_token_request(client, accepted.registration_id, token_request)
 
     _store_token(data_dir, issued.token)
     _write_status(data_dir, "assigned")
     logger.info("Registration complete, agent token stored.")
     return RegistrationOutcome(token=issued.token, already_registered=False)
+
+
+def _submit_registration_request(
+    client: httpx.Client, registration_code: str, public_key: str
+) -> RegistrationAccepted:
+    """`POST /v1/registration` (15.3 step 2) -- split out from `register`
+    so its non-201 branch is directly unit-testable (`httpx.MockTransport`,
+    no real server needed for this pure HTTP-status-code logic)."""
+
+    response = client.post(
+        "/v1/registration",
+        json={"registration_code": registration_code, "public_key": public_key},
+    )
+    if response.status_code != 201:
+        raise RegistrationError(
+            f"POST /v1/registration was refused: {response.status_code} {response.text}"
+        )
+    return RegistrationAccepted.model_validate(response.json())
+
+
+def _submit_token_request(
+    client: httpx.Client, registration_id: str, token_request: TokenRequest
+) -> TokenIssued:
+    """`POST /v1/registration/{registration_id}/token` (15.3 step 2/4,
+    final step) -- split out from `register` for the same testability
+    reason as `_submit_registration_request` above."""
+
+    response = client.post(
+        f"/v1/registration/{registration_id}/token",
+        json=token_request.model_dump(mode="json"),
+    )
+    if response.status_code != 200:
+        raise RegistrationError(
+            f"POST .../token was refused: {response.status_code} {response.text}"
+        )
+    return TokenIssued.model_validate(response.json())
+
+
+def _parse_and_clamp_retry_after(raw: str | None, default: float) -> float:
+    """Parses the `Retry-After` header from `.../challenge`'s `202`
+    response and clamps it into `[_MIN_RETRY_AFTER_S, _MAX_RETRY_AFTER_S]`
+    -- never trusts the server's number as-is (see the constants' own
+    docstring above).
+
+    Absent, empty, unparsable (`"abc"`), or non-finite (`"nan"`, `"inf"` --
+    both of which `float(...)` parses *without* raising) all fall back to
+    `default` first, which is then clamped exactly like any other value:
+    a caller-supplied `default` far outside the sane range does not get a
+    free pass either.
+    """
+
+    if not raw:
+        candidate = default
+    else:
+        try:
+            candidate = float(raw)
+        except ValueError:
+            candidate = default
+    if not math.isfinite(candidate):
+        candidate = default
+    if not math.isfinite(candidate):  # a pathological `default` itself
+        candidate = POLL_INTERVAL_S
+    return min(max(candidate, _MIN_RETRY_AFTER_S), _MAX_RETRY_AFTER_S)
 
 
 def _poll_for_challenge(
@@ -306,10 +431,7 @@ def _poll_for_challenge(
                     f"(after {polls} poll(s))."
                 )
             retry_after_raw = response.headers.get("Retry-After")
-            try:
-                retry_after = float(retry_after_raw) if retry_after_raw else poll_interval_s
-            except ValueError:
-                retry_after = poll_interval_s
+            retry_after = _parse_and_clamp_retry_after(retry_after_raw, poll_interval_s)
             sleep(retry_after)
             continue
         if response.status_code != 200:

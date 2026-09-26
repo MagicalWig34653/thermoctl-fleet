@@ -7,15 +7,25 @@ path, and the auth-failure path; a real, unreachable address (nothing
 listening on `127.0.0.1:1`, no mock) for the "server down" buffering case;
 and `tests.tls_support.run_recording_tls_server` for the pin-mismatch case,
 to prove the bearer token is never delivered.
+
+A handful of tests near the end use `httpx.MockTransport` -- not a mock of
+TLS or of the fleet HTTP layer's *behaviour*, just a fixed, local HTTP
+response for one specific status code this module's own branch logic reacts
+to (a `500` from `/v1/heartbeats`, for instance). Getting a real server to
+reliably answer with an arbitrary status code on demand would need its own
+fake endpoint anyway; `MockTransport` is the same tool `httpx`'s own test
+suite uses for exactly this kind of thing.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+import logging
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
 from agent.heartbeat_sender import (
@@ -249,3 +259,124 @@ def test_pin_mismatch_never_delivers_the_bearer_token(tmp_path: Path) -> None:
         assert received == []
         stored = json.loads(buffer_path.read_text(encoding="utf-8"))
         assert len(stored) == 1
+
+
+# -- cross-review follow-up: previously-untested non-2xx/edge branches -----
+
+
+def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.Client:
+    return httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+
+
+def test_empty_buffer_file_treated_as_no_buffer(tmp_path: Path) -> None:
+    """A buffer file that exists but holds only whitespace (e.g. truncated
+    by a crash between `open` and `write`) must not be treated as "one
+    garbled entry" -- `_load_buffer` returns `[]` for it, same as if the
+    file did not exist at all."""
+
+    buffer_path = tmp_path / "buffer.json"
+    buffer_path.write_text("   \n", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/heartbeat"  # never /v1/heartbeats
+        return httpx.Response(204)
+
+    send_heartbeat(
+        _mock_client(handler), _heartbeat(), apartment=APARTMENT, buffer_path=buffer_path
+    )
+
+
+def test_flush_auth_failure_raises_without_touching_buffer(tmp_path: Path) -> None:
+    buffer_path = tmp_path / "buffer.json"
+    buffer_path.write_text(
+        json.dumps([json.loads(_heartbeat().model_dump_json())]), encoding="utf-8"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/heartbeats"
+        return httpx.Response(403)
+
+    with pytest.raises(HeartbeatAuthError):
+        send_heartbeat(
+            _mock_client(handler), _heartbeat(), apartment=APARTMENT, buffer_path=buffer_path
+        )
+    # Not cleared, not grown -- exactly the one entry it started with.
+    assert len(json.loads(buffer_path.read_text())) == 1
+
+
+def test_flush_other_failure_keeps_buffer_and_still_attempts_the_new_heartbeat(
+    tmp_path: Path,
+) -> None:
+    buffer_path = tmp_path / "buffer.json"
+    buffer_path.write_text(
+        json.dumps([json.loads(_heartbeat().model_dump_json())]), encoding="utf-8"
+    )
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/v1/heartbeats":
+            return httpx.Response(500)
+        return httpx.Response(204)
+
+    send_heartbeat(
+        _mock_client(handler), _heartbeat(), apartment=APARTMENT, buffer_path=buffer_path
+    )
+    assert calls == ["/v1/heartbeats", "/v1/heartbeat"]
+    # The flush failed (500) -- the buffer still holds its original entry;
+    # the new heartbeat was sent fine and is not itself buffered.
+    assert len(json.loads(buffer_path.read_text())) == 1
+
+
+def test_send_other_failure_buffers_it(tmp_path: Path) -> None:
+    buffer_path = tmp_path / "buffer.json"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    send_heartbeat(
+        _mock_client(handler), _heartbeat(), apartment=APARTMENT, buffer_path=buffer_path
+    )
+    stored = json.loads(buffer_path.read_text())
+    assert len(stored) == 1
+
+
+def test_private_key_and_raw_token_never_leak_into_logs_or_requests(
+    tmp_path: Path, app_storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Mirrors the fleet side's own `tests.test_device_registration_v1
+    ::test_raw_token_never_stored_or_logged`, for the agent's own two
+    secrets: the Ed25519 private key and the raw agent token. Registration
+    itself is covered end to end in `tests/test_agent_registration.py`;
+    this test's job is only the leak check, done here (not duplicated
+    there) because it needs the token this fixture file's own `_issue_token`
+    helper already produces.
+    """
+
+    caplog.set_level(logging.DEBUG)
+    token = _issue_token(app_storage)
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        recorded_requests: list[httpx.Request] = []
+
+        def _record(request: httpx.Request) -> None:
+            request.read()
+            recorded_requests.append(request)
+
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=5.0) as client:
+            client.event_hooks["request"] = [_record]
+            client.headers["Authorization"] = f"Bearer {token}"
+            buffer_path = tmp_path / "buffer.json"
+            send_heartbeat(client, _heartbeat(), apartment=APARTMENT, buffer_path=buffer_path)
+
+    # A private key never even exists in this module's own responsibility
+    # (heartbeat sending holds no key at all) -- what it does hold is the
+    # bearer token, which *is* expected to appear, exactly once, as the
+    # `Authorization` header value of the one request this test sends.
+    # What must never happen: the raw token appearing anywhere else --
+    # logged, or embedded in a request *body*.
+    for request in recorded_requests:
+        assert token.encode("utf-8") not in request.content
+    assert token not in caplog.text

@@ -2,6 +2,121 @@
 
 Last updated: 2026-09-26.
 
+## P5.0 cross-review fixes: Retry-After clamping, CLI exception handling,
+file-tampering checks (main session read-back) **SR**
+
+Cross-review of P5.0 (below) found five gaps, all fixed in the same
+follow-up commit:
+
+1. **`agent/registration.py::_poll_for_challenge` trusted the server's
+   `Retry-After` header unclamped.** A `-5` reached `time.sleep(-5)`
+   directly (`ValueError: sleep length must be non-negative`, crashing the
+   poll loop); `99999999` parked the agent for ~3 years. CLAUDE.md security
+   principle 5 ("the agent is the security boundary") applies to a *number*
+   the cloud supplies, not only to a command -- a pinned, verified
+   connection proves *who* the agent is talking to, not that the values it
+   sends are sane. Fixed with `_parse_and_clamp_retry_after`: absent,
+   empty, unparsable (`"abc"`), or non-finite (`float("nan")`/`float("inf")`
+   both parse *without raising*, so the bare `except ValueError` alone
+   would not have caught them) all fall back to the caller's own
+   `poll_interval_s` default, and every value -- parsed or fallen back to --
+   is then clamped into `[1.0, 300.0]` seconds before it ever reaches
+   `sleep`. Tested directly (`-5`, `0`, `1e9`, `"nan"`, `"inf"`, `"-inf"`,
+   `"abc"`, absent, a normal `"30"`) and once more through the real poll
+   loop via `httpx.MockTransport` (`test_poll_for_challenge_clamps_a
+   _malicious_retry_after_end_to_end`) to prove the clamped value actually
+   reaches the injected `sleep` callable, not just the helper function in
+   isolation.
+2. **`agent/__main__.py` had 0% coverage, and its one `except` tuple did
+   not include `httpx.TransportError` or `pydantic.ValidationError`.** A
+   certificate pin mismatch (`agent.transport
+   .CertificateFingerprintMismatch`, itself an `httpx.TransportError`
+   subclass) or an unreachable server therefore crashed the CLI with a raw
+   traceback instead of the same clean "registration failed: ..." message
+   at exit code 1 every other failure already got. Both exception types
+   added to `_run_register`'s `except` tuple, each with a comment
+   explaining exactly which real failure it closes. `tests
+   /test_agent_main.py` (new, 9 tests, 100% coverage of `agent/__main__.py`)
+   covers: register success, already-registered, no subcommand, an unknown
+   subcommand (argparse's own exit code 2), `--help` (exit 0), a pin
+   mismatch, an unreachable server, a malformed server response
+   (`pydantic.ValidationError`), and `RegistrationError` -- all via
+   monkeypatching `agent.__main__.register` itself with a controllable
+   stand-in (a plain unit-testing seam for this module's own CLI plumbing,
+   not a mock of TLS or of registration's own logic, both already covered
+   for real in `tests/test_agent_registration.py`).
+3. **The private key and token files were writable/readable without
+   checking for a symlink or an over-wide mode.** `_write_private_file` now
+   opens with `O_CREAT | O_EXCL | O_NOFOLLOW` (both callers -- a freshly
+   generated key, a freshly issued token -- only ever write a path already
+   established not to exist, so `O_EXCL` turns a stale leftover or a race
+   into a loud `FileExistsError` instead of silently overwriting it, and
+   `O_NOFOLLOW` refuses to write through a symlink planted at that path).
+   Reading (`load_or_create_private_key`, `load_token`) now goes through
+   `_read_private_file`, which checks via `lstat` first (`_assert_safe
+   _private_file`: refuses a symlink, and refuses a mode other than exactly
+   0600, both with a clear `InsecureKeyFileError` -- **no silent chmod, no
+   silent unlink-and-follow**) and additionally opens with `O_NOFOLLOW`
+   itself, closing the TOCTOU gap between the `lstat` check and the actual
+   read. `InsecureKeyFileError` subclasses `RegistrationError`, so
+   `agent.__main__`'s existing catch-all already covers it too. Nine new
+   tests cover: a symlink (and a *dangling* symlink, which `Path.exists()`
+   alone would miss -- caught via `path.exists() or path.is_symlink()`) for
+   both the private-key and token files, a mode wider than 0600 for both,
+   the wrong key type on disk (an RSA key where an Ed25519 one is
+   expected), `_write_private_file` refusing to overwrite an existing file
+   and refusing to write through a symlink, and the `O_NOFOLLOW` read path
+   directly.
+4. **A leak-proof test for the agent's own two secrets, mirroring the
+   fleet side's `tests.test_device_registration_v1
+   ::test_raw_token_never_stored_or_logged`.** `tests
+   /test_agent_registration.py::test_private_key_and_token_never_leak
+   _during_registration` drives the full registration flow (registration,
+   confirm via storage, challenge poll, token request) against a real
+   fleet app over real TLS, recording every outgoing request via `httpx`'s
+   own `event_hooks["request"]`, and asserts the private key's raw bytes
+   (and its base64url encoding) never appear in any recorded request body,
+   header, or log line, and that the finally-issued raw token never appears
+   in a request (it is only ever *received*, in a response, during this
+   flow) or a log line. `tests/test_agent_heartbeat_sender.py::test
+   _private_key_and_raw_token_never_leak_into_logs_or_requests` covers the
+   complementary case for that module: the token legitimately *is* sent,
+   once, as the `Authorization` header of the one heartbeat request --
+   what must never happen there is the token appearing a second time, in a
+   request *body*, or in a log line.
+5. **Untested non-2xx/edge branches**, closed with direct tests rather than
+   accepted as gaps: `heartbeat_sender.py`'s flush-failure (`403` and a
+   generic `500`), send-failure (`500`), and empty-buffer-file branches
+   (all via `httpx.MockTransport`, now 100% covered); `registration.py`'s
+   `register`-non-201, challenge-non-200, and token-non-200 branches --
+   split out into two new, directly unit-testable helpers,
+   `_submit_registration_request`/`_submit_token_request` (same behaviour,
+   `register`'s own control flow unchanged, just easier to hit each branch
+   without a real server) -- and the pathological-default fallback inside
+   `_parse_and_clamp_retry_after` itself (now 100% covered).
+   `transport.py`'s `_PinnedTransport.close()` was reachable (via
+   `httpx.Client.close()` called outside a `with` block) but untested --
+   added a direct test rather than a pragma. `_PinningNetworkBackend
+   .connect_unix_socket` is marked `# pragma: no cover` with a reason: it is
+   genuinely unreachable, since `build_client` never passes `uds=` to
+   `httpcore.ConnectionPool` and nothing else in this module ever
+   constructs a unix-socket URL.
+
+**Verification after the fix commit** (fresh venv): `ruff check .` clean;
+`mypy .` and `mypy protocol fleet agent tools` clean (70/41 files); full
+suite `801 passed`, `TOTAL` coverage `99%` (3252 statements, 17 missed --
+none of the 17 in `agent/`, all in `agent/loop.py`'s still-deferred
+stage-2/24 command stubs, `fleet/admin.py`/`fleet/storage.py`'s own
+pre-existing single missed lines, or `tools/check_image_config.py`'s CLI
+entry point); the four P5.0 test files run five times in a row with no
+flakiness.
+
+Not touched by this fix round: the merge with `main` (11ff781: P3.4a,
+`PROTOCOL_VERSION = 2`, P5.6 watchdog) brought in unrelated changes this
+package's own docstrings and tests did not need to react to (P4.2b's
+registration models already existed before the bump; nothing about this
+package's own wire format changed).
+
 ## Agent transport: pinned HTTPS client, device registration, token storage,
 heartbeat sending (P5.0, sections 3, 4, 5, 10, 14, 15.3, 18.1, 18.2, 19.5,
 23.2) **SR**

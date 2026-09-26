@@ -16,6 +16,9 @@ import logging
 import sys
 from pathlib import Path
 
+import httpx
+import pydantic
+
 from agent.registration import (
     DEFAULT_DATA_DIR,
     DEFAULT_REGISTRATION_FILE,
@@ -31,7 +34,25 @@ def _run_register(args: argparse.Namespace) -> int:
             registration_file_path=Path(args.registration_file),
             data_dir=Path(args.data_dir),
         )
-    except (RegistrationError, FileNotFoundError, ValueError) as error:
+    except (
+        RegistrationError,
+        FileNotFoundError,
+        ValueError,
+        # A pin mismatch (`agent.transport.CertificateFingerprintMismatch`)
+        # or an unreachable/misbehaving server surfaces as some
+        # `httpx.TransportError` subclass -- without this, either would
+        # crash the CLI with a raw traceback instead of the same clear,
+        # exit-1 "registration failed: ..." message every other failure
+        # here gets.
+        httpx.TransportError,
+        # A response that parses as JSON but does not match the expected
+        # protocol model (`RegistrationAccepted`/`TokenChallenge`/
+        # `TokenIssued`) raises here, uncaught by `agent.registration`
+        # itself on purpose ("refuse anything unexpected from the server") --
+        # caught only at this outermost boundary, so the CLI still exits
+        # cleanly instead of a traceback.
+        pydantic.ValidationError,
+    ) as error:
         print(f"thermoctl-agent: registration failed: {error}", file=sys.stderr)
         return 1
 
