@@ -54,6 +54,12 @@ agent = [
     # depends on `cryptography` (P4.2b, above) for the verifying half of
     # this same exchange.
     "cryptography>=43",
+    # Real `age` file format encryption for operational-data backups
+    # (P5.5a, sections 15.1/15.3, security principle 4) -- Python bindings
+    # to the Rust `age`/`rage` implementation, not a hand-rolled format or
+    # cryptographic primitive (CLAUDE.md: "no invented functionality"
+    # applies doubly hard to cryptography). See `agent/encryption.py`.
+    "pyrage>=1.4",
 ]
 dev = [
     "pytest>=8.3",
@@ -112,6 +118,14 @@ ignore = ["S101"]  # assert is welcome in tests
 python_version = "3.13"
 strict = true
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# `pyrage` (P5.5a, `agent/encryption.py`) is a compiled Rust extension
+# (PyO3) shipping no `py.typed`/stub package -- unlike every other
+# dependency this project pins, there is no upstream stub to install
+# instead of ignoring it here.
+module = ["pyrage", "pyrage.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

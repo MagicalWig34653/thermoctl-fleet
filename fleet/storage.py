@@ -104,6 +104,7 @@ from fleet.device_lifecycle import (
     validate_manual_device_transition,
 )
 from protocol import Event, Heartbeat, fault_kind_from_key
+from protocol.backups import BackupKind
 from protocol.commands import Command, CommandResult, CommandType
 from protocol.version import PROTOCOL_VERSION
 
@@ -584,6 +585,54 @@ class CommandRecord(Base):
     duration_s: Mapped[float | None] = mapped_column(Float(), nullable=True)
     error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
     result_received_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
+
+class BackupRecord(Base):
+    """One backup ever uploaded for an apartment (P5.5a, `POST /v1/backups`,
+    sections 15.1/15.2/3): the metadata half -- the bytes themselves live
+    on disk (`fleet.backup_storage.BackupBlobStorage`), `storage_path` is
+    the relative path `BackupBlobStorage.store` returned.
+
+    `backup_id` mirrors `CommandRecord.command_id`'s own reasoning
+    (`0009_commands.py`'s docstring): a fresh, random, wire-facing id,
+    unique and indexed, deliberately **not** the primary key, so an agent
+    holding a valid token cannot enumerate other apartments' backup counts
+    by incrementing it.
+
+    `kind` is `protocol.backups.BackupKind`, stored as a plain string
+    (mirrors `CommandRecord.command_type`'s own "avoid a circular import
+    with `protocol`" reasoning). `content_hash` is the SHA-256 hex digest
+    of the *uploaded* bytes (verified against the upload's own claimed hash
+    by `fleet.app.upload_backup` before this row is ever written) -- shown
+    to the landlord alongside the download so a locally computed hash after
+    decryption can be compared, unrelated to backup *integrity* on this
+    side (which the filesystem, not this column, is responsible for).
+    """
+
+    __tablename__ = "backups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    backup_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(512), nullable=False)
+
+
+@dataclass(frozen=True)
+class BackupSummary:
+    """What `fleet.ui_apartment`'s backups list needs -- `Storage
+    .list_backups_for_apartment`'s own return type, already detached from
+    the session (mirrors `PendingCommand`'s own "ready to use, no ORM
+    session required afterward" shape)."""
+
+    backup_id: str
+    kind: str
+    created_at: datetime
+    size_bytes: int
+    content_hash: str
 
 
 @dataclass(frozen=True)
@@ -1332,6 +1381,166 @@ class Storage:
             )
             session.expunge_all()
             return rows
+
+    # -- backups (P5.5a, section 15.1/15.2) --------------------------------------
+
+    def create_backup_record(
+        self,
+        apartment_id: str,
+        kind: BackupKind,
+        *,
+        size_bytes: int,
+        content_hash: str,
+        storage_path: str,
+        now: datetime,
+    ) -> BackupSummary:
+        """Stores one backup's metadata row (`fleet.app.upload_backup`'s
+        only caller) -- refuses an unknown apartment, the same "cannot be
+        for an apartment that does not exist" guard `create_command`
+        already applies (`ValueError`, a caller bug, not an HTTP concern
+        this layer decides)."""
+
+        with self.session() as session:
+            if session.get(ApartmentRecord, apartment_id) is None:
+                raise ValueError(f"Unknown apartment {apartment_id!r}.")
+
+            backup_id = uuid.uuid4().hex
+            created_at = _naive_utc(now)
+            record = BackupRecord(
+                backup_id=backup_id,
+                apartment_id=apartment_id,
+                kind=str(kind),
+                created_at=created_at,
+                size_bytes=size_bytes,
+                content_hash=content_hash,
+                storage_path=storage_path,
+            )
+            session.add(record)
+
+        return BackupSummary(
+            backup_id=backup_id,
+            kind=str(kind),
+            created_at=created_at.replace(tzinfo=UTC),
+            size_bytes=size_bytes,
+            content_hash=content_hash,
+        )
+
+    def list_backups_for_apartment(self, apartment_id: str) -> list[BackupSummary]:
+        """All backups for `apartment_id`, newest first -- the "Eine
+        Wohnung" backups list (P5.5a). Scoped strictly to `apartment_id`,
+        the same "no other apartment's data" guarantee every other list
+        method in this class already gives."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(BackupRecord)
+                    .where(BackupRecord.apartment_id == apartment_id)
+                    .order_by(BackupRecord.created_at.desc(), BackupRecord.id.desc())
+                ).all()
+            )
+            return [
+                BackupSummary(
+                    backup_id=row.backup_id,
+                    kind=row.kind,
+                    created_at=row.created_at.replace(tzinfo=UTC),
+                    size_bytes=row.size_bytes,
+                    content_hash=row.content_hash,
+                )
+                for row in rows
+            ]
+
+    def get_backup_for_apartment(
+        self, apartment_id: str, backup_id: str
+    ) -> BackupSummary | None:
+        """One backup's metadata, scoped to `apartment_id` -- `None` for an
+        unknown id *or* a backup that belongs to a different apartment
+        (deliberately indistinguishable, mirroring `fleet.auth`'s own
+        "wrong token vs. unknown apartment" precedent): a landlord logged
+        in cannot even probe for another apartment's backup ids via the
+        download route's response shape."""
+
+        with self.session() as session:
+            row = session.scalar(
+                select(BackupRecord).where(
+                    BackupRecord.apartment_id == apartment_id,
+                    BackupRecord.backup_id == backup_id,
+                )
+            )
+            if row is None:
+                return None
+            return BackupSummary(
+                backup_id=row.backup_id,
+                kind=row.kind,
+                created_at=row.created_at.replace(tzinfo=UTC),
+                size_bytes=row.size_bytes,
+                content_hash=row.content_hash,
+            )
+
+    def get_backup_storage_path(self, apartment_id: str, backup_id: str) -> str | None:
+        """The stored blob's relative path, scoped to `apartment_id`
+        exactly like `get_backup_for_apartment` -- a separate method
+        (rather than a field the UI dataclass carries around) so the raw
+        filesystem path is never accidentally threaded through a view
+        layer that has no business seeing it."""
+
+        with self.session() as session:
+            return session.scalar(
+                select(BackupRecord.storage_path).where(
+                    BackupRecord.apartment_id == apartment_id,
+                    BackupRecord.backup_id == backup_id,
+                )
+            )
+
+    def list_all_backups_grouped(self) -> dict[tuple[str, str], list[BackupSummary]]:
+        """Every stored backup, grouped by `(apartment_id, kind)` -- what
+        `fleet.backup_retention.run_backup_retention` iterates over
+        (section 15.2's "last 14 daily ... plus one weekly ... for each
+        apartment and kind"). Not scoped to one apartment, unlike every
+        other read in this section -- this is the one caller allowed to see
+        across apartments, since retention is a fleet-wide maintenance job,
+        not a landlord-facing view."""
+
+        with self.session() as session:
+            rows = list(session.scalars(select(BackupRecord)).all())
+            grouped: dict[tuple[str, str], list[BackupSummary]] = {}
+            for row in rows:
+                key = (row.apartment_id, row.kind)
+                grouped.setdefault(key, []).append(
+                    BackupSummary(
+                        backup_id=row.backup_id,
+                        kind=row.kind,
+                        created_at=row.created_at.replace(tzinfo=UTC),
+                        size_bytes=row.size_bytes,
+                        content_hash=row.content_hash,
+                    )
+                )
+            return grouped
+
+    def delete_backups(self, backup_ids: list[str]) -> list[str]:
+        """Deletes the metadata rows for `backup_ids` (retention's own
+        "everything not kept is deleted") and returns each deleted row's
+        `storage_path` -- the caller (`fleet.backup_retention
+        .run_backup_retention`) deletes the corresponding blob via
+        `fleet.backup_storage.BackupBlobStorage.delete` **after** this
+        transaction commits, never before: a blob deleted first and a
+        crash before the metadata row follows would leave a dangling row
+        pointing at nothing, the wrong way around for this "acceptable to
+        retry" cleanup job (a dangling *blob* the next run will not find
+        again is harmless disk usage; a dangling *row* would 404 or crash a
+        later download)."""
+
+        if not backup_ids:
+            return []
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(BackupRecord).where(BackupRecord.backup_id.in_(backup_ids))
+                ).all()
+            )
+            paths = [row.storage_path for row in rows]
+            session.execute(delete(BackupRecord).where(BackupRecord.backup_id.in_(backup_ids)))
+        return paths
 
     def pending_commands(
         self, apartment_id: str, after_sequence: int, now: datetime

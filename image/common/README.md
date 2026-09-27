@@ -11,8 +11,38 @@ twice, "take a finished Debian, apply this to it".
 | `udev/99-zigbee-stick.rules` | Fixed device name for the Zigbee radio stick, so it is not `ttyUSB0` once and `ttyUSB1` after a reboot |
 | `unattended-upgrades/` | Security updates automatically, reboot only within the maintenance window |
 | `agent-registration.empty.json` | Template for the boot partition (sections 15.3, 19.5) -- the fields from `protocol.registration.AgentRegistrationFile`, empty, until the preparation tool fills them when writing the image |
-| `agent-compose.yml` | Fixed run configuration for the agent container (P5.6, cross-review R5; volumes corrected to directory mounts by the P5.7 hot-fix, see `docs/STATUS.md`) -- shipped at `/etc/thermoctl-agent/compose.yml`, **owner/mode `root:root 0644`** (`install -m 0644 image/common/agent-compose.yml /etc/thermoctl-agent/compose.yml`), the watchdog's `-runtime-compose` default; the watchdog only tags a digest and re-applies this file, never edits or generates one (section 13's "no arbitrary compose files" is about what the cloud may hand the agent, not about this fixed, locally shipped one). Readable by the watchdog user (group `docker`, per `watchdog/thermoctl-watchdog.service`'s own `User=`/`Group=`) and by `docker compose` itself (invoked as root or via the `docker` group, per the container runtime); writable by nobody but root, the same as any other file this image ships that only ever changes with an image update. |
+| `agent-compose.yml` | Fixed run configuration for the agent container (P5.6, cross-review R5; volumes corrected to directory mounts by the P5.7 hot-fix, see `docs/STATUS.md`) -- shipped at `/etc/thermoctl-agent/compose.yml`, **owner/mode `root:root 0644`** (`install -m 0644 image/common/agent-compose.yml /etc/thermoctl-agent/compose.yml`), the watchdog's `-runtime-compose` default; the watchdog only tags a digest and re-applies this file, never edits or generates one (section 13's "no arbitrary compose files" is about what the cloud may hand the agent, not about this fixed, locally shipped one). Readable by the watchdog user (group `docker`, per `watchdog/thermoctl-watchdog.service`'s own `User=`/`Group=`) and by `docker compose` itself (invoked as root or via the `docker` group, per the container runtime); writable by nobody but root, the same as any other file this image ships that only ever changes with an image update. Since P5.5a, also bind-mounts (all three **read-only**) the boot-partition backup-recipients file's directory, thermoctl's data directory, and Zigbee2MQTT's data directory -- see below. |
 | `tmpfiles.d/thermoctl-agent.conf` | `systemd-tmpfiles` snippet (P5.7 hot-fix) recreating `/run/thermoctl-agent` on every boot, installed as `/etc/tmpfiles.d/thermoctl-agent.conf` -- `agent-compose.yml`'s bind mount for that directory needs it to exist before the container starts |
+
+## Backups (P5.5a, sections 15.1, 15.3)
+
+`/boot/firmware/thermoctl/backup-recipients.txt` -- the landlord's two age
+recipients (the everyday key and one offline key, project owner decision
+2026-09-26/27), one per line, `#`-comments allowed, written onto the boot
+partition **by the preparation tool** (section 19.5, alongside
+`agent-registration.json`) when the image is prepared -- **never taken
+from the cloud**, the same "hard-coded on the device" reasoning CLAUDE.md's
+security principle 2 already applies to the image source list. The
+preparation tool's own section 19.5 step therefore gains one more line:
+after writing `agent-registration.json`, also write this file with the
+two recipients the landlord already holds (a `age1...` public key each --
+never a private key, principle 3) -- format and validation are documented
+in full in `agent/encryption.py`'s own module docstring, the single source
+of truth this README intentionally does not repeat verbatim.
+
+`agent-compose.yml` mounts that file's directory, plus thermoctl's and
+Zigbee2MQTT's own data directories, **read-only** into the agent
+container -- `/var/lib/thermoctl` (thermoctl's SQLite database) and
+`/var/lib/zigbee2mqtt` (Zigbee2MQTT's `database.db`/
+`coordinator_backup.json`) are this repository's own chosen convention
+(no compose file for thermoctl/Zigbee2MQTT themselves exists yet in this
+repository -- section 13's four containers are reconciled by the agent,
+not shipped by this image, see `docs/STATUS.md`'s P5.4/P5.6 open points),
+overridable per deployment via `python -m agent run`'s own
+`--thermoctl-db-file`/`--zigbee2mqtt-dir` CLI arguments.
+
+Restore (section 15.2 step 4, "the landlord enters the decryption key once
+in the fleet UI") is **P5.5b**, not yet built -- see `docs/STATUS.md`.
 
 **The watchdog's systemd unit deliberately does not live here**, but with
 its code at

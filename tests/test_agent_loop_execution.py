@@ -159,8 +159,8 @@ def test_rejected_command_with_invalid_id_is_not_reported(tmp_path: Path, bad_id
     assert bad_id not in state.executed_ids
 
 
-# --- report_now / fetch_logs / backup_now / diagnostic_bundle: honest ----
-# --- failed results, never a fake success ---------------------------------
+# --- report_now / fetch_logs / diagnostic_bundle: honest failed results, --
+# --- never a fake success --------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -169,7 +169,6 @@ def test_rejected_command_with_invalid_id_is_not_reported(tmp_path: Path, bad_id
         (CommandType.REPORT_NOW, "P2.3"),
         (CommandType.FETCH_LOGS, "P5.3"),
         (CommandType.DIAGNOSTIC_BUNDLE, "P5.3"),
-        (CommandType.BACKUP_NOW, "P5.5"),
     ],
 )
 def test_not_yet_available_commands_report_honest_failure(
@@ -186,6 +185,29 @@ def test_not_yet_available_commands_report_honest_failure(
     assert expected_substring in (outcome.result.error_text or "")
     assert outcome.exit_after_report is False
     # Still recorded as "seen" so a redelivery does not report a second time.
+    assert command.id in state.executed_ids
+
+
+# --- backup_now (P5.5a): genuinely executed, honest failure only when ------
+# --- unconfigured -----------------------------------------------------------
+
+
+def test_backup_now_reports_honest_failure_when_unconfigured(tmp_path: Path) -> None:
+    """`ctx.backup_config is None` (the default `_ctx` helper above builds)
+    -- `backup_now` refuses cleanly, naming the missing CLI configuration,
+    never a `NotImplementedError`/crash and never a fake success (P5.5a
+    replaces P5.2's own placeholder failure for this command)."""
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.BACKUP_NOW)
+
+    outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert outcome.result is not None
+    assert outcome.result.successful is False
+    assert "Backup-Konfiguration" in (outcome.result.error_text or "")
+    assert outcome.exit_after_report is False
     assert command.id in state.executed_ids
 
 

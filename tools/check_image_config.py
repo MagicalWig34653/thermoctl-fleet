@@ -143,6 +143,16 @@ def check_agent_compose_file(path: Path) -> None:
     bind-mounted into its container and still be refused by the daemon at
     the far end of it, since the socket itself is owned `root:docker
     0660` on the host.
+
+    **P5.5a:** also asserts the three read-only mounts backups need are
+    present -- the boot-partition recipients file
+    (`agent/encryption.py`'s own documented path,
+    `/boot/firmware/thermoctl`), thermoctl's own data directory, and
+    Zigbee2MQTT's data directory. All three carry an explicit `:ro` suffix
+    in the required line itself, so a future edit that widened one of them
+    to read-write would fail this check immediately, the same "structural
+    check, not just presence" reasoning the mount-type check above already
+    applies to the state-file/health-report directories.
     """
 
     if not path.is_file():
@@ -156,6 +166,9 @@ def check_agent_compose_file(path: Path) -> None:
         "- /run/thermoctl-agent:/run/thermoctl-agent",
         "group_add:",
         "${DOCKER_GID:?",
+        "- /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro",
+        "- /var/lib/thermoctl:/var/lib/thermoctl:ro",
+        "- /var/lib/zigbee2mqtt:/var/lib/zigbee2mqtt:ro",
     ]
     missing = [line for line in required if line not in content]
     if missing:

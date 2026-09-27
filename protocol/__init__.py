@@ -13,6 +13,12 @@ because they mirror thermoctl's real, unmodified webhook payload byte for byte
 (see that module's docstring) -- this is not an oversight.
 """
 
+from protocol.backups import (
+    AGE_HEADER_MAGIC,
+    MAX_BACKUP_UPLOAD_BYTES,
+    BackupKind,
+    BackupUploadAccepted,
+)
 from protocol.commands import Command, CommandResult, CommandType
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 from protocol.events import (
@@ -51,11 +57,15 @@ from protocol.registration import (
 from protocol.version import PROTOCOL_VERSION
 
 __all__ = [
+    "AGE_HEADER_MAGIC",
+    "MAX_BACKUP_UPLOAD_BYTES",
     "PROTOCOL_VERSION",
     "AgentRegistrationFile",
     "Apartment",
     "ApartmentState",
     "Assignment",
+    "BackupKind",
+    "BackupUploadAccepted",
     "Command",
     "CommandResult",
     "CommandType",

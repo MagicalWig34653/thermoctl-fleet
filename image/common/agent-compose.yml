@@ -126,3 +126,33 @@ services:
       # `group_add` above for why that additionally requires the host's
       # "docker" gid.
       - /var/run/docker.sock:/var/run/docker.sock
+      # P5.5a (sections 15.1, 15.2, 15.3): the age recipients file the
+      # preparation tool writes onto the boot partition when the image is
+      # prepared (section 19.5) -- **read-only**, so a compromised agent
+      # process can read it (it must, to encrypt an operational-data
+      # backup to it) but never overwrite it to smuggle in a third,
+      # cloud-reachable recipient. Same "hard-coded on the device, never
+      # taken from the cloud" reasoning CLAUDE.md's security principle 2
+      # already applies to the image source list -- see
+      # `agent/encryption.py`'s own module docstring for the full
+      # reasoning and the exact file format/path
+      # (`/boot/firmware/thermoctl/backup-recipients.txt`).
+      - /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro
+      # P5.5a, section 15.2: thermoctl's own SQLite database, read-only --
+      # `agent.loop.create_backup` only ever opens it via SQLite's own
+      # online backup API in a read-only-URI connection (never writes
+      # through this mount at all), so a read-only bind mount is not just
+      # a defensive default here, it matches what the agent code actually
+      # does. This repository's own convention for where thermoctl keeps
+      # its data on the base station (no compose file for thermoctl itself
+      # exists yet in this repository, section 13's own four containers
+      # being reconciled by the agent, not shipped by this image -- see
+      # `docs/STATUS.md`'s P5.4/P5.6 open points).
+      - /var/lib/thermoctl:/var/lib/thermoctl:ro
+      # P5.5a, section 15.2: Zigbee2MQTT's own data directory (`database
+      # .db`, the device table; `coordinator_backup.json`, the radio
+      # stick's network key/address) -- read-only for the same reason as
+      # thermoctl's own mount above: the agent only ever reads these two
+      # files to bundle them into an operational-data backup, it has no
+      # legitimate reason to write through this mount.
+      - /var/lib/zigbee2mqtt:/var/lib/zigbee2mqtt:ro

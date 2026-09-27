@@ -18,4 +18,8 @@ between the two packages of this repository and future compatibility checks.
 # reports that as a result, and keeps running") -- a `Command` must carry the
 # protocol version it was created under so the agent has something to reject
 # against; see protocol/commands.py and docs/STATUS.md's P5.1 section.
-PROTOCOL_VERSION = 3
+# 4: adds `protocol.backups` (`BackupKind`, `BackupUploadAccepted`) for
+# `POST /v1/backups` (P5.5a, section 15.1/15.2) -- a wholly new module
+# counts as a change to "the models" too, per this file's own opening
+# paragraph.
+PROTOCOL_VERSION = 4

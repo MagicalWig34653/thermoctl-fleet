@@ -49,15 +49,28 @@ def test_writes_proven_digest_when_given(tmp_path: Path) -> None:
 
 def test_file_is_not_json() -> None:
     """Section 17/18.3: deliberately not JSON, so that every language can
-
     read it with built-in tools -- checked representatively against the
-    source: `agent.loop` does not import `json` anywhere.
+    source of the three watchdog-contract writers themselves
+    (`report_watchdog_state`/`report_health`/`report_led_status`), not the
+    whole `agent.loop` module.
+
+    **Narrowed from "the whole module never imports json" (P5.5a):** that
+    broader assertion predates this module's own device-configuration
+    backup content (section 15.1's own "device config as JSON" -- a
+    deliberately different file, uploaded to the fleet, never read by the
+    watchdog at all), which legitimately needs `json` for a wire format
+    unrelated to this contract. What actually matters for the watchdog
+    contract is that the three functions below never build their own
+    output via `json.dumps`/`json.dump` -- checked directly against each
+    function's own source via `inspect.getsource`, not the module's import
+    list, which the module now shares with an unrelated feature.
     """
 
-    import agent.loop as module
+    import inspect
 
-    source = Path(module.__file__).read_text(encoding="utf-8")
-    assert "import json" not in source
+    for function in (report_watchdog_state, report_health, report_led_status):
+        source = inspect.getsource(function)
+        assert "json." not in source, f"{function.__name__} must not use json"
 
 
 def test_file_ends_with_a_newline(tmp_path: Path) -> None:

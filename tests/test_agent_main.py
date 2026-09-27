@@ -230,6 +230,62 @@ def test_run_cli_uses_pinned_config_and_handles_auth_failure(
         assert "token revoked or invalid" in err
 
 
+def test_run_cli_builds_a_backup_config_when_apartment_id_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P5.5a: `--apartment-id` (plus the backup-related arguments, all
+    defaulted here) makes `_run_agent` construct a real `loop.BackupConfig`
+    and pass it through to `loop.run` -- omitted entirely in every other
+    test in this file, which must therefore keep working with
+    `backup_config=None` (asserted by `test_run_cli_uses_pinned_config_and
+    _handles_auth_failure` above, whose `runner` never even looks at that
+    kwarg)."""
+
+    import json
+    import secrets
+
+    from agent.registration import DEFAULT_DATA_DIR, _store_token
+
+    token = secrets.token_urlsafe(32)
+    _store_token(tmp_path, token)
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+    seen: dict[str, object] = {}
+
+    def client_factory(address: str, pin: str) -> httpx.Client:
+        return httpx.Client(base_url=address)
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(agent_main, "build_client", client_factory)
+    monkeypatch.setattr(loop, "run", runner)
+
+    code = agent_main.main(
+        [
+            "run",
+            "--data-dir", str(tmp_path),
+            "--registration-file", str(config),
+            "--apartment-id", "apt-7",
+        ]
+    )
+
+    assert code == 0
+    backup_config = seen["backup_config"]
+    assert isinstance(backup_config, loop.BackupConfig)
+    assert backup_config.apartment_id == "apt-7"
+    assert backup_config.agent_version == agent_main.AGENT_VERSION
+    assert backup_config.staging_dir == DEFAULT_DATA_DIR / "backup-staging"
+
+
 def test_run_cli_reports_a_clear_error_for_an_unsafe_state_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

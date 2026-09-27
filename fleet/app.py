@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
+import json
 import logging
 import os
+import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
@@ -33,12 +37,18 @@ from sse_starlette.sse import EventSourceResponse
 
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
+from fleet.backup_retention import run_backup_retention
+from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
 from fleet.storage import RecordCommandResultOutcome, Storage, get_storage, hash_token
 from fleet.ui_auth import resolve_client_ip
 from fleet.ui_routes import install_security_headers
 from fleet.ui_routes import router as ui_router
 from protocol import (
+    AGE_HEADER_MAGIC,
+    MAX_BACKUP_UPLOAD_BYTES,
+    BackupKind,
+    BackupUploadAccepted,
     CommandResult,
     Event,
     Heartbeat,
@@ -79,6 +89,14 @@ _DEFAULT_COMMANDS_SSE_RETRY_MS = 5_000
 _COMMANDS_SSE_PING_INTERVAL_ENV = "FLEET_COMMANDS_SSE_PING_INTERVAL_S"
 _DEFAULT_COMMANDS_SSE_PING_INTERVAL_S = 15.0
 
+# P5.5a, section 15.2: "enforced by a periodic cleanup". A long default --
+# unlike the alarm/command polls above, retention is bounded by *days*
+# (14 daily) and *weeks* (8 weekly), so running it every few minutes would
+# only waste cycles; once an hour is already far more often than needed to
+# keep any apartment's backup count from growing unbounded between runs.
+_BACKUP_RETENTION_INTERVAL_ENV = "FLEET_BACKUP_RETENTION_INTERVAL_S"
+_DEFAULT_BACKUP_RETENTION_INTERVAL_S = 3600.0
+
 
 async def _alarm_check_loop(  # pragma: no cover
     interval_s: float, notifiers: Sequence[Notifier]
@@ -113,6 +131,25 @@ async def _alarm_check_loop(  # pragma: no cover
         await asyncio.sleep(interval_s)
 
 
+async def _backup_retention_loop(interval_s: float) -> None:  # pragma: no cover
+    # Same reasoning as `_alarm_check_loop` just above: the scheduling
+    # wrapper itself is deliberately untested (an infinite loop around a
+    # real `asyncio.sleep`), the logic it calls
+    # (`fleet.backup_retention.run_backup_retention`) is fully covered with
+    # an injected clock in `tests/test_backup_retention.py`.
+    # `run_backup_retention` does blocking file/database I/O -- run via
+    # `asyncio.to_thread` for the same "do not freeze every other request"
+    # reason `_alarm_check_loop` already documents for itself.
+    while True:
+        try:
+            await asyncio.to_thread(
+                run_backup_retention, get_storage(), get_backup_storage(), datetime.now(UTC)
+            )
+        except Exception:
+            logger.exception("Backup retention cleanup failed")
+        await asyncio.sleep(interval_s)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Starts the absence-alarm background task (P2.2) for the lifetime of
@@ -139,12 +176,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     interval_s = float(os.environ.get(_ALARM_CHECK_INTERVAL_ENV, _DEFAULT_ALARM_CHECK_INTERVAL_S))
     notifiers = load_notifiers_from_env(os.environ)
     task = asyncio.create_task(_alarm_check_loop(interval_s, notifiers))
+    retention_interval_s = float(
+        os.environ.get(_BACKUP_RETENTION_INTERVAL_ENV, _DEFAULT_BACKUP_RETENTION_INTERVAL_S)
+    )
+    retention_task = asyncio.create_task(_backup_retention_loop(retention_interval_s))
     try:
         yield
     finally:
         task.cancel()
+        retention_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        with contextlib.suppress(asyncio.CancelledError):
+            await retention_task
 
 
 app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION), lifespan=lifespan)
@@ -520,6 +564,130 @@ def receive_command_result(
     # `_COMMAND_RESULT_STATUS`'s own docstring for why a plain retry is not
     # an error.
     response.status_code = _COMMAND_RESULT_STATUS[outcome]
+
+
+_CONTENT_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+@app.post("/v1/backups", status_code=201, response_model=BackupUploadAccepted)
+async def upload_backup(
+    request: Request,
+    kind: BackupKind,
+    content_hash: str,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    backup_storage: BackupBlobStorage = Depends(get_backup_storage),  # noqa: B008
+) -> BackupUploadAccepted:
+    """Accepts one backup (P5.5a, section 15.1/15.2) -- the apartment id
+    comes from the token, exactly like every other endpoint with no
+    apartment in its own address (`require_apartment_token_by_hash`, see
+    `fleet/auth.py`); `kind`/`content_hash` are query parameters (section 3:
+    "ordinary POST calls"), the body is the raw bytes themselves, never
+    wrapped in JSON -- a `few megabytes` operational-data blob (section
+    15.1) does not belong inside a JSON string field, and a device-config
+    backup's own content is already JSON *bytes*, which wrapping in a
+    second layer of JSON would only have to unwrap again.
+
+    **What is checked, and why, in order:**
+
+    1. **Size, against the actually-received body, not a declared
+       `Content-Length`** (CLAUDE.md security principle 5 applied to a
+       client-supplied length header: never trusted alone) --
+       `protocol.backups.MAX_BACKUP_UPLOAD_BYTES`, `413` over it.
+    2. **`content_hash` must match a fresh SHA-256 of the body actually
+       received** -- `400` on a mismatch. This is not a cryptographic
+       integrity check in the "TLS already covers transport integrity"
+       sense; it exists so a truncated or corrupted upload is caught here,
+       immediately, with a clear error, rather than stored and only
+       discovered wrong at restore time, months later.
+    3. **For `operational_data`: the body must start with the real age
+       format's own header line** (`protocol.backups.AGE_HEADER_MAGIC`) --
+       security principle 4's "no tenant data in plain text in the cloud"
+       enforced structurally, not merely assumed of a well-behaved agent: a
+       buggy or compromised agent that tried to upload plaintext operational
+       data is refused here, `422`, before a single byte of it is ever
+       written to disk. This is a plausibility check on the file's own
+       framing, **not** a decrypt attempt -- the fleet holds no private key
+       to decrypt with in the first place (principle 3), so it could not
+       inspect the *plaintext* even if it wanted to.
+    4. **For `device_config`: the body must parse as JSON** -- `422`
+       otherwise. A plain plausibility check, mirroring step 3's own
+       "catch an obviously wrong upload immediately" reasoning; this
+       endpoint does not otherwise interpret the JSON's fields (masking or
+       validating their *content* against section 6 is `agent
+       .loop.create_backup`'s job, on the device, before the upload ever
+       happens -- the fleet only ever stores what it receives for this
+       kind).
+
+    Storage itself is two writes in sequence, not one transaction (a
+    blob-then-row ordering, matching `Storage.delete_backups`'s own
+    "row first, then blob" reasoning in reverse: a blob written but the row
+    insert failing leaves an orphaned, harmless file the next retention run
+    ignores; a row referencing a blob that failed to write would instead
+    break every future read of it) -- `BackupBlobStorage.store` first,
+    `Storage.create_backup_record` second.
+    """
+
+    body = await request.body()
+    if len(body) > MAX_BACKUP_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Backup upload exceeds {MAX_BACKUP_UPLOAD_BYTES} bytes.",
+        )
+    if not body:
+        raise HTTPException(status_code=400, detail="Backup upload is empty.")
+
+    normalized_hash = content_hash.lower()
+    if not _CONTENT_HASH_PATTERN.fullmatch(normalized_hash):
+        raise HTTPException(
+            status_code=400,
+            detail="content_hash must be 64 lowercase hex characters (SHA-256).",
+        )
+    actual_hash = hashlib.sha256(body).hexdigest()
+    if not hmac.compare_digest(actual_hash, normalized_hash):
+        raise HTTPException(
+            status_code=400,
+            detail="content_hash does not match the received body.",
+        )
+
+    if kind == BackupKind.OPERATIONAL_DATA and not body.startswith(AGE_HEADER_MAGIC):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "operational_data upload is not a valid age file (missing "
+                f"{AGE_HEADER_MAGIC!r} header) -- refusing to store plaintext "
+                "tenant data (CLAUDE.md security principle 4)."
+            ),
+        )
+    if kind == BackupKind.DEVICE_CONFIG:
+        try:
+            json.loads(body)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422, detail="device_config upload is not valid JSON."
+            ) from error
+
+    storage_path = backup_storage.store(authenticated_apartment, kind, body)
+    try:
+        summary = storage.create_backup_record(
+            authenticated_apartment,
+            kind,
+            size_bytes=len(body),
+            content_hash=actual_hash,
+            storage_path=storage_path,
+            now=datetime.now(UTC),
+        )
+    except Exception:
+        backup_storage.delete(storage_path)
+        raise
+
+    return BackupUploadAccepted(
+        id=summary.backup_id,
+        kind=BackupKind(summary.kind),
+        received_at=summary.created_at,
+        size_bytes=summary.size_bytes,
+        content_hash=summary.content_hash,
+    )
 
 
 # -----------------------------------------------------------------------------
