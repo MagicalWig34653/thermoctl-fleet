@@ -77,6 +77,7 @@ from httpx_sse import SSEError, connect_sse
 from pydantic import TypeAdapter
 
 from agent.registration import _parse_and_clamp_retry_after
+from agent.safe_io import UnsafeStateFileError, read_text_safe
 from protocol.commands import Command, CommandResult
 from protocol.version import PROTOCOL_VERSION
 
@@ -228,9 +229,23 @@ def _parse_command_obj(raw: object) -> CommandChannelItem:
 
 
 def _read_last_event_id(path: Path) -> str | None:
-    if not path.exists():
+    """**Fails safe, not closed** (cross-review, main-session decision): if
+    `path` is a symlink or not a regular file (`agent.safe_io
+    .UnsafeStateFileError`), this is treated exactly like "no bookmark
+    persisted yet" -- `None`, meaning "everything still pending" -- rather
+    than propagated. Losing this bookmark only ever means re-seeing
+    already-delivered commands on the next resume, which P5.2's own id
+    de-duplication (`AgentState.executed_ids`) already makes harmless (see
+    this module's own docstring); it is not an execution-safety mechanism,
+    so there is nothing to fail *closed* about here."""
+
+    try:
+        raw = read_text_safe(path)
+    except (OSError, UnsafeStateFileError):
         return None
-    raw = path.read_text(encoding="utf-8").strip()
+    if raw is None:
+        return None
+    raw = raw.strip()
     return raw or None
 
 
@@ -252,14 +267,28 @@ def _raise_for_non_200(status_code: int, description: str) -> None:
         raise CommandStreamError(f"{description} was refused: {status_code}")
 
 
-def _stream_once(client: httpx.Client, last_event_id_path: Path) -> Iterator[CommandChannelItem]:
+def _stream_once(
+    client: httpx.Client,
+    last_event_id_path: Path,
+    on_contact: Callable[[bool], None] = lambda ok: None,
+) -> Iterator[CommandChannelItem]:
     """One attempt at holding the SSE stream open -- raises (never
     swallows) on a transport failure or a non-200 response, so
     `receive_commands`'s own `except` clause decides what "dropped" means
     in one place. A 401/403 (`CommandStreamAuthError`) is the one exception
     to "swallows nothing" that still applies here too, by construction --
     it is not listed in that `except` clause at all, see that class's own
-    docstring."""
+    docstring.
+
+    `on_contact` (cross-review of P5.2, main-session decision): called
+    with `True` exactly once, right after the stream has actually
+    connected (past `_raise_for_non_200`, so never for a 401/403/other
+    non-200) -- an **additive**, optional parameter (default a no-op), so
+    every existing caller and test of this function is unaffected. Exists
+    so a caller like `agent.loop.run` can know "the command channel just
+    worked" without watching this module's own log output for it (an
+    earlier draft of that caller did exactly that, via a `logging.Handler`
+    -- reverted in favor of this explicit, first-class signal)."""
 
     headers: dict[str, str] = {}
     last_event_id = _read_last_event_id(last_event_id_path)
@@ -268,6 +297,7 @@ def _stream_once(client: httpx.Client, last_event_id_path: Path) -> Iterator[Com
 
     with connect_sse(client, "GET", "/v1/commands", headers=headers) as event_source:
         _raise_for_non_200(event_source.response.status_code, "GET /v1/commands (SSE)")
+        on_contact(True)
         for sse in event_source.iter_sse():
             # Persisted as soon as the event is off the wire, **before**
             # yielding it -- `Last-Event-ID` is a transport-level bookmark
@@ -322,6 +352,7 @@ def receive_commands(
     *,
     fallback_poll_interval_s: float = DEFAULT_FALLBACK_POLL_INTERVAL_S,
     sleep: Callable[[float], None] = time.sleep,
+    on_contact: Callable[[bool], None] = lambda ok: None,
 ) -> Generator[CommandChannelItem]:
     """Reads the SSE command channel, falling back to `wait=0` polling on
     an interrupted or refused stream, forever -- see the module docstring
@@ -343,12 +374,22 @@ def receive_commands(
     (clamped) fallback interval before trying the stream again. Never
     executes anything -- only yields `Command`/`RejectedCommand` items to
     the caller (P5.2's job).
+
+    `on_contact` (cross-review of P5.2, main-session decision): an
+    **additive**, optional callback (default a no-op) invoked with `True`
+    exactly where the stream connects (`_stream_once`'s own call) or a
+    `wait=0` poll succeeds, and `False` exactly where either fails --
+    never inferred from this module's log output by a caller, which is
+    what an earlier draft of `agent.loop.run` did instead. Every existing
+    call site and test of `receive_commands` is unaffected (the parameter
+    defaults to doing nothing).
     """
 
     while True:
         try:
-            yield from _stream_once(client, last_event_id_path)
+            yield from _stream_once(client, last_event_id_path, on_contact)
         except (httpx.TransportError, SSEError, CommandStreamError) as error:
+            on_contact(False)
             logger.warning(
                 "SSE command stream unavailable (%s); falling back to polling.", error
             )
@@ -357,8 +398,10 @@ def receive_commands(
         try:
             items, retry_after_raw = _poll_once(client, last_event_id_path)
         except (httpx.TransportError, CommandStreamError) as error:
+            on_contact(False)
             logger.warning("Command poll fallback failed too (%s); retrying later.", error)
         else:
+            on_contact(True)
             yield from items
             retry_after_s = _parse_and_clamp_retry_after(retry_after_raw, fallback_poll_interval_s)
 
@@ -366,9 +409,22 @@ def receive_commands(
 
 
 def _load_outbox(path: Path) -> list[CommandResult]:
-    if not path.exists():
+    """**Fails safe, not closed** (cross-review, main-session decision): a
+    symlink or non-regular file at `path` (`agent.safe_io
+    .UnsafeStateFileError`) is treated as "nothing buffered", the same as
+    a genuinely absent file -- not propagated. The worst case is a result
+    that was already buffered becoming unreachable until the path is fixed
+    by hand, which only delays a result report; it can never cause a
+    command to be executed twice (that guarantee lives entirely in
+    P5.2's own `AgentState.executed_ids`, a different file)."""
+
+    try:
+        raw = read_text_safe(path)
+    except (OSError, UnsafeStateFileError):
         return []
-    raw = path.read_text(encoding="utf-8").strip()
+    if raw is None:
+        return []
+    raw = raw.strip()
     if not raw:
         return []
     return _RESULT_LIST_ADAPTER.validate_json(raw)
@@ -425,6 +481,21 @@ def _flush_outbox_if_any(client: httpx.Client, outbox_path: Path) -> None:
         logger.info("Flushed buffered result for command %r.", result.id)
 
     _save_outbox(outbox_path, remaining)
+
+
+def flush_outbox(client: httpx.Client, outbox_path: Path) -> None:
+    """Public entry point for retrying buffered results **independent of
+    reporting a new one** (cross-review of P5.2, main-session decision:
+    "idle flush of the result outbox") -- `report_result` below already
+    flushes as a side effect of reporting a fresh result, but a result
+    that failed to report earlier must not have to wait for the *next*
+    command to arrive at all. `agent.loop.run` calls this from its
+    `on_contact(True)` handler, i.e. on every successful poll or stream
+    (re)connect, not only when there happens to be a new result to send.
+    A thin, named wrapper around the existing `_flush_outbox_if_any`
+    rather than a caller reaching into that private helper directly."""
+
+    _flush_outbox_if_any(client, outbox_path)
 
 
 def report_result(client: httpx.Client, result: CommandResult, *, outbox_path: Path) -> None:
