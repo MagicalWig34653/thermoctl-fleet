@@ -167,7 +167,6 @@ def test_rejected_command_with_invalid_id_is_not_reported(tmp_path: Path, bad_id
     ("command_type", "expected_substring"),
     [
         (CommandType.REPORT_NOW, "P2.3"),
-        (CommandType.FETCH_LOGS, "P5.3"),
         (CommandType.DIAGNOSTIC_BUNDLE, "P5.3"),
         (CommandType.BACKUP_NOW, "P5.5"),
     ],
@@ -175,9 +174,12 @@ def test_rejected_command_with_invalid_id_is_not_reported(tmp_path: Path, bad_id
 def test_not_yet_available_commands_report_honest_failure(
     tmp_path: Path, command_type: CommandType, expected_substring: str
 ) -> None:
+    """`fetch_logs` is no longer in this list -- P5.3a gave it a real
+    handler, see `tests/test_agent_fetch_logs.py`."""
+
     state = AgentState()
     ctx = _ctx(tmp_path)
-    command = _command(command_type, lines=10 if command_type == CommandType.FETCH_LOGS else None)
+    command = _command(command_type)
 
     outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
 

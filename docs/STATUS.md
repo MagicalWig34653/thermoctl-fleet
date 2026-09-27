@@ -2,6 +2,86 @@
 
 Last updated: 2026-09-27.
 
+## P5.3a -- `fetch_logs` with an on-device allowlist filter (sections 6, 7, 21.5)
+
+Built per the project owner's 2026-09-27 decision (recorded in `docs/specification.md`
+21.5's own "Decided afterward" paragraph): `fetch_logs` now has a real agent-side handler,
+not the P5.2 placeholder.
+
+**Allowlist, not denylist** (`agent/log_filter.py`): a line only ever leaves the device if
+(1) it structurally matches thermoctl's own text log line shape
+(`thermoctl/logging.py::TextFormatter`, read from the sibling repository) **and** (2) its
+level/message is one of a short, explicit list of known-harmless shapes --
+`WARNING`/`ERROR`/`CRITICAL` at any message (thermoctl's own connection-lost/restored
+messages surface at these levels already), or one of four known-safe `INFO` templates
+(version/startup banner, MQTT connection established, MQTT receiving disabled, cluster
+leadership state). Everything else -- an unrecognised `INFO` shape (including thermoctl's
+own one-time setup-token banner, which deliberately is **not** covered by thermoctl's own
+masking, see that function's docstring), `DEBUG`, or a line that does not even match the
+log format at all (e.g. a stack-trace continuation line) -- is dropped and counted, never
+partially redacted and passed through.
+
+**Placeholders, within an already-allowed line:** temperatures and setpoints (`21,5 °C` /
+`Sollwert: 21,5 °C`) -> `<temperatur>`/`<sollwert>`; a name after a known prefix
+(`Gemeldet von:`, `Raum:`, `Name:`, `Mieter:`) -> `<name>`; a free-text note
+(`Hinweis:`) -> `<hinweis>`; an e-mail address -> `<email>`; an IPv4/MAC address ->
+`<ip>`/`<mac>`; anything token-shaped (`agent_...`, `Bearer ...`, or a bare 20+ character
+mixed-alphanumeric run) -> `<token>`. Every placeholder is fixed and dumb -- never a stable
+hash of the underlying value, so two lines carrying the same reading cannot be correlated
+across the log even after masking.
+
+**Agent** (`agent/loop.py`): `_handle_fetch_logs` reads the last `Command.lines` lines of
+the `thermoctl` container's log via the local Docker Engine API over the Unix socket
+(`read_container_log_lines`, own hand-rolled demultiplexer for Docker's multiplexed log
+stream framing -- **no Docker SDK dependency**, mirroring CLAUDE.md security principle 6's
+reasoning for the watchdog, applied here for the same "no dependency this package does not
+need" reason), filters through `agent.log_filter.filter_log_lines`, and uploads the result
+as `protocol.commands.LogExcerpt` via `POST /v1/commands/{id}/logs`. Every failure path
+(no client configured, the log source raising, the upload being refused) is an honest
+failed `CommandResult`, never a fabricated success -- matching this module's own existing
+"never an invented stopgap" rule.
+
+**Protocol**: `protocol.commands.LogExcerpt` (`command_id`, `lines` -- already filtered on
+the device, documented as such --, `dropped_lines`, `source`, `captured_at`), capped at
+`MAX_LOG_EXCERPT_LINES` (500, reusing `Command.lines`'s own bound) and a per-line length
+cap. `PROTOCOL_VERSION` bumped to 4 (a wholly new model counts as a model change, per the
+project owner's own literal reading of "any change to the models" from P5.1/18.2).
+
+**Fleet**: `POST /v1/commands/{id}/logs` (`fleet/app.py::receive_log_excerpt`, agent token,
+`require_apartment_token_by_hash`) -- the command named must belong to the authenticated
+apartment and be a `fetch_logs` command (otherwise 404, deliberately indistinguishable from
+"unknown", mirroring `receive_command_result`'s own reasoning), one excerpt per command
+(a second upload is 409), and a cheap aggregate-size backstop (413) independent of the
+per-field model bounds -- **the fleet does no filtering of its own**, only this size cap.
+Storage: `command_log_excerpts` table (`fleet/migrations/versions/0010_command_log_excerpts.py`,
+`fleet.storage.Storage.store_log_excerpt`/`get_log_excerpt_for_command`).
+
+**Retention** (project owner condition 4): `Storage.delete_expired_log_excerpts`, run
+periodically by a background loop in `fleet/app.py::lifespan` (`_log_retention_loop`, the
+same "thin scheduling wrapper, tested via an injected clock on the logic it calls" pattern
+`_alarm_check_loop` already established) -- 14 days by default, both the retention window
+(`FLEET_LOG_RETENTION_DAYS`) and the check interval (`FLEET_LOG_RETENTION_CHECK_INTERVAL_S`)
+env-configurable, per CLAUDE.md ("nothing hard-coded").
+
+**UI**: "Eine Wohnung"'s "Befehle" history shows a `fetch_logs` row's stored excerpt
+alongside it -- capture time, source, the dropped-line count shown plainly ("N Zeilen
+entfernt"), and the filtered lines themselves in a monospace, escaped block
+(`fleet/ui_apartment.py::LogExcerptDisplay`, `fleet/templates/ui/apartment.html`).
+
+**Tests**: `tests/test_log_filter.py` (the condition-6 test -- a tenant name, °C values, a
+token, a setpoint, and a free-text note, none of which appear in the output; placeholder
+identity across different values; unknown shapes dropped, not passed through),
+`tests/test_agent_fetch_logs.py` (the Docker log-stream demultiplexer; the handler against a
+stub log reader and a real, locally-run `fleet.app.app` end to end; every honest-failure
+path), `tests/test_storage.py`/`tests/test_fleet.py`/`tests/test_ui_commands.py` (storage
+ownership/duplicate rules and the retention cleanup with an injected clock; the endpoint's
+auth/ownership/type/size checks; the UI display, escaped).
+
+**Open for P5.3b** (a separate, later package, not built here): the end-to-end encrypted
+`diagnostic_bundle` -- see `docs/specification.md` 21.5's own "Decided afterward" paragraph
+for why it must stay a one-off, encrypted snapshot and never grow into the cloud's running
+storage the way `fetch_logs`'s own retention window does.
+
 ## P5.E: local end-to-end test environment (base station VM + scenarios)
 
 Built per the project owner's 2026-09-27 offer ("you can set up a VM

@@ -40,6 +40,7 @@ from fleet.storage import (
     InventoryAuditLogRecord,
     RecordCommandResultOutcome,
     Storage,
+    StoreLogExcerptOutcome,
     _alembic_config,
     create_engine_from_url,
     create_storage,
@@ -48,7 +49,7 @@ from fleet.storage import (
     hash_token,
     upgrade,
 )
-from protocol import CommandResult, Event, FaultKind, Heartbeat
+from protocol import CommandResult, Event, FaultKind, Heartbeat, LogExcerpt
 from protocol.commands import CommandType
 from protocol.version import PROTOCOL_VERSION
 
@@ -3137,3 +3138,210 @@ def test_create_command_unless_duplicate_rejects_invalid_command(
             ui_username="landlord", now=datetime.now(UTC),
         )
     assert storage.list_commands_for_apartment("house7-a03") == []
+
+
+# --- fetch_logs uploads (P5.3a, sections 6, 7, 21.5) -------------------------
+
+
+def _make_log_excerpt(
+    command_id: str, *, lines: list[str] | None = None, dropped_lines: int = 0
+) -> LogExcerpt:
+    return LogExcerpt(
+        command_id=command_id,
+        lines=lines if lines is not None else ["<temperatur>"],
+        dropped_lines=dropped_lines,
+        source="thermoctl",
+        captured_at=datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC),
+    )
+
+
+def test_store_log_excerpt_unknown_command_id_is_not_found(storage: Storage) -> None:
+    outcome = storage.store_log_excerpt(
+        "house7-a03", _make_log_excerpt("does-not-exist"), datetime.now(UTC)
+    )
+
+    assert outcome is StoreLogExcerptOutcome.NOT_FOUND
+    assert storage.get_log_excerpt_for_command("does-not-exist") is None
+
+
+def test_store_log_excerpt_another_apartments_command_is_not_found(storage: Storage) -> None:
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house7-a04")
+    command = storage.create_command(
+        "house7-a04", CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    outcome = storage.store_log_excerpt(
+        "house7-a03", _make_log_excerpt(command.id), datetime.now(UTC)
+    )
+
+    assert outcome is StoreLogExcerptOutcome.NOT_FOUND
+
+
+def test_store_log_excerpt_refuses_a_non_fetch_logs_command(storage: Storage) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    outcome = storage.store_log_excerpt(
+        "house7-a03", _make_log_excerpt(command.id), datetime.now(UTC)
+    )
+
+    assert outcome is StoreLogExcerptOutcome.NOT_FOUND
+
+
+def test_store_log_excerpt_stores_fields(storage: Storage) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    outcome = storage.store_log_excerpt(
+        "house7-a03",
+        _make_log_excerpt(command.id, lines=["a", "b"], dropped_lines=3),
+        datetime.now(UTC),
+    )
+
+    assert outcome is StoreLogExcerptOutcome.STORED
+    stored = storage.get_log_excerpt_for_command(command.id)
+    assert stored is not None
+    assert stored.lines == ["a", "b"]
+    assert stored.dropped_lines == 3
+    assert stored.source == "thermoctl"
+
+
+def test_store_log_excerpt_refuses_a_second_upload_for_the_same_command(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    now = datetime.now(UTC)
+    first = storage.store_log_excerpt("house7-a03", _make_log_excerpt(command.id), now)
+    assert first is StoreLogExcerptOutcome.STORED
+
+    second = storage.store_log_excerpt(
+        "house7-a03", _make_log_excerpt(command.id, lines=["different"]), now
+    )
+
+    assert second is StoreLogExcerptOutcome.ALREADY_EXISTS
+    stored = storage.get_log_excerpt_for_command(command.id)
+    assert stored is not None
+    assert stored.lines == ["<temperatur>"]  # the first upload, unchanged
+
+
+def test_get_log_excerpt_for_command_returns_none_when_never_uploaded(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    assert storage.get_log_excerpt_for_command(command.id) is None
+
+
+def test_delete_expired_log_excerpts_removes_only_old_rows(storage: Storage) -> None:
+    _make_apartment(storage)
+    old_command = storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    fresh_command = storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    old_received_at = datetime(2026, 1, 1, tzinfo=UTC)
+    fresh_received_at = datetime(2026, 9, 20, tzinfo=UTC)
+    storage.store_log_excerpt(
+        "house7-a03", _make_log_excerpt(old_command.id), old_received_at
+    )
+    storage.store_log_excerpt(
+        "house7-a03", _make_log_excerpt(fresh_command.id), fresh_received_at
+    )
+
+    deleted = storage.delete_expired_log_excerpts(
+        datetime(2026, 9, 27, tzinfo=UTC), timedelta(days=14)
+    )
+
+    assert deleted == 1
+    assert storage.get_log_excerpt_for_command(old_command.id) is None
+    assert storage.get_log_excerpt_for_command(fresh_command.id) is not None
+
+
+def test_delete_expired_log_excerpts_returns_zero_when_nothing_is_expired(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    storage.store_log_excerpt(
+        "house7-a03", _make_log_excerpt(command.id), datetime.now(UTC)
+    )
+
+    deleted = storage.delete_expired_log_excerpts(datetime.now(UTC), timedelta(days=14))
+
+    assert deleted == 0
+
+
+def test_migration_0010_creates_the_command_log_excerpts_table(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+
+    upgrade(url)
+
+    engine = create_storage(url).engine
+    columns = {
+        column["name"] for column in inspect(engine).get_columns("command_log_excerpts")
+    }
+    assert columns == {
+        "id",
+        "command_id",
+        "apartment_id",
+        "lines_json",
+        "dropped_lines",
+        "source",
+        "captured_at",
+        "received_at",
+    }
+
+
+def test_migration_0010_downgrade_removes_the_table_upgrade_restores_it(
+    tmp_path: object,
+) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_storage(url).engine
+    assert "command_log_excerpts" in inspect(engine).get_table_names()
+
+    downgrade(url, "0009")
+    assert "command_log_excerpts" not in inspect(engine).get_table_names()
+
+    upgrade(url)
+    assert "command_log_excerpts" in inspect(engine).get_table_names()
+
+
+def test_migrations_0001_through_0010_match_the_orm_model_exactly(tmp_path: object) -> None:
+    """Extends the existing migration-vs-ORM coverage to include
+    `0010_command_log_excerpts.py` -- see
+    `test_migrations_0001_through_0009_match_the_orm_model_exactly`'s own
+    docstring for why this is its own test."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_storage(url).engine
+
+    with engine.connect() as connection:
+        context = MigrationContext.configure(connection)
+        diff = compare_metadata(context, Base.metadata)
+
+    assert diff == []

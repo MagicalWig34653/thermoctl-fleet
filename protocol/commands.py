@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 
 class CommandType(StrEnum):
@@ -85,3 +86,58 @@ class CommandResult(BaseModel):
     successful: bool
     duration_s: float = Field(ge=0)
     error_text: str | None = None
+
+
+# Section 7: "the last n lines ... capped at 500 lines" -- reused here (not
+# re-derived as a second number) for `LogExcerpt.lines`'s own upper bound,
+# the same cap `Command.lines` already enforces on the *request* side.
+MAX_LOG_EXCERPT_LINES = 500
+# A generous, defensive cap on a single line's length -- thermoctl's own
+# `TextFormatter` appends every `extra=` field to one line (never wraps), so
+# a legitimate line with several fields can run a few hundred characters;
+# this is not meant to be a tight bound, only a backstop against a single
+# absurdly long "line" (e.g. a stack trace `agent.log_filter` failed to
+# split, or a hostile source) blowing up storage/display.
+MAX_LOG_LINE_LENGTH = 4000
+_LogLine = Annotated[str, StringConstraints(max_length=MAX_LOG_LINE_LENGTH)]
+
+
+class LogExcerpt(BaseModel):
+    """Body of `POST /v1/commands/{id}/logs` (P5.3a, sections 6, 7, 21.5):
+    the masked, on-device-filtered content of a `fetch_logs` command.
+
+    **`lines` are filtered on the device before this model is ever
+    constructed** (`agent.log_filter.filter_log_lines`, project owner
+    decision 2026-09-27: filtering happens exclusively in the agent, never
+    in the cloud) -- an allowlist of known-harmless line shapes, with every
+    temperature, setpoint, name, free-text note, and token-like value
+    already replaced by a fixed placeholder (`<temperatur>`, `<sollwert>`,
+    `<name>`, `<hinweis>`, `<token>`, ...). This model carries no field that
+    could smuggle in more than that: there is no raw-log or free-text field
+    here beyond the already-filtered `lines` themselves, precisely so a
+    model change alone cannot widen what this endpoint accepts without
+    `agent/log_filter.py` also changing.
+
+    `dropped_lines` is the count of input lines the allowlist rejected
+    (project owner, condition 3: "N Zeilen entfernt") -- always sent, even
+    when zero, so the cloud-side display never has to guess whether
+    something was silently cut.
+
+    `source` names what was read (the container, e.g. `"thermoctl"`), not
+    a path or any host-identifying detail. `captured_at` is when the agent
+    read the log, distinct from `command_id`'s own `Command.expires_at` --
+    the UI shows both the command's history entry and this capture time
+    side by side (`fleet/ui_apartment.py`).
+
+    One excerpt per command (`fleet.storage.Storage.store_log_excerpt`
+    refuses a second one for the same `command_id`) -- `fetch_logs` runs at
+    most once per command id anyway (section 7's own at-most-once rule,
+    enforced in the agent), so a second upload for the same id can only be
+    a retry, never a legitimately different result.
+    """
+
+    command_id: str = Field(min_length=1)
+    lines: list[_LogLine] = Field(max_length=MAX_LOG_EXCERPT_LINES)
+    dropped_lines: int = Field(ge=0)
+    source: str = Field(min_length=1)
+    captured_at: datetime

@@ -18,4 +18,10 @@ between the two packages of this repository and future compatibility checks.
 # reports that as a result, and keeps running") -- a `Command` must carry the
 # protocol version it was created under so the agent has something to reject
 # against; see protocol/commands.py and docs/STATUS.md's P5.1 section.
-PROTOCOL_VERSION = 3
+# 4: adds `protocol.commands.LogExcerpt` (P5.3a, sections 6, 7, 21.5) -- the
+# `fetch_logs` upload body (already-filtered lines, a dropped-line count,
+# source, capture time). A wholly new model counts as "a change to the
+# models" too, per the project owner's 2026-09-26 literal reading of this
+# rule (see above) -- see protocol/commands.py and docs/STATUS.md's P5.3a
+# section.
+PROTOCOL_VERSION = 4
