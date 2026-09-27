@@ -19,6 +19,7 @@ from agent.transport import (
     CertificateFingerprintMismatch,
     InvalidCertificateFingerprint,
     InvalidFleetAddress,
+    _map_httpcore_exceptions,
     build_client,
     fingerprint_for_certificate,
     parse_certificate_fingerprint,
@@ -126,3 +127,26 @@ def test_client_close_without_context_manager_closes_the_pool(tmp_path: Path) ->
         assert response.status_code == 204
         client.close()
         assert len(received) == 1
+
+
+def test_map_httpcore_exceptions_passes_through_a_certificate_pin_mismatch() -> None:
+    """`CertificateFingerprintMismatch` is already an `httpx.TransportError`
+    subclass raised by this module's own pin check, never by `httpcore` --
+    `_map_httpcore_exceptions` must not try to re-map it (there is no
+    `httpcore` equivalent to map it *to*), only let it through unchanged."""
+
+    with pytest.raises(CertificateFingerprintMismatch):
+        with _map_httpcore_exceptions():
+            raise CertificateFingerprintMismatch("test")
+
+
+def test_map_httpcore_exceptions_passes_through_anything_not_from_httpcore() -> None:
+    """An exception that is neither `CertificateFingerprintMismatch` nor
+    one of `httpcore`'s own exception types (P5.1, found while building
+    the SSE command channel -- see `_HTTPCORE_EXCEPTION_MAP`'s own
+    docstring for why this mapping exists at all) must reach the caller
+    completely unchanged, not swallowed or replaced."""
+
+    with pytest.raises(KeyError):
+        with _map_httpcore_exceptions():
+            raise KeyError("unrelated bug")

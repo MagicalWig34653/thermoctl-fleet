@@ -71,9 +71,11 @@ plaintext fallback.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import ssl
 import typing
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -83,6 +85,59 @@ import httpx
 FINGERPRINT_PREFIX = "sha256"
 _FINGERPRINT_HEX_LENGTH = 64  # SHA-256, 32 bytes, 64 hex characters.
 _HEX_DIGITS = frozenset("0123456789abcdef")
+
+# `httpcore` and `httpx` each define their own, separate exception
+# hierarchy for the same underlying failures -- `httpx.HTTPTransport`
+# (the built-in transport this module's own docstring already says it
+# mirrors) translates one into the other via its own internal
+# `map_httpcore_exceptions`, applied both around the initial request *and*
+# around iterating the response stream afterwards. This module used to
+# translate only `httpcore.ConnectError` (the one case P5.0's own tests
+# happened to exercise, request/response calls that never stream a long-
+# lived body) -- P5.1's SSE channel is the first caller that reads a
+# response incrementally over a connection that can be interrupted mid-
+# read, and a plain `httpcore.RemoteProtocolError` from a dropped
+# connection surfacing here uncaught (never becoming the `httpx
+# .TransportError` every other caller in this codebase already catches)
+# was found and fixed while building it. Ordered most-specific-first, the
+# same reasoning `httpx`'s own internal map applies (an `httpcore
+# .ConnectTimeout` must map to `httpx.ConnectTimeout`, not merely to the
+# broader `httpx.TimeoutException` a naive unordered scan might hit first).
+_HTTPCORE_EXCEPTION_MAP: dict[type[Exception], type[httpx.TransportError]] = {
+    httpcore.ConnectTimeout: httpx.ConnectTimeout,
+    httpcore.ReadTimeout: httpx.ReadTimeout,
+    httpcore.WriteTimeout: httpx.WriteTimeout,
+    httpcore.PoolTimeout: httpx.PoolTimeout,
+    httpcore.TimeoutException: httpx.TimeoutException,
+    httpcore.ConnectError: httpx.ConnectError,
+    httpcore.ReadError: httpx.ReadError,
+    httpcore.WriteError: httpx.WriteError,
+    httpcore.NetworkError: httpx.NetworkError,
+    httpcore.LocalProtocolError: httpx.LocalProtocolError,
+    httpcore.RemoteProtocolError: httpx.RemoteProtocolError,
+    httpcore.ProtocolError: httpx.ProtocolError,
+    httpcore.ProxyError: httpx.ProxyError,
+    httpcore.UnsupportedProtocol: httpx.UnsupportedProtocol,
+}
+
+
+@contextlib.contextmanager
+def _map_httpcore_exceptions() -> Iterator[None]:
+    """Translates any `httpcore.*` exception raised inside the `with` block
+    into its `httpx.*` equivalent (`_HTTPCORE_EXCEPTION_MAP`) -- a
+    `CertificateFingerprintMismatch` (itself already an `httpx
+    .TransportError` subclass, raised by this module's own pin check, not
+    by `httpcore`) passes through unchanged."""
+
+    try:
+        yield
+    except CertificateFingerprintMismatch:
+        raise
+    except Exception as error:
+        for httpcore_exc, httpx_exc in _HTTPCORE_EXCEPTION_MAP.items():
+            if isinstance(error, httpcore_exc):
+                raise httpx_exc(str(error)) from error
+        raise
 
 
 class InvalidFleetAddress(ValueError):
@@ -251,6 +306,48 @@ class _PinningNetworkBackend(httpcore.NetworkBackend):
         self._inner.sleep(seconds)
 
 
+class _LazyHttpcoreStream(httpx.SyncByteStream):
+    """Wraps an `httpcore` response stream as an `httpx.SyncByteStream`
+    **without** reading it eagerly (P5.1, section 3: the SSE command
+    channel needs a response body that is read incrementally, potentially
+    over a connection held open for a long time, not fully materialized
+    into memory before `handle_request` even returns -- an eager
+    `b"".join(response.stream)`, this class's predecessor, blocks forever
+    on a stream that is not meant to end, such as an open `GET
+    /v1/commands`).
+
+    Correct for both call styles `httpx.Client` produces from one
+    `handle_request` return value: an ordinary `client.get`/`.post` (the
+    default, `stream=False`) has `httpx.Client.send` call `response.read()`
+    immediately after this method returns, which iterates this stream to
+    completion and then calls `.close()` itself -- so a ordinary call
+    behaves exactly as it did when this class's predecessor buffered
+    eagerly, just with the reading (and therefore the pool-slot release,
+    see `close` below) happening a few lines further up the call stack
+    instead of here. `client.stream(...)` (used by `httpx_sse.connect_sse`
+    for the SSE channel) instead passes `stream=True`, leaving the caller's
+    own `with` block responsible for iterating and closing -- which is
+    exactly what makes a long-lived, incrementally-delivered response
+    possible at all.
+    """
+
+    def __init__(self, stream: typing.Iterable[bytes]) -> None:
+        self._stream = stream
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        with _map_httpcore_exceptions():
+            yield from self._stream
+
+    def close(self) -> None:
+        # `httpcore` only returns this response's connection to the pool
+        # once its stream is explicitly closed (the same "leaked pool slot"
+        # reasoning the eager-buffering predecessor's own `finally` already
+        # documented) -- `httpx.Response.close`/`.read()` both call this
+        # for us now, at the right point for either call style.
+        if hasattr(self._stream, "close"):
+            self._stream.close()
+
+
 class _PinnedTransport(httpx.BaseTransport):
     """A minimal `httpx.BaseTransport`, deliberately not `httpx.HTTPTransport`
     (which has no way to accept a custom `network_backend`, see the module
@@ -279,28 +376,14 @@ class _PinnedTransport(httpx.BaseTransport):
             content=request.stream,
             extensions=request.extensions,
         )
-        try:
+        with _map_httpcore_exceptions():
             response = self._pool.handle_request(httpcore_request)
-        except CertificateFingerprintMismatch:
-            raise
-        except httpcore.ConnectError as error:
-            raise httpx.ConnectError(str(error), request=request) from error
 
         assert isinstance(response.stream, typing.Iterable)
-        try:
-            body = b"".join(response.stream)
-        finally:
-            # `httpcore` only returns this response's connection to the
-            # pool once its stream is explicitly closed -- without this,
-            # every request here would leak a pool slot instead of reusing
-            # a keep-alive connection, exhausting `max_connections` after a
-            # handful of calls (`httpcore.PoolTimeout`).
-            if hasattr(response.stream, "close"):
-                response.stream.close()
         return httpx.Response(
             status_code=response.status,
             headers=response.headers,
-            stream=httpx.ByteStream(body),
+            stream=_LazyHttpcoreStream(response.stream),
             extensions=response.extensions,
         )
 

@@ -57,10 +57,12 @@ import hmac
 import json
 import os
 import secrets
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
@@ -71,6 +73,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Engine,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -98,6 +101,7 @@ from fleet.device_lifecycle import (
     validate_manual_device_transition,
 )
 from protocol import Event, Heartbeat, fault_kind_from_key
+from protocol.commands import Command, CommandResult, CommandType
 from protocol.version import PROTOCOL_VERSION
 
 
@@ -536,6 +540,101 @@ class InventoryAuditLogRecord(Base):
     reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     before_json: Mapped[str | None] = mapped_column(Text(), nullable=True)
     after_json: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
+class CommandRecord(Base):
+    __tablename__ = "commands"
+
+    # Doubles as the SSE stream's own monotonically increasing sequence
+    # number (`fleet.app.commands_stream`'s `id:` field, and what
+    # `Last-Event-ID` resumes from) -- see `0009_commands.py`'s own
+    # docstring for why a separate `sequence` column would only duplicate
+    # what an autoincrement primary key already guarantees.
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # The wire `id` (`protocol.commands.Command.id`, a `uuid4` hex string) --
+    # deliberately not the primary key, see the migration's own docstring
+    # for why (enumeration by an agent holding a valid token).
+    command_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # `protocol.commands.CommandType` value, plain string -- same reasoning
+    # as `EventRecord.fault_kind`/`AlarmRecord.kind`.
+    command_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Only meaningful for `fetch_logs` (section 7) -- `NULL` for every other
+    # command type, enforced by `Storage.create_command` before a row is
+    # ever written.
+    lines: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    # Always `created_at` + 15 minutes (section 7's own default), computed
+    # once at creation time -- see `Storage.create_command`.
+    expires_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Set once, the first time this command is actually handed to the agent
+    # (SSE delivery or a `wait=0` poll) -- not re-set on later deliveries,
+    # see the migration's own docstring.
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    # Result fields (`protocol.commands.CommandResult`), all `NULL` until
+    # `POST /v1/commands/{id}/result` reports one.
+    successful: Mapped[bool | None] = mapped_column(Boolean(), nullable=True)
+    duration_s: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    result_received_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
+
+@dataclass(frozen=True)
+class PendingCommand:
+    """One not-yet-expired, not-yet-resulted command still owed to an
+    apartment (P5.1, `Storage.pending_commands`).
+
+    `sequence` is `CommandRecord.id` -- the SSE stream's own `id:` field and
+    what a resuming client's `Last-Event-ID` compares against
+    (`fleet.app.commands_stream`); `command` is the full wire model, ready
+    to be JSON-encoded straight into the event body or a `wait=0` response
+    list without the caller having to reconstruct it from raw columns.
+    """
+
+    sequence: int
+    command: Command
+
+
+class RecordCommandResultOutcome(StrEnum):
+    """What `Storage.record_command_result` actually did -- `fleet.app
+    .receive_command_result` maps each value to its own HTTP status (see
+    that function's own docstring for the exact mapping and the reasoning
+    behind it, section 7's "result via POST /v1/commands/{id}/result").
+    """
+
+    # No command with this id at all, for *this* apartment -- an unknown
+    # command id and another apartment's command id are, deliberately,
+    # the same outcome (indistinguishable to the caller, mirroring every
+    # other "unknown vs. not yours" choice this codebase already makes,
+    # e.g. `fleet/auth.py`'s 403).
+    NOT_FOUND = "not_found"
+    # Stored for the first time.
+    STORED = "stored"
+    # A result was already stored, and this one reports the exact same
+    # content -- an agent retry after a lost response, not a conflicting
+    # second report. Treated as a no-op success, not an error.
+    DUPLICATE_IDENTICAL = "duplicate_identical"
+    # A result was already stored, and this one disagrees with it (a
+    # different `successful`/`duration_s`/`error_text`) -- genuinely
+    # unexpected, surfaced as a conflict rather than silently overwritten.
+    CONFLICT = "conflict"
+
+
+# Section 7: "every command has an expiry (default 15 minutes)".
+COMMAND_EXPIRY = timedelta(minutes=15)
+
+# The largest value SQLite's/PostgreSQL's own `BIGINT` (what `CommandRecord
+# .id` -- the SSE sequence number -- is stored as) can represent. A
+# `Last-Event-ID` this large (or non-positive) is rejected *before* it is
+# ever bound as a SQL parameter in `Storage.pending_commands` -- binding,
+# say, `2**128` directly would risk an `OverflowError`/driver-level failure
+# depending on dialect, rather than the ordinary "not a valid resume point"
+# fallback every other out-of-range value already gets.
+_MAX_COMMAND_SEQUENCE = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -977,6 +1076,270 @@ class Storage:
 
         with self.session() as session:
             return list(session.scalars(select(ApartmentRecord.id)).all())
+
+    # -- commands (P5.1, sections 3, 7) -------------------------------------------
+
+    def create_command(
+        self,
+        apartment_id: str,
+        command_type: CommandType,
+        *,
+        lines: int | None,
+        ui_username: str,
+        now: datetime,
+    ) -> Command:
+        """Creates a new command for `apartment_id` (section 7) -- the
+        storage function P5.1b's UI buttons will call; this package builds
+        it and tests it, not the button itself.
+
+        **Refuses an unknown or a retired apartment**, `ValueError`
+        (mirrors `create_apartment`'s own "duplicate id" `ValueError`, not
+        a caller-facing HTTP concern -- the route layer decides what HTTP
+        status that becomes): a command for an apartment that does not
+        exist, or that has been taken permanently out of service
+        (`ApartmentRecord.state == "retired"`), can never be delivered to
+        an agent, so creating one at all would be silent dead weight at
+        best and confusing at worst.
+
+        **`lines` is only ever allowed for `CommandType.FETCH_LOGS`**
+        (section 7: "the last *n* lines ... capped at 500 lines" -- "stays
+        empty for every other command", `protocol.commands.Command`'s own
+        docstring) -- `ValueError` for any other command type with `lines`
+        set, checked before the apartment lookup even runs, since it is a
+        caller bug regardless of which apartment is named.
+
+        `expires_at` is always `created_at` + `COMMAND_EXPIRY` (15 minutes,
+        section 7's own default) -- computed once, here, not derived later:
+        a command's expiry must not silently shift if the default itself
+        is ever changed after the fact.
+
+        Returns the wire `Command` model (`id` is a fresh `uuid4` hex
+        string, never the row's own sequential primary key -- see
+        `0009_commands.py`'s docstring for why), stamped with
+        `protocol.version.PROTOCOL_VERSION` as of *this* call.
+        """
+
+        if lines is not None and command_type != CommandType.FETCH_LOGS:
+            raise ValueError(
+                f"lines is only valid for {CommandType.FETCH_LOGS!r}, not "
+                f"{command_type!r}."
+            )
+
+        with self.session() as session:
+            apartment = session.get(ApartmentRecord, apartment_id)
+            if apartment is None:
+                raise ValueError(f"Unknown apartment {apartment_id!r}.")
+            if apartment.state == "retired":
+                raise ValueError(f"Apartment {apartment_id!r} is retired.")
+
+            command_id = uuid.uuid4().hex
+            created_at = _naive_utc(now)
+            expires_at = created_at + COMMAND_EXPIRY
+            record = CommandRecord(
+                command_id=command_id,
+                apartment_id=apartment_id,
+                command_type=str(command_type),
+                lines=lines,
+                created_at=created_at,
+                expires_at=expires_at,
+                created_by=ui_username,
+                protocol_version=PROTOCOL_VERSION,
+            )
+            session.add(record)
+
+        return Command(
+            id=command_id,
+            command=command_type,
+            expires_at=expires_at.replace(tzinfo=UTC),
+            lines=lines,
+            protocol_version=PROTOCOL_VERSION,
+        )
+
+    def pending_commands(
+        self, apartment_id: str, after_sequence: int, now: datetime
+    ) -> list[PendingCommand]:
+        """Not-yet-expired, not-yet-resulted commands for `apartment_id`
+        with a sequence greater than `after_sequence` (P5.1, section 3 --
+        `Last-Event-ID` resumption; `after_sequence=0` for a fresh
+        connection or a `wait=0` poll returns everything still pending).
+
+        **Expired commands are never returned here** (section 7: "if an
+        apartment comes back after three days, an old command is not
+        executed any more") -- filtered by `expires_at`, not by a status
+        column, so an apartment that reconnects long after `now` simply
+        never sees it, exactly like it was never delivered.
+
+        **`after_sequence` is only ever honoured if it is exactly one of
+        this apartment's own command sequences** -- otherwise treated as
+        `0` (cross-review of this package, main-session decision, second
+        round). `id`/sequence is a single, global autoincrement counter
+        shared by every apartment's commands (see `CommandRecord.id`'s own
+        docstring for why -- it doubles as the SSE stream's own monotonic
+        event id), which means a `Last-Event-ID` legitimately issued for
+        *one* apartment is, structurally, also a syntactically valid (if
+        never actually sent) resume point for *any other* apartment.
+        **First reproduction (round 1):** ten commands for apartment B
+        (sequences 1-10), then one for apartment A (sequence 11);
+        `pending_commands("apartment-a", 16, now)` returned `[]`, hiding
+        A's own pending command -- fixed at the time by clamping to `0`
+        whenever `after_sequence` exceeded A's own *maximum* sequence
+        (`MAX(id) WHERE apartment_id = ...`). **That fix was itself
+        incomplete (round 2):** a value *between* an apartment's own
+        sequences, but not equal to any of them, still was not A's own and
+        still passed the `MAX()` bound unnoticed. Reproduced: A at
+        sequences 1 and 11, B at 2-10; `pending_commands("apartment-a", 2,
+        now)` returned only `[11]` -- A's own still-pending sequence 1 was
+        skipped, since `2 < 11` (A's max) let the `MAX()`-only clamp treat
+        it as legitimate even though A was never sent sequence 2 (that one
+        belongs to B). **Fixed by a membership check instead of a bound:**
+        `after_sequence` is honoured only if a `CommandRecord` with
+        exactly that `id` *and* `apartment_id` exists at all (any of this
+        apartment's own commands, not only its still-pending ones -- a
+        resume point legitimately names an already-delivered, already
+        resulted, or already-expired command just as often as a pending
+        one) -- anything else (including every value a `MAX()` bound alone
+        would have let through) falls back to `0`.
+
+        **Also guarded before the value is ever bound as a SQL
+        parameter**: a non-positive `after_sequence`, or one larger than
+        `_MAX_COMMAND_SEQUENCE` (the largest value a `BIGINT` id column can
+        hold), is treated as `0` immediately -- a `Last-Event-ID` this
+        large (nothing stops a client from sending `2**128`) risks an
+        `OverflowError`/driver-level failure if bound directly, rather
+        than the ordinary "not a valid resume point" fallback every other
+        out-of-range value already gets.
+
+        **A per-apartment sequence counter was considered and rejected**
+        (both rounds): it would need its own migration and its own
+        concurrency-safe allocation scheme for no operational gain, since
+        **re-delivering an already-seen command is always safe** -- P5.2's
+        own id de-duplication (`AgentState.executed_ids`) and the result
+        endpoint's idempotency (`Storage.record_command_result`'s
+        `DUPLICATE_IDENTICAL` outcome) already make a redundant delivery
+        harmless, which is exactly what makes falling back to `0` (rather
+        than rejecting the request, or trying to reconstruct "the last
+        sequence this apartment was actually sent") the correct fix: an
+        over-permissive resume point costs one apartment a handful of
+        redundant, already-idempotent redeliveries; the bug this replaces
+        could permanently hide a real, pending command instead.
+
+        Ordered by sequence ascending -- the order commands were created
+        in, and the order `fleet.app.commands_stream` writes them into the
+        SSE stream so `Last-Event-ID` resumption is unambiguous about
+        "everything after this point", not merely "everything currently
+        pending" in arbitrary order.
+
+        Also sets `delivered_at` for every row this call returns that does
+        not have one yet -- "the first time this command is actually
+        handed to the agent" (see `CommandRecord.delivered_at`'s own
+        docstring) happens here, the one place both SSE delivery and a
+        `wait=0` poll go through, rather than duplicated in both callers.
+        """
+
+        normalized_now = _naive_utc(now)
+        # Guarded before it is ever bound as a SQL parameter -- see the
+        # docstring above.
+        candidate_after_sequence = (
+            after_sequence if 0 < after_sequence <= _MAX_COMMAND_SEQUENCE else 0
+        )
+
+        with self.session() as session:
+            effective_after_sequence = 0
+            if candidate_after_sequence:
+                is_this_apartments_own_sequence = session.scalar(
+                    select(CommandRecord.id).where(
+                        CommandRecord.apartment_id == apartment_id,
+                        CommandRecord.id == candidate_after_sequence,
+                    )
+                )
+                if is_this_apartments_own_sequence is not None:
+                    effective_after_sequence = candidate_after_sequence
+
+            rows = session.scalars(
+                select(CommandRecord)
+                .where(
+                    CommandRecord.apartment_id == apartment_id,
+                    CommandRecord.id > effective_after_sequence,
+                    CommandRecord.expires_at > normalized_now,
+                    CommandRecord.result_received_at.is_(None),
+                )
+                .order_by(CommandRecord.id)
+            ).all()
+
+            result = [
+                PendingCommand(
+                    sequence=row.id,
+                    command=Command(
+                        id=row.command_id,
+                        command=CommandType(row.command_type),
+                        expires_at=row.expires_at.replace(tzinfo=UTC),
+                        lines=row.lines,
+                        protocol_version=row.protocol_version,
+                    ),
+                )
+                for row in rows
+            ]
+            for row in rows:
+                if row.delivered_at is None:
+                    row.delivered_at = normalized_now
+            return result
+
+    def record_command_result(
+        self, command_id: str, apartment_id: str, result: CommandResult, now: datetime
+    ) -> RecordCommandResultOutcome:
+        """Stores the result of an executed (or rejected) command (section
+        7: "result via POST /v1/commands/{id}/result, with duration and
+        error text") -- see `RecordCommandResultOutcome`'s own docstring
+        for what each outcome means and how `fleet.app.receive_command_result`
+        maps it to an HTTP status.
+
+        **Scoped to `apartment_id`** -- a command id that exists but
+        belongs to a different apartment is `NOT_FOUND`, indistinguishable
+        from a command id that does not exist at all (mirrors `fleet/auth
+        .py`'s "wrong token vs. unknown apartment" reasoning: an agent must
+        not learn, from this endpoint's response, whether a given command
+        id belongs to *some other* apartment).
+
+        **A second result for an already-resulted command** is not simply
+        rejected outright: if it reports the exact same
+        `successful`/`duration_s`/`error_text` as what is already stored,
+        it is `DUPLICATE_IDENTICAL` (a plain retry after a lost response
+        must not become a permanent error for a well-behaved agent that
+        simply never saw its own `204`); if it disagrees with what is
+        stored, it is `CONFLICT` -- genuinely unexpected, and deliberately
+        not silently overwritten (the first report stays authoritative).
+
+        Not gated on `expires_at`: a command can legitimately still be
+        executing, or have just finished, at the moment its expiry passes
+        -- expiry only ever gates *delivery* (`pending_commands`), never
+        whether a result for an already-delivered command may still be
+        reported.
+        """
+
+        with self.session() as session:
+            record = session.scalar(
+                select(CommandRecord).where(
+                    CommandRecord.command_id == command_id,
+                    CommandRecord.apartment_id == apartment_id,
+                )
+            )
+            if record is None:
+                return RecordCommandResultOutcome.NOT_FOUND
+
+            if record.result_received_at is not None:
+                if (
+                    record.successful == result.successful
+                    and record.duration_s == result.duration_s
+                    and record.error_text == result.error_text
+                ):
+                    return RecordCommandResultOutcome.DUPLICATE_IDENTICAL
+                return RecordCommandResultOutcome.CONFLICT
+
+            record.successful = result.successful
+            record.duration_s = result.duration_s
+            record.error_text = result.error_text
+            record.result_received_at = _naive_utc(now)
+            return RecordCommandResultOutcome.STORED
 
     # -- alarms (P2.2, section 8) -------------------------------------------------
 

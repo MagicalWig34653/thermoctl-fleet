@@ -94,6 +94,7 @@ def test_command_list_is_closed() -> None:
         "id": "123",
         "command": "report_now",
         "expires_at": "2026-09-22T14:18:11Z",
+        "protocol_version": 1,
     }
     Command.model_validate(valid)
 
@@ -123,6 +124,7 @@ def test_stage_2_commands_are_not_part_of_the_enumeration() -> None:
                     "id": "123",
                     "command": name,
                     "expires_at": "2026-09-22T14:18:11Z",
+                    "protocol_version": 1,
                 }
             )
 
@@ -138,8 +140,27 @@ def test_diagnostic_bundle_is_stage_1_and_is_accepted() -> None:
             "id": "123",
             "command": "diagnostic_bundle",
             "expires_at": "2026-09-22T14:18:11Z",
+            "protocol_version": 1,
         }
     )
+
+
+def test_command_without_protocol_version_is_rejected() -> None:
+    """P5.1, section 18.2: `Command.protocol_version` is required, not
+
+    defaulted -- a command the fleet forgot to stamp must not silently pass
+    as "version 0" or similar; the agent needs a real value to compare
+    against its own understanding of the protocol.
+    """
+
+    with pytest.raises(pydantic.ValidationError):
+        Command.model_validate(
+            {
+                "id": "123",
+                "command": "report_now",
+                "expires_at": "2026-09-22T14:18:11Z",
+            }
+        )
 
 
 def test_heartbeat_with_lower_protocol_version_is_accepted() -> None:

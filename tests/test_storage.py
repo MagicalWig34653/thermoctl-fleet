@@ -32,8 +32,10 @@ from fleet.storage import (
     ApartmentRecord,
     AssignmentRecord,
     Base,
+    CommandRecord,
     DeviceRecord,
     HeartbeatRecord,
+    RecordCommandResultOutcome,
     Storage,
     _alembic_config,
     create_engine_from_url,
@@ -43,7 +45,9 @@ from fleet.storage import (
     hash_token,
     upgrade,
 )
-from protocol import Event, FaultKind, Heartbeat
+from protocol import CommandResult, Event, FaultKind, Heartbeat
+from protocol.commands import CommandType
+from protocol.version import PROTOCOL_VERSION
 
 
 def _database_url(tmp_path: object) -> str:
@@ -2329,3 +2333,531 @@ def test_remove_device_rejects_an_expected_assignment_id_from_another_apartment(
     assert storage.get_current_assignment("house9-b01") is not None
     assert storage.get_apartment_token_hash("house7-a03") is not None
     assert storage.get_apartment_token_hash("house9-b01") is not None
+
+
+# -----------------------------------------------------------------------------
+# Commands (P5.1, docs/specification.md sections 3, 7)
+# -----------------------------------------------------------------------------
+
+
+def _make_apartment(storage: Storage, apartment_id: str = "house7-a03") -> None:
+    storage.create_apartment(
+        apartment_id,
+        property_id=storage.create_property("House 7", "Sample Street 7").id,
+        label=apartment_id,
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+
+
+def test_create_command_refuses_an_unknown_apartment(storage: Storage) -> None:
+    with pytest.raises(ValueError, match="Unknown apartment"):
+        storage.create_command(
+            "no-such-apartment",
+            CommandType.REPORT_NOW,
+            lines=None,
+            ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+
+
+def test_create_command_refuses_a_retired_apartment(storage: Storage) -> None:
+    _make_apartment(storage)
+    storage.update_apartment(
+        "house7-a03",
+        label="house7-a03",
+        floor=None,
+        orientation=None,
+        heating_circuits=1,
+        state="retired",
+        pilot_mode=False,
+        ui_username="landlord",
+        reason="Out of service",
+    )
+
+    with pytest.raises(ValueError, match="retired"):
+        storage.create_command(
+            "house7-a03",
+            CommandType.REPORT_NOW,
+            lines=None,
+            ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+
+
+def test_create_command_refuses_lines_on_a_non_fetch_logs_command(storage: Storage) -> None:
+    _make_apartment(storage)
+
+    with pytest.raises(ValueError, match="lines is only valid"):
+        storage.create_command(
+            "house7-a03",
+            CommandType.REPORT_NOW,
+            lines=100,
+            ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+
+
+def test_create_command_allows_lines_on_fetch_logs(storage: Storage) -> None:
+    _make_apartment(storage)
+
+    command = storage.create_command(
+        "house7-a03",
+        CommandType.FETCH_LOGS,
+        lines=200,
+        ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    assert command.lines == 200
+    assert command.command == CommandType.FETCH_LOGS
+
+
+def test_create_command_sets_expiry_15_minutes_after_creation(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert command.expires_at == now + timedelta(minutes=15)
+
+
+def test_create_command_stamps_current_protocol_version(storage: Storage) -> None:
+    _make_apartment(storage)
+
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    assert command.protocol_version == PROTOCOL_VERSION
+
+
+def test_create_command_id_is_a_fresh_uuid4_hex_each_time(storage: Storage) -> None:
+    _make_apartment(storage)
+
+    first = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    second = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    assert first.id != second.id
+    assert len(first.id) == 32  # uuid4().hex
+
+
+def test_pending_commands_returns_nothing_for_an_apartment_with_no_commands(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage)
+
+    assert storage.pending_commands("house7-a03", 0, datetime.now(UTC)) == []
+
+
+def test_pending_commands_returns_a_created_command(storage: Storage) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    pending = storage.pending_commands("house7-a03", 0, datetime.now(UTC))
+
+    assert len(pending) == 1
+    assert pending[0].command == command
+    assert pending[0].sequence == 1
+
+
+def test_pending_commands_after_sequence_skips_already_seen_ones(storage: Storage) -> None:
+    _make_apartment(storage)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    second = storage.create_command(
+        "house7-a03", CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    pending = storage.pending_commands("house7-a03", 1, datetime.now(UTC))
+
+    assert [item.command.id for item in pending] == [second.id]
+
+
+def test_pending_commands_never_returns_an_expired_command(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    pending = storage.pending_commands("house7-a03", 0, now + timedelta(minutes=16))
+
+    assert pending == []
+
+
+def test_pending_commands_scoped_to_the_apartment(storage: Storage) -> None:
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    storage.create_command(
+        "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    assert storage.pending_commands("house7-a03", 0, datetime.now(UTC)) == []
+
+
+def test_pending_commands_clamps_an_after_sequence_beyond_this_apartments_own_range(
+    storage: Storage,
+) -> None:
+    """Cross-review reproduction: `id`/sequence is one global counter
+    shared by every apartment's commands -- a `Last-Event-ID` that is
+    syntactically valid (just never actually sent to *this* apartment)
+    must not silently hide a command this apartment genuinely has pending.
+    Ten commands for B (sequences 1-10), then one for A (sequence 11):
+    `pending_commands("house9-b01" -> unrelated apartment "house7-a03",
+    16, now)` used to return `[]` -- 16 is beyond A's own maximum sequence
+    (11), so it is now clamped to `0` instead of trusted as-is."""
+
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    for _ in range(10):
+        storage.create_command(
+            "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+    a_command = storage.create_command(
+        "house7-a03", CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    pending = storage.pending_commands("house7-a03", 16, datetime.now(UTC))
+
+    assert [item.command.id for item in pending] == [a_command.id]
+
+
+def test_pending_commands_legitimate_resume_still_skips_this_apartments_older_commands(
+    storage: Storage,
+) -> None:
+    """The clamp above must not defeat ordinary, legitimate resumption --
+    an `after_sequence` that *is* within this apartment's own range still
+    excludes that apartment's own older, already-delivered commands."""
+
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    for _ in range(10):
+        storage.create_command(
+            "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+    first = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    second = storage.create_command(
+        "house7-a03", CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    all_pending = storage.pending_commands("house7-a03", 0, datetime.now(UTC))
+    assert [item.command.id for item in all_pending] == [first.id, second.id]
+    first_sequence = all_pending[0].sequence
+
+    resumed = storage.pending_commands("house7-a03", first_sequence, datetime.now(UTC))
+
+    assert [item.command.id for item in resumed] == [second.id]
+
+
+def test_pending_commands_between_range_sequence_not_this_apartments_own_is_rejected(
+    storage: Storage,
+) -> None:
+    """Round-2 cross-review reproduction: the round-1 fix (clamp only if
+    `after_sequence` exceeds this apartment's own *maximum* sequence) was
+    itself incomplete -- a value strictly *between* two of this
+    apartment's own sequences, but not equal to either, still slipped
+    through unnoticed and hid a genuinely pending command. A at sequences
+    1 and 11, B at 2-10: `pending_commands("apartment-a", 2, now)` must
+    still deliver A's own pending sequence-1 command, not skip it just
+    because `2 < 11`."""
+
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    first = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    for _ in range(9):
+        storage.create_command(
+            "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+    eleventh = storage.create_command(
+        "house7-a03", CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    all_pending = storage.pending_commands("house7-a03", 0, datetime.now(UTC))
+    assert [item.command.id for item in all_pending] == [first.id, eleventh.id]
+    # A sequence that belongs to B (house9-b01), strictly between A's own
+    # two sequences -- syntactically plausible, never actually sent to A.
+    b_owned_between_sequence = all_pending[0].sequence + 1
+
+    pending = storage.pending_commands(
+        "house7-a03", b_owned_between_sequence, datetime.now(UTC)
+    )
+
+    assert [item.command.id for item in pending] == [first.id, eleventh.id]
+
+
+def test_pending_commands_rejects_a_non_positive_after_sequence_without_a_db_error(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage, "house7-a03")
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    for value in (-1, 0):
+        pending = storage.pending_commands("house7-a03", value, datetime.now(UTC))
+        assert [item.command.id for item in pending] == [command.id]
+
+
+def test_pending_commands_rejects_an_after_sequence_beyond_bigint_range_without_overflowing(
+    storage: Storage,
+) -> None:
+    """`_MAX_COMMAND_SEQUENCE` (`2**63 - 1`) is the guard -- exactly that
+    value is still a plausible (if absurd) `BIGINT`, so it goes through the
+    ordinary membership check (and is correctly rejected there, this
+    apartment never had a command at that sequence); `2**63` and `2**128`
+    are rejected *before* ever being bound as a SQL parameter, since
+    neither SQLite nor PostgreSQL can represent them in a `BIGINT` column
+    at all -- binding either directly risks an `OverflowError` or a
+    driver-level failure instead of the ordinary "not a valid resume
+    point" fallback."""
+
+    _make_apartment(storage, "house7-a03")
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    for value in (2**63 - 1, 2**63, 2**128):
+        pending = storage.pending_commands("house7-a03", value, datetime.now(UTC))
+        assert [item.command.id for item in pending] == [command.id]
+
+
+def test_pending_commands_never_returns_a_command_with_a_stored_result(storage: Storage) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    storage.record_command_result(
+        command.id,
+        "house7-a03",
+        CommandResult(id=command.id, successful=True, duration_s=1.0),
+        datetime.now(UTC),
+    )
+
+    assert storage.pending_commands("house7-a03", 0, datetime.now(UTC)) == []
+
+
+def test_pending_commands_marks_delivered_at_on_first_delivery(storage: Storage) -> None:
+    _make_apartment(storage)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    storage.pending_commands("house7-a03", 0, datetime.now(UTC))
+
+    with storage.session() as session:
+        row = session.query(CommandRecord).filter_by(apartment_id="house7-a03").one()
+        assert row.delivered_at is not None
+
+
+def test_record_command_result_unknown_command_id_is_not_found(storage: Storage) -> None:
+    outcome = storage.record_command_result(
+        "does-not-exist",
+        "house7-a03",
+        CommandResult(id="does-not-exist", successful=True, duration_s=1.0),
+        datetime.now(UTC),
+    )
+
+    assert outcome is RecordCommandResultOutcome.NOT_FOUND
+
+
+def test_record_command_result_another_apartments_command_is_not_found(storage: Storage) -> None:
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    command = storage.create_command(
+        "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    outcome = storage.record_command_result(
+        command.id,
+        "house7-a03",
+        CommandResult(id=command.id, successful=True, duration_s=1.0),
+        datetime.now(UTC),
+    )
+
+    assert outcome is RecordCommandResultOutcome.NOT_FOUND
+
+
+def test_record_command_result_stores_fields(storage: Storage) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    now = datetime.now(UTC)
+
+    outcome = storage.record_command_result(
+        command.id,
+        "house7-a03",
+        CommandResult(id=command.id, successful=False, duration_s=3.5, error_text="disk full"),
+        now,
+    )
+
+    assert outcome is RecordCommandResultOutcome.STORED
+    with storage.session() as session:
+        row = session.query(CommandRecord).filter_by(command_id=command.id).one()
+        assert row.successful is False
+        assert row.duration_s == 3.5
+        assert row.error_text == "disk full"
+        assert row.result_received_at is not None
+
+
+def test_record_command_result_duplicate_identical_report_is_a_no_op(storage: Storage) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    result = CommandResult(id=command.id, successful=True, duration_s=1.0)
+
+    first = storage.record_command_result(command.id, "house7-a03", result, datetime.now(UTC))
+    second = storage.record_command_result(command.id, "house7-a03", result, datetime.now(UTC))
+
+    assert first is RecordCommandResultOutcome.STORED
+    assert second is RecordCommandResultOutcome.DUPLICATE_IDENTICAL
+
+
+def test_record_command_result_conflicting_second_report_is_a_conflict(storage: Storage) -> None:
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    first = storage.record_command_result(
+        command.id, "house7-a03",
+        CommandResult(id=command.id, successful=True, duration_s=1.0),
+        datetime.now(UTC),
+    )
+    second = storage.record_command_result(
+        command.id, "house7-a03",
+        CommandResult(id=command.id, successful=False, duration_s=2.0, error_text="retry"),
+        datetime.now(UTC),
+    )
+
+    assert first is RecordCommandResultOutcome.STORED
+    assert second is RecordCommandResultOutcome.CONFLICT
+    # The first, authoritative report is never overwritten by the conflict.
+    with storage.session() as session:
+        row = session.query(CommandRecord).filter_by(command_id=command.id).one()
+        assert row.successful is True
+        assert row.duration_s == 1.0
+
+
+def test_record_command_result_not_gated_on_expiry(storage: Storage) -> None:
+    """A result for a command that has since expired must still be
+    recordable -- expiry only ever gates *delivery* (`pending_commands`),
+    never result reporting."""
+
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    outcome = storage.record_command_result(
+        command.id,
+        "house7-a03",
+        CommandResult(id=command.id, successful=True, duration_s=1.0),
+        now + timedelta(minutes=30),
+    )
+
+    assert outcome is RecordCommandResultOutcome.STORED
+
+
+# -----------------------------------------------------------------------------
+# Migration 0009: commands table
+# -----------------------------------------------------------------------------
+
+
+def test_migration_0009_creates_the_commands_table(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+
+    upgrade(url)
+
+    engine = create_storage(url).engine
+    columns = {column["name"] for column in inspect(engine).get_columns("commands")}
+    assert columns == {
+        "id",
+        "command_id",
+        "apartment_id",
+        "command_type",
+        "lines",
+        "created_at",
+        "expires_at",
+        "created_by",
+        "protocol_version",
+        "delivered_at",
+        "successful",
+        "duration_s",
+        "error_text",
+        "result_received_at",
+    }
+
+
+def test_migration_0009_downgrade_removes_the_table_upgrade_restores_it(
+    tmp_path: object,
+) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_storage(url).engine
+    assert "commands" in inspect(engine).get_table_names()
+
+    downgrade(url, "0008")
+    assert "commands" not in inspect(engine).get_table_names()
+
+    upgrade(url)
+    assert "commands" in inspect(engine).get_table_names()
+
+
+def test_migrations_0001_through_0009_match_the_orm_model_exactly(tmp_path: object) -> None:
+    """Extends the existing `test_migrations_match_the_orm_model_exactly`
+    coverage to include `0009_commands.py` -- run as its own test (not a
+    change to that one) so a failure here is unambiguous about which
+    migration regressed."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_storage(url).engine
+
+    with engine.connect() as connection:
+        context = MigrationContext.configure(connection)
+        diff = compare_metadata(context, Base.metadata)
+
+    assert diff == []

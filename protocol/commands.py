@@ -54,6 +54,19 @@ class Command(BaseModel):
     (section 7). The agent **no longer** executes a command after it has expired --
     this check belongs, like the command list itself, in the agent, not in the
     cloud (section 2: the agent is the security boundary).
+
+    `protocol_version` (P5.1, section 18.2): the `PROTOCOL_VERSION` this
+    command was created under. Required, not defaulted to the fleet's own
+    current `PROTOCOL_VERSION` at the model level -- the whole point of
+    carrying it is that a *future* fleet service, running a newer
+    `PROTOCOL_VERSION` than an older, still-deployed agent understands, can
+    stamp a command with that newer number, and section 18.2's rule ("the
+    agent rejects commands of a newer version it does not know ... reports
+    that as a result, and keeps running") needs a value to compare against
+    on the agent side. `fleet.storage.Storage.create_command` is what fills
+    it in for real, from `protocol.version.PROTOCOL_VERSION` at creation
+    time -- this model itself only carries the field, it does not decide
+    its value.
     """
 
     id: str = Field(min_length=1)
@@ -62,6 +75,7 @@ class Command(BaseModel):
     # Only relevant for fetch_logs: "the last n lines ... capped at 500 lines"
     # (section 7). Stays empty for every other command.
     lines: int | None = Field(default=None, ge=1, le=500)
+    protocol_version: int = Field(ge=1)
 
 
 class CommandResult(BaseModel):
