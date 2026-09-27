@@ -4,14 +4,17 @@ Flow: send heartbeat, keep the SSE command channel open (fallback: poll every
 60 s), locally check and execute an incoming command, report the result.
 
 **P5.2 (this package) wires up command execution**: `receive_commands` and
-`report_result` are thin calls into `agent.commands_channel` (P5.1, left
-**unmodified** -- everything P5.2 needs from that channel, receiving items
-and reporting a result, was already there); `execute_command`/
-`_handle_rejected_command`/`run` are new, real implementations, not
-placeholders -- section 7's own rules (execute at most once, honour expiry,
-log locally, keep running on a newer `protocol_version`) are enforced here,
-in the agent, per CLAUDE.md security principle 5 ("the agent is the security
-boundary, not the cloud"), never only assumed from what the cloud sends.
+`report_result` are thin calls into `agent.commands_channel` (P5.1);
+`execute_command`/`_handle_rejected_command`/`run` are new, real
+implementations, not placeholders -- section 7's own rules (execute at
+most once, honour expiry, log locally, keep running on a newer
+`protocol_version`) are enforced here, in the agent, per CLAUDE.md
+security principle 5 ("the agent is the security boundary, not the
+cloud"), never only assumed from what the cloud sends.
+`agent.commands_channel.receive_commands` itself gained one small,
+additive, optional parameter for this package (`on_contact`, cross-review
+finding -- see that module's own docstring): every other P5.1 behaviour
+and test is unaffected.
 
 Only `report_now`/`fetch_logs`/`backup_now`/`diagnostic_bundle`'s actual
 *effects* stay honest failures for now (each names the follow-up package
@@ -30,22 +33,32 @@ faking success.
 section was produced by a Codex run that was interrupted before it could
 verify or commit its own work (its own environment could not open local
 TLS/socket connections at all, so it never actually ran the real end-to-end
-tests it wrote). That draft is not used as-is here: its executed-id
-persistence (JSON, hashed ids in the local log) and its channel-level
-`on_contact` callback (which would have modified the already-shipped,
-cross-reviewed `agent/commands_channel.py`, P5.1) were both reverted in
-favor of the design below, which needs no change to that file at all. Two
-of its ideas *were* kept, independently re-verified here: local-log
+tests it wrote). That draft's own executed-id persistence (JSON, hashed
+ids in the local log) was reverted in favor of the design below (line-based,
+raw ids -- see `AgentState`'s own docstring); its channel-level `on_contact`
+idea was **not** reverted, on cross-review of this package's own first,
+log-sniffing replacement -- an explicit, additive signal from
+`agent.commands_channel.receive_commands` itself is more direct and does
+not depend on that module's log wording staying stable. Two further ideas
+from the draft were kept, independently re-verified here: local-log
 newline-escaping/truncation against a hostile, cloud-echoed rejection
 reason, and representing "fault/control not yet knowable" (P2.3 still
 deferred) as a genuinely stale LED status file rather than a fabricated
 "no fault" value -- see `_append_local_log` and `report_led_status` below
-for the reasoning in full.
+for the reasoning in full. Cross-review of this package's own first
+version (after the draft) additionally found and fixed: a command id
+containing a newline breaking at-most-once persistence (`_is_valid_command_id`),
+no idle retry of the result outbox (`run`'s own `_on_contact`), and
+missing hardening of this package's own on-disk state files against a
+symlink or FIFO (`agent.safe_io`, this module's `load_agent_state`/
+`_append_local_log`, `agent.commands_channel`'s `_read_last_event_id`/
+`_load_outbox`).
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from collections.abc import Callable, Generator
@@ -61,9 +74,10 @@ from agent.commands_channel import (
     CommandStreamAuthError,
     RejectedCommand,
 )
-from agent.commands_channel import logger as _commands_channel_logger
+from agent.commands_channel import flush_outbox as _flush_outbox
 from agent.commands_channel import receive_commands as _receive_commands
 from agent.commands_channel import report_result as _report_result
+from agent.safe_io import append_bytes_safe, read_text_safe
 from protocol import Command, CommandResult, DesiredState, Heartbeat
 from protocol.commands import CommandType
 
@@ -104,6 +118,34 @@ DEFAULT_LED_STATUS_FILE = Path("/run/thermoctl-agent/led-status.env")
 # line's length is not fixed the way a command id is.
 DEFAULT_LOCAL_LOG_MAX_BYTES = 1_000_000
 
+# **Cross-review finding, main-session decision:** `protocol.commands
+# .Command.id` carries no charset restriction at the model level
+# (`Field(min_length=1)` only) -- a compromised or merely buggy fleet
+# service could send an id containing a newline (e.g. `"a\nb"`). Before
+# this check existed, `save_agent_state`'s own newline-joined file format
+# meant such an id would be split across two lines on disk and never
+# recognised as itself again after a restart (`load_agent_state` reads it
+# back as two *different*, shorter ids) -- breaking section 7's own
+# at-most-once guarantee for exactly the id that most needed it (an
+# attacker-chosen one). `fleet.storage.Storage.create_command` only ever
+# produces `uuid4().hex` (a fixed 32-character lowercase hex string), so
+# this pattern is not a functional restriction on any real id, only on a
+# malformed/malicious one. Checked in `execute_command`/
+# `_handle_rejected_command` **before** anything is executed or persisted
+# -- see `_is_valid_command_id`.
+_COMMAND_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _is_valid_command_id(command_id: str) -> bool:
+    """`True` iff `command_id` matches `_COMMAND_ID_PATTERN` -- see that
+    constant's own comment for why this check exists at all. Deliberately
+    a plain ASCII allow-list (no unicode letters, no control characters,
+    bounded length) rather than merely "no newline": a narrow allow-list
+    is safer than trying to enumerate every character that could ever
+    cause trouble in a log line or a line-based file format."""
+
+    return bool(_COMMAND_ID_PATTERN.fullmatch(command_id))
+
 
 @dataclass
 class AgentState:
@@ -131,11 +173,27 @@ class AgentState:
 
 def load_agent_state(path: Path) -> AgentState:
     """Loads `AgentState.executed_ids` from `path` -- absent file (first
-    run) is not an error, just an empty list."""
+    run) is not an error, just an empty list.
 
-    if not path.exists():
+    **Fails closed** (cross-review, main-session decision): unlike
+    `agent.commands_channel`'s own bookkeeping files (its `Last-Event-ID`
+    bookmark, its result outbox -- both degrade to "nothing persisted" on
+    an unsafe path, see that module's own docstrings for why that is safe
+    there), a symlink or non-regular file at `path`
+    (`agent.safe_io.UnsafeStateFileError`) is **not** silently treated as
+    "no executed ids yet": doing so would let the very memory that
+    enforces section 7's at-most-once rule be quietly emptied by a local
+    attacker (or a corrupted disk), after which every already-executed
+    command becomes executable again. This function therefore lets that
+    exception (or any other `OSError`) propagate -- `agent.loop.run`'s own
+    caller (`agent.__main__._run_agent`) already turns any `OSError` into a
+    clear, non-zero exit rather than silently starting an executor that
+    cannot trust its own dedup memory.
+    """
+
+    raw = read_text_safe(path)
+    if raw is None:
         return AgentState()
-    raw = path.read_text(encoding="utf-8")
     ids = [line for line in raw.splitlines() if line]
     return AgentState(executed_ids=ids[-MAX_EXECUTED_IDS:])
 
@@ -163,9 +221,20 @@ def _record_executed(state: AgentState, command_id: str, path: Path) -> None:
 
 
 def _rotate_local_log_if_needed(path: Path, max_bytes: int) -> None:
-    if path.exists() and path.stat().st_size >= max_bytes:
+    try:
+        needs_rotation = path.exists() and path.stat().st_size >= max_bytes
+    except OSError:
+        # Fails safe, same reasoning as `_append_local_log`'s own docstring:
+        # an `lstat`/`stat` failure here just means rotation is skipped for
+        # this call, not that the whole command execution this log entry
+        # describes should be aborted.
+        return
+    if needs_rotation:
         backup = path.with_suffix(path.suffix + ".1")
-        path.replace(backup)
+        try:
+            path.replace(backup)
+        except OSError:
+            return
 
 
 def _append_local_log(
@@ -194,6 +263,16 @@ def _append_local_log(
     capped to `max_bytes - 1` bytes (a UTF-8-safe truncation, not a raw byte
     slice) so a single absurdly long message cannot by itself consume the
     entire bounded log before rotation ever gets a chance to run.
+
+    **Fails safe, not closed** (cross-review, main-session decision): the
+    actual file write goes through `agent.safe_io.append_bytes_safe`, which
+    refuses a symlink or non-regular file (a FIFO, a socket, a device node)
+    at `path` -- quickly, never blocking -- and returns `False` instead of
+    raising. This function does not surface that failure at all: the local
+    log is a nice-to-have local record (the `logger.info` call just above
+    already delivered `message` to the ordinary Python logger regardless),
+    not a security control that gates whether a command executes -- unlike
+    `load_agent_state`'s deliberately fail-**closed** executed-ids file.
     """
 
     logger.info("%s", message)
@@ -204,8 +283,7 @@ def _append_local_log(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     _rotate_local_log_if_needed(path, max_bytes)
-    with path.open("ab") as handle:
-        handle.write(data)
+    append_bytes_safe(path, data)
 
 
 def _as_aware_utc(value: datetime) -> datetime:
@@ -323,16 +401,19 @@ def receive_commands(
     *,
     fallback_poll_interval_s: float = 60.0,
     sleep: Callable[[float], None] = time.sleep,
+    on_contact: Callable[[bool], None] = lambda ok: None,
 ) -> Generator[Command | RejectedCommand]:
     """Reads the SSE stream `GET /v1/commands`, or the 60 s fallback (section 3).
 
     **A thin call into `agent.commands_channel.receive_commands`** (P5.1),
     now that P5.2 below can actually act on what it yields -- not a
     reimplementation, exactly as this function's own docstring used to say
-    it should become, and **without any change to that module** (see this
-    file's own module docstring for why that matters). Execution, id
-    de-duplication, and expiry checking still are not this function's job:
-    see `execute_command` and `run`.
+    it should become. `on_contact` (cross-review of P5.2, main-session
+    decision) is forwarded unchanged -- see that module's own
+    `receive_commands` docstring for the full contract; `run` below is
+    this package's own caller. Execution, id de-duplication, and expiry
+    checking still are not this function's job: see `execute_command` and
+    `run`.
     """
 
     return _receive_commands(
@@ -340,6 +421,7 @@ def receive_commands(
         last_event_id_path,
         fallback_poll_interval_s=fallback_poll_interval_s,
         sleep=sleep,
+        on_contact=on_contact,
     )
 
 
@@ -490,6 +572,20 @@ def execute_command(
 ) -> ExecutionOutcome:
     """Checks and executes a single stage-1 command (section 7).
 
+    0. **`command.id` matches `_COMMAND_ID_PATTERN`** -- checked before
+       anything else, including the duplicate check (principle 5: this is
+       validation, done in the agent, not assumed from what the cloud
+       sends). `protocol.commands.Command.id` has no charset restriction
+       at the model level; an id containing e.g. a newline would silently
+       break `save_agent_state`'s newline-joined file format (see that
+       constant's own comment). An invalid id is never executed, never
+       persisted into `state.executed_ids` (it is not trustworthy enough
+       to spend a dedup slot on), and gets **no result report at all** --
+       the id itself cannot be trusted enough to address a report to.
+       Logged locally only, via `repr()` (which itself already renders
+       every control character, including a raw newline, as a backslash
+       escape -- `_append_local_log`'s own newline-escaping is layered on
+       top of that, not a replacement for it).
     1. **Id not already in `state.executed_ids`** (execute at most once) --
        if it is, `ExecutionOutcome.result` is `None`: nothing is reported a
        second time, only logged locally (see `ExecutionOutcome`'s own
@@ -513,6 +609,13 @@ def execute_command(
     command and every rejection lands in the apartment's local log, not
     only in the cloud."
     """
+
+    if not _is_valid_command_id(command.id):
+        _append_local_log(
+            ctx.local_log_path,
+            f"command {command.command}: abgelehnt, ungültige id {command.id!r}.",
+        )
+        return ExecutionOutcome(result=None)
 
     if command.id in state.executed_ids:
         _append_local_log(
@@ -583,12 +686,26 @@ def _handle_rejected_command(
     nothing new to it) and still logged locally, but only ever through
     `_append_local_log`'s own escaping, never interpolated into anything
     else.
+
+    `rejected.id` (best-effort-extracted from a malformed payload, see
+    `agent.commands_channel._best_effort_command_id`) is just as untrusted
+    as a well-formed `Command.id` and gets the identical charset check
+    (`_is_valid_command_id`) before anything else -- an id this module
+    cannot trust enough to persist a dedup entry for is also not trusted
+    enough to address a result report to.
     """
 
     if rejected.id is None:
         _append_local_log(
             ctx.local_log_path,
             f"rejected command with no recoverable id: {rejected.reason}",
+        )
+        return ExecutionOutcome(result=None)
+
+    if not _is_valid_command_id(rejected.id):
+        _append_local_log(
+            ctx.local_log_path,
+            f"rejected command with an invalid id {rejected.id!r}: {rejected.reason}",
         )
         return ExecutionOutcome(result=None)
 
@@ -624,29 +741,6 @@ def report_result(client: httpx.Client, result: CommandResult, *, outbox_path: P
     """
 
     _report_result(client, result, outbox_path=outbox_path)
-
-
-class _CloudContactLogHandler(logging.Handler):
-    """Watches `agent.commands_channel`'s own `logger` for the WARNING it
-    already emits whenever the SSE stream or the `wait=0` fallback fails
-    (`receive_commands`'s own two `except` blocks) -- the P5.7 LED status
-    file's `cloud_contact` field flips to `lost` from here, **without any
-    change to `agent.commands_channel.receive_commands` itself** (it only
-    ever yields items, by design, see that module's docstring; an earlier
-    draft of this loop instead added a channel-level `on_contact` callback
-    parameter to that already-shipped, cross-reviewed P5.1 module purely
-    for this loop's own LED bookkeeping -- reverted here in favor of
-    observing the log output it already produces). Reset to `ok` happens
-    the moment `run` below actually receives another item -- succeeding at
-    that, by definition, means the channel currently works again (a still-
-    successful `wait=0` poll included)."""
-
-    def __init__(self, on_lost: Callable[[], None]) -> None:
-        super().__init__(level=logging.WARNING)
-        self._on_lost = on_lost
-
-    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover -- trivial delegate
-        self._on_lost()
 
 
 def report_led_status(
@@ -778,24 +872,36 @@ def run(
     `fault`/`control` in the LED status file stay `None` (unknown) here on
     every call -- see `report_led_status`'s own docstring for why, and for
     the trade-off that follows from it.
+
+    **`cloud_contact` and the idle outbox flush both come from one
+    callback, `_on_contact`, passed to `agent.commands_channel
+    .receive_commands` as `on_contact`** (cross-review of P5.2,
+    main-session decision: an explicit, additive signal from that module
+    itself, invoked exactly where the stream connects/fails or a poll
+    succeeds/fails -- not inferred by watching its log output, which an
+    earlier draft of this function did instead). On every `on_contact(True)`
+    (the channel just worked), this also calls `agent.commands_channel
+    .flush_outbox` -- a result that failed to report earlier is retried on
+    every successful poll/stream reconnect, not only when a *new* result
+    happens to be reported (cross-review: "idle flush of the result
+    outbox").
     """
 
     state = load_agent_state(executed_ids_path)
     ctx = ExecutionContext(watchdog_state_path=watchdog_state_path, local_log_path=local_log_path)
 
-    def _mark_lost() -> None:
-        report_led_status(led_status_path, cloud_contact="lost", fault=None, control=None)
+    def _on_contact(ok: bool) -> None:
+        report_led_status(
+            led_status_path, cloud_contact="ok" if ok else "lost", fault=None, control=None
+        )
+        if ok:
+            _flush_outbox(client, outbox_path)
 
-    handler = _CloudContactLogHandler(_mark_lost)
-    _commands_channel_logger.addHandler(handler)
-
-    report_led_status(led_status_path, cloud_contact="ok", fault=None, control=None)
-
-    commands = receive_commands(client, last_event_id_path, sleep=sleep)
+    commands = receive_commands(
+        client, last_event_id_path, sleep=sleep, on_contact=_on_contact
+    )
     try:
         for item in commands:
-            report_led_status(led_status_path, cloud_contact="ok", fault=None, control=None)
-
             if isinstance(item, RejectedCommand):
                 outcome = _handle_rejected_command(item, state, ctx, executed_ids_path)
             else:
@@ -819,7 +925,6 @@ def run(
         report_led_status(led_status_path, cloud_contact="lost", fault=None, control=None)
         raise
     finally:
-        _commands_channel_logger.removeHandler(handler)
         commands.close()
 
 

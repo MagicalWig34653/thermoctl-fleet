@@ -74,6 +74,91 @@ def test_handler_mapping_covers_exactly_command_type() -> None:
     assert set(_HANDLERS) == set(CommandType)
 
 
+# --- Command id charset validation (cross-review finding) -----------------
+# `protocol.commands.Command.id` has no charset restriction at the model
+# level (`Field(min_length=1)` only) -- a compromised fleet could send an
+# id containing a newline, which would silently break
+# `save_agent_state`'s newline-joined file format and defeat section 7's
+# at-most-once guarantee for exactly that id. Checked in `execute_command`
+# before anything is executed or persisted: an invalid id is never
+# executed, never added to `state.executed_ids`, and gets no result report
+# at all (the id itself cannot be trusted enough to address one to).
+
+
+@pytest.mark.parametrize(
+    ("bad_id", "case_name"),
+    [
+        ("a\nb", "embedded newline"),
+        ("a\rb", "embedded carriage return"),
+        ("a\x00b", "embedded NUL"),
+        ("a" * 129, "over-long (129 chars)"),
+        (" ", "empty after strip (whitespace only)"),
+        ("café-42", "unicode letters"),
+        ("id with spaces", "embedded space"),
+    ],
+)
+def test_execute_command_rejects_ids_outside_the_charset(
+    tmp_path: Path, bad_id: str, case_name: str
+) -> None:
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.AGENT_RESTART, command_id=bad_id)
+
+    outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert outcome.result is None, case_name
+    assert outcome.exit_after_report is False, case_name
+    # Not spent as a dedup slot either -- an untrustworthy id is not worth
+    # remembering.
+    assert bad_id not in state.executed_ids, case_name
+    assert not tmp_path.joinpath("executed_ids").exists(), case_name
+
+
+def test_execute_command_accepts_a_real_uuid4_hex_id(tmp_path: Path) -> None:
+    """The one shape `fleet.storage.Storage.create_command` actually
+    produces (`uuid4().hex`) must still pass -- this check is not a
+    functional restriction on any real id."""
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    _write_watchdog_state(ctx.watchdog_state_path, desired=_DIGEST_A, proven=_DIGEST_A)
+    command = _command(CommandType.AGENT_RESTART, command_id="0123456789abcdef0123456789abcdef")
+
+    outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert outcome.result is not None
+    assert outcome.result.successful is True
+
+
+def test_execute_command_logs_an_invalid_id_safely(tmp_path: Path) -> None:
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.AGENT_RESTART, command_id="a\nFAKE forged entry")
+
+    execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    log_contents = ctx.local_log_path.read_text(encoding="utf-8")
+    lines = log_contents.splitlines()
+    assert len(lines) == 1
+    assert "FAKE forged entry" in lines[0]
+    assert "\\n" in lines[0]
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["a\nb", "a\rb", "a\x00b", "a" * 129, " ", "café-42"],
+)
+def test_rejected_command_with_invalid_id_is_not_reported(tmp_path: Path, bad_id: str) -> None:
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    rejected = RejectedCommand(id=bad_id, reason="malformed")
+
+    outcome = _handle_rejected_command(rejected, state, ctx, tmp_path / "executed_ids")
+
+    assert outcome.result is None
+    assert bad_id not in state.executed_ids
+
+
 # --- report_now / fetch_logs / backup_now / diagnostic_bundle: honest ----
 # --- failed results, never a fake success ---------------------------------
 
@@ -270,6 +355,115 @@ def test_load_agent_state_with_no_file_is_empty(tmp_path: Path) -> None:
     assert state.executed_ids == []
 
 
+# --- Hardened reads of the agent's own state files (cross-review finding) -
+# `executed_command_ids` fails **closed**: a symlink or FIFO must not be
+# silently treated as "no ids yet" (that would quietly erase the very
+# at-most-once memory section 7 relies on) -- see `load_agent_state`'s own
+# docstring. Mirrors `agent.registration`'s established symlink/FIFO guard
+# for the private key and token files, minus that guard's additional
+# mode-0600 requirement (`agent.safe_io`'s own module docstring).
+
+
+def test_load_agent_state_fails_closed_on_a_symlink(tmp_path: Path) -> None:
+    from agent.safe_io import UnsafeStateFileError
+
+    target = tmp_path / "elsewhere"
+    target.write_text("some-id\n", encoding="utf-8")
+    path = tmp_path / "executed_command_ids"
+    path.symlink_to(target)
+
+    with pytest.raises(UnsafeStateFileError):
+        load_agent_state(path)
+
+
+def test_load_agent_state_refuses_a_fifo_quickly_not_a_hang(tmp_path: Path) -> None:
+    """A hard `signal.alarm` guard, the same tool used to originally
+    reproduce this class of hang for `agent.registration`'s own private-key
+    file (see `tests/test_agent_registration.py`) -- if this regressed
+    back to blocking on a FIFO, this test fails fast with a `TimeoutError`
+    instead of hanging the suite."""
+
+    import os
+    import signal
+
+    from agent.safe_io import UnsafeStateFileError
+
+    path = tmp_path / "executed_command_ids"
+    os.mkfifo(path)
+
+    def _on_alarm(signum: int, frame: object) -> None:
+        raise TimeoutError("blocked past the alarm guard -- likely a FIFO hang")
+
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(5)
+    try:
+        with pytest.raises(UnsafeStateFileError):
+            load_agent_state(path)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_run_stops_cleanly_when_executed_ids_file_is_unsafe(tmp_path: Path) -> None:
+    """The fail-closed behaviour is not just an internal detail: `run`
+    calls `load_agent_state` before anything else, so an unsafe
+    `executed_command_ids` file stops the whole loop before a single
+    command is ever considered -- proven here at the unit level (the
+    exception propagating out of `load_agent_state` itself); the CLI's own
+    handling of this (`agent.__main__._run_agent`, a clear exit-1 message)
+    is covered in `tests/test_agent_main.py`."""
+
+    from agent.safe_io import UnsafeStateFileError
+
+    path = tmp_path / "executed_command_ids"
+    path.symlink_to(tmp_path / "nonexistent-target")
+
+    with pytest.raises((UnsafeStateFileError, OSError)):
+        load_agent_state(path)
+
+
+# --- Local log write degrades safely, does not hang or crash execution ----
+
+
+def test_append_local_log_degrades_on_a_fifo_quickly_not_a_hang(tmp_path: Path) -> None:
+    """Unlike `executed_command_ids` above, the local log fails **safe**,
+    not closed (`_append_local_log`'s own docstring): a FIFO at its path
+    must not hang, and must not stop `execute_command` from returning a
+    real result either."""
+
+    import os
+    import signal
+
+    log_path = tmp_path / "agent.log"
+    os.mkfifo(log_path)
+
+    def _on_alarm(signum: int, frame: object) -> None:
+        raise TimeoutError("blocked past the alarm guard -- likely a FIFO hang")
+
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(5)
+    try:
+        state = AgentState()
+        ctx = ExecutionContext(
+            watchdog_state_path=tmp_path / "state.env",
+            local_log_path=log_path,
+            now=lambda: APARTMENT_NOW,
+        )
+        _write_watchdog_state(ctx.watchdog_state_path, desired=_DIGEST_A, proven=_DIGEST_A)
+        command = _command(CommandType.AGENT_RESTART)
+
+        outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+    assert outcome.result is not None
+    assert outcome.result.successful is True
+    # The FIFO was never actually written to -- `append_bytes_safe` refused
+    # it, silently, exactly as documented.
+    assert log_path.is_fifo()
+
+
 # --- expiry: rejected by the agent's own clock -----------------------------
 
 
@@ -422,6 +616,53 @@ def test_local_log_is_bounded_and_rotates(tmp_path: Path) -> None:
     backup_path = log_path.with_suffix(log_path.suffix + ".1")
     assert backup_path.exists()
     assert "third line" in log_path.read_text(encoding="utf-8")
+
+
+def test_local_log_rotation_degrades_safely_when_stat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_rotate_local_log_if_needed` fails safe (skips rotation for this
+    call, does not raise) if `Path.stat` itself raises `OSError` --
+    mirrors `_append_local_log`'s own "the log is advisory, not a security
+    control" reasoning. Tested directly against
+    `_rotate_local_log_if_needed` (not through `_append_local_log`, which
+    itself calls `Path.mkdir`/`Path.exists` -- both internally use `stat`
+    too, so patching it globally would break those instead of only the
+    rotation check this test means to exercise)."""
+
+    from pathlib import Path as PathType
+
+    from agent.loop import _rotate_local_log_if_needed
+
+    log_path = tmp_path / "agent.log"
+    log_path.write_text("existing content\n", encoding="utf-8")
+
+    def _raising_stat(self: PathType, *args: object, **kwargs: object) -> object:
+        raise OSError("simulated stat failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PathType, "stat", _raising_stat)
+        _rotate_local_log_if_needed(log_path, max_bytes=1)
+
+    assert not log_path.with_suffix(log_path.suffix + ".1").exists()
+
+
+def test_local_log_rotation_degrades_safely_when_replace_fails(tmp_path: Path) -> None:
+    """The rotation target (`<log>.1`) already existing as a directory
+    makes `Path.replace` raise `OSError` -- also skipped, not raised."""
+
+    from agent.loop import _append_local_log
+
+    log_path = tmp_path / "agent.log"
+    log_path.write_text("x" * 100, encoding="utf-8")
+    backup_path = log_path.with_suffix(log_path.suffix + ".1")
+    backup_path.mkdir()
+
+    _append_local_log(log_path, "a new line", max_bytes=10)
+
+    # Rotation was skipped (the directory is still there, untouched, not
+    # replaced by the log file) -- the write itself still happened.
+    assert backup_path.is_dir()
 
 
 def test_local_log_directory_is_created_if_missing(tmp_path: Path) -> None:

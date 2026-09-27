@@ -19,6 +19,7 @@ from agent.registration import (
     load_token,
     register,
 )
+from agent.safe_io import UnsafeStateFileError
 from agent.transport import build_client
 from protocol.registration import AgentRegistrationFile
 
@@ -89,6 +90,18 @@ def _run_agent(args: argparse.Namespace) -> int:
     except CommandStreamAuthError:
         print(
             "thermoctl-agent: command authorization refused; token revoked or invalid.",
+            file=sys.stderr,
+        )
+        return 1
+    except UnsafeStateFileError:
+        # `loop.run`'s own `load_agent_state` fails closed (cross-review,
+        # main-session decision) rather than silently starting an executor
+        # that cannot trust its own at-most-once dedup memory -- a clear,
+        # specific message here, distinct from the generic one below.
+        print(
+            "thermoctl-agent: refusing to run -- the agent's own state file "
+            "is a symlink or not a regular file; fix it by hand before "
+            "retrying.",
             file=sys.stderr,
         )
         return 1

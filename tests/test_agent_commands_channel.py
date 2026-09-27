@@ -49,7 +49,9 @@ from agent.commands_channel import (
     _parse_command_obj,
     _parse_event_data,
     _poll_once,
+    _read_last_event_id,
     _stream_once,
+    flush_outbox,
     receive_commands,
     report_result,
 )
@@ -593,7 +595,9 @@ def test_receive_commands_uses_the_poll_fallback_when_only_the_stream_fails(
         now=datetime.now(UTC),
     )
 
-    def _always_fails(client: object, path: object) -> Iterator[object]:
+    def _always_fails(
+        client: object, path: object, on_contact: object = None
+    ) -> Iterator[object]:
         raise CommandStreamError("forced failure for this test")
         yield  # pragma: no cover -- makes this a generator, never reached.
 
@@ -757,3 +761,233 @@ def test_receive_commands_does_not_swallow_a_revoked_token(
                     next(gen)
             finally:
                 gen.close()
+
+
+# -----------------------------------------------------------------------------
+# `on_contact` (cross-review of P5.2, main-session decision): an additive,
+# optional callback -- existing behaviour/tests above are all unaffected
+# (none of them pass it).
+# -----------------------------------------------------------------------------
+
+
+def test_stream_once_calls_on_contact_true_once_connected(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    """A pending command is created first so the stream actually delivers
+    an event -- `on_contact(True)` fires right after the connection opens
+    (before the `for sse in event_source.iter_sse():` loop, which blocks
+    until an event arrives), but nothing is ever *yielded* at that point;
+    without a real event to wait for, `next(gen)` on an otherwise-empty
+    stream would block forever, not merely until the connection opens."""
+
+    token = _issue_token(app_storage)
+    app_storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            calls: list[bool] = []
+            gen = _stream_once(client, tmp_path / "last-event-id", calls.append)
+            try:
+                next(gen)
+            finally:
+                # `_stream_once` is typed as the narrower `Iterator` (unlike
+                # `receive_commands`'s own `Generator`, see that function's
+                # docstring for why) -- it is still a real generator object
+                # at runtime, so `.close()` works; only the static type is
+                # too narrow to know that.
+                gen.close()  # type: ignore[attr-defined]
+
+            assert calls == [True]
+
+
+def test_stream_once_does_not_call_on_contact_on_auth_failure(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    token = _issue_token_via_device_flow(app_storage)
+    _revoke_token(app_storage, APARTMENT)
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            calls: list[bool] = []
+
+            with pytest.raises(CommandStreamAuthError):
+                list(_stream_once(client, tmp_path / "last-event-id", calls.append))
+
+            assert calls == []
+
+
+def test_receive_commands_calls_on_contact_false_on_stream_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[bool] = []
+
+    def _always_fails(
+        client: object, path: object, on_contact: object = None
+    ) -> Iterator[object]:
+        raise CommandStreamError("forced failure for this test")
+        yield  # pragma: no cover -- makes this a generator, never reached.
+
+    monkeypatch.setattr(commands_channel_module, "_stream_once", _always_fails)
+
+    # The `wait=0` fallback returns one deliberately malformed entry (`{}`,
+    # no `id`/`command`) so `receive_commands`'s own `yield from items`
+    # actually yields something -- otherwise (an empty list) the outer
+    # `while True` would spin internally forever inside this one `next()`
+    # call, never returning control to this test at all.
+    with httpx.Client(
+        base_url="https://example.invalid",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[{}])),
+    ) as client:
+        gen = receive_commands(
+            client, tmp_path / "last-event-id", sleep=lambda seconds: None,
+            on_contact=calls.append,
+        )
+        try:
+            item = next(gen)
+            assert isinstance(item, RejectedCommand)
+        finally:
+            gen.close()
+
+    assert calls == [False, True]  # stream failed, then the wait=0 poll succeeded
+
+
+def test_receive_commands_calls_on_contact_false_when_poll_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[bool] = []
+
+    def _always_fails(
+        client: object, path: object, on_contact: object = None
+    ) -> Iterator[object]:
+        raise CommandStreamError("forced stream failure")
+        yield  # pragma: no cover -- makes this a generator, never reached.
+
+    class _StopAfterOneIteration(Exception):
+        pass
+
+    def _sleep_once(seconds: float) -> None:
+        # Both the stream and the poll fail without ever yielding anything
+        # -- `sleep` is this outer loop's only "end of one iteration"
+        # signal, so it is used here to escape deterministically after
+        # exactly one full failed round, rather than spinning forever
+        # inside a single `next()` call.
+        raise _StopAfterOneIteration
+
+    monkeypatch.setattr(commands_channel_module, "_stream_once", _always_fails)
+
+    with httpx.Client(
+        base_url="https://example.invalid",
+        transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+    ) as client:
+        gen = receive_commands(
+            client, tmp_path / "last-event-id", sleep=_sleep_once, on_contact=calls.append,
+        )
+        try:
+            with pytest.raises(_StopAfterOneIteration):
+                next(gen)
+        finally:
+            gen.close()
+
+    assert calls == [False, False]
+
+    assert calls == [False, False]
+
+
+# -----------------------------------------------------------------------------
+# `flush_outbox`: the idle-flush entry point `agent.loop.run` calls from its
+# own `on_contact(True)` handler.
+# -----------------------------------------------------------------------------
+
+
+def test_flush_outbox_delivers_a_previously_buffered_result(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    token = _issue_token(app_storage)
+    command = app_storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    outbox_path = tmp_path / "outbox.json"
+    _append_to_outbox(
+        outbox_path, CommandResult(id=command.id, successful=True, duration_s=1.0)
+    )
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            flush_outbox(client, outbox_path)
+
+    assert app_storage.pending_commands(APARTMENT, 0, datetime.now(UTC)) == []
+    assert _load_outbox(outbox_path) == []
+
+
+def test_flush_outbox_is_a_no_op_on_an_empty_or_missing_outbox(tmp_path: Path) -> None:
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: (_ for _ in ()).throw(AssertionError("no request expected"))
+        )
+    ) as client:
+        flush_outbox(client, tmp_path / "does-not-exist.json")
+
+
+# -----------------------------------------------------------------------------
+# Safe-degrade reads (cross-review of P5.2, main-session decision): a
+# symlink or FIFO at `commands_last_event_id`/`commands_outbox.json` must
+# not hang the process, and is treated as "nothing persisted yet" rather
+# than propagated -- see `_read_last_event_id`/`_load_outbox`'s own
+# docstrings for why this is "fail safe", unlike P5.2's own
+# `executed_command_ids` (fail closed, tested in
+# tests/test_agent_loop_execution.py).
+# -----------------------------------------------------------------------------
+
+
+def test_read_last_event_id_degrades_on_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "elsewhere"
+    target.write_text("123", encoding="utf-8")
+    path = tmp_path / "commands_last_event_id"
+    path.symlink_to(target)
+
+    assert _read_last_event_id(path) is None
+
+
+def test_read_last_event_id_refuses_a_fifo_quickly_not_a_hang(tmp_path: Path) -> None:
+    import os
+    import signal
+
+    path = tmp_path / "commands_last_event_id"
+    os.mkfifo(path)
+
+    def _on_alarm(signum: int, frame: object) -> None:
+        raise TimeoutError("blocked past the alarm guard -- likely a FIFO hang")
+
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(5)
+    try:
+        assert _read_last_event_id(path) is None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_load_outbox_degrades_on_a_fifo_quickly_not_a_hang(tmp_path: Path) -> None:
+    import os
+    import signal
+
+    path = tmp_path / "commands_outbox.json"
+    os.mkfifo(path)
+
+    def _on_alarm(signum: int, frame: object) -> None:
+        raise TimeoutError("blocked past the alarm guard -- likely a FIFO hang")
+
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(5)
+    try:
+        assert _load_outbox(path) == []
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)

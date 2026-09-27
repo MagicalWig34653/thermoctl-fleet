@@ -2,6 +2,134 @@
 
 Last updated: 2026-09-27.
 
+## P5.2 cross-review fixes: a command id containing a newline broke
+at-most-once, no idle retry of the result outbox, on-disk state files not
+hardened against a symlink/FIFO
+
+Cross-review of P5.2 (below) found one **required** fix and asked for three
+further changes, all four addressed in the same follow-up commit:
+
+1. **Required -- a command id containing a newline broke section 7's
+   at-most-once guarantee.** `protocol.commands.Command.id` carries no
+   charset restriction at the model level (`Field(min_length=1)` only) --
+   a compromised or merely buggy fleet service could send an id like
+   `"a\nb"`. `save_agent_state`'s own newline-joined file format
+   (`AgentState.executed_ids`, one id per line) would then split such an
+   id across two lines on disk; after a restart, `load_agent_state` reads
+   it back as two *different*, shorter ids, and the original id is no
+   longer recognised as already executed -- reproduced, then fixed by
+   validating `command.id`/`rejected.id` against a strict allow-list
+   (`agent.loop._COMMAND_ID_PATTERN`, `^[A-Za-z0-9_-]{1,128}$` -- the only
+   shape `fleet.storage.Storage.create_command` ever actually produces,
+   `uuid4().hex`) **before** anything is executed or persisted, in both
+   `execute_command` and `_handle_rejected_command`. An id that fails this
+   check is never executed, never spends a dedup slot in
+   `state.executed_ids` (not trustworthy enough to remember), and gets
+   **no result report at all** (not trustworthy enough to address one to)
+   -- logged locally only, via `repr()` (which itself already escapes every
+   control character) on top of `_append_local_log`'s own newline
+   escaping. Tested: embedded newline, embedded carriage return, embedded
+   NUL, over-long (129 characters), whitespace-only ("empty after strip"),
+   unicode letters, embedded space -- each rejected, none executed, none
+   persisted; a real `uuid4().hex`-shaped id still passes.
+
+2. **Explicit `on_contact` signal from `agent.commands_channel
+   .receive_commands`, replacing the log-sniffing `_CloudContactLogHandler`**
+   this package's own first version used instead (main-session decision on
+   cross-review's suggestion): a small, **additive**, optional callback
+   parameter (default a no-op, so every existing call site and test of
+   `receive_commands`/`_stream_once` is unaffected) invoked with `True`
+   exactly where the SSE stream connects or a `wait=0` poll succeeds, and
+   `False` exactly where either fails -- P5.1's own behaviour and test
+   suite are otherwise untouched. `agent.loop.run`'s own `_on_contact`
+   passes this straight through to `report_led_status`'s `cloud_contact`
+   field, no longer inferring channel health from that module's log
+   *wording*, which could drift independently of the behaviour it
+   described.
+
+3. **Idle flush of the result outbox.** `run`'s `_on_contact(True)` handler
+   now also calls the new `agent.commands_channel.flush_outbox` (a thin,
+   public wrapper around the existing `_flush_outbox_if_any`) on **every**
+   successful poll/stream reconnect, not only when a *new* result happens
+   to be reported (`report_result`'s own pre-existing flush-before-post is
+   unchanged, still runs too) -- a result that failed to report earlier no
+   longer has to wait for the next command to arrive at all. Tested end to
+   end: a command's id is pre-seeded into `executed_command_ids` (as if a
+   previous run already executed it but its report never made it out) and
+   its `CommandResult` pre-seeded into the outbox file directly; its own
+   redelivery over the real channel is therefore a no-op duplicate
+   (`execute_command` reports nothing for it), so the *only* way its
+   buffered result can reach the fleet is the idle flush -- proven by
+   monkeypatching `agent.loop._flush_outbox` to perform the real flush and
+   then raise a sentinel, stopping the loop deterministically with no
+   second command ever created, and confirming the result landed at the
+   fleet regardless.
+
+4. **Hardened reads of the agent's own on-disk state files** (executed
+   ids, the SSE `Last-Event-ID` bookmark, the result outbox, the local
+   log) against a symlink or a non-regular file (FIFO, socket, device,
+   directory) planted at one of their paths -- the same defense
+   `agent.registration` already established for the private key and
+   bearer-token files (`lstat` pre-check, `O_NOFOLLOW | O_NONBLOCK` on
+   `open`, an `fstat` re-check on the resulting descriptor to close the
+   TOCTOU window), factored into a new, shared `agent/safe_io.py`
+   (`read_text_safe`, `append_bytes_safe`) -- deliberately **without**
+   `agent.registration`'s additional mode-0600 requirement, since none of
+   these four files carries a secret. **Which failure mode applies is a
+   per-file decision, not uniform:**
+   - `executed_command_ids` fails **closed**: `load_agent_state` lets
+     `UnsafeStateFileError`/`OSError` propagate rather than silently
+     returning an empty `AgentState` -- doing the latter would quietly
+     erase the very at-most-once memory section 7 relies on, letting every
+     already-executed command become executable again. `agent.__main__
+     ._run_agent` gained a specific `except UnsafeStateFileError` clause
+     (a clear, distinct message, not folded into the generic "run failed"
+     catch-all) so the CLI still exits cleanly rather than with a raw
+     traceback.
+   - `commands_last_event_id` and `commands_outbox.json` (both
+     `agent.commands_channel`'s own files) fail **safe**: an unsafe path is
+     treated exactly like "nothing persisted yet" -- losing the SSE resume
+     bookmark only means re-seeing already-delivered commands (harmless,
+     P5.2's own id de-duplication already covers it); losing sight of a
+     buffered result only delays its delivery, never causes a command to
+     execute twice (that guarantee lives entirely in the executed-ids file
+     above, a different file).
+   - The local log (`agent.loop._append_local_log`) also fails **safe**:
+     it is advisory, not a security control, and must not itself crash
+     whatever command execution it was in the middle of describing.
+   Tested: a symlink and a FIFO at each of the four paths (the FIFO cases
+   guarded with a `signal.alarm`, the same tool cross-review used to
+   reproduce the class of hang this closes, mirroring
+   `tests/test_agent_registration.py`'s own established pattern) -- none
+   hang, `executed_command_ids` raises, the other three degrade quietly.
+   `agent/safe_io.py` itself has a dedicated test file
+   (`tests/test_agent_safe_io.py`, 13 tests: symlink, dangling symlink,
+   directory, FIFO, Unix-domain socket, a TOCTOU simulation via
+   monkeypatching the `lstat` pre-check, and the fd-not-leaked-on-`fstat`-
+   failure branch), at 100% coverage.
+
+**Verification** (fresh `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`):
+
+```text
+$ ruff check .
+All checks passed!
+$ mypy .
+Success: no issues found in 77 source files
+$ mypy protocol fleet agent tools
+Success: no issues found in 44 source files
+```
+
+`python -m pytest -W ignore::ResourceWarning -rA`, run twice: **989 passed**
+both times, coverage **99%** both times, identical (3867 statements, 13
+missed both runs -- `agent/loop.py`'s four still-deferred stage-2/24 stubs,
+`fleet/admin.py`/`tools/check_image_config.py`'s own pre-existing single
+lines; `agent/commands_channel.py` and `agent/safe_io.py` both at 100%).
+`tests/test_agent_loop_run.py`, `tests/test_agent_commands_channel.py`,
+`tests/test_agent_main.py`, `tests/test_watchdog_contract.py`, and
+`tests/test_agent_safe_io.py` (82 tests together) run 5 times in a row with
+no flakiness. `protocol/`, `fleet/`, `watchdog/` unchanged.
+
 ## P5.2 -- stage-1 command execution with local safeguards (section 7,
 CLAUDE.md security principle 5)
 

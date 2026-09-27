@@ -18,6 +18,7 @@ from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import httpx
 import pytest
 import uvicorn
 from cryptography.hazmat.primitives import serialization
@@ -29,7 +30,7 @@ from agent.loop import load_agent_state, run
 from agent.transport import build_client, fingerprint_for_certificate
 from fleet.app import app
 from fleet.storage import CommandRecord, Storage, create_storage, get_storage, hash_token, upgrade
-from protocol.commands import CommandType
+from protocol.commands import CommandResult, CommandType
 from protocol.registration import encode_bytes, verification_code_for
 from protocol.version import PROTOCOL_VERSION
 from tests.tls_support import (
@@ -558,3 +559,80 @@ def test_run_keeps_going_after_a_refused_result_report(
     with app_storage.session() as session:
         row = session.scalar(select(CommandRecord).where(CommandRecord.command_id == command.id))
         assert row is not None and row.successful is True
+
+
+# -----------------------------------------------------------------------------
+# Idle flush of the result outbox (cross-review of P5.2, main-session
+# decision): a result that failed to report earlier must be retried on
+# every successful poll/stream reconnect, not only when a *new* result
+# happens to be reported.
+# -----------------------------------------------------------------------------
+
+
+def test_run_delivers_a_buffered_result_via_idle_flush_without_a_new_command(
+    tmp_path: Path, app_storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`buffered_command`'s id is pre-seeded into `executed_command_ids`,
+    as if a previous run already executed it but its own report never
+    made it out (buffered in the outbox instead) -- its own redelivery
+    over the real channel is therefore a no-op duplicate (`execute_command`
+    reports nothing for it), so the *only* way its buffered result can
+    ever reach the fleet is `run`'s own idle flush
+    (`_on_contact(True)` -> `agent.commands_channel.flush_outbox`), proven
+    here by monkeypatching that exact call to perform the real flush and
+    then raise a sentinel to stop the loop deterministically, with no
+    second command ever created."""
+
+    import agent.loop as loop_module
+    from agent.commands_channel import _append_to_outbox
+
+    token = _issue_token(app_storage)
+    buffered_command = app_storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    executed_ids_path = tmp_path / "executed-ids"
+    executed_ids_path.write_text(buffered_command.id + "\n", encoding="utf-8")
+
+    outbox_path = tmp_path / "outbox.json"
+    buffered_result = CommandResult(
+        id=buffered_command.id, successful=False, duration_s=0.01,
+        error_text="Herzschlag-Erfassung noch nicht verfügbar (P2.3).",
+    )
+    _append_to_outbox(outbox_path, buffered_result)
+
+    class _StopAfterFlush(Exception):
+        pass
+
+    real_flush = loop_module._flush_outbox  # type: ignore[attr-defined]
+
+    def _flush_then_stop(client_: httpx.Client, outbox_path_: Path) -> None:
+        real_flush(client_, outbox_path_)
+        raise _StopAfterFlush
+
+    monkeypatch.setattr(loop_module, "_flush_outbox", _flush_then_stop)
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            with pytest.raises(_StopAfterFlush):
+                run(
+                    client,
+                    last_event_id_path=tmp_path / "last-event-id",
+                    outbox_path=outbox_path,
+                    executed_ids_path=executed_ids_path,
+                    local_log_path=tmp_path / "agent.log",
+                    watchdog_state_path=tmp_path / "watchdog-state.env",
+                    led_status_path=tmp_path / "led-status.env",
+                    exit_fn=lambda code: None,
+                )
+
+    with app_storage.session() as session:
+        row = session.scalar(
+            select(CommandRecord).where(CommandRecord.command_id == buffered_command.id)
+        )
+        assert row is not None
+        assert row.successful is False
+        assert row.error_text == buffered_result.error_text
+        assert row.result_received_at is not None

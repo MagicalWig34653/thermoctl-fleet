@@ -230,6 +230,50 @@ def test_run_cli_uses_pinned_config_and_handles_auth_failure(
         assert "token revoked or invalid" in err
 
 
+def test_run_cli_reports_a_clear_error_for_an_unsafe_state_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`loop.run`'s own `load_agent_state` fails closed on a symlink/FIFO
+    at `executed_command_ids` (cross-review, main-session decision) --
+    this is the CLI's own, specific handling of that, distinct from the
+    generic "run failed" message every other configuration/state problem
+    gets."""
+
+    import json
+    import secrets
+
+    from agent.registration import _store_token
+    from agent.safe_io import UnsafeStateFileError
+
+    token = secrets.token_urlsafe(32)
+    _store_token(tmp_path, token)
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+
+    def client_factory(address: str, pin: str) -> httpx.Client:
+        return httpx.Client(base_url=address)
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        raise UnsafeStateFileError("executed_command_ids is a symlink")
+
+    monkeypatch.setattr(agent_main, "build_client", client_factory)
+    monkeypatch.setattr(loop, "run", runner)
+    code = agent_main.main(["run", "--data-dir", str(tmp_path), "--registration-file", str(config)])
+
+    assert code == 1
+    assert "refusing to run" in capsys.readouterr().err
+
+
 def test_run_cli_invalid_config_does_not_echo_secrets(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
