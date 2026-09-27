@@ -2,6 +2,98 @@
 
 Last updated: 2026-09-27.
 
+## Fix: Docker and Compose v2 from Docker's official apt repository (image/, section 19)
+
+**Finding (P5.E, 2026-09-27):** `image/common/packages.txt` named
+`docker-compose-v2`, which does not exist as a Debian 13 "trixie" package
+(`E: Unable to locate package docker-compose-v2`), and Debian's own
+`docker-compose` package only ever installs the legacy hyphenated v1
+script, never the `docker compose` (space) v2 CLI subcommand
+`watchdog/runtime.go` actually invokes (`execCommand(r.bin, "compose",
+...)`). On a real device the watchdog could never start the agent.
+
+**Decision by the project owner (2026-09-27):** install `docker-ce`,
+`docker-ce-cli`, `containerd.io`, `docker-compose-plugin` from Docker's
+official apt repository (`download.docker.com`), with security updates
+continuing to come in via apt like everything else in this image, rather
+than a static binary download or a third-party workaround confined to a
+test environment. `docker-buildx-plugin` deliberately **not** installed --
+the base station never builds an image, only preloads the already-built
+agent image (section 19.3).
+
+**What was built** (`image/common/apt/`): a deb822 repository definition
+(`docker.sources`, `Suites: trixie` for both `image/pi/` and `image/x86/`,
+`Signed-By:` a keyring file rather than a system-wide `apt-key add`), an
+apt preferences file (`preferences.d/docker`) pinning **only** `docker-ce`,
+`docker-ce-cli`, `containerd.io`, `docker-compose-plugin` to that
+repository (origin-wide priority 1, these four names at priority 600 --
+apt pinning so no other package can come from `download.docker.com`), and
+a fetch script (`fetch-docker-key.sh`) that downloads Docker's signing key
+over HTTPS and **verifies its fingerprint before installing it**, refusing
+(non-zero exit) on any mismatch. The pinned fingerprint,
+**`9DC858229FC7DD38854AE2D88D81803C0EBFCD88`**, is Docker's published
+release key (verified in the local E2E run below by re-deriving it from
+the actually-installed keyring with `gpg --show-keys`, not just trusted
+from the script's own comment). `tools/check_image_config.py` gained four
+new checks (`check_docker_packages_from_official_repo`,
+`check_docker_apt_source`, `check_docker_apt_preferences`,
+`check_docker_key_fetch`), each with passing and failing cases in
+`tests/test_image_config.py`. `image/common/README.md`,
+`image/pi/README.md`, `image/x86/README.md` now document the exact build
+step order (`ca-certificates` first, then the key fetch, then the
+repo/pinning files, then `apt-get update`, then the rest of
+`packages.txt`), and that the `DOCKER_GID` `.env` step (P5.7 hot-fix round
+2) must run *after* this whole sequence, since `docker-ce` is what creates
+the `docker` group in the first place.
+
+**E2E re-run:** `tools/e2e/provision/install-packages.sh` now provisions
+the VM from these exact shipped repo files (ca-certificates/curl/gnupg,
+`fetch-docker-key.sh`, `docker.sources` + `preferences.d/docker`, a second
+`apt-get update`, then the rest of `packages.txt`) instead of the previous
+static-binary workaround; `tools/e2e/provision/install-compose-plugin.sh`
+was removed. Re-run against the existing `thermoctl-e2e-basestation` VM
+(`limactl start`, the stale static compose-plugin binary and the old
+`docker.io`/`docker-compose` packages removed first so the new apt-based
+path was genuinely exercised, not masked by leftovers): `docker-ce`,
+`docker-ce-cli`, `containerd.io`, `docker-compose-plugin` all installed
+from `download.docker.com` (`apt-cache policy docker-ce` shows `600
+https://download.docker.com/linux/debian trixie/stable`), `docker compose
+version` reports `v5.5.1`, and the installed keyring's fingerprint
+(`gpg --show-keys /etc/apt/keyrings/docker.asc`) matches
+`9DC858229FC7DD38854AE2D88D81803C0EBFCD88` exactly.
+
+All six scenarios then ran against the real code on this branch and
+**PASSED** (one re-run of scenario (a) needed after clearing stale device
+state left over from a previous P5.E session's fleet database -- not a
+finding about this fix, the fleet DB simply isn't reset by `limactl
+start`):
+
+| Scenario | Result |
+|---|---|
+| (a) registration end-to-end | **PASS** |
+| (b) mounts and permissions | **PASS** |
+| (c) watchdog swap | **PASS** |
+| (d) watchdog rollback (restart-count and the real 10-minute deadline) | **PASS (both)** |
+| (e) no registry pull | **PASS** |
+| (f) command channel | **PASS** |
+
+No change to `fleet/`, `agent/`, `protocol/`, or `watchdog/` code. Full
+verification (fresh venv, `python3.13 -m venv` + `pip install -e
+".[dev,fleet,agent]"`): `ruff check .` clean, `python -m
+tools.check_image_config` plausible, `pytest
+tests/test_image_config.py` 32 passed, full suite 990 passed (99% overall
+coverage, `tools/check_image_config.py` itself 92%). VM stopped (not
+deleted) afterward; host disk usage stayed inside the ~5 GB budget (`df -h
+~`: 31 GB free before, 29 GB free after).
+
+**P5.E discrepancy list (`tools/e2e/README.md`) updated:** item 1
+(`docker-compose-v2` does not exist in Debian 13 "trixie") marked
+**RESOLVED**, pointing back here. Items 2-5 (hardware watchdog unit not
+enableable under QEMU/vz, host-side uid/gid 10002 not literally required,
+`/var/lib/thermoctl-agent` ownership/mode not documented, no template for
+the watchdog's build-time state file) are unrelated to this fix and remain
+open, as recorded there.
+
 ## P5.E: local end-to-end test environment (base station VM + scenarios)
 
 Built per the project owner's 2026-09-27 offer ("you can set up a VM

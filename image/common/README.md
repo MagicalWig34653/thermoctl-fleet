@@ -7,7 +7,10 @@ twice, "take a finished Debian, apply this to it".
 
 | File/folder | Purpose |
 |---|---|
-| `packages.txt` | Packages both images install (container runtime, time sync, hardware watchdog, `unattended-upgrades`, log2ram, udev, WireGuard tools) |
+| `packages.txt` | Packages both images install (container runtime, time sync, hardware watchdog, `unattended-upgrades`, log2ram, udev, WireGuard tools) -- the container-runtime packages come from `apt/`, not from Debian's own archive, see below |
+| `apt/docker.sources` | Docker's official apt repository (deb822, `Signed-By:` a keyring, not a system-wide `apt-key add`), suite `trixie` for both targets |
+| `apt/preferences.d/docker` | Apt pinning restricting that repository to exactly `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-compose-plugin` -- no other package may come from it |
+| `apt/fetch-docker-key.sh` | Fetches Docker's signing key and verifies its fingerprint (pinned in the script) before installing it as the keyring `docker.sources` trusts -- run before `apt-get update` picks up that repository |
 | `udev/99-zigbee-stick.rules` | Fixed device name for the Zigbee radio stick, so it is not `ttyUSB0` once and `ttyUSB1` after a reboot |
 | `unattended-upgrades/` | Security updates automatically, reboot only within the maintenance window |
 | `agent-registration.empty.json` | Template for the boot partition (sections 15.3, 19.5) -- the fields from `protocol.registration.AgentRegistrationFile`, empty, until the preparation tool fills them when writing the image |
@@ -25,6 +28,48 @@ copies it from there into the image. The status-LED program's unit
 `docs/specification.md` section 23's "Decided afterward") follows the
 same rule, with its code at
 [`../../watchdog/cmd/thermoctl-leds/thermoctl-leds.service`](../../watchdog/cmd/thermoctl-leds/thermoctl-leds.service).
+
+## Docker's official apt repository, not Debian's (decision, 2026-09-27)
+
+The P5.E local end-to-end run (`docs/STATUS.md`) found that
+`docker.io`/`docker-compose-v2` (what `packages.txt` used to list) do not
+give a working `docker compose` (v2, with a space) on Debian 13 "trixie" at
+all -- `docker-compose-v2` does not exist as a package there, and Debian's
+own `docker-compose` only ever ships the legacy hyphenated v1 script, never
+the subcommand `watchdog/runtime.go` invokes
+(`execCommand(r.bin, "compose", ...)`). The project owner decided (same
+date) to install `docker-ce`, `docker-ce-cli`, `containerd.io`,
+`docker-compose-plugin` from Docker's own official apt repository instead,
+with security updates continuing to come in via apt like everything else in
+this image -- not a static binary download, not a workaround confined to
+the test environment.
+
+**Build step order** (both `image/pi/` and `image/x86/`, exactly the same
+either way, per the shared-recipe reasoning above):
+
+1. Install `ca-certificates` from `packages.txt` (needed for the HTTPS
+   fetch in the next step).
+2. Run `apt/fetch-docker-key.sh` as root -- fetches Docker's signing key
+   and verifies its fingerprint (pinned in the script,
+   `9DC858229FC7DD38854AE2D88D81803C0EBFCD88`) before installing it at
+   `/etc/apt/keyrings/docker.asc`. Refuses (non-zero exit) on a mismatch;
+   the build must not continue past that point.
+3. Place `apt/docker.sources` at `/etc/apt/sources.list.d/docker.sources`
+   and `apt/preferences.d/docker` at `/etc/apt/preferences.d/docker`
+   (`install -m 0644` for both -- plain configuration files, not secrets).
+4. `apt-get update`.
+5. Install the rest of `packages.txt`, including the four Docker-repo
+   packages named above -- apt's own dependency resolution pulls them from
+   `download.docker.com` because of the pinning in step 3, from Debian's
+   archive for everything else.
+6. **Only after this**, per section 19.3's `DOCKER_GID` step below: the
+   `docker` group did not exist before `docker-ce` was installed in step 5,
+   so `getent group docker` has nothing to read before then.
+
+`docker-buildx-plugin` is deliberately **not** installed: the base station
+never builds an image (section 19.3's "Agent image already preloaded" --
+`docker pull`/`docker load` at build time, not a `docker build` at
+runtime), so buildx buys nothing here.
 
 ## What else belongs in both images per section 19.3
 
@@ -49,8 +94,9 @@ file but needs a real build step (see `docs/STATUS.md`):
 - **`/etc/thermoctl-agent/.env` with `DOCKER_GID=<gid>`** (P5.7 hot-fix,
   round 2, `docs/STATUS.md`), generated once during this same build step
   with `DOCKER_GID=$(getent group docker | cut -d: -f3)` -- run *after*
-  `packages.txt`'s container runtime package is installed, since that
-  package is what creates the `docker` group in the first place --
+  `docker-ce` (from Docker's official apt repository, see "Docker's
+  official apt repository" above) is installed, since that package is what
+  creates the `docker` group in the first place --
   `agent-compose.yml`'s `group_add: ["${DOCKER_GID:?...}"]` reads this
   file automatically (`docker compose` loads `.env` from the compose
   file's own directory), and fails loud rather than starting the agent

@@ -9,8 +9,23 @@
 
 # Container-Laufzeit für die vier Container aus Abschnitt 13 und den
 # Agent-Container, den der Wächter tauscht (Abschnitt 17).
-docker.io
-docker-compose-v2
+#
+# Aus Docker's offiziellem apt-Repository, NICHT aus Debian (Entscheidung
+# des Projekteigners, 2026-09-27): Debian 13 "trixie" hat weder ein
+# docker.io- noch ein "docker compose" (v2, mit Leerzeichen)-Paket -- nur
+# den veralteten docker-compose-Befehl (v1), den watchdog/runtime.go nicht
+# aufruft (`execCommand(r.bin, "compose", ...)`). Repository-Definition,
+# Schlüssel-Fingerabdruck und apt-Pinning (nur diese vier Pakete kommen aus
+# diesem Repository) liegen unter image/common/apt/ -- die genaue
+# Reihenfolge der Bauschritte steht in image/common/README.md und
+# image/pi/README.md / image/x86/README.md.
+docker-ce
+docker-ce-cli
+containerd.io
+docker-compose-plugin
+# docker-buildx-plugin absichtlich nicht aufgenommen: Die Basisstation baut
+# keine Images, sie lädt nur das bereits fertig gebaute Agent-Image vorab
+# (Abschnitt 19.3) -- buildx wird dafür nicht gebraucht.
 
 # Zeitsynchronisation -- Voraussetzung dafür, dass "zeitversatz_s" im
 # Herzschlag (Abschnitt 5) überhaupt etwas Sinnvolles misst und dass Zeitpläne

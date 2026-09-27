@@ -1,0 +1,21 @@
+# Apt pinning for image/common/apt/docker.sources: only the four package
+# names below may actually be installed from Docker's official apt
+# repository. Everything else -- including any other package that happens
+# to share a name with something Docker also publishes there -- stays
+# pinned to whatever priority the Debian archive itself already has
+# (apt_preferences(5) default is 500; a origin-wide priority of 1 here
+# means "only from this origin if nothing else provides it at all", which
+# in practice means "never" for anything not named in the second stanza,
+# since the Debian archive itself provides everything else this image
+# installs).
+#
+# This is the "apt pinning so only those Docker packages come from that
+# repo" mechanism the image build recipe requires -- Docker's repository is
+# trusted for these four package names and nothing wider.
+Package: *
+Pin: origin "download.docker.com"
+Pin-Priority: 1
+
+Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin
+Pin: origin "download.docker.com"
+Pin-Priority: 600

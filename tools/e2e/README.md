@@ -117,26 +117,19 @@ Per the work order, a discrepancy in the documented build steps is one of
 this package's main outputs; fixing `image/` docs/code is explicitly out of
 scope for this package.
 
-1. **`image/common/packages.txt` names `docker-compose-v2`, which does not
-   exist as a Debian 13 "trixie" package** (`apt-get install
-   docker-compose-v2` fails with `E: Unable to locate package
-   docker-compose-v2` against the real trixie repositories -- not a guess,
-   reproduced during this run). Debian's own `docker-compose` package
-   (which *does* exist) only installs the legacy hyphenated v1 script (a
-   `docker-compose` command) -- never the `docker compose` (space) v2 CLI
-   subcommand `watchdog/runtime.go` actually invokes
-   (`execCommand(r.bin, "compose", ...)`) and `agent-compose.yml`'s own
-   comments assume. Stock Debian 13 has **no package at all** that provides
-   the v2 plugin; only Docker's own third-party apt repository does
-   (`docker-compose-plugin`), which conflicts with `image/README.md`'s own
-   "a prepared Debian image, no custom OS/sources" premise.
-   **Worked around here only** (`tools/e2e/provision/install-compose-plugin.sh`)
-   by installing the official static v2 plugin binary directly -- not a
-   proposed production fix; the main session decides how
-   `image/common/packages.txt` should actually name this dependency (e.g.
-   documenting the third-party repo as an accepted exception, or building
-   the plugin from source in CI the way the watchdog binary itself already
-   is).
+1. **RESOLVED (see `docs/STATUS.md`).** `image/common/packages.txt` used to
+   name `docker-compose-v2`, which does not exist as a Debian 13 "trixie"
+   package (`apt-get install docker-compose-v2` failed with `E: Unable to
+   locate package docker-compose-v2` against the real trixie repositories),
+   and Debian's own `docker-compose` package only ever installed the legacy
+   hyphenated v1 script, never the `docker compose` (space) v2 CLI
+   subcommand `watchdog/runtime.go` actually invokes. Fixed by the project
+   owner's 2026-09-27 decision to install `docker-ce`, `docker-ce-cli`,
+   `containerd.io`, `docker-compose-plugin` from Docker's own official apt
+   repository (`image/common/apt/`, security updates via apt like
+   everything else) -- `tools/e2e/provision/install-packages.sh` now
+   provisions this VM from those same shipped repo files, and the former
+   `install-compose-plugin.sh` workaround has been removed.
 2. **The "watchdog" package's own `watchdog.service` (the *hardware*
    watchdog, section 19.3 -- not `waechter/thermoctl-watchdog.service`)
    cannot be enabled in this VM at all** (`/dev/watchdog` does not exist

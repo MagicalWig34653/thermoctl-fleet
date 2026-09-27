@@ -24,8 +24,18 @@ and packaged in Debian itself.
 Entirely missing:
 
 - an `mkosi.conf`/`debos` recipe file that carries out the same shared
-  steps as `image/pi/`: installing `image/common/packages.txt`, applying
-  the udev rule and the `unattended-upgrades` configuration, installing
+  steps as `image/pi/`, in order (see `image/common/README.md`, "Docker's
+  official apt repository", for the full reasoning): installs
+  `ca-certificates` first; runs `image/common/apt/fetch-docker-key.sh` to
+  fetch and fingerprint-verify Docker's signing key; places
+  `image/common/apt/docker.sources` at
+  `/etc/apt/sources.list.d/docker.sources` and
+  `image/common/apt/preferences.d/docker` at
+  `/etc/apt/preferences.d/docker`; runs `apt-get update`; then installs the
+  rest of `image/common/packages.txt` (including `docker-ce`,
+  `docker-ce-cli`, `containerd.io`, `docker-compose-plugin` from that
+  repository) -- applies the udev rule and the `unattended-upgrades`
+  configuration, installing
   `image/common/tmpfiles.d/thermoctl-agent.conf` (P5.7 hot-fix, needed on
   this target too -- `/run/thermoctl-agent` is required by the agent
   container's own bind mount regardless of whether the LED display is
@@ -43,8 +53,10 @@ Entirely missing:
   state file there (section 17, "Fallback without a proven revision") --
   needed on this target too, regardless of the LED display's own absence,
 - writes `/etc/thermoctl-agent/.env` with `DOCKER_GID=$(getent group
-  docker | cut -d: -f3)` after `image/common/packages.txt`'s container
-  runtime package is installed (P5.7 hot-fix round 2) --
+  docker | cut -d: -f3)` **after** `docker-ce` (from Docker's official apt
+  repository, see `image/common/README.md`) is installed (P5.7 hot-fix
+  round 2) -- the `docker` group does not exist before that package is
+  installed, so this step must run after the whole apt sequence above --
   `agent-compose.yml`'s `group_add: ["${DOCKER_GID:?...}"]` reads this
   file automatically and fails loud if it is missing,
 - the EFI boot partition and bootloader configuration,
