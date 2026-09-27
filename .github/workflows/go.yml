@@ -105,5 +105,8 @@ jobs:
           python-version: "3.13"
       # Only pydantic -- protocol/ (imported by agent/loop.py) needs nothing
       # further, and the watchdog itself is unaffected by it.
-      - run: pip install pydantic
+      # The `agent` extra, not just pydantic: agent/loop.py imports httpx at
+      # module level since P5.2 (the command loop), and the contract test
+      # imports report_* from that module.
+      - run: pip install -e ".[agent]"
       - run: bash watchdog/check_contract.sh
