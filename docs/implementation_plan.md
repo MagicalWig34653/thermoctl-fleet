@@ -466,27 +466,43 @@ storage, heartbeat sending **SR**
   open at all.
 
 ### P5.2 -- Command execution in the agent **SR**
-- **Goal:** implement `agent/loop.py::execute_command` for the four
-  stage-1 commands (`REPORT_NOW`, `FETCH_LOGS`, `BACKUP_NOW`,
-  `AGENT_RESTART`) plus id and expiry checking, a local log per command and
-  rejection.
-- **Files:** `agent/loop.py`, persistence for `executed_ids` across
-  restarts (open point from the `AgentState` docstring -- to be resolved
-  here).
-- **Section:** 7.
-- **Acceptance:** test per command type, plus: a duplicate id is rejected,
-  an expired command is rejected, an unknown command cannot even be
-  constructed for lack of a `CommandType` value (a model test is enough
-  here).
-- **Depends on:** P5.1.
-- **Read back by:** main session (agent security boundary, principle 5).
+- [x] done -- see `docs/STATUS.md`'s P5.2 section (including its provenance
+  note: a first, uncommitted draft of this package came from an interrupted
+  Codex run and was reviewed and corrected here, not used as-is).
+- Implemented: a closed handler mapping covering exactly the five stage-1
+  `CommandType` values, persisted last-200 execution ids (at-most-once
+  across restarts), expiry/newer-protocol-version handling, a bounded local
+  log, and `python -m agent run` (new CLI subcommand).
+- `agent_restart` is genuinely executed: reports its result before an
+  injectable clean exit, refuses a pending swap (`desired != proven`) and
+  fails closed on a missing/incomplete watchdog state file (cannot
+  conclusively rule out a pending swap). Duplicate ids are never
+  re-executed and never re-reported (no synthetic second result).
+- Per-command follow-ups, each an honest failed result naming the package
+  that will replace it: `report_now` needs P2.3 heartbeat acquisition;
+  `fetch_logs`/`diagnostic_bundle` need P5.3 masking/upload; `backup_now`
+  needs P5.5.
+- LED `cloud_contact` follows the command channel's own already-existing
+  WARNING log (no change to `agent/commands_channel.py`); `fault`/`control`
+  stay honestly unknown (not a fabricated "no fault") via a deliberately
+  stale timestamp, reusing `cmd/thermoctl-leds`'s existing staleness
+  fallback rather than inventing a new state -- watchdog code unchanged.
+- **Tests:** unit-level execution/log/state tests, CLI wiring tests, and
+  end-to-end tests against the real fleet app over real TLS -- all
+  verified green in this session (fresh venv, see STATUS's verbatim
+  verification output).
+- **Depends on:** P5.1. **Read back by:** main session (principle 5).
 
 ### P5.3 -- Result reporting and `create_diagnostic_bundle`
-- **Goal:** implement `agent/loop.py::report_result` and
-  `create_diagnostic_bundle` (stage 1), including masking of
-  credentials/tenant data in the collected logs. **SR** because of the
-  masking (section 21.5, docstring in `loop.py`).
-- **Files:** `agent/loop.py`, `fleet/app.py::receive_command_result`.
+- **Goal:** complete `fetch_logs` and `create_diagnostic_bundle` (stage 1),
+  including masking of credentials/tenant data in the collected logs.
+  **SR** because of the masking (section 21.5, docstring in `loop.py`).
+- Result *transport* (`POST /v1/commands/{id}/result`, buffering, retry) is
+  already complete since P5.1/P5.2 -- what is missing here is producing the
+  actual, masked *content* for these two commands in the first place, and
+  wiring their `agent/loop.py::_HANDLERS` entries to call it instead of
+  today's honest "not yet available" failure.
+- **Files:** `agent/loop.py`, content upload endpoints.
 - **Section:** 21.5.
 - **Acceptance:** test demonstrates that a known secret pattern (example
   token, not real) appears masked in the generated bundle.

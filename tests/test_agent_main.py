@@ -27,6 +27,7 @@ import pydantic
 import pytest
 
 import agent.__main__ as agent_main
+from agent import loop
 from agent.registration import RegistrationError, RegistrationOutcome
 from agent.transport import CertificateFingerprintMismatch
 
@@ -172,3 +173,77 @@ def test_register_forwards_registration_file_and_data_dir_arguments(
     assert exit_code == 0
     assert seen["registration_file_path"] == registration_file
     assert seen["data_dir"] == data_dir
+
+
+def test_run_requires_registration(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert agent_main.main(["run", "--data-dir", str(tmp_path)]) == 1
+    assert "requires registration" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("auth_error", [False, True])
+def test_run_cli_uses_pinned_config_and_handles_auth_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    auth_error: bool,
+) -> None:
+    import json
+    import secrets
+
+    from agent.commands_channel import CommandStreamAuthError
+    from agent.registration import _store_token
+
+    token = secrets.token_urlsafe(32)
+    _store_token(tmp_path, token)
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+    seen: dict[str, object] = {}
+
+    def client_factory(address: str, pin: str) -> httpx.Client:
+        seen.update(address=address, pin=pin)
+        return httpx.Client(base_url=address)
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        assert client.headers["Authorization"] == f"Bearer {token}"
+        seen.update(kwargs)
+        if auth_error:
+            raise CommandStreamAuthError(token)
+
+    monkeypatch.setattr(agent_main, "build_client", client_factory)
+    monkeypatch.setattr(loop, "run", runner)
+    code = agent_main.main(["run", "--data-dir", str(tmp_path), "--registration-file", str(config)])
+    assert code == int(auth_error)
+    assert seen["address"] == "https://fleet.invalid"
+    assert seen["pin"] == "sha256:" + "a" * 64
+    assert seen["executed_ids_path"] == tmp_path / loop.DEFAULT_EXECUTED_IDS_FILE
+    err = capsys.readouterr().err
+    assert token not in err
+    if auth_error:
+        assert "token revoked or invalid" in err
+
+
+def test_run_cli_invalid_config_does_not_echo_secrets(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import secrets
+
+    from agent.registration import _store_token
+
+    secret = secrets.token_urlsafe(32)
+    _store_token(tmp_path, secret)
+    config = tmp_path / "bad.json"
+    config.write_text(secret)
+    assert (
+        agent_main.main(["run", "--data-dir", str(tmp_path), "--registration-file", str(config)])
+        == 1
+    )
+    assert secret not in capsys.readouterr().err
