@@ -2,6 +2,90 @@
 
 Last updated: 2026-09-27.
 
+## P5.1 cross-review fixes: silently-retried auth failures, a global-sequence
+`Last-Event-ID` that could hide an apartment's own commands
+
+Cross-review of P5.1 (below) reproduced two defects, both fixed in the same
+follow-up commit:
+
+1. **A revoked/invalid token on the command channel was retried forever
+   instead of surfaced.** `agent.commands_channel._stream_once`/`_poll_once`
+   raised the generic `CommandStreamError` for *any* non-200 response,
+   including 401/403 -- and `receive_commands`'s own fallback loop catches
+   `CommandStreamError` exactly like a dropped connection, so a revoked
+   token looked indistinguishable from a network hiccup and was polled
+   forever, never surfaced to the caller. Inconsistent with
+   `agent.heartbeat_sender.HeartbeatAuthError` (the equivalent case for the
+   heartbeat channel) and with this same module's own `CommandResultError`
+   (which already propagated any non-204, 401/403 included). **Fixed** with
+   a new, deliberately *separate* exception, `CommandStreamAuthError` (not
+   a subclass of `CommandStreamError` -- an `except CommandStreamError`
+   clause must never accidentally also catch an auth failure by
+   inheritance): `_raise_for_non_200`, a small shared helper both
+   `_stream_once` and `_poll_once` now call, raises it for 401/403 and the
+   ordinary `CommandStreamError` for anything else non-200.
+   `CommandStreamAuthError` is not listed in either of `receive_commands`'s
+   two `except` tuples, so it always propagates straight to the caller.
+   **Tested against the real fleet app** with a token actually revoked via
+   `Storage.remove_device(expected_assignment_id=...)` (mirroring
+   `tests/test_agent_heartbeat_sender.py`'s own identical pattern for the
+   heartbeat side) -- `_stream_once`, `_poll_once`, and the full
+   `receive_commands` end-to-end all raise `CommandStreamAuthError`
+   directly (`tests/test_agent_commands_channel.py`). The generic
+   `CommandStreamError` path (a non-200, non-401/403 response) is now
+   covered separately via a fixed-status `httpx.MockTransport` -- the real
+   fleet app has no code path that returns anything else for this
+   endpoint, so this is purely the branch logic, the same established
+   `MockTransport` exception `tests/test_agent_heartbeat_sender.py`'s own
+   module docstring already documents.
+
+2. **A global command sequence, combined with an untrusted client-supplied
+   `Last-Event-ID`, could hide an apartment's own pending commands.**
+   `CommandRecord.id` (the SSE stream's own monotonic sequence number,
+   shared by *every* apartment's commands, see that column's own
+   docstring) means a `Last-Event-ID` legitimately issued for one apartment
+   is, structurally, also a syntactically valid resume point for any other
+   apartment -- `Storage.pending_commands` trusted `after_sequence` as-is.
+   Reproduced: ten commands created for apartment B (sequences 1-10), then
+   one for apartment A (sequence 11); `pending_commands("apartment-a", 16,
+   now)` returned `[]` -- 16 was never actually sent to apartment A, but
+   `pending_commands` had no way to tell that from a legitimate resume
+   point. **Fixed** by clamping `after_sequence` to `0` whenever it exceeds
+   this apartment's own maximum command sequence (`MAX(id) WHERE
+   apartment_id = ...`, computed inside the same query) -- "everything
+   still pending for *this* apartment" is always a safe fallback. **A
+   per-apartment sequence counter was considered and rejected** (main
+   session decision, see `Storage.pending_commands`'s own docstring for the
+   full reasoning): it would need its own migration and its own
+   concurrency-safe allocation scheme for no operational gain, since
+   re-delivering an already-seen command is always safe -- P5.2's own id
+   de-duplication (`AgentState.executed_ids`) and
+   `Storage.record_command_result`'s `DUPLICATE_IDENTICAL` outcome already
+   make a redundant delivery harmless. Tested both at the storage level
+   (`tests/test_storage.py`: the exact reproduction above, plus a
+   legitimate resume still correctly skipping the apartment's own older
+   commands) and at the HTTP level (`tests/test_fleet.py`, same
+   reproduction via `GET /v1/commands?wait=0` with a real `Last-Event-ID`
+   header).
+
+**Coverage wobble note:** the reviewer observed coverage wobble in
+pre-existing `fleet/storage.py` lines (~2447, ~2500-2502, inside
+`confirm_device`'s "replace previous device" branch) in one of three runs.
+That code path is untouched by this package or by this fix -- neither P5.1
+nor this follow-up adds, removes, or reorders any test that exercises
+`confirm_device`. All three fresh-venv runs done for this fix showed
+`fleet/storage.py` at a stable 100% with an identical `TOTAL` (see
+"Verification" below); the wobble, if real, is pre-existing and unrelated
+to this package's own changes.
+
+**Verification** (fresh venv): `ruff check .`, `mypy .`, `mypy protocol
+fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
+**3x**: **898 passed** each run, coverage **99%** (3593 statements, 16
+missed) identical across all three; `tests/test_agent_commands_channel.py`,
+`tests/test_fleet.py`, `tests/test_agent_transport.py` run **5x** with no
+flakiness. `watchdog/`: `go vet ./...` clean, `go test ./...` green,
+`check_contract.sh` passes (no protocol change in this fix round).
+
 ## SSE command channel between fleet and agent (P5.1, sections 3, 7, 18.2)
 
 **`PROTOCOL_VERSION` bumped to 3** for `protocol.commands.Command.protocol_version`

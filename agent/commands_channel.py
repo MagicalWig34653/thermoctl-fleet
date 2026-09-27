@@ -119,10 +119,31 @@ CommandChannelItem = Command | RejectedCommand
 
 
 class CommandStreamError(Exception):
-    """A non-200 response from `GET /v1/commands` this module does not
-    otherwise know how to interpret (neither a usable SSE stream nor a
-    successful `wait=0` poll) -- treated exactly like a transport failure
-    by `receive_commands`'s own fallback logic."""
+    """A non-200, non-401/403 response from `GET /v1/commands` this module
+    does not otherwise know how to interpret (neither a usable SSE stream
+    nor a successful `wait=0` poll) -- treated exactly like a transport
+    failure by `receive_commands`'s own fallback logic. **Not** raised for
+    401/403 -- see `CommandStreamAuthError` for that case, deliberately a
+    separate, non-overlapping exception, not a subclass of this one (a
+    `except CommandStreamError` clause must never accidentally also catch
+    an auth failure by inheritance)."""
+
+
+class CommandStreamAuthError(Exception):
+    """401/403 from `GET /v1/commands` (either the SSE path or the
+    `wait=0` poll) -- the token is revoked, or not valid for the reported
+    apartment (`fleet/auth.py`'s own two indistinguishable reasons for a
+    403). **Never treated as a transient failure** -- cross-review found
+    that `receive_commands`'s own fallback logic used to catch this the
+    same way as a dropped connection, silently retrying a revoked token
+    forever instead of surfacing it, unlike `agent.heartbeat_sender
+    .HeartbeatAuthError` (the equivalent case for the heartbeat channel)
+    and `CommandResultError` (which already propagated any non-204,
+    401/403 included). This exception is therefore deliberately **not**
+    a `CommandStreamError` and is never listed in either of
+    `receive_commands`'s two `except` tuples -- it always propagates
+    straight to the caller, exactly like `HeartbeatAuthError` does for
+    `agent.heartbeat_sender.send_heartbeat`."""
 
 
 class CommandResultError(Exception):
@@ -219,11 +240,26 @@ def _write_last_event_id(path: Path, value: str) -> None:
     temp.replace(path)
 
 
+def _raise_for_non_200(status_code: int, description: str) -> None:
+    """Shared status-code check for `_stream_once` and `_poll_once`: 401/403
+    is `CommandStreamAuthError` (never retried by `receive_commands`, see
+    that class's own docstring), any other non-200 is the ordinary,
+    fallback-triggering `CommandStreamError`."""
+
+    if status_code in (401, 403):
+        raise CommandStreamAuthError(f"{description} was refused: {status_code}")
+    if status_code != 200:
+        raise CommandStreamError(f"{description} was refused: {status_code}")
+
+
 def _stream_once(client: httpx.Client, last_event_id_path: Path) -> Iterator[CommandChannelItem]:
     """One attempt at holding the SSE stream open -- raises (never
     swallows) on a transport failure or a non-200 response, so
     `receive_commands`'s own `except` clause decides what "dropped" means
-    in one place."""
+    in one place. A 401/403 (`CommandStreamAuthError`) is the one exception
+    to "swallows nothing" that still applies here too, by construction --
+    it is not listed in that `except` clause at all, see that class's own
+    docstring."""
 
     headers: dict[str, str] = {}
     last_event_id = _read_last_event_id(last_event_id_path)
@@ -231,11 +267,7 @@ def _stream_once(client: httpx.Client, last_event_id_path: Path) -> Iterator[Com
         headers["Last-Event-ID"] = last_event_id
 
     with connect_sse(client, "GET", "/v1/commands", headers=headers) as event_source:
-        if event_source.response.status_code != 200:
-            raise CommandStreamError(
-                f"GET /v1/commands (SSE) was refused: "
-                f"{event_source.response.status_code}"
-            )
+        _raise_for_non_200(event_source.response.status_code, "GET /v1/commands (SSE)")
         for sse in event_source.iter_sse():
             # Persisted as soon as the event is off the wire, **before**
             # yielding it -- `Last-Event-ID` is a transport-level bookmark
@@ -279,10 +311,7 @@ def _poll_once(
         headers["Last-Event-ID"] = last_event_id
 
     response = client.get("/v1/commands", params={"wait": 0}, headers=headers)
-    if response.status_code != 200:
-        raise CommandStreamError(
-            f"GET /v1/commands?wait=0 was refused: {response.status_code}"
-        )
+    _raise_for_non_200(response.status_code, "GET /v1/commands?wait=0")
     items = [_parse_command_obj(raw) for raw in response.json()]
     return items, response.headers.get("Retry-After")
 

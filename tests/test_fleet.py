@@ -997,6 +997,35 @@ def test_commands_stream_wait_0_honours_last_event_id(
     assert [entry["id"] for entry in body] == [second.id]
 
 
+def test_commands_stream_wait_0_out_of_range_last_event_id_does_not_hide_own_command(
+    client: TestClient, storage: Storage, token: str, other_token: str
+) -> None:
+    """Cross-review reproduction, at the HTTP level: `Last-Event-ID` is a
+    global sequence shared by every apartment's commands, so a value that
+    is syntactically valid but was never actually sent to *this*
+    apartment (here: `OTHER_APARTMENT`'s ten commands push the global
+    counter well past anything `APARTMENT` has ever seen) must not hide
+    `APARTMENT`'s own, genuinely pending command."""
+
+    for _ in range(10):
+        storage.create_command(
+            OTHER_APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+    own_command = storage.create_command(
+        APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.get(
+        "/v1/commands?wait=0",
+        headers={**_bearer(token), "Last-Event-ID": "16"},
+    )
+
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [own_command.id]
+
+
 def test_commands_stream_wait_0_with_a_malformed_last_event_id_is_treated_as_0(
     client: TestClient, storage: Storage, token: str
 ) -> None:

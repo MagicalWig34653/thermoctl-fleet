@@ -1160,6 +1160,38 @@ class Storage:
         column, so an apartment that reconnects long after `now` simply
         never sees it, exactly like it was never delivered.
 
+        **`after_sequence` is clamped to this apartment's own range before
+        it is ever used in the query** (cross-review of this package,
+        main-session decision): `id`/sequence is a single, global
+        autoincrement counter shared by every apartment's commands (see
+        `CommandRecord.id`'s own docstring for why -- it doubles as the SSE
+        stream's own monotonic event id), which means a `Last-Event-ID`
+        legitimately issued for *one* apartment is, structurally, also a
+        syntactically valid (if never actually sent) resume point for
+        *any other* apartment. Reproduced: ten commands created for
+        apartment B (sequences 1-10), then one for apartment A (sequence
+        11); `pending_commands("apartment-a", 16, now)` -- a stale,
+        forged, or simply confused `after_sequence` naming a sequence that
+        was never sent to A at all -- returned `[]`, silently hiding
+        apartment A's own, genuinely pending command. **Fixed by treating
+        any `after_sequence` beyond this apartment's own highest command
+        sequence as `0`** ("everything still pending for *this*
+        apartment"), computed as `MAX(id) WHERE apartment_id = ...` inside
+        the same query. A per-apartment sequence counter (instead of one
+        global counter clamped per read) was considered and rejected: it
+        would need its own migration and its own concurrency-safe
+        allocation scheme for no operational gain, since **re-delivering
+        an already-seen command is always safe** -- P5.2's own id
+        de-duplication (`AgentState.executed_ids`) and the result
+        endpoint's idempotency (`Storage.record_command_result`'s
+        `DUPLICATE_IDENTICAL` outcome) already make a redundant delivery
+        harmless, which is exactly what makes clamping to `0` (rather than
+        rejecting the request, or trying to reconstruct "the last sequence
+        this apartment was actually sent") the correct, simplest fix: an
+        over-permissive resume point costs one apartment a handful of
+        redundant, already-idempotent redeliveries; the bug this replaces
+        could permanently hide a real, pending command instead.
+
         Ordered by sequence ascending -- the order commands were created
         in, and the order `fleet.app.commands_stream` writes them into the
         SSE stream so `Last-Event-ID` resumption is unambiguous about
@@ -1175,11 +1207,20 @@ class Storage:
 
         normalized_now = _naive_utc(now)
         with self.session() as session:
+            apartment_max_sequence = session.scalar(
+                select(func.max(CommandRecord.id)).where(
+                    CommandRecord.apartment_id == apartment_id
+                )
+            )
+            effective_after_sequence = after_sequence
+            if apartment_max_sequence is None or after_sequence > apartment_max_sequence:
+                effective_after_sequence = 0
+
             rows = session.scalars(
                 select(CommandRecord)
                 .where(
                     CommandRecord.apartment_id == apartment_id,
-                    CommandRecord.id > after_sequence,
+                    CommandRecord.id > effective_after_sequence,
                     CommandRecord.expires_at > normalized_now,
                     CommandRecord.result_received_at.is_(None),
                 )

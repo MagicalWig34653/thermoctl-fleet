@@ -1,7 +1,7 @@
 """End-to-end tests for `agent/commands_channel.py` (P5.1, docs
 /specification.md sections 3, 7) against the **real** `fleet.app.app`, over
 **real** TLS (`tests.tls_support`) -- no mock of TLS, of the fleet HTTP
-layer, or of `httpx_sse` anywhere in this file.
+layer's *behaviour*, or of `httpx_sse` anywhere in this file.
 
 The "interrupted stream, falls back to polling, resumes" scenario needs
 actual control over starting and stopping a real TLS server without losing
@@ -12,23 +12,34 @@ context manager, which only ever starts one server for its whole `with`
 block. The injected `sleep=` callable (the same test hook
 `agent.registration.register` already uses) is what restarts the server in
 these tests -- so "60 s" never means a real wait.
+
+A handful of tests near the end use `httpx.MockTransport` -- the same
+established exception `tests/test_agent_heartbeat_sender.py`'s own module
+docstring documents: not a mock of TLS or of the real fleet app's
+behaviour, just a fixed, local HTTP response for one specific status code
+(`500`) this module's own branch logic reacts to, since the real fleet app
+has no code path that returns anything other than 200/401/403 for
+`GET /v1/commands`.
 """
 
 from __future__ import annotations
 
 import secrets
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 import uvicorn
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import agent.commands_channel as commands_channel_module
 from agent.commands_channel import (
     MAX_OUTBOX_RESULTS,
     CommandResultError,
+    CommandStreamAuthError,
     CommandStreamError,
     RejectedCommand,
     _append_to_outbox,
@@ -44,8 +55,9 @@ from agent.commands_channel import (
 )
 from agent.transport import build_client, fingerprint_for_certificate
 from fleet.app import app
-from fleet.storage import Storage, create_storage, get_storage, upgrade
+from fleet.storage import Storage, create_storage, get_storage, hash_token, upgrade
 from protocol.commands import Command, CommandResult, CommandType
+from protocol.registration import encode_bytes, verification_code_for
 from protocol.version import PROTOCOL_VERSION
 from tests.tls_support import (
     _free_port,
@@ -83,6 +95,47 @@ def _override_storage(app_storage: Storage) -> Iterator[None]:
 def _issue_token(storage: Storage, apartment: str = APARTMENT) -> str:
     token = f"agent_{apartment}_{secrets.token_urlsafe(32)}"
     storage.set_apartment_token(apartment, token)
+    return token
+
+
+def _issue_token_via_device_flow(storage: Storage, apartment: str = APARTMENT) -> str:
+    """Unlike `_issue_token` above (a direct token set, no assignment
+    record), this goes through the real device-registration flow so the
+    resulting token is backed by an actual, open `AssignmentRecord` --
+    needed only by the auth-revocation test below, which revokes via
+    `Storage.remove_device(expected_assignment_id=...)`, mirroring
+    `tests/test_agent_heartbeat_sender.py`'s own identical helper for the
+    equivalent heartbeat-side test."""
+
+    device_id = f"sn-{apartment}"
+    storage.register_device(
+        device_id, model="Pi 5", acquisition_date=date(2026, 1, 1),
+        image_version="2026.1", watchdog_version="0.1.0",
+    )
+    property_ = storage.create_property(f"Property for {apartment}", "Sample Street 7")
+    storage.create_apartment(
+        apartment, property_id=property_.id, label=apartment, floor=None,
+        orientation=None, state="occupied", heating_circuits=1, pilot_mode=False,
+    )
+    now = datetime.now(UTC)
+    raw_code = storage.prepare_device(
+        device_id, ui_username="landlord", confirmed_reset=False, now=now
+    )
+    private_key = Ed25519PrivateKey.generate()
+    public_key = encode_bytes(private_key.public_key().public_bytes_raw())
+    verification_code = verification_code_for(public_key)
+    assert storage.record_device_report(raw_code, public_key, verification_code, now)
+    external_id = storage.assign_registration_external_id(device_id, now)
+    assert external_id is not None
+    storage.confirm_device(
+        device_id, apartment, verification_code, ui_user="landlord", reason="Setup",
+        replace_previous=False, previous_device_target_state=None, now=now,
+    )
+    nonce = "test-nonce"
+    expires_at = storage.issue_token_challenge(external_id, hash_token(nonce), now)
+    assert expires_at is not None
+    token = storage.issue_device_token(external_id, nonce, now)
+    assert token is not None
     return token
 
 
@@ -475,27 +528,49 @@ def test_append_to_outbox_caps_at_max_outbox_results_oldest_dropped_first(
     assert outbox[-1].id == f"cmd-{MAX_OUTBOX_RESULTS + 4}"
 
 
-def test_stream_once_non_200_response_raises_command_stream_error(
-    tmp_path: Path, app_storage: Storage
+def _mock_status_client(status_code: int) -> httpx.Client:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code)
+
+    return httpx.Client(base_url="https://example.invalid", transport=httpx.MockTransport(handler))
+
+
+def test_stream_once_non_200_non_auth_response_raises_command_stream_error(
+    tmp_path: Path,
 ) -> None:
-    """No `Authorization` header at all -- `require_apartment_token_by_hash`
-    refuses with `401` before `commands_stream` ever runs, which
-    `_stream_once` must turn into `CommandStreamError`, not silently treat
-    as a valid (empty) SSE stream."""
+    """A non-200 response that is **not** 401/403 (a `500`, say -- a
+    genuinely unexpected server error, not an auth refusal) is the
+    ordinary, fallback-triggering `CommandStreamError`, not
+    `CommandStreamAuthError`. A fixed-status `httpx.MockTransport` is used
+    here (the same established pattern `tests/test_agent_heartbeat_sender
+    .py`'s own module docstring documents) since the real fleet app has no
+    code path that returns anything other than 200/401/403 for this
+    endpoint -- this is purely `_stream_once`'s own branch logic, not a
+    claim about the real server's behaviour."""
 
-    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
-        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
-            with pytest.raises(CommandStreamError):
-                list(_stream_once(client, tmp_path / "last-event-id"))
+    with pytest.raises(CommandStreamError):
+        list(_stream_once(_mock_status_client(500), tmp_path / "last-event-id"))
 
 
-def test_poll_once_non_200_response_raises_command_stream_error(
-    tmp_path: Path, app_storage: Storage
+def test_stream_once_401_raises_command_stream_auth_error_not_the_generic_one(
+    tmp_path: Path,
 ) -> None:
-    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
-        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
-            with pytest.raises(CommandStreamError):
-                _poll_once(client, tmp_path / "last-event-id")
+    with pytest.raises(CommandStreamAuthError):
+        list(_stream_once(_mock_status_client(401), tmp_path / "last-event-id"))
+
+
+def test_poll_once_non_200_non_auth_response_raises_command_stream_error(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CommandStreamError):
+        _poll_once(_mock_status_client(500), tmp_path / "last-event-id")
+
+
+def test_poll_once_403_raises_command_stream_auth_error_not_the_generic_one(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CommandStreamAuthError):
+        _poll_once(_mock_status_client(403), tmp_path / "last-event-id")
 
 
 def test_receive_commands_uses_the_poll_fallback_when_only_the_stream_fails(
@@ -615,3 +690,70 @@ def test_report_result_raises_command_result_error_on_an_explicit_refusal(
 
     # Not buffered -- an explicit refusal is not a transport failure.
     assert not (tmp_path / "outbox.json").exists()
+
+
+# -----------------------------------------------------------------------------
+# Cross-review fix: a revoked token must propagate as `CommandStreamAuthError`
+# on both the SSE path and the `wait=0` fallback, never be silently retried
+# forever the way a dropped connection is (see `CommandStreamAuthError`'s
+# own docstring in `agent/commands_channel.py`).
+# -----------------------------------------------------------------------------
+
+
+def _revoke_token(storage: Storage, apartment: str) -> None:
+    current_assignment = storage.get_current_assignment(apartment)
+    assert current_assignment is not None
+    storage.remove_device(
+        apartment, expected_assignment_id=current_assignment.id, target_state="in_storage",
+        reason="Ausbau", ui_username="landlord", now=datetime.now(UTC),
+    )
+
+
+def test_stream_once_raises_auth_error_on_a_revoked_token(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    token = _issue_token_via_device_flow(app_storage)
+    _revoke_token(app_storage, APARTMENT)
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            with pytest.raises(CommandStreamAuthError):
+                list(_stream_once(client, tmp_path / "last-event-id"))
+
+
+def test_poll_once_raises_auth_error_on_a_revoked_token(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    token = _issue_token_via_device_flow(app_storage)
+    _revoke_token(app_storage, APARTMENT)
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            with pytest.raises(CommandStreamAuthError):
+                _poll_once(client, tmp_path / "last-event-id")
+
+
+def test_receive_commands_does_not_swallow_a_revoked_token(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    """The end-to-end case: `receive_commands`'s own fallback loop must
+    propagate `CommandStreamAuthError` to its caller rather than treating a
+    revoked token like a dropped connection and retrying forever -- the
+    exact defect cross-review reproduced (both the SSE attempt and the
+    `wait=0` fallback used to be swallowed by `CommandStreamError`'s own
+    generic, retryable handling)."""
+
+    token = _issue_token_via_device_flow(app_storage)
+    _revoke_token(app_storage, APARTMENT)
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            gen = receive_commands(client, tmp_path / "last-event-id")
+            try:
+                with pytest.raises(CommandStreamAuthError):
+                    next(gen)
+            finally:
+                gen.close()

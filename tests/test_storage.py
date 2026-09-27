@@ -2515,6 +2515,67 @@ def test_pending_commands_scoped_to_the_apartment(storage: Storage) -> None:
     assert storage.pending_commands("house7-a03", 0, datetime.now(UTC)) == []
 
 
+def test_pending_commands_clamps_an_after_sequence_beyond_this_apartments_own_range(
+    storage: Storage,
+) -> None:
+    """Cross-review reproduction: `id`/sequence is one global counter
+    shared by every apartment's commands -- a `Last-Event-ID` that is
+    syntactically valid (just never actually sent to *this* apartment)
+    must not silently hide a command this apartment genuinely has pending.
+    Ten commands for B (sequences 1-10), then one for A (sequence 11):
+    `pending_commands("house9-b01" -> unrelated apartment "house7-a03",
+    16, now)` used to return `[]` -- 16 is beyond A's own maximum sequence
+    (11), so it is now clamped to `0` instead of trusted as-is."""
+
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    for _ in range(10):
+        storage.create_command(
+            "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+    a_command = storage.create_command(
+        "house7-a03", CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    pending = storage.pending_commands("house7-a03", 16, datetime.now(UTC))
+
+    assert [item.command.id for item in pending] == [a_command.id]
+
+
+def test_pending_commands_legitimate_resume_still_skips_this_apartments_older_commands(
+    storage: Storage,
+) -> None:
+    """The clamp above must not defeat ordinary, legitimate resumption --
+    an `after_sequence` that *is* within this apartment's own range still
+    excludes that apartment's own older, already-delivered commands."""
+
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    for _ in range(10):
+        storage.create_command(
+            "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+    first = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    second = storage.create_command(
+        "house7-a03", CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    all_pending = storage.pending_commands("house7-a03", 0, datetime.now(UTC))
+    assert [item.command.id for item in all_pending] == [first.id, second.id]
+    first_sequence = all_pending[0].sequence
+
+    resumed = storage.pending_commands("house7-a03", first_sequence, datetime.now(UTC))
+
+    assert [item.command.id for item in resumed] == [second.id]
+
+
 def test_pending_commands_never_returns_a_command_with_a_stored_result(storage: Storage) -> None:
     _make_apartment(storage)
     command = storage.create_command(
