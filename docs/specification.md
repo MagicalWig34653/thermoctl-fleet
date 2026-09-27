@@ -1037,6 +1037,12 @@ because of defective hardware, where someone has to go anyway -- A/B is the righ
 can be retrofitted. The decision is reversible as long as the image recipe stays in our own
 hands.
 
+There is a cheaper way to buy the same capability, examined and written down but not adopted:
+an immutable distribution that brings transactional updates and snapshot rollback with it
+(openSUSE Leap Micro). It carries its own costs, in the image recipe and in the container
+runtime. See `docs/deferred-options.md` before building A/B partitions -- that is the entry
+point for this decision, not a fresh round of research.
+
 **What remains impossible remotely:** a device that no longer boots. That is what the
 replacement device on the shelf is for.
 
