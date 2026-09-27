@@ -1260,6 +1260,11 @@ def command_confirm_form(
     )
 
 
+async def _command_lines_submitted(request: Request) -> bool:
+    """Distinguish an omitted field from a submitted empty string."""
+    return "lines" in await request.form()
+
+
 @router.post("/apartments/{apartment_id}/commands/{command}/confirm")
 def command_confirm_submit(
     request: Request,
@@ -1269,26 +1274,14 @@ def command_confirm_submit(
     lines: str = Form(""),
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    lines_submitted: bool = Depends(_command_lines_submitted),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
-    """Step two (section 9): the only route that ever calls
-    `Storage.create_command`. **Retired apartments are refused here**
-    (`ValueError` from `create_command` itself would also catch this, but
-    checking it before ever touching `lines`/dedup logic keeps the error
-    message specific and avoids a wasted double-submit lookup for a request
-    that can never succeed). `lines` is only ever parsed for `fetch_logs` --
-    a tampered `lines` field posted alongside any other command is silently
-    ignored, never passed through to `Storage.create_command` (which would
-    itself reject it with `ValueError`, but this route's own job is to
-    never construct that call in the first place for a command that takes
-    no parameters).
+    """Validate the confirmation and atomically create the command and audit.
 
-    **Double-submit protection** (P5.1b, decided and documented in
-    `Storage.has_pending_identical_command`'s own docstring): a resubmission
-    of this exact form (apartment, command, lines) within
-    `fleet.storage.DOUBLE_SUBMIT_WINDOW` of an still-pending, identical
-    command is silently treated as already done -- redirected exactly like
-    a fresh success, no second command or audit row created.
+    Invalid fields re-render with HTTP 400, including any `lines` field on
+    commands other than `fetch_logs`. Duplicate submissions within the
+    storage window redirect like a success without creating another row.
     """
 
     command_type = _parse_command_type(command)
@@ -1335,17 +1328,17 @@ def command_confirm_submit(
                 f"Anzahl Zeilen muss zwischen {MIN_FETCH_LOGS_LINES} und "
                 f"{MAX_FETCH_LOGS_LINES} liegen."
             )
+    elif lines_submitted:
+        return _error("Dieser Befehl unterstützt keine Zeilenzahl.")
 
-    now = datetime.now(UTC)
-    if not storage.has_pending_identical_command(apartment_id, command_type, parsed_lines, now):
-        storage.create_command(
-            apartment_id,
-            command_type,
-            lines=parsed_lines,
-            ui_username=authenticated.user.username,
-            reason=reason.strip(),
-            now=now,
-        )
+    storage.create_command_unless_duplicate(
+        apartment_id,
+        command_type,
+        lines=parsed_lines,
+        ui_username=authenticated.user.username,
+        reason=reason.strip(),
+        now=datetime.now(UTC),
+    )
 
     return RedirectResponse(
         url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303

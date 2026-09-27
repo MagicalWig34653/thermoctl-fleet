@@ -83,7 +83,10 @@ from sqlalchemy import (
     case,
     create_engine,
     delete,
+    exists,
     func,
+    insert,
+    literal,
     or_,
     select,
     text,
@@ -631,9 +634,10 @@ COMMAND_EXPIRY = timedelta(minutes=15)
 # within this window of an identical, still-not-resulted command (same
 # apartment, command type, and `lines`) for the same apartment is refused
 # rather than creating a second, redundant command -- see
-# `Storage.has_pending_identical_command`'s own docstring for the full
-# reasoning and the alternative (a one-time confirmation token) this
-# package decided against.
+# `Storage.create_command_unless_duplicate`'s own docstring for the full
+# reasoning (including the atomic check-and-insert this package's
+# cross-review required), and the alternative (a one-time confirmation
+# token) this package decided against.
 DOUBLE_SUBMIT_WINDOW = timedelta(seconds=10)
 
 # P5.1b: bounds how many rows `Storage.list_commands_for_apartment` (the
@@ -1106,17 +1110,16 @@ class Storage:
         reason: str | None = None,
     ) -> Command:
         """Creates a new command for `apartment_id` (section 7) -- the
-        storage function P5.1b's UI buttons call; P5.1 built and tested the
-        function itself, P5.1b (below, `reason`) adds the audit entry and
-        wires it to an actual button.
+        direct storage API, without duplicate suppression. UI buttons use
+        `create_command_unless_duplicate` to serialize duplicate checks.
 
         **`reason` is optional here, at the storage layer** (`None` by
         default) so P5.1's own pre-existing direct callers (`tests/
         test_storage.py`, `tests/test_fleet.py`,
         `tests/test_agent_commands_channel.py` -- none of them going
-        through the UI) keep working unchanged; `fleet/ui_routes.py`'s
-        confirmation POST (P5.1b) is the one real caller that always
-        supplies a non-empty, already-validated one. **An audit row is
+        through the UI) keep working unchanged. The confirmation POST uses
+        `create_command_unless_duplicate` with a validated reason.
+        **An audit row is
         written unconditionally**, `reason=None` included, in the *same*
         transaction as the command row (section 20.3's "who, when, why",
         applied here even though it was P5.1's own "still missing" note
@@ -1201,56 +1204,115 @@ class Storage:
             protocol_version=PROTOCOL_VERSION,
         )
 
-    def has_pending_identical_command(
+    def create_command_unless_duplicate(
         self,
         apartment_id: str,
         command_type: CommandType,
+        *,
         lines: int | None,
+        ui_username: str,
         now: datetime,
-    ) -> bool:
-        """P5.1b double-submit protection: `True` if `apartment_id` already
-        has a not-yet-resulted command of the exact same `command_type`/
-        `lines`, created within `DOUBLE_SUBMIT_WINDOW` of `now`.
+        reason: str | None = None,
+    ) -> Command | None:
+        """Create a command and its audit row unless an identical one is pending.
 
-        **Decided over a one-time confirmation token (documented here, not
-        only in `docs/STATUS.md`):** a token minted on the GET confirmation
-        page and checked on POST would need somewhere server-side to
-        record "already used" (a session-scoped store, or a new table) --
-        this apartment/type/lines/recency check instead reuses the
-        `commands` table that already exists, needs no migration, and is
-        directly unit-testable with an injected clock. The cost is
-        accepted deliberately: two *genuinely separate* identical commands
-        (say, `report_now` pressed twice on purpose within the same 10
-        seconds) are indistinguishable from a double submit and the second
-        press is silently dropped -- section 7 already makes a redundant
-        delivery harmless (`Storage.pending_commands`'s own "re-delivering
-        an already-seen command is always safe" reasoning), so losing one
-        redundant, on-purpose second command in this narrow window costs
-        nothing operationally, while a resubmitted browser form (back
-        button, double click, a flaky connection retried by the browser
-        itself) is exactly what this closes.
+        The duplicate check and both inserts share one transaction. SQLite
+        takes its write lock with BEGIN IMMEDIATE before any lookup; other
+        databases lock the apartment row with SELECT FOR UPDATE. Concurrent
+        submissions for an apartment therefore wait for the previous commit
+        before checking the ten-second window, including on PostgreSQL.
+        Any insert failure rolls back both the command and its audit row.
 
-        Not gated on `expires_at`/`delivered_at` -- only on
-        `result_received_at IS NULL` and the creation-time window, so an
-        already-delivered-but-still-pending command still blocks an
-        identical resubmission, which is exactly the case double-submit
-        protection exists for.
+        This reuses command history instead of storing one-time confirmation
+        tokens. An intentional identical submission inside the window is also
+        suppressed. Only type, lines, creation time and missing result matter;
+        delivery and expiry do not disable protection against double clicks.
         """
 
-        window_start = _naive_utc(now) - DOUBLE_SUBMIT_WINDOW
-        with self.session() as session:
-            return (
-                session.scalar(
-                    select(CommandRecord.id).where(
-                        CommandRecord.apartment_id == apartment_id,
-                        CommandRecord.command_type == str(command_type),
-                        CommandRecord.lines == lines,
-                        CommandRecord.result_received_at.is_(None),
-                        CommandRecord.created_at >= window_start,
-                    )
-                )
-                is not None
+        if lines is not None and command_type != CommandType.FETCH_LOGS:
+            raise ValueError(
+                f"lines is only valid for {CommandType.FETCH_LOGS!r}, not "
+                f"{command_type!r}."
             )
+
+        normalized_now = _naive_utc(now)
+        window_start = normalized_now - DOUBLE_SUBMIT_WINDOW
+        command_id = uuid.uuid4().hex
+        created_at = normalized_now
+        expires_at = created_at + COMMAND_EXPIRY
+
+        with self.session() as session:
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            apartment = session.scalar(
+                select(ApartmentRecord)
+                .where(ApartmentRecord.id == apartment_id)
+                .with_for_update()
+            )
+            if apartment is None:
+                raise ValueError(f"Unknown apartment {apartment_id!r}.")
+            if apartment.state == "retired":
+                raise ValueError(f"Apartment {apartment_id!r} is retired.")
+
+            lines_filter = (
+                CommandRecord.lines.is_(None) if lines is None else CommandRecord.lines == lines
+            )
+            duplicate_exists = exists(
+                select(CommandRecord.id).where(
+                    CommandRecord.apartment_id == apartment_id,
+                    CommandRecord.command_type == str(command_type),
+                    lines_filter,
+                    CommandRecord.result_received_at.is_(None),
+                    CommandRecord.created_at >= window_start,
+                )
+            )
+            select_new_row = select(
+                literal(command_id).label("command_id"),
+                literal(apartment_id).label("apartment_id"),
+                literal(str(command_type)).label("command_type"),
+                literal(lines, type_=Integer).label("lines"),
+                literal(created_at).label("created_at"),
+                literal(expires_at).label("expires_at"),
+                literal(ui_username).label("created_by"),
+                literal(PROTOCOL_VERSION, type_=Integer).label("protocol_version"),
+            ).where(~duplicate_exists)
+            insert_stmt = insert(CommandRecord).from_select(
+                [
+                    "command_id",
+                    "apartment_id",
+                    "command_type",
+                    "lines",
+                    "created_at",
+                    "expires_at",
+                    "created_by",
+                    "protocol_version",
+                ],
+                select_new_row,
+            )
+            inserted_id = session.execute(
+                insert_stmt.returning(CommandRecord.command_id)
+            ).scalar_one_or_none()
+            if inserted_id is None:
+                return None
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="command",
+                entity_id=command_id,
+                action="created",
+                reason=reason,
+                before=None,
+                after={"command_type": str(command_type), "lines": lines},
+            )
+
+        return Command(
+            id=command_id,
+            command=command_type,
+            expires_at=expires_at.replace(tzinfo=UTC),
+            lines=lines,
+            protocol_version=PROTOCOL_VERSION,
+        )
 
     def list_commands_for_apartment(self, apartment_id: str) -> list[CommandRecord]:
         """Recent commands for `apartment_id`, newest first, bounded at

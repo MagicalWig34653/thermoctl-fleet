@@ -22,10 +22,12 @@ from datetime import UTC, datetime, timedelta
 import pyotp
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from fleet.storage import (
     DOUBLE_SUBMIT_WINDOW,
     CommandRecord,
+    InventoryAuditLogRecord,
     Storage,
     create_storage,
     get_storage,
@@ -438,24 +440,32 @@ def test_confirm_post_creates_command_with_correct_fields_and_audit_row(
     assert log[0].action == "created"
 
 
-def test_confirm_post_ignores_a_tampered_lines_field_for_a_non_fetch_logs_command(
-    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+@pytest.mark.parametrize("lines_value", ["999", "", " "])
+@pytest.mark.parametrize("command_type", [c for c in CommandType if c != CommandType.FETCH_LOGS])
+def test_confirm_post_rejects_a_lines_field_for_a_non_fetch_logs_command(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int,
+    lines_value: str, command_type: CommandType,
 ) -> None:
     _make_apartment(storage)
     _login(client, password, totp_secret)
-    confirm_page = client.get(f"/ui/apartments/{APARTMENT}/commands/report_now/confirm")
+    url = f"/ui/apartments/{APARTMENT}/commands/{command_type}/confirm"
+    confirm_page = client.get(url)
     csrf_token = _csrf_from_confirm_page(confirm_page.text)
 
     response = client.post(
-        f"/ui/apartments/{APARTMENT}/commands/report_now/confirm",
-        data={"reason": "Testlauf", "lines": "999", "csrf_token": csrf_token},
+        url,
+        data={"reason": "Testlauf", "lines": lines_value, "csrf_token": csrf_token},
         follow_redirects=False,
     )
 
-    assert response.status_code == 303
-    rows = storage.list_commands_for_apartment(APARTMENT)
-    assert len(rows) == 1
-    assert rows[0].lines is None
+    assert response.status_code == 400
+    assert "Dieser Befehl unterstützt keine Zeilenzahl." in response.text
+    assert 'name="csrf_token"' in response.text
+    assert storage.list_commands_for_apartment(APARTMENT) == []
+    with storage.session() as session:
+        assert session.scalars(
+            select(InventoryAuditLogRecord).where(InventoryAuditLogRecord.entity_type == "command")
+        ).all() == []
 
 
 def test_confirm_post_double_submit_creates_only_one_command(
@@ -464,7 +474,7 @@ def test_confirm_post_double_submit_creates_only_one_command(
     """A reloaded/re-sent confirmation POST (same apartment, command, and
     `lines`, within `DOUBLE_SUBMIT_WINDOW`) must not create a second
     identical command (P5.1b's own double-submit protection,
-    `Storage.has_pending_identical_command`)."""
+    `Storage.create_command_unless_duplicate`)."""
 
     _make_apartment(storage)
     _login(client, password, totp_secret)

@@ -62,17 +62,17 @@ built.
 **Commands (P5.1b, section 9: "the four to seven allowed commands as
 buttons with confirmation") -- built here, on top of P5.1's storage
 (`Storage.create_command`/`list_commands_for_apartment`/
-`has_pending_identical_command`).** `COMMAND_TYPE_LABELS` below is a
+`create_command_unless_duplicate`).** `COMMAND_TYPE_LABELS` below is a
 mapping keyed by every `protocol.commands.CommandType` value -- **the
 button list itself (`available_commands`) always iterates the enum
 directly**, never a separately hand-maintained list of buttons, so the UI
 can never offer (or, symmetrically, silently drop) a command the closed
 protocol list does not/does have (CLAUDE.md principle 1). The actual
 two-step confirmation flow (GET confirmation page, POST that calls
-`Storage.create_command`) lives in `fleet/ui_routes.py`, mirroring this
-module's existing split (view-model here, thin HTTP layer there); this
-module only derives the button labels and the "Befehle" history list
-(`CommandDisplay`, `build_command_history`).
+`Storage.create_command_unless_duplicate`) lives in `fleet/ui_routes.py`,
+mirroring this module's existing split (view-model here, thin HTTP layer
+there); this module only derives the button labels and the "Befehle"
+history list (`CommandDisplay`, `build_command_history`).
 """
 
 from __future__ import annotations
