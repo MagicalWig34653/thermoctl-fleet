@@ -2802,6 +2802,185 @@ def test_record_command_result_not_gated_on_expiry(storage: Storage) -> None:
 
 
 # -----------------------------------------------------------------------------
+# P5.1b: audit logging, double-submit protection, command history listing
+# -----------------------------------------------------------------------------
+
+
+def test_create_command_writes_one_audit_row_in_the_same_transaction(
+    storage: Storage,
+) -> None:
+    """Section 20.3's "who, when, why" applied to commands (P5.1b) --
+    `entity_type="command"`, `entity_id` is the wire command id (not the
+    internal sequence), `reason`/`created_by` both recorded."""
+
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+
+    command = storage.create_command(
+        "house7-a03",
+        CommandType.FETCH_LOGS,
+        lines=150,
+        ui_username="landlord",
+        reason="Diagnose eines Fehlers",
+        now=now,
+    )
+
+    log = storage.list_audit_log_for_entity("command", command.id)
+    assert len(log) == 1
+    entry = log[0]
+    assert entry.ui_username == "landlord"
+    assert entry.action == "created"
+    assert entry.reason == "Diagnose eines Fehlers"
+    assert entry.after_json is not None
+    assert "fetch_logs" in entry.after_json
+    assert "150" in entry.after_json
+
+
+def test_create_command_writes_an_audit_row_with_no_reason_for_a_direct_caller(
+    storage: Storage,
+) -> None:
+    """`reason` is optional at the storage layer -- P5.1's own pre-existing
+    direct callers (not through the UI) still get exactly one audit row,
+    with `reason=None`."""
+
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03",
+        CommandType.REPORT_NOW,
+        lines=None,
+        ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    log = storage.list_audit_log_for_entity("command", command.id)
+    assert len(log) == 1
+    assert log[0].reason is None
+
+
+def test_has_pending_identical_command_true_within_the_window(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert storage.has_pending_identical_command(
+        "house7-a03", CommandType.REPORT_NOW, None, now + timedelta(seconds=5)
+    )
+
+
+def test_has_pending_identical_command_false_outside_the_window(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert not storage.has_pending_identical_command(
+        "house7-a03", CommandType.REPORT_NOW, None, now + timedelta(seconds=11)
+    )
+
+
+def test_has_pending_identical_command_false_for_a_different_command_type(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert not storage.has_pending_identical_command(
+        "house7-a03", CommandType.BACKUP_NOW, None, now + timedelta(seconds=1)
+    )
+
+
+def test_has_pending_identical_command_false_for_different_lines(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord", now=now
+    )
+
+    assert not storage.has_pending_identical_command(
+        "house7-a03", CommandType.FETCH_LOGS, 200, now + timedelta(seconds=1)
+    )
+
+
+def test_has_pending_identical_command_false_for_a_different_apartment(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert not storage.has_pending_identical_command(
+        "house9-b01", CommandType.REPORT_NOW, None, now + timedelta(seconds=1)
+    )
+
+
+def test_has_pending_identical_command_false_once_a_result_is_stored(storage: Storage) -> None:
+    """A command that already has a result is not "pending" any more --
+    double-submit protection must not block a genuinely new command just
+    because an old, already-finished one shares the same type/lines."""
+
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+    storage.record_command_result(
+        command.id,
+        "house7-a03",
+        CommandResult(id=command.id, successful=True, duration_s=1.0),
+        now + timedelta(seconds=1),
+    )
+
+    assert not storage.has_pending_identical_command(
+        "house7-a03", CommandType.REPORT_NOW, None, now + timedelta(seconds=2)
+    )
+
+
+def test_list_commands_for_apartment_newest_first(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    first = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+    second = storage.create_command(
+        "house7-a03",
+        CommandType.BACKUP_NOW,
+        lines=None,
+        ui_username="landlord",
+        now=now + timedelta(seconds=1),
+    )
+
+    rows = storage.list_commands_for_apartment("house7-a03")
+
+    assert [row.command_id for row in rows] == [second.id, first.id]
+
+
+def test_list_commands_for_apartment_scoped_to_one_apartment(storage: Storage) -> None:
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+    storage.create_command(
+        "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    rows = storage.list_commands_for_apartment("house7-a03")
+
+    assert len(rows) == 1
+    assert rows[0].apartment_id == "house7-a03"
+
+
+# -----------------------------------------------------------------------------
 # Migration 0009: commands table
 # -----------------------------------------------------------------------------
 

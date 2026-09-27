@@ -627,6 +627,22 @@ class RecordCommandResultOutcome(StrEnum):
 # Section 7: "every command has an expiry (default 15 minutes)".
 COMMAND_EXPIRY = timedelta(minutes=15)
 
+# P5.1b double-submit protection: a reloaded/re-sent confirmation POST
+# within this window of an identical, still-not-resulted command (same
+# apartment, command type, and `lines`) for the same apartment is refused
+# rather than creating a second, redundant command -- see
+# `Storage.has_pending_identical_command`'s own docstring for the full
+# reasoning and the alternative (a one-time confirmation token) this
+# package decided against.
+DOUBLE_SUBMIT_WINDOW = timedelta(seconds=10)
+
+# P5.1b: bounds how many rows `Storage.list_commands_for_apartment` (the
+# "Befehle" section's history list) ever reads -- mirrors
+# `_MAX_EVENT_HISTORY_ROWS`'s own reasoning (a landlord's UI list must stay
+# renderable regardless of how many commands accumulate over an
+# apartment's lifetime).
+_MAX_COMMAND_HISTORY_ROWS = 200
+
 # The largest value SQLite's/PostgreSQL's own `BIGINT` (what `CommandRecord
 # .id` -- the SSE sequence number -- is stored as) can represent. A
 # `Last-Event-ID` this large (or non-positive) is rejected *before* it is
@@ -1087,10 +1103,30 @@ class Storage:
         lines: int | None,
         ui_username: str,
         now: datetime,
+        reason: str | None = None,
     ) -> Command:
         """Creates a new command for `apartment_id` (section 7) -- the
-        storage function P5.1b's UI buttons will call; this package builds
-        it and tests it, not the button itself.
+        storage function P5.1b's UI buttons call; P5.1 built and tested the
+        function itself, P5.1b (below, `reason`) adds the audit entry and
+        wires it to an actual button.
+
+        **`reason` is optional here, at the storage layer** (`None` by
+        default) so P5.1's own pre-existing direct callers (`tests/
+        test_storage.py`, `tests/test_fleet.py`,
+        `tests/test_agent_commands_channel.py` -- none of them going
+        through the UI) keep working unchanged; `fleet/ui_routes.py`'s
+        confirmation POST (P5.1b) is the one real caller that always
+        supplies a non-empty, already-validated one. **An audit row is
+        written unconditionally**, `reason=None` included, in the *same*
+        transaction as the command row (section 20.3's "who, when, why",
+        applied here even though it was P5.1's own "still missing" note
+        that flagged this as P5.1b's job, not a new requirement) --
+        `entity_type="command"`, `entity_id` is the wire `command_id` (the
+        `uuid4` hex string, not the internal sequence number, for the same
+        "no enumerable primary key over an audit trail either" reasoning
+        `0009_commands.py` already gives for not using the sequence as the
+        wire id), `action="created"`, `after` carries the command type and
+        `lines`.
 
         **Refuses an unknown or a retired apartment**, `ValueError`
         (mirrors `create_apartment`'s own "duplicate id" `ValueError`, not
@@ -1146,6 +1182,16 @@ class Storage:
                 protocol_version=PROTOCOL_VERSION,
             )
             session.add(record)
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="command",
+                entity_id=command_id,
+                action="created",
+                reason=reason,
+                before=None,
+                after={"command_type": str(command_type), "lines": lines},
+            )
 
         return Command(
             id=command_id,
@@ -1154,6 +1200,76 @@ class Storage:
             lines=lines,
             protocol_version=PROTOCOL_VERSION,
         )
+
+    def has_pending_identical_command(
+        self,
+        apartment_id: str,
+        command_type: CommandType,
+        lines: int | None,
+        now: datetime,
+    ) -> bool:
+        """P5.1b double-submit protection: `True` if `apartment_id` already
+        has a not-yet-resulted command of the exact same `command_type`/
+        `lines`, created within `DOUBLE_SUBMIT_WINDOW` of `now`.
+
+        **Decided over a one-time confirmation token (documented here, not
+        only in `docs/STATUS.md`):** a token minted on the GET confirmation
+        page and checked on POST would need somewhere server-side to
+        record "already used" (a session-scoped store, or a new table) --
+        this apartment/type/lines/recency check instead reuses the
+        `commands` table that already exists, needs no migration, and is
+        directly unit-testable with an injected clock. The cost is
+        accepted deliberately: two *genuinely separate* identical commands
+        (say, `report_now` pressed twice on purpose within the same 10
+        seconds) are indistinguishable from a double submit and the second
+        press is silently dropped -- section 7 already makes a redundant
+        delivery harmless (`Storage.pending_commands`'s own "re-delivering
+        an already-seen command is always safe" reasoning), so losing one
+        redundant, on-purpose second command in this narrow window costs
+        nothing operationally, while a resubmitted browser form (back
+        button, double click, a flaky connection retried by the browser
+        itself) is exactly what this closes.
+
+        Not gated on `expires_at`/`delivered_at` -- only on
+        `result_received_at IS NULL` and the creation-time window, so an
+        already-delivered-but-still-pending command still blocks an
+        identical resubmission, which is exactly the case double-submit
+        protection exists for.
+        """
+
+        window_start = _naive_utc(now) - DOUBLE_SUBMIT_WINDOW
+        with self.session() as session:
+            return (
+                session.scalar(
+                    select(CommandRecord.id).where(
+                        CommandRecord.apartment_id == apartment_id,
+                        CommandRecord.command_type == str(command_type),
+                        CommandRecord.lines == lines,
+                        CommandRecord.result_received_at.is_(None),
+                        CommandRecord.created_at >= window_start,
+                    )
+                )
+                is not None
+            )
+
+    def list_commands_for_apartment(self, apartment_id: str) -> list[CommandRecord]:
+        """Recent commands for `apartment_id`, newest first, bounded at
+        `_MAX_COMMAND_HISTORY_ROWS` -- the "Befehle" section's history list
+        (P5.1b, section 9). Scoped strictly to `apartment_id`, mirroring
+        `list_events_for_apartment`/`list_alarms_for_apartment`'s own
+        "no other apartment's data" guarantee."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(CommandRecord)
+                    .where(CommandRecord.apartment_id == apartment_id)
+                    .order_by(CommandRecord.id.desc())
+                    .limit(_MAX_COMMAND_HISTORY_ROWS)
+                ).all()
+            )
+            session.expunge_all()
+            return rows
 
     def pending_commands(
         self, apartment_id: str, after_sequence: int, now: datetime

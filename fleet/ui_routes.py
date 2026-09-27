@@ -25,7 +25,13 @@ from fastapi.templating import Jinja2Templates
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
 from fleet.storage import Storage, get_storage
-from fleet.ui_apartment import build_apartment_detail
+from fleet.ui_apartment import (
+    COMMAND_TYPE_LABELS,
+    DEFAULT_FETCH_LOGS_LINES,
+    MAX_FETCH_LOGS_LINES,
+    MIN_FETCH_LOGS_LINES,
+    build_apartment_detail,
+)
 from fleet.ui_auth import (
     PRE_SESSION_CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
@@ -60,6 +66,7 @@ from fleet.ui_inventory import (
     build_replace_device_view,
 )
 from fleet.ui_tasks import build_task_overview
+from protocol.commands import CommandType
 from protocol.inventory import ApartmentState
 from protocol.registration import AgentRegistrationFile
 
@@ -1158,6 +1165,191 @@ def device_state_submit(
         )
 
     return RedirectResponse(url="/ui/inventory", status_code=303)
+
+
+# -----------------------------------------------------------------------------
+# Stage-1 command buttons with confirmation (P5.1b, section 9: "the four to
+# seven allowed commands as buttons with confirmation"). Two steps, both
+# `require_ui_user`-gated: `command_confirm_form` (GET) names the apartment
+# and the command in words and asks for a mandatory reason; only
+# `command_confirm_submit` (POST, CSRF-checked) actually calls
+# `Storage.create_command`. **Both routes are registered here, above
+# `apartment_detail`'s own `{apartment_id:path}` route below** -- the same
+# route-ordering rule that route's own comment already states: a fixed
+# suffix under `/ui/apartments/...` must be registered before the greedy
+# `:path` converter, or it is never reached.
+#
+# **`command` is a plain `str` path parameter, not `CommandType`-typed**,
+# deliberately: a FastAPI/Pydantic-typed enum path parameter that fails to
+# parse is a `422`, not the `404` the work package asks for ("an unknown
+# command value in the URL -> 404, never reaches storage") -- mirrors
+# `fleet/ui_routes.py::apartment_detail`'s own `days: str | None` reasoning
+# for the identical "never a 422 for a value this module wants to validate
+# itself" rule. `_parse_command_type` below is the one place both routes
+# convert it, raising the 404 before `storage` is ever touched.
+# -----------------------------------------------------------------------------
+
+
+def _parse_command_type(command: str) -> CommandType:
+    try:
+        return CommandType(command)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Unbekannter Befehl.") from exc
+
+
+def _command_confirm_response(
+    request: Request,
+    authenticated: AuthenticatedUiSession,
+    *,
+    apartment_id: str,
+    apartment_label: str,
+    command_type: CommandType,
+    retired: bool,
+    error: str | None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "command_confirm.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "apartment_id": apartment_id,
+            "apartment_label": apartment_label,
+            "command": command_type.value,
+            "command_label": COMMAND_TYPE_LABELS[command_type],
+            "requires_lines": command_type == CommandType.FETCH_LOGS,
+            "default_lines": DEFAULT_FETCH_LOGS_LINES,
+            "min_lines": MIN_FETCH_LOGS_LINES,
+            "max_lines": MAX_FETCH_LOGS_LINES,
+            "retired": retired,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/apartments/{apartment_id}/commands/{command}/confirm", response_class=HTMLResponse)
+def command_confirm_form(
+    request: Request,
+    apartment_id: str,
+    command: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """Step one of two (section 9): names the apartment and the command in
+    words, asks for a mandatory reason. Never calls `Storage.create_command`
+    itself -- only the POST below does."""
+
+    command_type = _parse_command_type(command)
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    return _command_confirm_response(
+        request,
+        authenticated,
+        apartment_id=apartment_id,
+        apartment_label=apartment.label,
+        command_type=command_type,
+        retired=apartment.state == "retired",
+        error=None,
+    )
+
+
+@router.post("/apartments/{apartment_id}/commands/{command}/confirm")
+def command_confirm_submit(
+    request: Request,
+    apartment_id: str,
+    command: str,
+    reason: str = Form(...),
+    lines: str = Form(""),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Step two (section 9): the only route that ever calls
+    `Storage.create_command`. **Retired apartments are refused here**
+    (`ValueError` from `create_command` itself would also catch this, but
+    checking it before ever touching `lines`/dedup logic keeps the error
+    message specific and avoids a wasted double-submit lookup for a request
+    that can never succeed). `lines` is only ever parsed for `fetch_logs` --
+    a tampered `lines` field posted alongside any other command is silently
+    ignored, never passed through to `Storage.create_command` (which would
+    itself reject it with `ValueError`, but this route's own job is to
+    never construct that call in the first place for a command that takes
+    no parameters).
+
+    **Double-submit protection** (P5.1b, decided and documented in
+    `Storage.has_pending_identical_command`'s own docstring): a resubmission
+    of this exact form (apartment, command, lines) within
+    `fleet.storage.DOUBLE_SUBMIT_WINDOW` of an still-pending, identical
+    command is silently treated as already done -- redirected exactly like
+    a fresh success, no second command or audit row created.
+    """
+
+    command_type = _parse_command_type(command)
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    def _error(message: str) -> HTMLResponse:
+        return _command_confirm_response(
+            request,
+            authenticated,
+            apartment_id=apartment_id,
+            apartment_label=apartment.label,
+            command_type=command_type,
+            retired=apartment.state == "retired",
+            error=message,
+            status_code=400,
+        )
+
+    if apartment.state == "retired":
+        return _error("Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.")
+
+    if not reason.strip():
+        return _error("Ein Grund ist erforderlich.")
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        return _error(length_error)
+
+    parsed_lines: int | None = None
+    if command_type == CommandType.FETCH_LOGS:
+        try:
+            parsed_lines = int(lines)
+        except ValueError:
+            return _error(
+                f"Anzahl Zeilen muss eine Zahl zwischen {MIN_FETCH_LOGS_LINES} und "
+                f"{MAX_FETCH_LOGS_LINES} sein."
+            )
+        if not (MIN_FETCH_LOGS_LINES <= parsed_lines <= MAX_FETCH_LOGS_LINES):
+            return _error(
+                f"Anzahl Zeilen muss zwischen {MIN_FETCH_LOGS_LINES} und "
+                f"{MAX_FETCH_LOGS_LINES} liegen."
+            )
+
+    now = datetime.now(UTC)
+    if not storage.has_pending_identical_command(apartment_id, command_type, parsed_lines, now):
+        storage.create_command(
+            apartment_id,
+            command_type,
+            lines=parsed_lines,
+            ui_username=authenticated.user.username,
+            reason=reason.strip(),
+            now=now,
+        )
+
+    return RedirectResponse(
+        url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+    )
 
 
 # P3.2 review: any future `/ui/apartments/...` sub-route (a fixed suffix,
