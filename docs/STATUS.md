@@ -134,19 +134,27 @@ row. Monkeypatched insert failures verify rollback in both directions:
 a failed command insert leaves no audit row, and a failed audit insert
 leaves no command.
 
-**Cross-review verification:** used the main checkout's existing `.venv`
-interpreter with `PYTHONPATH=.`; no packages installed. `ruff check .`:
-`All checks passed!`. `mypy .`:
-`Success: no issues found in 74 source files`. `mypy protocol fleet agent tools`:
-`Success: no issues found in 43 source files`. Targeted storage/UI tests:
-`210 passed, 1 warning in 13.40s`, including all ten concurrency cases.
-Independent full `pytest -W ignore::ResourceWarning -p no:cacheprovider`:
-`31 failed, 938 passed, 1 warning, 7 errors in 80.08s (0:01:20)`;
-`TOTAL                                                                   3725    125    97%`.
-Every failure/error was a sandbox `PermissionError: [Errno 1] Operation
-not permitted` while binding a local socket. A full passing run remains
-to be verified in an environment that permits those integration tests.
-Temporary files were kept in the worktree's `.tmp` and removed afterwards.
+**Cross-review's own verification pass ran in a sandbox that refused to
+bind local sockets** (`PermissionError: [Errno 1] Operation not
+permitted`), which the agent-side TLS test suite
+(`tests/test_agent_commands_channel.py` and others) needs -- their run
+showed `31 failed, 7 errors` for exactly that reason and explicitly left a
+full passing run "to be verified in an environment that permits those
+integration tests." **Done here, fresh venv** (`python3.13 -m venv`,
+`pip install -e ".[dev,fleet,agent]"`, no sandbox restriction): `ruff
+check .` -- `All checks passed!`; `mypy .` -- `Success: no issues found in
+74 source files`; `mypy protocol fleet agent tools` -- `Success: no issues
+found in 43 source files`; `python -m pytest -W ignore::ResourceWarning`
+**2x**, both exit code 0, **976 passed** each run (`--collect-only` count,
+cross-checked against zero failure/error markers in either run -- this
+pytest/coverage configuration's own `-q` output ends at the coverage table
+with no separate "N passed" summary line, same as every earlier round in
+this file), coverage **99%** (3725 statements; run 1: 17 missed, run 2: 16
+missed). **The one-line difference is `fleet/storage.py`'s pre-existing
+`remove_device` concurrent-race branch** (line 3618, the "lost the race to
+a concurrent removal" guard) -- the same timing-based coverage wobble this
+file's P5.1 cross-review section already documented for that exact test
+class, untouched by this fix.
 
 ### "Befehle" history list (section 9)
 
