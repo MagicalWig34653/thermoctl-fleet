@@ -2,6 +2,83 @@
 
 Last updated: 2026-09-27.
 
+## P5.E: local end-to-end test environment (base station VM + scenarios)
+
+Built per the project owner's 2026-09-27 offer ("you can set up a VM
+locally with UTM/qemu ... or use Docker to build a complete test
+environment"): a Lima VM (`thermoctl-e2e-basestation`, Debian 13 "trixie"
+arm64 genericcloud image -- available, no fallback to 12 needed), provisioned
+following `image/`'s documented build steps as literally as possible, plus a
+Dockerized fleet service (throwaway TLS CA) and a local registry, all under
+`tools/e2e/` (not part of CI, run by hand -- see `tools/e2e/README.md`).
+
+**All six required scenarios ran against the real code on this branch and
+PASSED**, each with the committed scenario script itself (not just an
+ad-hoc rehearsal) re-run once more against a freshly restarted VM right
+before this entry was written, to confirm the checked-in scripts -- not
+just the commands typed by hand while building them -- actually reproduce
+the result:
+
+| Scenario | Result | Evidence (abridged -- full output in the scenario scripts' own runs) |
+|---|---|---|
+| (a) registration end-to-end | **PASS** | `python -m agent register` (real, unmodified, section 15.3) against the real fleet over real TLS + fingerprint pinning: `201 Created` -> `202`/`200` challenge poll (fleet's real `Retry-After: 60` honoured) -> `200` token. The verification code the agent *displayed* (`8AQ7-QFJZ`) matched the code `protocol.registration.verification_code_for` *independently computed* from the stored public key on the fleet side, byte for byte. `agent_token` and `device_private_key.pem`: mode `0600`, owner `10002:10002`. |
+| (b) mounts and permissions | **PASS** | A uid-10002 container, the real image, the real `agent-compose.yml` mounts and `group_add` pattern, wrote `/run/thermoctl-agent/health.env`+`led-status.env` and a sibling of `/var/lib/thermoctl-watchdog/state.env` via the exact temp-file-plus-rename pattern P5.7 depends on -- all landed on the host as `10002:10002`, and the **host-side `thermoctl-watchdog` binary's own `-check-mode`** read them back correctly. Docker socket reachable via `group_add`: raw `GET /_ping` over the mounted socket returned `200 OK` from `dockerd`. |
+| (c) watchdog swap | **PASS** | v2 pushed to the local registry, pulled by digest (`localhost:5000/thermoctl-agent`, via `-runtime-repo`, production default untouched -- proved separately by (e)), `desired=v2/proven=v1` written, agent stopped, the already-running `thermoctl-watchdog.service` retagged+recreated the compose-managed container within one 5s poll, the new revision's health report matched `desired` exactly, and the watchdog journal shows **no** rollback line. |
+| (d) watchdog rollback | **PASS (both trigger paths)** | d1 (restart-count): a v2 with the same placeholder `python -m agent` CMD as v1 (crashes immediately) hit "three restarts in a row" and rolled back in ~12s (Docker's own backoff, no code change). d2 (the real 10-minute deadline, `AwaitHealthReport`'s `time.Unix(s.Since,0).Add(10*time.Minute)`, unmodified): a v2 that only sleeps (never crashes, never writes a health report) was given a state file with `since` backdated ~9.5 real minutes, so the real, unmodified deadline check only had to wait out the real last ~30s on the real wall clock -- journal: `rolled back to <v1 digest>: no health report for the new digest within the deadline`. No faketime, no `watchdog/watch.go` edit, in either path. |
+| (e) no registry pull | **PASS** | `desired` = a well-formed but never-pushed digest -- `docker tag` (purely local) failed repeatedly, exactly as the watchdog journal shows, and the local registry's own container log **line count did not change at all** (`delta=0`) across a 20s window, i.e. zero HTTP requests reached it. No container ever started under that digest. |
+| (f) command channel | **PASS** | A `report_now` command created via the storage helper; the real `agent.commands_channel.receive_commands` generator, over the real pinned transport (`agent.transport.build_client`) with the real bearer token from (a), received it over the real SSE stream and posted a real `POST /v1/commands/{id}/result`; the fleet's own `commands` table shows `result_received_at` populated, `successful=1`. |
+
+**What stands in for P5.2 (being built in parallel, not on `main` at the
+time of this run):** `agent/loop.py` has no health-report/LED-status/
+state-file writer yet -- `python -m agent` with no subcommand only prints
+the scaffold message and exits 1. Scenario (a) needs none of that
+(registration is real P5.0 code). Scenarios (b)/(c) use a small, explicitly
+labelled **test fixture** (a Python snippet doing the exact
+temp-file-plus-rename atomic write the real writer will also use, reading
+its own "desired" digest back out of the watchdog's own state file so it
+can report on itself truthfully) to exercise the **mount/permission
+mechanics** (P5.7, the actual subject under test) independent of that
+still-missing business logic -- called out inline in both scripts, never
+presented as "the real agent loop proved healthy". Scenarios (d)/(e) need
+no fixture: a v2 that never writes a health report is exactly what the
+current placeholder CMD already does.
+
+**Discrepancies found in `image/`'s own documented build steps** (recorded
+for the main session to schedule, not fixed here per the work order) -- the
+one substantive one: **`image/common/packages.txt`'s `docker-compose-v2`
+does not exist as a Debian 13 "trixie" package** (`E: Unable to locate
+package docker-compose-v2`, reproduced against the real trixie repos), and
+even Debian's own `docker-compose` package only ships the legacy hyphenated
+v1 script, never the `docker compose` (space) v2 CLI subcommand
+`watchdog/runtime.go` itself invokes -- stock Debian 13 has no package at
+all for that; only Docker's own third-party apt repo does
+(`docker-compose-plugin`), which conflicts with `image/README.md`'s own "a
+prepared Debian image" premise. Worked around in `tools/e2e/` only (a
+manually installed static plugin binary) -- not a proposed production fix.
+Four smaller documentation gaps (the hardware `watchdog.service` being
+silently host-dependent; no doc stating a host-side uid/gid 10002 is
+*not* actually required, only matching numeric ids; no stated
+ownership/mode for `/var/lib/thermoctl-agent`; no template for the
+watchdog's build-time state file's exact shape) are listed in full, with
+the reasoning for each, in `tools/e2e/README.md`'s own "Discrepancies
+found" section.
+
+**No bug in `fleet/`, `agent/`, `protocol/`, or `watchdog/` itself was
+found** -- every real, non-fixture code path exercised (registration,
+transport pinning, the SSE command channel, the watchdog's tag/compose/
+rollback/refusal logic) behaved exactly as `docs/specification.md` and this
+repository's own docstrings describe it. `image/common/agent-compose.yml`'s
+P5.7 directory-mount design (the reason single-file bind mounts were
+replaced with whole-directory mounts) was independently re-confirmed here,
+against real atomic renames from a real uid-10002 container, not just by
+re-reading the comment.
+
+**Environment**: `thermoctl-e2e-basestation`, Debian 13 "trixie" arm64, 2
+CPUs / 3 GiB RAM / 8 GiB disk (thin-provisioned; ~2.3 GiB actual host usage
+after the full provisioning run plus all six scenarios, comfortably inside
+the 15 GB budget). Left **stopped** (not deleted) so it can be reused; see
+`tools/e2e/README.md` for how to resume or clean it up.
+
 ## P5.1 cross-review fixes: silently-retried auth failures, a global-sequence
 `Last-Event-ID` that could hide an apartment's own commands
 
