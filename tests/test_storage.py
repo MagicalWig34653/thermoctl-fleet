@@ -3,7 +3,7 @@
 Runs against a **real SQLite database file in `tmp_path`**, created by running
 the Alembic migrations programmatically (`fleet.storage.upgrade`) -- no
 `Base.metadata.create_all()` shortcut, so the migration itself is exercised,
-not only the ORM model built on top of it. No mocks anywhere in this file.
+not only the ORM model built on top of it. Failure injection uses monkeypatch.
 
 Test tokens are built at runtime with `secrets.token_urlsafe`, never written
 out as a real-looking literal (CLAUDE.md: "no secrets in the repo, not even
@@ -17,13 +17,15 @@ import secrets
 import sqlite3
 import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 
 import fleet.storage as storage_module
 from fleet.alarms import AlarmKind, Urgency
@@ -35,6 +37,7 @@ from fleet.storage import (
     CommandRecord,
     DeviceRecord,
     HeartbeatRecord,
+    InventoryAuditLogRecord,
     RecordCommandResultOutcome,
     Storage,
     _alembic_config,
@@ -2802,6 +2805,191 @@ def test_record_command_result_not_gated_on_expiry(storage: Storage) -> None:
 
 
 # -----------------------------------------------------------------------------
+# P5.1b: audit logging, double-submit protection, command history listing
+# -----------------------------------------------------------------------------
+
+
+def test_create_command_writes_one_audit_row_in_the_same_transaction(
+    storage: Storage,
+) -> None:
+    """Section 20.3's "who, when, why" applied to commands (P5.1b) --
+    `entity_type="command"`, `entity_id` is the wire command id (not the
+    internal sequence), `reason`/`created_by` both recorded."""
+
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+
+    command = storage.create_command(
+        "house7-a03",
+        CommandType.FETCH_LOGS,
+        lines=150,
+        ui_username="landlord",
+        reason="Diagnose eines Fehlers",
+        now=now,
+    )
+
+    log = storage.list_audit_log_for_entity("command", command.id)
+    assert len(log) == 1
+    entry = log[0]
+    assert entry.ui_username == "landlord"
+    assert entry.action == "created"
+    assert entry.reason == "Diagnose eines Fehlers"
+    assert entry.after_json is not None
+    assert "fetch_logs" in entry.after_json
+    assert "150" in entry.after_json
+
+
+def test_create_command_writes_an_audit_row_with_no_reason_for_a_direct_caller(
+    storage: Storage,
+) -> None:
+    """`reason` is optional at the storage layer -- P5.1's own pre-existing
+    direct callers (not through the UI) still get exactly one audit row,
+    with `reason=None`."""
+
+    _make_apartment(storage)
+    command = storage.create_command(
+        "house7-a03",
+        CommandType.REPORT_NOW,
+        lines=None,
+        ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    log = storage.list_audit_log_for_entity("command", command.id)
+    assert len(log) == 1
+    assert log[0].reason is None
+
+
+def test_create_command_unless_duplicate_suppresses_within_the_window(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert storage.create_command_unless_duplicate(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=now + timedelta(seconds=5)
+    ) is None
+
+
+def test_create_command_unless_duplicate_creates_outside_the_window(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert storage.create_command_unless_duplicate(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=now + timedelta(seconds=11)
+    ) is not None
+
+
+def test_create_command_unless_duplicate_creates_for_a_different_command_type(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert storage.create_command_unless_duplicate(
+        "house7-a03", CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=now + timedelta(seconds=1)
+    ) is not None
+
+
+def test_create_command_unless_duplicate_creates_for_different_lines(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.FETCH_LOGS, lines=100, ui_username="landlord", now=now
+    )
+
+    assert storage.create_command_unless_duplicate(
+        "house7-a03", CommandType.FETCH_LOGS, lines=200, ui_username="landlord",
+        now=now + timedelta(seconds=1)
+    ) is not None
+
+
+def test_create_command_unless_duplicate_creates_for_a_different_apartment(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    assert storage.create_command_unless_duplicate(
+        "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=now + timedelta(seconds=1)
+    ) is not None
+
+
+def test_create_command_unless_duplicate_creates_once_a_result_is_stored(storage: Storage) -> None:
+    """A command that already has a result is not "pending" any more --
+    double-submit protection must not block a genuinely new command just
+    because an old, already-finished one shares the same type/lines."""
+
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+    storage.record_command_result(
+        command.id,
+        "house7-a03",
+        CommandResult(id=command.id, successful=True, duration_s=1.0),
+        now + timedelta(seconds=1),
+    )
+
+    assert storage.create_command_unless_duplicate(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=now + timedelta(seconds=2)
+    ) is not None
+
+
+def test_list_commands_for_apartment_newest_first(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    first = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+    second = storage.create_command(
+        "house7-a03",
+        CommandType.BACKUP_NOW,
+        lines=None,
+        ui_username="landlord",
+        now=now + timedelta(seconds=1),
+    )
+
+    rows = storage.list_commands_for_apartment("house7-a03")
+
+    assert [row.command_id for row in rows] == [second.id, first.id]
+
+
+def test_list_commands_for_apartment_scoped_to_one_apartment(storage: Storage) -> None:
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+    storage.create_command(
+        "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord", now=now
+    )
+
+    rows = storage.list_commands_for_apartment("house7-a03")
+
+    assert len(rows) == 1
+    assert rows[0].apartment_id == "house7-a03"
+
+
+# -----------------------------------------------------------------------------
 # Migration 0009: commands table
 # -----------------------------------------------------------------------------
 
@@ -2861,3 +3049,91 @@ def test_migrations_0001_through_0009_match_the_orm_model_exactly(tmp_path: obje
         diff = compare_metadata(context, Base.metadata)
 
     assert diff == []
+
+
+@pytest.mark.parametrize("attempt", range(10))
+def test_create_command_unless_duplicate_is_safe_under_concurrent_calls(
+    storage: Storage, attempt: int
+) -> None:
+    """Separate engines race at a barrier against the same migrated database."""
+    _make_apartment(storage)
+    barrier = threading.Barrier(2)
+    now = datetime.now(UTC)
+
+    def submit() -> str | None:
+        independent_storage = create_storage(str(storage.engine.url))
+        try:
+            barrier.wait(timeout=10)
+            command = independent_storage.create_command_unless_duplicate(
+                "house7-a03", CommandType.AGENT_RESTART,
+                lines=None, ui_username="landlord", now=now,
+            )
+            return command.id if command is not None else None
+        finally:
+            independent_storage.engine.dispose()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(submit) for _ in range(2)]
+        results = [future.result(timeout=30) for future in futures]
+
+    assert sum(result is not None for result in results) == 1
+    commands = storage.list_commands_for_apartment("house7-a03")
+    assert len(commands) == 1
+    with storage.session() as session:
+        audit = session.scalars(
+            select(InventoryAuditLogRecord).where(InventoryAuditLogRecord.entity_type == "command")
+        ).all()
+        assert len(audit) == 1
+        assert audit[0].entity_id == commands[0].command_id
+
+
+@pytest.mark.parametrize("atomic", [False, True])
+@pytest.mark.parametrize("failed_table", ["commands", "inventory_audit_log"])
+def test_create_command_unless_duplicate_rolls_back_failed_insert(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch, failed_table: str, atomic: bool
+) -> None:
+    _make_apartment(storage)
+    execute = storage.engine.dialect.do_execute
+    failed = False
+
+    def fail_insert(cursor: Any, statement: str, parameters: Any, context: Any = None) -> None:
+        nonlocal failed
+        if statement.startswith(f"INSERT INTO {failed_table} "):
+            failed = True
+            raise RuntimeError("injected insert failure")
+        execute(cursor, statement, parameters, context)
+
+    monkeypatch.setattr(storage.engine.dialect, "do_execute", fail_insert)
+    create = storage.create_command_unless_duplicate if atomic else storage.create_command
+    with pytest.raises(RuntimeError, match="injected insert failure"):
+        create(
+            "house7-a03", CommandType.AGENT_RESTART,
+            lines=None, ui_username="landlord", now=datetime.now(UTC),
+        )
+
+    assert failed
+    assert storage.list_commands_for_apartment("house7-a03") == []
+    with storage.session() as session:
+        assert session.scalars(
+            select(InventoryAuditLogRecord).where(InventoryAuditLogRecord.entity_type == "command")
+        ).all() == []
+
+
+@pytest.mark.parametrize("invalid", ["unknown", "retired", "lines"])
+def test_create_command_unless_duplicate_rejects_invalid_command(
+    storage: Storage, invalid: str
+) -> None:
+    if invalid != "unknown":
+        _make_apartment(storage)
+    if invalid == "retired":
+        with storage.session() as session:
+            apartment = session.get(ApartmentRecord, "house7-a03")
+            assert apartment is not None
+            apartment.state = "retired"
+    with pytest.raises(ValueError):
+        storage.create_command_unless_duplicate(
+            "house7-a03", CommandType.AGENT_RESTART,
+            lines=100 if invalid == "lines" else None,
+            ui_username="landlord", now=datetime.now(UTC),
+        )
+    assert storage.list_commands_for_apartment("house7-a03") == []

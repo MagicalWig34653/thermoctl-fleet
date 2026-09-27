@@ -277,3 +277,57 @@ ul.inventory-devices li {
     border-radius: 0.25rem;
     padding: 0.5rem 0.75rem;
 }
+
+/* Stage-1 command buttons with confirmation (P5.1b) -- one button per
+ * CommandType value, and the "Befehle" history list below them. Same
+ * "never colour alone" rule as everywhere else in this file: status is
+ * conveyed by its own German text (offen/zugestellt/abgelaufen ohne
+ * Ergebnis/erfolgreich/fehlgeschlagen), reusing `.apartment-tile__tag`'s
+ * existing pill styling rather than a new, redundant one.
+ */
+ul.command-buttons {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+a.command-button {
+    display: inline-block;
+    border: 1px solid #8888;
+    border-radius: 0.25rem;
+    padding: 0.4rem 0.9rem;
+    text-decoration: none;
+}
+
+ul.command-history {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+}
+
+ul.command-history li {
+    border: 1px solid #8888;
+    border-radius: 0.25rem;
+    padding: 0.5rem 0.75rem;
+}
+
+.command-history__type {
+    font-weight: bold;
+}
+
+.command-history__meta {
+    display: block;
+    opacity: 0.8;
+    font-size: 0.9em;
+}
+
+.command-history__error {
+    margin: 0.35rem 0 0;
+    font-size: 0.9em;
+    word-break: break-word;
+}

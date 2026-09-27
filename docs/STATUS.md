@@ -79,6 +79,233 @@ after the full provisioning run plus all six scenarios, comfortably inside
 the 15 GB budget). Left **stopped** (not deleted) so it can be reused; see
 `tools/e2e/README.md` for how to resume or clean it up.
 
+## Stage-1 command buttons with confirmation in "Eine Wohnung" (P5.1b, section 9)
+
+Turns P3.2's static "commands not yet available" note into the real thing:
+one button per `protocol.commands.CommandType` value, each behind a
+two-step confirmation (name the apartment and the command, require a
+reason, only *then* create it), plus a "Befehle" history section on the
+same page. Built entirely on top of P5.1's storage
+(`Storage.create_command`/`pending_commands`/`record_command_result`) --
+`protocol/`, `agent/`, `watchdog/`, `fleet/auth.py`, and `fleet/ui_auth.py`
+are all untouched, and no migration was needed (the `commands` table
+P5.1 already created, and the `inventory_audit_log` table P4.1 already
+created, both already had everything this package needed).
+
+### Buttons generated from the enum, never a hand-written list (principle 1)
+
+`fleet.ui_apartment.COMMAND_TYPE_LABELS` is a `dict[CommandType, str]`
+German-label mapping; `available_commands()` returns
+`[(value, label) for command in CommandType]` -- **iterating the enum
+directly**, so a value added to or removed from `CommandType` shows up (or
+disappears) here automatically, and a mapping that fell out of sync would
+fail `tests/test_ui_commands.py::test_command_type_labels_cover_exactly_
+the_enum` (`set(COMMAND_TYPE_LABELS) == set(CommandType)`) immediately.
+`fleet/templates/ui/apartment.html`'s button list iterates
+`detail.available_commands` (itself `available_commands()`, computed in
+`build_apartment_detail`) -- there is no second, independently-maintained
+list of buttons anywhere in this package.
+
+### Two-step confirmation (`fleet/ui_routes.py`)
+
+`command_confirm_form` (`GET /ui/apartments/{apartment_id}/commands/
+{command}/confirm`) names the apartment (id + label) and the command (its
+German label) in words and renders a form with a mandatory reason field
+(plus a line-count field, 1-500, default 200, only for `fetch_logs`).
+`command_confirm_submit` (`POST`, same path) is the **only** caller of
+`Storage.create_command_unless_duplicate` in this package -- CSRF-checked
+(`check_csrf`), `require_ui_user`-gated, and it re-validates everything a
+tampered POST could lie about:
+
+- **An unknown command value in the URL is a 404 that never reaches
+  storage** -- `command` is deliberately a plain `str` path parameter, not
+  `CommandType`-typed (a FastAPI/Pydantic-typed enum parameter that fails
+  to parse is a `422`, not the `404` the work package asks for -- the same
+  "never a 422 for a value this module wants to validate itself" reasoning
+  `apartment_detail`'s own `days: str | None` already established).
+  `_parse_command_type` converts it, in both routes, before either ever
+  touches `storage`.
+- **A retired apartment gets no buttons on the apartment page
+  (`ApartmentDetail.retired`) and the POST refuses one explicitly**,
+  checked before `lines`/dedup logic even runs, with its own message
+  ("Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.") -- not
+  merely relying on `Storage.create_command`'s own `ValueError` for this
+  (that still exists as a second line of defence for any future caller).
+- **`lines` is only accepted for `fetch_logs`** -- any submitted `lines`
+  field for another command re-renders the confirmation page with HTTP
+  `400` and a German error, without creating a command or audit row.
+  For `fetch_logs`, `0`/`501`/`abc` all `400`; `1`-`500` are accepted.
+- **A mandatory, non-empty `reason`**, length-checked against
+  `fleet.ui_inventory.MAX_REASON_LENGTH` (500, the same bound every other
+  reason field in this codebase uses) -- both re-rendered as `400` with
+  the confirmation form and the original error, mirroring
+  `apartment_edit_submit`'s existing pattern exactly.
+
+### Audit logging (`Storage.create_command`, section 20.3: "who, when, why")
+
+`create_command` gained an optional `reason: str | None = None` keyword
+parameter and now **unconditionally** writes one `inventory_audit_log` row
+in the same transaction as the command row --
+`entity_type="command"`, `entity_id` is the wire `command_id` (the `uuid4`
+hex string, not the internal sequence number -- the same "no enumerable
+primary key over an audit trail either" reasoning `0009_commands.py`
+already gives for not using the sequence as the wire id), `action="created"`,
+`after_json` carries the command type and `lines`. **`reason` is optional
+at the storage layer, not at the UI layer**: P5.1's own pre-existing direct
+callers (`tests/test_storage.py`, `tests/test_fleet.py`,
+`tests/test_agent_commands_channel.py`, none of them going through the UI)
+keep working completely unchanged and simply get an audit row with
+`reason=None`; `fleet/ui_routes.py::command_confirm_submit` is the one real
+caller that always supplies a non-empty, already-validated one.
+
+### Double-submit protection -- decided, documented, tested
+
+**Decided against a one-time confirmation token, in favour of reusing the
+`commands` table itself** (`Storage.create_command_unless_duplicate`,
+documented in that method's docstring): a token minted on the
+GET confirmation page and checked on the POST would need its own
+server-side "already used" state (a session-scoped store, or a new table)
+-- this package instead checks within the command-creation transaction
+whether an apartment already has a not-yet-resulted command of the exact
+same `command_type`/`lines`, created within `fleet.storage
+.DOUBLE_SUBMIT_WINDOW` (10 seconds) of `now`; if so, the POST is treated as
+already done and redirected exactly like a fresh success, with no second
+command and no second audit row. Needs no migration (reuses the existing
+`commands` table) and is directly unit-testable with an injected clock.
+
+**The accepted trade-off, stated plainly**: two genuinely separate,
+deliberately identical commands (the same button pressed twice on purpose
+within the same 10 seconds) are indistinguishable from a double submit,
+and the second press is silently dropped. Accepted because
+`Storage.pending_commands`'s own established reasoning already makes a
+redundant delivery harmless ("re-delivering an already-seen command is
+always safe") -- losing one on-purpose, redundant second command in this
+narrow window costs nothing operationally, while it closes the actual
+target (a reloaded confirmation page, a double-clicked button, a browser
+retry after a flaky connection). Tested at both levels: storage
+(`tests/test_storage.py`, inside/outside the window, a different command
+type, different `lines`, a different apartment, and -- **not** blocked --
+once a result has already been stored for the earlier command) and HTTP
+(`tests/test_ui_commands.py::test_confirm_post_double_submit_creates_only
+_one_command`, two POSTs with the same CSRF-covered form data producing
+exactly one stored command, and `::test_confirm_post_after_the_double
+_submit_window_creates_a_second_command`, an older command backdated past
+the window, allowing a second one).
+
+### P5.1b cross-review fixes
+
+The UI now uses `Storage.create_command_unless_duplicate` for the duplicate
+check, command creation and audit entry in one transaction. SQLite takes
+a write lock before reading; PostgreSQL locks the apartment row. Concurrent
+submissions therefore serialize before checking the ten-second duplicate
+window. A duplicate still redirects with HTTP 303 and writes nothing.
+
+A submitted `lines` field on any command other than `fetch_logs` now
+re-renders the confirmation form with HTTP 400 and a German error message.
+This includes empty and whitespace-only fields; neither a command nor an
+audit row is created.
+
+Regression coverage uses real threads and a `threading.Barrier` against a
+file-backed SQLite database, asserting exactly one command and one audit
+row. Monkeypatched insert failures verify rollback in both directions:
+a failed command insert leaves no audit row, and a failed audit insert
+leaves no command.
+
+**Cross-review's own verification pass ran in a sandbox that refused to
+bind local sockets** (`PermissionError: [Errno 1] Operation not
+permitted`), which the agent-side TLS test suite
+(`tests/test_agent_commands_channel.py` and others) needs -- their run
+showed `31 failed, 7 errors` for exactly that reason and explicitly left a
+full passing run "to be verified in an environment that permits those
+integration tests." **Done here, fresh venv** (`python3.13 -m venv`,
+`pip install -e ".[dev,fleet,agent]"`, no sandbox restriction): `ruff
+check .` -- `All checks passed!`; `mypy .` -- `Success: no issues found in
+74 source files`; `mypy protocol fleet agent tools` -- `Success: no issues
+found in 43 source files`; `python -m pytest -W ignore::ResourceWarning`
+**2x**, both exit code 0, **976 passed** each run (`--collect-only` count,
+cross-checked against zero failure/error markers in either run -- this
+pytest/coverage configuration's own `-q` output ends at the coverage table
+with no separate "N passed" summary line, same as every earlier round in
+this file), coverage **99%** (3725 statements; run 1: 17 missed, run 2: 16
+missed). **The one-line difference is `fleet/storage.py`'s pre-existing
+`remove_device` concurrent-race branch** (line 3618, the "lost the race to
+a concurrent removal" guard) -- the same timing-based coverage wobble this
+file's P5.1 cross-review section already documented for that exact test
+class, untouched by this fix.
+
+### "Befehle" history list (section 9)
+
+`Storage.list_commands_for_apartment(apartment_id)` -- newest first,
+bounded at `_MAX_COMMAND_HISTORY_ROWS` (200), scoped strictly to
+`apartment_id` (mirrors `list_events_for_apartment`/
+`list_alarms_for_apartment`'s own "no other apartment's data" guarantee).
+`fleet.ui_apartment.build_command_history` turns each row into a
+`CommandDisplay` (command label, `created_by`/`created_text`,
+`expires_text`, `status_label`, `duration_text`, `error_text`) --
+**status is derived purely from already-stored fields, no new column**:
+a stored result is authoritative regardless of expiry (`erfolgreich`/
+`fehlgeschlagen`, since `record_command_result` is deliberately not gated
+on `expires_at`); otherwise `abgelaufen ohne Ergebnis` if `expires_at` has
+passed, `zugestellt` if `delivered_at` is set, else `offen`.
+`error_text` is truncated to `_MAX_ERROR_TEXT_DISPLAY_LENGTH` (500
+characters, with a trailing "…") before it ever reaches the template --
+Jinja's own autoescaping (already relied on everywhere else in this
+codebase, no `|safe` anywhere) handles the escaping half, verified end to
+end by `tests/test_ui_commands.py::test_apartment_page_error_text_is
+_escaped` (a real `<script>` tag posted as `error_text`, asserted absent
+from the raw response body, `&lt;script&gt;` present instead).
+
+### Templates and CSS
+
+`fleet/templates/ui/command_confirm.html` (new) -- the two-step
+confirmation page itself. `fleet/templates/ui/apartment.html`'s "Befehle"
+section replaced: a button list (or "außer Betrieb" for a retired
+apartment) followed by the history list. `fleet/static/ui/fleet-ui.css`
+gained `.command-button`/`.command-history*` rules only -- reuses
+`.apartment-tile__tag`'s existing pill styling for the status label rather
+than inventing a second one, same "status is text, never colour alone"
+rule every other view in this codebase already follows. No inline
+style/script anywhere (covered automatically by `tests/test_ui_auth.py
+::test_templates_contain_no_inline_style_or_script`'s existing
+glob over every template in the directory).
+
+### Tests
+
+`tests/test_ui_commands.py`: the enum-coverage tests
+above; GET confirmation (unauthenticated -> 303, shows apartment/command,
+`fetch_logs` shows the lines field, unknown command -> 404 never reaching
+storage, unknown apartment -> 404, retired apartment shows no form); POST
+confirmation (unauthenticated -> 303, missing CSRF -> 422 -- it is a
+required `Form` field, mirroring every other CSRF-protected POST in this
+codebase -- wrong CSRF -> 403, unknown command/apartment -> 404 never
+reaching storage, missing/too-long reason -> 400 re-rendered, retired
+apartment refused, `fetch_logs` lines `0`/`501`/`abc` -> 400, `500` ok,
+successful creation with every field plus its audit row verified directly
+against `CommandRecord`/`InventoryAuditLogRecord`, a tampered `lines` field
+on a non-`fetch_logs` command rejected with HTTP 400, the double-submit
+pair above);
+history-list unit tests for all five status labels (`offen`/`zugestellt`/
+`abgelaufen ohne Ergebnis`/`erfolgreich`/`fehlgeschlagen`, the last two via
+`record_command_result`, `zugestellt` via `pending_commands` marking
+`delivered_at`), duration formatting, error-text truncation; HTTP-level
+error-text escaping, another apartment's commands never shown, retired
+apartment hides buttons, no inline style/script. `tests/test_storage.py`
+gained the audit-row tests (with and without `reason`) and the full
+`create_command_unless_duplicate`/`list_commands_for_apartment` matrix
+described above. `tests/test_ui_apartment.py`'s pre-existing
+`test_every_section_renders_from_real_stored_data` updated for the new
+"Befehle" section content (the old "noch nicht verfügbar" note is gone).
+
+**Original P5.1b verification** (fresh venv, `python3.13 -m venv`,
+`pip install -e ".[dev,fleet,agent]"`): `ruff check .` and `mypy .`/`mypy
+protocol fleet agent tools` both clean; `python -m pytest -W
+ignore::ResourceWarning` **2x**: **948 passed** each run, coverage **99%**
+(3702 statements, 16 missed) identical across both runs -- `fleet/storage.py` and
+`fleet/ui_apartment.py` both at 100%, the handful of remaining misses all
+pre-existing and unrelated to this package (`fleet/ui_routes.py`'s own
+already-untested branches from earlier packages, `tools/
+check_image_config.py`'s own pre-existing gaps).
+
 ## P5.1 cross-review fixes: silently-retried auth failures, a global-sequence
 `Last-Event-ID` that could hide an apartment's own commands
 

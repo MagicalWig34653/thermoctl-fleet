@@ -59,12 +59,20 @@ ever be added" (section 18.2) require clearing with the project owner
 first, not invented here. Noted as an open point in `docs/STATUS.md`, not
 built.
 
-**Commands are not built here (section 9: "the four to seven allowed
-commands as buttons with confirmation").** The work package for this
-package (P3.2) explicitly scopes that to a later step (P3.x, "commands are
-not implemented yet") -- this module renders a short static note instead of
-any button/form, and `fleet/ui_routes.py` gains no `POST` route for a
-command on this page.
+**Commands (P5.1b, section 9: "the four to seven allowed commands as
+buttons with confirmation") -- built here, on top of P5.1's storage
+(`Storage.create_command`/`list_commands_for_apartment`/
+`create_command_unless_duplicate`).** `COMMAND_TYPE_LABELS` below is a
+mapping keyed by every `protocol.commands.CommandType` value -- **the
+button list itself (`available_commands`) always iterates the enum
+directly**, never a separately hand-maintained list of buttons, so the UI
+can never offer (or, symmetrically, silently drop) a command the closed
+protocol list does not/does have (CLAUDE.md principle 1). The actual
+two-step confirmation flow (GET confirmation page, POST that calls
+`Storage.create_command_unless_duplicate`) lives in `fleet/ui_routes.py`,
+mirroring this module's existing split (view-model here, thin HTTP layer
+there); this module only derives the button labels and the "Befehle"
+history list (`CommandDisplay`, `build_command_history`).
 """
 
 from __future__ import annotations
@@ -73,9 +81,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fleet.alarms import ABSENCE_THRESHOLD, AlarmKind
-from fleet.storage import AlarmRecord, HeartbeatHistoryEntry, Storage
+from fleet.storage import AlarmRecord, CommandRecord, HeartbeatHistoryEntry, Storage
 from fleet.ui_house import FAULT_KIND_LABELS
 from protocol import FaultKind
+from protocol.commands import CommandType
 
 # Section 9: "heartbeat history of the last few days" -- default and cap for
 # the `days` query parameter (`fleet/ui_routes.py::apartment_detail`).
@@ -97,6 +106,136 @@ ALARM_KIND_LABELS: dict[str, str] = {
 # deliberate `sensor:` ambiguity, both map to `fault_kind = None`) -- the
 # same "other report" reading `fleet/storage.py`/`protocol/events.py` use.
 _OTHER_REPORT_LABEL = "sonstige Meldung"
+
+# P5.1b, section 9: "the four to seven allowed commands as buttons with
+# confirmation" -- German label per `protocol.commands.CommandType` value.
+# **Covers exactly the enum, tested directly**
+# (`tests/test_ui_apartment.py::test_command_type_labels_cover_exactly_the_enum`)
+# -- a value added to or removed from `CommandType` without a matching
+# change here fails that test immediately, rather than the button list
+# silently drifting out of sync with the closed command list (CLAUDE.md
+# principle 1).
+COMMAND_TYPE_LABELS: dict[CommandType, str] = {
+    CommandType.REPORT_NOW: "Sofort melden",
+    CommandType.FETCH_LOGS: "Logs abrufen",
+    CommandType.BACKUP_NOW: "Sicherung jetzt anstoßen",
+    CommandType.AGENT_RESTART: "Agent neu starten",
+    CommandType.DIAGNOSTIC_BUNDLE: "Diagnosepaket erstellen",
+}
+
+# Section 7: "the last n lines ... capped at 500 lines" -- the confirmation
+# form's own bounds for `fetch_logs`'s line-count field
+# (`fleet/ui_routes.py`), mirrored from `protocol.commands.Command.lines`'s
+# own `Field(ge=1, le=500)` rather than re-deriving the same two numbers.
+MIN_FETCH_LOGS_LINES = 1
+MAX_FETCH_LOGS_LINES = 500
+DEFAULT_FETCH_LOGS_LINES = 200
+
+# A sane display cap for `CommandRecord.error_text` (P5.3's future
+# diagnostic-bundle/fetch_logs content is masked before it ever reaches
+# here, per that package's own scope -- this is only a defensive display
+# limit against an unexpectedly long agent-reported error string blowing
+# up the "Befehle" section's layout).
+_MAX_ERROR_TEXT_DISPLAY_LENGTH = 500
+
+# section 9's own five command outcomes, in the order `_command_status_label`
+# below decides between them.
+_STATUS_OFFEN = "offen"
+_STATUS_ZUGESTELLT = "zugestellt"
+_STATUS_ABGELAUFEN = "abgelaufen ohne Ergebnis"
+_STATUS_ERFOLGREICH = "erfolgreich"
+_STATUS_FEHLGESCHLAGEN = "fehlgeschlagen"
+
+
+def available_commands() -> list[tuple[str, str]]:
+    """`(value, German label)` for every `CommandType`, in enum definition
+    order -- **generated from the enum**, the button list this returns can
+    structurally never omit or invent a command (CLAUDE.md principle 1)."""
+
+    return [(command.value, COMMAND_TYPE_LABELS[command]) for command in CommandType]
+
+
+def _truncate_error_text(error_text: str) -> str:
+    if len(error_text) <= _MAX_ERROR_TEXT_DISPLAY_LENGTH:
+        return error_text
+    return error_text[:_MAX_ERROR_TEXT_DISPLAY_LENGTH] + "…"
+
+
+def _format_duration_seconds(duration_s: float) -> str:
+    return f"{duration_s:.1f} s"
+
+
+def _format_timestamp(moment: datetime) -> str:
+    """A fixed, unambiguous absolute timestamp (not a relative "vor X" --
+    the "Befehle" history is an audit-style list where an exact moment
+    matters more than its age) -- always UTC, since every stored timestamp
+    here is naive UTC (see `fleet/storage.py`'s own module docstring)."""
+
+    return moment.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _command_status_label(record: CommandRecord, now: datetime) -> str:
+    """Derives the status purely from already-stored fields (section 9) --
+    no separate status column exists or is needed. **Order matters**: a
+    result, once stored, is authoritative regardless of `expires_at`
+    (`Storage.record_command_result` is deliberately not gated on expiry --
+    a command can finish executing right as its expiry passes); only a
+    command with no result yet can be "abgelaufen ohne Ergebnis"."""
+
+    if record.result_received_at is not None:
+        return _STATUS_ERFOLGREICH if record.successful else _STATUS_FEHLGESCHLAGEN
+    if record.expires_at <= _naive_utc(now):
+        return _STATUS_ABGELAUFEN
+    if record.delivered_at is not None:
+        return _STATUS_ZUGESTELLT
+    return _STATUS_OFFEN
+
+
+@dataclass(frozen=True)
+class CommandDisplay:
+    """One row of the "Befehle" history list (P5.1b, section 9) -- already
+    derived and German-rendered, same rule every other `*Display`
+    dataclass in this module follows."""
+
+    command_label: str
+    created_by: str
+    created_text: str
+    expires_text: str
+    status_label: str
+    duration_text: str | None
+    error_text: str | None
+
+
+def _build_command_display(record: CommandRecord, now: datetime) -> CommandDisplay:
+    return CommandDisplay(
+        command_label=COMMAND_TYPE_LABELS[CommandType(record.command_type)],
+        created_by=record.created_by,
+        created_text=_format_timestamp(record.created_at),
+        expires_text=_format_timestamp(record.expires_at),
+        status_label=_command_status_label(record, now),
+        duration_text=(
+            _format_duration_seconds(record.duration_s)
+            if record.duration_s is not None
+            else None
+        ),
+        error_text=(
+            _truncate_error_text(record.error_text) if record.error_text else None
+        ),
+    )
+
+
+def build_command_history(
+    storage: Storage, apartment_id: str, now: datetime
+) -> list[CommandDisplay]:
+    """The apartment's own recent commands, newest first (bounded by
+    `Storage.list_commands_for_apartment`), each already derived into a
+    `CommandDisplay` -- no other apartment's commands are ever included,
+    since the underlying storage call is itself scoped to `apartment_id`."""
+
+    return [
+        _build_command_display(record, now)
+        for record in storage.list_commands_for_apartment(apartment_id)
+    ]
 
 
 def clamp_history_days(days: int | str | None) -> int:
@@ -264,6 +403,15 @@ class ApartmentDetail:
     zones_with_heat_demand: int | None
     # Alarms (section 8/9).
     alarms: list[AlarmDisplay]
+    # Commands (P5.1b, section 9). `retired` gates the button list (a
+    # retired apartment shows no buttons at all, `fleet/ui_routes.py`'s
+    # confirmation POST refuses one too); `available_commands` is always
+    # every `CommandType` (see `available_commands()` above) regardless of
+    # `retired` -- the template itself decides whether to render them,
+    # this dataclass only carries the data.
+    retired: bool
+    available_commands: list[tuple[str, str]]
+    commands: list[CommandDisplay]
 
 
 def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> TimelineEntry:
@@ -400,9 +548,12 @@ def build_apartment_detail(
     clock.
     """
 
-    label = storage.get_apartment_label(apartment_id)
-    if label is None:
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
         return None
+    label = apartment.label
+    retired = apartment.state == "retired"
+    commands = build_command_history(storage, apartment_id, now)
 
     history_days = clamp_history_days(days)
     since = now - timedelta(days=history_days)
@@ -467,6 +618,9 @@ def build_apartment_detail(
             zones_without_reading=None,
             zones_with_heat_demand=None,
             alarms=alarms,
+            retired=retired,
+            available_commands=available_commands(),
+            commands=commands,
         )
 
     heartbeat = latest.heartbeat
@@ -497,18 +651,28 @@ def build_apartment_detail(
         zones_without_reading=heartbeat.control.zones_without_reading,
         zones_with_heat_demand=heartbeat.control.zones_with_heat_demand,
         alarms=alarms,
+        retired=retired,
+        available_commands=available_commands(),
+        commands=commands,
     )
 
 
 __all__ = [
     "ALARM_KIND_LABELS",
+    "COMMAND_TYPE_LABELS",
+    "DEFAULT_FETCH_LOGS_LINES",
     "DEFAULT_HISTORY_DAYS",
+    "MAX_FETCH_LOGS_LINES",
     "MAX_HISTORY_DAYS",
+    "MIN_FETCH_LOGS_LINES",
     "AlarmDisplay",
     "ApartmentDetail",
+    "CommandDisplay",
     "OpenFaultDisplay",
     "PastFaultDisplay",
     "TimelineEntry",
+    "available_commands",
     "build_apartment_detail",
+    "build_command_history",
     "clamp_history_days",
 ]

@@ -153,7 +153,32 @@
 
 <section aria-labelledby="commands-heading">
     <h2 id="commands-heading">Befehle</h2>
-    <p>Befehle für diese Wohnung sind in dieser Version der Oberfläche noch nicht verfügbar.</p>
+    {% if detail.retired %}
+    <p>Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.</p>
+    {% else %}
+    <ul class="command-buttons">
+        {% for value, label in detail.available_commands %}
+        <li><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ value | urlpath }}/confirm">{{ label }}</a></li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <h3>Verlauf</h3>
+    {% if detail.commands %}
+    <ul class="command-history">
+        {% for cmd in detail.commands %}
+        <li>
+            <span class="command-history__type">{{ cmd.command_label }}</span>
+            <span class="apartment-tile__tag">{{ cmd.status_label }}</span>
+            <span class="command-history__meta">von {{ cmd.created_by }}, erstellt {{ cmd.created_text }}, läuft ab {{ cmd.expires_text }}</span>
+            {% if cmd.duration_text %}<span class="command-history__meta">Dauer: {{ cmd.duration_text }}</span>{% endif %}
+            {% if cmd.error_text %}<p class="command-history__error">{{ cmd.error_text }}</p>{% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>Keine Befehle für diese Wohnung.</p>
+    {% endif %}
 </section>
 
 {% endif %}

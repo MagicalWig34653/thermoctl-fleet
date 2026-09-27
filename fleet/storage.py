@@ -83,7 +83,10 @@ from sqlalchemy import (
     case,
     create_engine,
     delete,
+    exists,
     func,
+    insert,
+    literal,
     or_,
     select,
     text,
@@ -627,6 +630,23 @@ class RecordCommandResultOutcome(StrEnum):
 # Section 7: "every command has an expiry (default 15 minutes)".
 COMMAND_EXPIRY = timedelta(minutes=15)
 
+# P5.1b double-submit protection: a reloaded/re-sent confirmation POST
+# within this window of an identical, still-not-resulted command (same
+# apartment, command type, and `lines`) for the same apartment is refused
+# rather than creating a second, redundant command -- see
+# `Storage.create_command_unless_duplicate`'s own docstring for the full
+# reasoning (including the atomic check-and-insert this package's
+# cross-review required), and the alternative (a one-time confirmation
+# token) this package decided against.
+DOUBLE_SUBMIT_WINDOW = timedelta(seconds=10)
+
+# P5.1b: bounds how many rows `Storage.list_commands_for_apartment` (the
+# "Befehle" section's history list) ever reads -- mirrors
+# `_MAX_EVENT_HISTORY_ROWS`'s own reasoning (a landlord's UI list must stay
+# renderable regardless of how many commands accumulate over an
+# apartment's lifetime).
+_MAX_COMMAND_HISTORY_ROWS = 200
+
 # The largest value SQLite's/PostgreSQL's own `BIGINT` (what `CommandRecord
 # .id` -- the SSE sequence number -- is stored as) can represent. A
 # `Last-Event-ID` this large (or non-positive) is rejected *before* it is
@@ -1087,10 +1107,29 @@ class Storage:
         lines: int | None,
         ui_username: str,
         now: datetime,
+        reason: str | None = None,
     ) -> Command:
         """Creates a new command for `apartment_id` (section 7) -- the
-        storage function P5.1b's UI buttons will call; this package builds
-        it and tests it, not the button itself.
+        direct storage API, without duplicate suppression. UI buttons use
+        `create_command_unless_duplicate` to serialize duplicate checks.
+
+        **`reason` is optional here, at the storage layer** (`None` by
+        default) so P5.1's own pre-existing direct callers (`tests/
+        test_storage.py`, `tests/test_fleet.py`,
+        `tests/test_agent_commands_channel.py` -- none of them going
+        through the UI) keep working unchanged. The confirmation POST uses
+        `create_command_unless_duplicate` with a validated reason.
+        **An audit row is
+        written unconditionally**, `reason=None` included, in the *same*
+        transaction as the command row (section 20.3's "who, when, why",
+        applied here even though it was P5.1's own "still missing" note
+        that flagged this as P5.1b's job, not a new requirement) --
+        `entity_type="command"`, `entity_id` is the wire `command_id` (the
+        `uuid4` hex string, not the internal sequence number, for the same
+        "no enumerable primary key over an audit trail either" reasoning
+        `0009_commands.py` already gives for not using the sequence as the
+        wire id), `action="created"`, `after` carries the command type and
+        `lines`.
 
         **Refuses an unknown or a retired apartment**, `ValueError`
         (mirrors `create_apartment`'s own "duplicate id" `ValueError`, not
@@ -1146,6 +1185,16 @@ class Storage:
                 protocol_version=PROTOCOL_VERSION,
             )
             session.add(record)
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="command",
+                entity_id=command_id,
+                action="created",
+                reason=reason,
+                before=None,
+                after={"command_type": str(command_type), "lines": lines},
+            )
 
         return Command(
             id=command_id,
@@ -1154,6 +1203,135 @@ class Storage:
             lines=lines,
             protocol_version=PROTOCOL_VERSION,
         )
+
+    def create_command_unless_duplicate(
+        self,
+        apartment_id: str,
+        command_type: CommandType,
+        *,
+        lines: int | None,
+        ui_username: str,
+        now: datetime,
+        reason: str | None = None,
+    ) -> Command | None:
+        """Create a command and its audit row unless an identical one is pending.
+
+        The duplicate check and both inserts share one transaction. SQLite
+        takes its write lock with BEGIN IMMEDIATE before any lookup; other
+        databases lock the apartment row with SELECT FOR UPDATE. Concurrent
+        submissions for an apartment therefore wait for the previous commit
+        before checking the ten-second window, including on PostgreSQL.
+        Any insert failure rolls back both the command and its audit row.
+
+        This reuses command history instead of storing one-time confirmation
+        tokens. An intentional identical submission inside the window is also
+        suppressed. Only type, lines, creation time and missing result matter;
+        delivery and expiry do not disable protection against double clicks.
+        """
+
+        if lines is not None and command_type != CommandType.FETCH_LOGS:
+            raise ValueError(
+                f"lines is only valid for {CommandType.FETCH_LOGS!r}, not "
+                f"{command_type!r}."
+            )
+
+        normalized_now = _naive_utc(now)
+        window_start = normalized_now - DOUBLE_SUBMIT_WINDOW
+        command_id = uuid.uuid4().hex
+        created_at = normalized_now
+        expires_at = created_at + COMMAND_EXPIRY
+
+        with self.session() as session:
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            apartment = session.scalar(
+                select(ApartmentRecord)
+                .where(ApartmentRecord.id == apartment_id)
+                .with_for_update()
+            )
+            if apartment is None:
+                raise ValueError(f"Unknown apartment {apartment_id!r}.")
+            if apartment.state == "retired":
+                raise ValueError(f"Apartment {apartment_id!r} is retired.")
+
+            lines_filter = (
+                CommandRecord.lines.is_(None) if lines is None else CommandRecord.lines == lines
+            )
+            duplicate_exists = exists(
+                select(CommandRecord.id).where(
+                    CommandRecord.apartment_id == apartment_id,
+                    CommandRecord.command_type == str(command_type),
+                    lines_filter,
+                    CommandRecord.result_received_at.is_(None),
+                    CommandRecord.created_at >= window_start,
+                )
+            )
+            select_new_row = select(
+                literal(command_id).label("command_id"),
+                literal(apartment_id).label("apartment_id"),
+                literal(str(command_type)).label("command_type"),
+                literal(lines, type_=Integer).label("lines"),
+                literal(created_at).label("created_at"),
+                literal(expires_at).label("expires_at"),
+                literal(ui_username).label("created_by"),
+                literal(PROTOCOL_VERSION, type_=Integer).label("protocol_version"),
+            ).where(~duplicate_exists)
+            insert_stmt = insert(CommandRecord).from_select(
+                [
+                    "command_id",
+                    "apartment_id",
+                    "command_type",
+                    "lines",
+                    "created_at",
+                    "expires_at",
+                    "created_by",
+                    "protocol_version",
+                ],
+                select_new_row,
+            )
+            inserted_id = session.execute(
+                insert_stmt.returning(CommandRecord.command_id)
+            ).scalar_one_or_none()
+            if inserted_id is None:
+                return None
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="command",
+                entity_id=command_id,
+                action="created",
+                reason=reason,
+                before=None,
+                after={"command_type": str(command_type), "lines": lines},
+            )
+
+        return Command(
+            id=command_id,
+            command=command_type,
+            expires_at=expires_at.replace(tzinfo=UTC),
+            lines=lines,
+            protocol_version=PROTOCOL_VERSION,
+        )
+
+    def list_commands_for_apartment(self, apartment_id: str) -> list[CommandRecord]:
+        """Recent commands for `apartment_id`, newest first, bounded at
+        `_MAX_COMMAND_HISTORY_ROWS` -- the "Befehle" section's history list
+        (P5.1b, section 9). Scoped strictly to `apartment_id`, mirroring
+        `list_events_for_apartment`/`list_alarms_for_apartment`'s own
+        "no other apartment's data" guarantee."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(CommandRecord)
+                    .where(CommandRecord.apartment_id == apartment_id)
+                    .order_by(CommandRecord.id.desc())
+                    .limit(_MAX_COMMAND_HISTORY_ROWS)
+                ).all()
+            )
+            session.expunge_all()
+            return rows
 
     def pending_commands(
         self, apartment_id: str, after_sequence: int, now: datetime

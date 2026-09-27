@@ -706,8 +706,12 @@ def test_every_section_renders_from_real_stored_data(
     assert "0.9.5" in body
     # alarms
     assert "Meldet sich nicht" in body
-    # commands note, no form/button for one
-    assert "noch nicht verfügbar" in body
+    # commands (P5.1b): one button per CommandType value, no in-page form
+    # (buttons are GET links to the confirmation page) except the base
+    # layout's own logout form.
+    assert "Sofort melden" in body
+    assert "command-button" in body
+    assert "Keine Befehle für diese Wohnung." in body
     assert "<form" not in body or "csrf_token" in body  # only the logout form, if any
 
 

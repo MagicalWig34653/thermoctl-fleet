@@ -465,6 +465,37 @@ storage, heartbeat sending **SR**
   body eagerly) this package needed to hold a real streaming connection
   open at all.
 
+### P5.1b -- Stage-1 command buttons with confirmation in "Eine Wohnung"
+- **Goal:** turn P3.2's static "commands not yet available" note into one
+  button per `CommandType` value, generated from the enum, each behind a
+  two-step confirmation page with a mandatory reason, plus a "Befehle"
+  history list on the apartment page.
+- **Files:** `fleet/storage.py` (`create_command` gains `reason`, an audit
+  row; `has_pending_identical_command`, `list_commands_for_apartment`,
+  `DOUBLE_SUBMIT_WINDOW`), `fleet/ui_apartment.py` (`COMMAND_TYPE_LABELS`,
+  `available_commands`, `CommandDisplay`, `build_command_history`,
+  `ApartmentDetail.retired`/`available_commands`/`commands`),
+  `fleet/ui_routes.py` (`command_confirm_form`, `command_confirm_submit`),
+  `fleet/templates/ui/command_confirm.html` (new),
+  `fleet/templates/ui/apartment.html`, `fleet/static/ui/fleet-ui.css`.
+  `protocol/`, `agent/`, `watchdog/`, `fleet/auth.py`, `fleet/ui_auth.py`
+  untouched; no migration (reuses `commands` and `inventory_audit_log`,
+  both already existing).
+- **Section:** 9, 20.3 (audit: who/when/why).
+- **Acceptance:** buttons exactly match `CommandType`
+  (`COMMAND_TYPE_LABELS`/`available_commands` tested for exact enum
+  coverage); GET confirmation names apartment and command, POST (CSRF,
+  `require_ui_user`) is the only caller of `Storage.create_command`;
+  retired apartments show no buttons and refuse the POST; double-submit
+  protection (`has_pending_identical_command`, a 10 s window) verified at
+  storage and HTTP level; command history shows status derived from stored
+  fields, duration, and escaped/truncated `error_text`; another
+  apartment's commands never shown; an unknown command in the URL is a 404
+  that never reaches storage.
+- **Depends on:** P5.1.
+- [x] done -- see `docs/STATUS.md`'s P5.1b section for the double-submit
+  design decision and the full verification output.
+
 ### P5.2 -- Command execution in the agent **SR**
 - **Goal:** implement `agent/loop.py::execute_command` for the four
   stage-1 commands (`REPORT_NOW`, `FETCH_LOGS`, `BACKUP_NOW`,
