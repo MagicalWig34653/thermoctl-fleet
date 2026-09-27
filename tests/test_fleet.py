@@ -1026,6 +1026,41 @@ def test_commands_stream_wait_0_out_of_range_last_event_id_does_not_hide_own_com
     assert [entry["id"] for entry in response.json()] == [own_command.id]
 
 
+def test_commands_stream_wait_0_between_range_last_event_id_does_not_hide_own_command(
+    client: TestClient, storage: Storage, token: str, other_token: str
+) -> None:
+    """Round-2 cross-review reproduction, at the HTTP level: a
+    `Last-Event-ID` strictly *between* two of `APARTMENT`'s own sequences,
+    but belonging to `OTHER_APARTMENT`, must not hide `APARTMENT`'s own
+    still-pending, earlier command -- the gap the round-1 `MAX()`-only
+    clamp missed."""
+
+    first = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    for _ in range(9):
+        storage.create_command(
+            OTHER_APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+    eleventh = storage.create_command(
+        APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    all_pending = storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
+    assert [item.command.id for item in all_pending] == [first.id, eleventh.id]
+    other_apartments_between_sequence = all_pending[0].sequence + 1
+
+    response = client.get(
+        "/v1/commands?wait=0",
+        headers={**_bearer(token), "Last-Event-ID": str(other_apartments_between_sequence)},
+    )
+
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [first.id, eleventh.id]
+
+
 def test_commands_stream_wait_0_with_a_malformed_last_event_id_is_treated_as_0(
     client: TestClient, storage: Storage, token: str
 ) -> None:

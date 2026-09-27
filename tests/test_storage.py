@@ -2576,6 +2576,85 @@ def test_pending_commands_legitimate_resume_still_skips_this_apartments_older_co
     assert [item.command.id for item in resumed] == [second.id]
 
 
+def test_pending_commands_between_range_sequence_not_this_apartments_own_is_rejected(
+    storage: Storage,
+) -> None:
+    """Round-2 cross-review reproduction: the round-1 fix (clamp only if
+    `after_sequence` exceeds this apartment's own *maximum* sequence) was
+    itself incomplete -- a value strictly *between* two of this
+    apartment's own sequences, but not equal to either, still slipped
+    through unnoticed and hid a genuinely pending command. A at sequences
+    1 and 11, B at 2-10: `pending_commands("apartment-a", 2, now)` must
+    still deliver A's own pending sequence-1 command, not skip it just
+    because `2 < 11`."""
+
+    _make_apartment(storage, "house7-a03")
+    _make_apartment(storage, "house9-b01")
+    first = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    for _ in range(9):
+        storage.create_command(
+            "house9-b01", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+    eleventh = storage.create_command(
+        "house7-a03", CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    all_pending = storage.pending_commands("house7-a03", 0, datetime.now(UTC))
+    assert [item.command.id for item in all_pending] == [first.id, eleventh.id]
+    # A sequence that belongs to B (house9-b01), strictly between A's own
+    # two sequences -- syntactically plausible, never actually sent to A.
+    b_owned_between_sequence = all_pending[0].sequence + 1
+
+    pending = storage.pending_commands(
+        "house7-a03", b_owned_between_sequence, datetime.now(UTC)
+    )
+
+    assert [item.command.id for item in pending] == [first.id, eleventh.id]
+
+
+def test_pending_commands_rejects_a_non_positive_after_sequence_without_a_db_error(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage, "house7-a03")
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    for value in (-1, 0):
+        pending = storage.pending_commands("house7-a03", value, datetime.now(UTC))
+        assert [item.command.id for item in pending] == [command.id]
+
+
+def test_pending_commands_rejects_an_after_sequence_beyond_bigint_range_without_overflowing(
+    storage: Storage,
+) -> None:
+    """`_MAX_COMMAND_SEQUENCE` (`2**63 - 1`) is the guard -- exactly that
+    value is still a plausible (if absurd) `BIGINT`, so it goes through the
+    ordinary membership check (and is correctly rejected there, this
+    apartment never had a command at that sequence); `2**63` and `2**128`
+    are rejected *before* ever being bound as a SQL parameter, since
+    neither SQLite nor PostgreSQL can represent them in a `BIGINT` column
+    at all -- binding either directly risks an `OverflowError` or a
+    driver-level failure instead of the ordinary "not a valid resume
+    point" fallback."""
+
+    _make_apartment(storage, "house7-a03")
+    command = storage.create_command(
+        "house7-a03", CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    for value in (2**63 - 1, 2**63, 2**128):
+        pending = storage.pending_commands("house7-a03", value, datetime.now(UTC))
+        assert [item.command.id for item in pending] == [command.id]
+
+
 def test_pending_commands_never_returns_a_command_with_a_stored_result(storage: Storage) -> None:
     _make_apartment(storage)
     command = storage.create_command(

@@ -627,6 +627,15 @@ class RecordCommandResultOutcome(StrEnum):
 # Section 7: "every command has an expiry (default 15 minutes)".
 COMMAND_EXPIRY = timedelta(minutes=15)
 
+# The largest value SQLite's/PostgreSQL's own `BIGINT` (what `CommandRecord
+# .id` -- the SSE sequence number -- is stored as) can represent. A
+# `Last-Event-ID` this large (or non-positive) is rejected *before* it is
+# ever bound as a SQL parameter in `Storage.pending_commands` -- binding,
+# say, `2**128` directly would risk an `OverflowError`/driver-level failure
+# depending on dialect, rather than the ordinary "not a valid resume point"
+# fallback every other out-of-range value already gets.
+_MAX_COMMAND_SEQUENCE = 2**63 - 1
+
 
 @dataclass(frozen=True)
 class LatestHeartbeat:
@@ -1160,34 +1169,56 @@ class Storage:
         column, so an apartment that reconnects long after `now` simply
         never sees it, exactly like it was never delivered.
 
-        **`after_sequence` is clamped to this apartment's own range before
-        it is ever used in the query** (cross-review of this package,
-        main-session decision): `id`/sequence is a single, global
-        autoincrement counter shared by every apartment's commands (see
-        `CommandRecord.id`'s own docstring for why -- it doubles as the SSE
-        stream's own monotonic event id), which means a `Last-Event-ID`
-        legitimately issued for *one* apartment is, structurally, also a
-        syntactically valid (if never actually sent) resume point for
-        *any other* apartment. Reproduced: ten commands created for
-        apartment B (sequences 1-10), then one for apartment A (sequence
-        11); `pending_commands("apartment-a", 16, now)` -- a stale,
-        forged, or simply confused `after_sequence` naming a sequence that
-        was never sent to A at all -- returned `[]`, silently hiding
-        apartment A's own, genuinely pending command. **Fixed by treating
-        any `after_sequence` beyond this apartment's own highest command
-        sequence as `0`** ("everything still pending for *this*
-        apartment"), computed as `MAX(id) WHERE apartment_id = ...` inside
-        the same query. A per-apartment sequence counter (instead of one
-        global counter clamped per read) was considered and rejected: it
-        would need its own migration and its own concurrency-safe
-        allocation scheme for no operational gain, since **re-delivering
-        an already-seen command is always safe** -- P5.2's own id
-        de-duplication (`AgentState.executed_ids`) and the result
+        **`after_sequence` is only ever honoured if it is exactly one of
+        this apartment's own command sequences** -- otherwise treated as
+        `0` (cross-review of this package, main-session decision, second
+        round). `id`/sequence is a single, global autoincrement counter
+        shared by every apartment's commands (see `CommandRecord.id`'s own
+        docstring for why -- it doubles as the SSE stream's own monotonic
+        event id), which means a `Last-Event-ID` legitimately issued for
+        *one* apartment is, structurally, also a syntactically valid (if
+        never actually sent) resume point for *any other* apartment.
+        **First reproduction (round 1):** ten commands for apartment B
+        (sequences 1-10), then one for apartment A (sequence 11);
+        `pending_commands("apartment-a", 16, now)` returned `[]`, hiding
+        A's own pending command -- fixed at the time by clamping to `0`
+        whenever `after_sequence` exceeded A's own *maximum* sequence
+        (`MAX(id) WHERE apartment_id = ...`). **That fix was itself
+        incomplete (round 2):** a value *between* an apartment's own
+        sequences, but not equal to any of them, still was not A's own and
+        still passed the `MAX()` bound unnoticed. Reproduced: A at
+        sequences 1 and 11, B at 2-10; `pending_commands("apartment-a", 2,
+        now)` returned only `[11]` -- A's own still-pending sequence 1 was
+        skipped, since `2 < 11` (A's max) let the `MAX()`-only clamp treat
+        it as legitimate even though A was never sent sequence 2 (that one
+        belongs to B). **Fixed by a membership check instead of a bound:**
+        `after_sequence` is honoured only if a `CommandRecord` with
+        exactly that `id` *and* `apartment_id` exists at all (any of this
+        apartment's own commands, not only its still-pending ones -- a
+        resume point legitimately names an already-delivered, already
+        resulted, or already-expired command just as often as a pending
+        one) -- anything else (including every value a `MAX()` bound alone
+        would have let through) falls back to `0`.
+
+        **Also guarded before the value is ever bound as a SQL
+        parameter**: a non-positive `after_sequence`, or one larger than
+        `_MAX_COMMAND_SEQUENCE` (the largest value a `BIGINT` id column can
+        hold), is treated as `0` immediately -- a `Last-Event-ID` this
+        large (nothing stops a client from sending `2**128`) risks an
+        `OverflowError`/driver-level failure if bound directly, rather
+        than the ordinary "not a valid resume point" fallback every other
+        out-of-range value already gets.
+
+        **A per-apartment sequence counter was considered and rejected**
+        (both rounds): it would need its own migration and its own
+        concurrency-safe allocation scheme for no operational gain, since
+        **re-delivering an already-seen command is always safe** -- P5.2's
+        own id de-duplication (`AgentState.executed_ids`) and the result
         endpoint's idempotency (`Storage.record_command_result`'s
         `DUPLICATE_IDENTICAL` outcome) already make a redundant delivery
-        harmless, which is exactly what makes clamping to `0` (rather than
-        rejecting the request, or trying to reconstruct "the last sequence
-        this apartment was actually sent") the correct, simplest fix: an
+        harmless, which is exactly what makes falling back to `0` (rather
+        than rejecting the request, or trying to reconstruct "the last
+        sequence this apartment was actually sent") the correct fix: an
         over-permissive resume point costs one apartment a handful of
         redundant, already-idempotent redeliveries; the bug this replaces
         could permanently hide a real, pending command instead.
@@ -1206,15 +1237,23 @@ class Storage:
         """
 
         normalized_now = _naive_utc(now)
+        # Guarded before it is ever bound as a SQL parameter -- see the
+        # docstring above.
+        candidate_after_sequence = (
+            after_sequence if 0 < after_sequence <= _MAX_COMMAND_SEQUENCE else 0
+        )
+
         with self.session() as session:
-            apartment_max_sequence = session.scalar(
-                select(func.max(CommandRecord.id)).where(
-                    CommandRecord.apartment_id == apartment_id
+            effective_after_sequence = 0
+            if candidate_after_sequence:
+                is_this_apartments_own_sequence = session.scalar(
+                    select(CommandRecord.id).where(
+                        CommandRecord.apartment_id == apartment_id,
+                        CommandRecord.id == candidate_after_sequence,
+                    )
                 )
-            )
-            effective_after_sequence = after_sequence
-            if apartment_max_sequence is None or after_sequence > apartment_max_sequence:
-                effective_after_sequence = 0
+                if is_this_apartments_own_sequence is not None:
+                    effective_after_sequence = candidate_after_sequence
 
             rows = session.scalars(
                 select(CommandRecord)

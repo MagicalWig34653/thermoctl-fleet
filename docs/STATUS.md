@@ -40,51 +40,89 @@ follow-up commit:
    module docstring already documents.
 
 2. **A global command sequence, combined with an untrusted client-supplied
-   `Last-Event-ID`, could hide an apartment's own pending commands.**
+   `Last-Event-ID`, could hide an apartment's own pending commands** --
+   fixed in **two rounds**, the first of which was itself incomplete.
    `CommandRecord.id` (the SSE stream's own monotonic sequence number,
    shared by *every* apartment's commands, see that column's own
    docstring) means a `Last-Event-ID` legitimately issued for one apartment
    is, structurally, also a syntactically valid resume point for any other
    apartment -- `Storage.pending_commands` trusted `after_sequence` as-is.
-   Reproduced: ten commands created for apartment B (sequences 1-10), then
-   one for apartment A (sequence 11); `pending_commands("apartment-a", 16,
-   now)` returned `[]` -- 16 was never actually sent to apartment A, but
-   `pending_commands` had no way to tell that from a legitimate resume
-   point. **Fixed** by clamping `after_sequence` to `0` whenever it exceeds
-   this apartment's own maximum command sequence (`MAX(id) WHERE
-   apartment_id = ...`, computed inside the same query) -- "everything
-   still pending for *this* apartment" is always a safe fallback. **A
-   per-apartment sequence counter was considered and rejected** (main
-   session decision, see `Storage.pending_commands`'s own docstring for the
-   full reasoning): it would need its own migration and its own
-   concurrency-safe allocation scheme for no operational gain, since
-   re-delivering an already-seen command is always safe -- P5.2's own id
-   de-duplication (`AgentState.executed_ids`) and
+
+   **Round 1 reproduction:** ten commands for apartment B (sequences
+   1-10), then one for apartment A (sequence 11); `pending_commands
+   ("apartment-a", 16, now)` returned `[]` -- 16 was never sent to A.
+   **Round 1 fix (incomplete):** clamp `after_sequence` to `0` whenever it
+   exceeds this apartment's own *maximum* command sequence (`MAX(id)
+   WHERE apartment_id = ...`).
+
+   **Round 2 reproduction (re-review found the same class of gap
+   survived):** A at sequences 1 and 11, B at 2-10;
+   `pending_commands("apartment-a", 2, now)` returned only `[11]` -- A's
+   own still-pending sequence-1 command was skipped, because `2` is *less
+   than* A's own maximum (11), so the round-1 `MAX()`-only clamp let it
+   through even though A was never actually sent sequence 2 (it belongs to
+   B, sitting strictly *between* A's own two sequences). A bound
+   ("not beyond the maximum") can never catch a gap value like this --
+   only a bound *and* the exact set of values.
+
+   **Round 2 fix -- membership, not a bound:** `after_sequence` is now
+   honoured only if a `CommandRecord` with exactly that `id` *and*
+   `apartment_id` actually exists (`EXISTS ... WHERE apartment_id = :a AND
+   id = :after`, replacing the `MAX()` comparison entirely) -- checked
+   against **any** of this apartment's own commands, not only its
+   still-pending ones, since a legitimate resume point just as often names
+   an already-delivered, already-resulted, or already-expired command as a
+   pending one. Anything that fails this check -- beyond the apartment's
+   range, in a gap between two of its own sequences, or simply another
+   apartment's value -- falls back to `0`.
+
+   **Also guarded before ever being bound as a SQL parameter:** a
+   non-positive `after_sequence`, or one larger than `_MAX_COMMAND_SEQUENCE`
+   (`2**63 - 1`, the largest value a `BIGINT` id column can hold), is
+   rejected outright -- nothing stops a client from sending, say, `2**128`
+   in a `Last-Event-ID` header, and binding that directly risks an
+   `OverflowError`/driver-level failure instead of the ordinary "not a
+   valid resume point" fallback every other out-of-range value gets.
+
+   **A per-apartment sequence counter was considered and rejected in both
+   rounds** (main session decision, see `Storage.pending_commands`'s own
+   docstring for the full reasoning): it would need its own migration and
+   its own concurrency-safe allocation scheme for no operational gain,
+   since re-delivering an already-seen command is always safe -- P5.2's
+   own id de-duplication (`AgentState.executed_ids`) and
    `Storage.record_command_result`'s `DUPLICATE_IDENTICAL` outcome already
-   make a redundant delivery harmless. Tested both at the storage level
-   (`tests/test_storage.py`: the exact reproduction above, plus a
-   legitimate resume still correctly skipping the apartment's own older
-   commands) and at the HTTP level (`tests/test_fleet.py`, same
-   reproduction via `GET /v1/commands?wait=0` with a real `Last-Event-ID`
-   header).
+   make a redundant delivery harmless.
 
-**Coverage wobble note:** the reviewer observed coverage wobble in
-pre-existing `fleet/storage.py` lines (~2447, ~2500-2502, inside
+   **Tested** (both rounds' reproductions kept, not replaced): storage
+   level (`tests/test_storage.py`) -- beyond-range (round 1), between-range
+   (round 2), legitimate resume still skipping the apartment's own older
+   commands, non-positive values (`-1`, `0`), and the `BIGINT`-overflow
+   guard (`2**63 - 1` -- still a plausible value, correctly rejected by the
+   membership check; `2**63` and `2**128` -- rejected before binding at
+   all, no exception raised). HTTP level (`tests/test_fleet.py`): the same
+   beyond-range and between-range reproductions via `GET
+   /v1/commands?wait=0` with a real `Last-Event-ID` header.
+
+**Coverage wobble note (round 1):** the reviewer observed coverage wobble
+in pre-existing `fleet/storage.py` lines (~2447, ~2500-2502, inside
 `confirm_device`'s "replace previous device" branch) in one of three runs.
-That code path is untouched by this package or by this fix -- neither P5.1
-nor this follow-up adds, removes, or reorders any test that exercises
-`confirm_device`. All three fresh-venv runs done for this fix showed
-`fleet/storage.py` at a stable 100% with an identical `TOTAL` (see
-"Verification" below); the wobble, if real, is pre-existing and unrelated
-to this package's own changes.
+That code path is untouched by this package or by either round of this
+fix -- neither P5.1 nor either follow-up adds, removes, or reorders any
+test that exercises `confirm_device`. Every fresh-venv run done for this
+package (both rounds) showed `fleet/storage.py` at a stable 100% with an
+identical `TOTAL`; the wobble, if real, is pre-existing and unrelated to
+this package's own changes.
 
-**Verification** (fresh venv): `ruff check .`, `mypy .`, `mypy protocol
-fleet agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
-**3x**: **898 passed** each run, coverage **99%** (3593 statements, 16
-missed) identical across all three; `tests/test_agent_commands_channel.py`,
-`tests/test_fleet.py`, `tests/test_agent_transport.py` run **5x** with no
-flakiness. `watchdog/`: `go vet ./...` clean, `go test ./...` green,
-`check_contract.sh` passes (no protocol change in this fix round).
+**Verification** (fresh venv, round 2): `ruff check .`, `mypy .`, `mypy
+protocol fleet agent tools` all clean; `python -m pytest -W
+ignore::ResourceWarning` **3x**: **902 passed** each run, coverage **99%**
+(3596 statements, 16 missed) identical across all three. (A stray extra,
+ad-hoc run outside this official 3x once showed 19 missed instead of 16 --
+a pre-existing, timing-based flake in this file's own `threading.Thread`
+concurrency tests, e.g. `test_remove_device_concurrent_double_removal_only
+_one_wins`/`test_partial_unique_index_for_assignments_is_safe_under
+_concurrent_calls`, none of them touched by this package; not reproduced
+in any of the 3 official runs above.)
 
 ## SSE command channel between fleet and agent (P5.1, sections 3, 7, 18.2)
 
