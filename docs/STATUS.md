@@ -55,6 +55,32 @@ or `heizung/thermostate/<digits>/<attribute>/get` (`domain/legacy_system.py`'s o
 shape) -- every other topic, including every Zigbee2MQTT device/actuator topic, becomes
 `<wert>`.
 
+**Third cross-review correction: the leading segment of a command topic was still kept
+verbatim.** The second fix's `<prefix>/zones/<digits>/command/<kind>[/<key>]` pattern
+checked the *shape* of the leading segment (`[^/\s]+`, no slash or whitespace) but not its
+*content* -- `integrations/mqtt/commands.py::split_topic` additionally requires that segment
+to equal the deployment's own configured `mqtt_prefix` exactly, a check this agent-side
+filter cannot perform (it does not know the prefix, and must not guess it from what it
+sees). On a shared local MQTT broker, any other publisher can put an arbitrary name there,
+and `thermoctl/app.py`'s own "Unbrauchbarer Befehl verworfen"/"Befehl für unbekannte Zone
+verworfen" log lines fire *precisely* for such a foreign topic -- reproduced with
+`topic=Kinderzimmer-Mia/zones/999/command/boost` and
+`topic=AnnaMustermann/zones/7/command/boost`, both kept unchanged by the second fix. **Fixed
+for real** (`_mask_zone_command_topic`): the leading segment is now **never** kept, under
+any circumstances -- only `zone` (numeric), `kind` (verified against the exact closed set
+`split_topic` itself accepts: `setpoint`/`operating_mode`/`boost`/`cancel_override`/`mode`/
+`parameter`), and, where applicable, `key` (a digit-only mode id for `mode`, or one of the
+15 real control parameter names from `domain/zone_settings.py::PARAMETERS` for
+`parameter` -- never a bare shape match like `split_topic`'s own `[a-z][a-z0-9_]*`
+validation, which a room or device name could satisfy just as well) are ever kept, each
+independently verified against thermoctl's real, closed vocabulary; anything that does not
+check out, including an unrecognised `kind` (e.g. a Zigbee2MQTT name crafted to end in
+`/command/set/set`), collapses the **whole** topic to `<wert>`, not just its prefix. The
+same "verify the actual vocabulary, not just the shape" correction was applied to the
+legacy-system pattern's `<attribute>` (`_LEGACY_ATTRIBUTES`, restricted to
+`_NUMBER_ATTRIBUTE`/`_TEXT_ATTRIBUTE`'s own 7 names) even though that pattern's other
+segments are all fixed literals with no equivalent spoofing risk.
+
 **Coverage gap closed, not a leak**: `integrations/mqtt/client.py::run` logs two of its own
 messages ("MQTT-Verbindung verloren; neuer Versuch folgt", "MQTT-Nachricht konnte nicht
 verarbeitet werden") through a `melden = log.exception if short_lived == 0 else log.error`

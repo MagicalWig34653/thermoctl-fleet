@@ -146,40 +146,162 @@ _EXTRA_SAFE_KEY_SHAPES: dict[str, re.Pattern[str]] = {
 }
 
 # `topic` (an MQTT topic) needs its own check, not a generic shape regex in
-# `_EXTRA_SAFE_KEY_SHAPES` above -- **cross-review correction**: a first
-# version allowed any space-free, path-like topic verbatim
-# (`^[\w/.\-:]+$`), reasoning that a free-text payload value would never
-# have that shape. That missed thermoctl's own Zigbee2MQTT actuator topics
-# (`integrations/actuators.py::Zigbee2MqttValve`/`ThermostatValve.__init__`:
-# `f"{base}/{device_name}/set"`; `services/publishing.py`'s own
-# `f"{base}/{device.external_id}/set"` publish calls), which embed the
-# device's Zigbee2MQTT **friendly name** -- Z2M's own convention is to use
-# `_`/`-` instead of spaces in that name, so e.g.
-# `zigbee2mqtt/Kinderzimmer_Mia/set` is exactly as path-like and space-free
-# as any id-based topic, and passed through unchanged. Reproduced and
-# fixed: a topic is now kept verbatim **only** if it fully matches one of
-# thermoctl's own numeric-id, non-device-name control-topic shapes (both
-# read from the sibling repository); every other topic -- including every
-# Zigbee2MQTT device/actuator topic -- becomes `<wert>`.
-_SAFE_TOPIC_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # `integrations/mqtt/commands.py::_PATTERN` -- Home Assistant's own
-    # command topics: "<prefix>/zones/<zone id>/command/<kind>[/<key>]".
-    # `prefix` is `settings.mqtt_prefix` (operator configuration, not
-    # tenant data) but still shape-restricted (no slash, no whitespace) --
-    # this is a structural safety net, not a trust decision about the
-    # prefix's content.
-    re.compile(r"^[^/\s]+/zones/\d+/command/[a-z_]+(?:/[A-Za-z0-9_]+)?$"),
-    # `domain/legacy_system.py`'s own fixed topic shape:
-    # "heizung/thermostate/<id>/<attribute>/get" -- `<id>` numeric,
-    # `<attribute>` one of `_NUMBER_ATTRIBUTE`/`_TEXT_ATTRIBUTE`'s closed,
-    # letters-only vocabulary, never a device name.
-    re.compile(r"^heizung/thermostate/\d+/[A-Za-z]+/get$"),
+# `_EXTRA_SAFE_KEY_SHAPES` above.
+#
+# **First cross-review correction**: a first version allowed any space-free,
+# path-like topic verbatim (`^[\w/.\-:]+$`), reasoning that a free-text
+# payload value would never have that shape. That missed thermoctl's own
+# Zigbee2MQTT actuator topics (`integrations/actuators.py
+# ::Zigbee2MqttValve`/`ThermostatValve.__init__`: `f"{base}/{device_name}
+# /set"`; `services/publishing.py`'s own `f"{base}/{device.external_id}
+# /set"` publish calls), which embed the device's Zigbee2MQTT **friendly
+# name** -- Z2M's own convention is to use `_`/`-` instead of spaces in
+# that name, so e.g. `zigbee2mqtt/Kinderzimmer_Mia/set` is exactly as
+# path-like and space-free as any id-based topic, and passed through
+# unchanged.
+#
+# **Second cross-review correction**: fixing the above with a *shape* check
+# on the whole topic (`^[^/\s]+/zones/\d+/command/[a-z_]+(?:/[A-Za-z0-9_]+
+# )?$`) was still not enough, because it kept the **leading segment**
+# verbatim on the theory that "zones/<digits>/command/<kind>" alone was
+# enough of an anchor. It is not: `integrations/mqtt/commands.py
+# ::split_topic` additionally requires that leading segment to equal
+# `settings.mqtt_prefix` exactly -- a check this agent-side filter cannot
+# perform (it does not know the deployment's configured prefix, and must
+# not guess it from what it sees, since a topic that happens to *look*
+# right is exactly what an untrusted publisher would send). On a shared
+# local MQTT broker, any other publisher can put an arbitrary name in that
+# leading segment: `thermoctl/app.py`'s own "Unbrauchbarer Befehl
+# verworfen"/"Befehl für unbekannte Zone verworfen" log lines fire
+# *precisely* for a topic `ist_command`/`split_topic` did not recognise as
+# its own -- e.g. `Kinderzimmer-Mia/zones/999/command/boost` -- and the
+# previous fix kept that leading segment unchanged.
+#
+# **Fixed, for real this time**: the leading segment is never kept, under
+# any circumstances (`_mask_zone_command_topic` always emits `<wert>` for
+# it) -- only the parts *after* it that are independently verified against
+# thermoctl's own closed vocabulary are ever kept: `kind` against
+# `_COMMAND_KINDS` (the exact set `split_topic` accepts, read from
+# `integrations/mqtt/commands.py`), and the optional key either as a
+# digit-only mode id (`kind == "mode"`) or as one of the fixed control
+# parameter names (`kind == "parameter"`, `_KNOWN_PARAMETER_NAMES`, read
+# from `domain/zone_settings.py::PARAMETERS`) -- never as a free-form
+# identifier matching the *shape* `[A-Za-z0-9_]+` alone, which a device or
+# room name could just as easily satisfy. Anything that does not fit this
+# exactly, including an unknown `kind` (e.g. a Zigbee2MQTT-style topic that
+# happens to end in `/command/set/set`), collapses the **whole** topic to
+# `<wert>` -- there is no partial credit for "the shape looked right".
+_ZONE_COMMAND_TOPIC_RE = re.compile(
+    r"^(?P<prefix>[^/]+)/zones/(?P<zone>\d+)/command/(?P<kind>[a-z_]+)"
+    r"(?:/(?P<key>[A-Za-z0-9_]+))?$"
+)
+
+# `integrations/mqtt/commands.py::split_topic`'s own exhaustive `if kind
+# == ...` chain -- anything else is `Unbekannte Befehlsart` there and is
+# therefore never a real thermoctl command topic either.
+_COMMAND_KINDS = frozenset(
+    {"setpoint", "operating_mode", "boost", "cancel_override", "mode", "parameter"}
+)
+# `kind`s that carry no key at all in a real command (`split_topic` raises
+# if one is present).
+_COMMAND_KINDS_WITHOUT_KEY = frozenset({"setpoint", "operating_mode", "boost", "cancel_override"})
+
+# `domain/zone_settings.py::PARAMETERS`' own `name` field, the exhaustive,
+# closed set `set_parameter`/`BY_NAME` accept -- the *only* values `kind ==
+# "parameter"`'s key may safely keep, never a bare shape check
+# (`[a-z][a-z0-9_]*`, `split_topic`'s own validation) that a room or device
+# name could satisfy just as well.
+_KNOWN_PARAMETER_NAMES = frozenset(
+    {
+        "hysteresis_k",
+        "min_on_seconds",
+        "min_off_seconds",
+        "sensor_timeout_seconds",
+        "temperature_offset_k",
+        "window_resume_delay_seconds",
+        "solar_setback_max_k",
+        "valve_protection_enabled",
+        "valve_protection_interval_days",
+        "valve_protection_duration_minutes",
+        "pi_enabled",
+        "pi_gain_per_k",
+        "pi_integral_time_minutes",
+        "pi_min_on_seconds",
+        "pi_min_off_seconds",
+    }
 )
 
 
+def _mask_zone_command_topic(value: str) -> str | None:
+    """`None` if `value` does not even have the right shape at all --
+    `_mask_topic` then tries the next known topic family. Otherwise always
+    returns a string: either the topic rebuilt with its prefix replaced
+    (`kind`/`key` both individually verified safe) or `<wert>` outright if
+    `kind`/`key` do not check out."""
+
+    match = _ZONE_COMMAND_TOPIC_RE.fullmatch(value)
+    if match is None:
+        return None
+
+    kind = match.group("kind")
+    key = match.group("key")
+    zone = match.group("zone")
+
+    if kind not in _COMMAND_KINDS:
+        return "<wert>"
+    if kind in _COMMAND_KINDS_WITHOUT_KEY:
+        return "<wert>" if key is not None else f"<wert>/zones/{zone}/command/{kind}"
+    if kind == "mode":
+        return (
+            f"<wert>/zones/{zone}/command/mode/{key}"
+            if key is not None and key.isdigit()
+            else "<wert>"
+        )
+    # kind == "parameter" (the only remaining member of `_COMMAND_KINDS`).
+    return (
+        f"<wert>/zones/{zone}/command/parameter/{key}"
+        if key in _KNOWN_PARAMETER_NAMES
+        else "<wert>"
+    )
+
+
+# `domain/legacy_system.py`'s own fixed topic shape:
+# "heizung/thermostate/<id>/<attribute>/get". Unlike the command topic
+# above, every segment here is either a fixed literal (`heizung`,
+# `thermostate`, `get` -- `_PRAEFIX`/`_SUFFIX` in that module, not derived
+# from any operator- or publisher-supplied configuration) or numeric, so
+# there is no equivalent "unverified leading segment" risk to correct for
+# -- the one thing still worth checking explicitly is `<attribute>`,
+# restricted to `_NUMBER_ATTRIBUTE`/`_TEXT_ATTRIBUTE`'s own closed
+# vocabulary rather than merely "looks like letters", the same "verify the
+# actual vocabulary, not just the shape" correction as `_KNOWN_PARAMETER_NAMES`
+# above.
+_LEGACY_TOPIC_RE = re.compile(r"^heizung/thermostate/\d+/(?P<attribute>[A-Za-z_]+)/get$")
+_LEGACY_ATTRIBUTES = frozenset(
+    {
+        "temperatureActual",
+        "temperatureTarget",
+        "preset_mode",
+        "thermostatTargetState",
+        "thermostatActualState",
+        "thermostatActualStateHA",
+        "availability",
+    }
+)
+
+
+def _mask_legacy_topic(value: str) -> str | None:
+    match = _LEGACY_TOPIC_RE.fullmatch(value)
+    if match is None:
+        return None
+    return value if match.group("attribute") in _LEGACY_ATTRIBUTES else "<wert>"
+
+
 def _mask_topic(value: str) -> str:
-    if any(pattern.fullmatch(value) for pattern in _SAFE_TOPIC_PATTERNS):
-        return value
+    for masker in (_mask_zone_command_topic, _mask_legacy_topic):
+        result = masker(value)
+        if result is not None:
+            return result
     return "<wert>"
 
 # A key on this list is **always** replaced by `<wert>`, regardless of its

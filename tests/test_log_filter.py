@@ -362,10 +362,14 @@ def test_zigbee2mqtt_actuator_topic_with_device_name_is_masked() -> None:
         assert "topic=<wert>" in result.lines[0], device_name
 
 
-def test_home_assistant_command_topic_is_kept_verbatim() -> None:
+def test_home_assistant_command_topic_keeps_the_verified_suffix_masks_the_prefix() -> None:
     """`integrations/mqtt/commands.py::_PATTERN`'s own shape -- a numeric
     zone id and a closed-vocabulary command kind, never a device/zone
-    name."""
+    name. **The leading segment is never kept** (second cross-review
+    correction): `split_topic` only accepts this topic if that segment
+    equals the deployment's configured `mqtt_prefix`, which this agent-side
+    filter has no way to verify -- see `_mask_zone_command_topic`'s own
+    docstring."""
 
     line = _line(
         "WARNING",
@@ -377,7 +381,8 @@ def test_home_assistant_command_topic_is_kept_verbatim() -> None:
     result = filter_log_lines([line])
 
     assert len(result.lines) == 1
-    assert "topic=thermoctl/zones/7/command/setpoint" in result.lines[0]
+    assert "topic=<wert>/zones/7/command/setpoint" in result.lines[0]
+    assert "thermoctl/zones" not in result.lines[0]
 
 
 def test_unknown_topic_shape_is_masked() -> None:
@@ -392,6 +397,155 @@ def test_unknown_topic_shape_is_masked() -> None:
 
     assert len(result.lines) == 1
     assert "topic=<wert>" in result.lines[0]
+
+
+def test_a_foreign_publishers_topic_never_leaks_its_name_in_the_prefix() -> None:
+    """**Second cross-review correction, the reproduced leak**: `app.py`'s
+    "Unbrauchbarer Befehl verworfen"/"Befehl für unbekannte Zone verworfen"
+    log lines fire *precisely* for a topic `split_topic`/`ist_command` did
+    not recognise as thermoctl's own (a wrong or missing `mqtt_prefix`) --
+    on a shared local broker, any other publisher can put an arbitrary name
+    in that leading segment. A first fix kept it verbatim as long as the
+    rest of the topic *looked* like a real command topic; both real
+    call sites and their exact reproduced topics are exercised here."""
+
+    cases = [
+        (
+            "thermoctl.app",
+            "Befehl für unbekannte Zone verworfen",
+            "Kinderzimmer-Mia/zones/999/command/boost",
+        ),
+        (
+            "thermoctl.app",
+            "Unbrauchbarer Befehl verworfen: Unbekannte Betriebsart: 'x'",
+            "AnnaMustermann/zones/7/command/boost",
+        ),
+    ]
+    for logger, message, topic in cases:
+        line = _line("WARNING", logger, message, extra=f"topic={topic}")
+
+        result = filter_log_lines([line])
+
+        assert len(result.lines) == 1, topic
+        output = result.lines[0]
+        assert "Kinderzimmer-Mia" not in output, topic
+        assert "AnnaMustermann" not in output, topic
+        assert "topic=<wert>/zones/" in output, topic
+
+
+def test_command_topic_with_a_valid_mode_id_keeps_the_id_masks_the_prefix() -> None:
+    line = _line(
+        "WARNING",
+        "thermoctl.app",
+        "Befehl für unbekannte Zone verworfen",
+        extra="topic=thermoctl/zones/7/command/mode/3",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "topic=<wert>/zones/7/command/mode/3" in result.lines[0]
+
+
+def test_command_topic_with_a_known_parameter_name_keeps_it_masks_the_prefix() -> None:
+    line = _line(
+        "WARNING",
+        "thermoctl.app",
+        "Befehl für unbekannte Zone verworfen",
+        extra="topic=thermoctl/zones/7/command/parameter/hysteresis_k",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "topic=<wert>/zones/7/command/parameter/hysteresis_k" in result.lines[0]
+
+
+def test_command_topic_with_an_unknown_parameter_name_masks_the_whole_topic() -> None:
+    """A key that only *shapes* like a parameter name (`split_topic`'s own
+    validation is a bare regex, `[a-z][a-z0-9_]*`) is not enough -- only
+    the closed, real set of control parameter names
+    (`domain/zone_settings.py::PARAMETERS`) is kept."""
+
+    line = _line(
+        "WARNING",
+        "thermoctl.app",
+        "Befehl für unbekannte Zone verworfen",
+        extra="topic=thermoctl/zones/7/command/parameter/geheimzimmer",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "topic=<wert>" in result.lines[0]
+    assert "geheimzimmer" not in result.lines[0]
+
+
+def test_command_topic_with_a_non_digit_mode_key_masks_the_whole_topic() -> None:
+    line = _line(
+        "WARNING",
+        "thermoctl.app",
+        "Befehl für unbekannte Zone verworfen",
+        extra="topic=thermoctl/zones/7/command/mode/Kinderzimmer",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "topic=<wert>" in result.lines[0]
+    assert "Kinderzimmer" not in result.lines[0]
+
+
+def test_command_topic_with_an_unexpected_key_on_a_keyless_kind_masks_the_whole_topic() -> None:
+    """`setpoint`/`operating_mode`/`boost`/`cancel_override` never carry a
+    key in a real command (`split_topic` raises if one is present) -- a
+    topic that has one anyway does not get the benefit of the doubt."""
+
+    line = _line(
+        "WARNING",
+        "thermoctl.app",
+        "Befehl für unbekannte Zone verworfen",
+        extra="topic=thermoctl/zones/7/command/boost/Anna",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "topic=<wert>" in result.lines[0]
+    assert "Anna" not in result.lines[0]
+
+
+def test_zigbee2mqtt_name_shaped_like_a_command_topic_is_fully_masked() -> None:
+    """A Zigbee2MQTT friendly name chosen to *look* like a command topic
+    (`.../command/set/set`) has an unknown `kind` ("set") and is therefore
+    masked in full, not just in its prefix."""
+
+    line = _line(
+        "WARNING",
+        "thermoctl.integrations.mqtt.client",
+        "Trockenlauf: Schaltbefehl abgewiesen, obwohl der Aufrufer ihn verlangt hat",
+        extra="topic=zigbee2mqtt/zones/7/command/set/set",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert result.lines[0].endswith("topic=<wert>")
+
+
+def test_legacy_topic_with_an_unknown_attribute_is_masked() -> None:
+    line = _line(
+        "WARNING",
+        "thermoctl.domain.legacy_system",
+        "Altsystem-Temperaturwert ist nicht lesbar",
+        extra="topic=heizung/thermostate/12/deviceFriendlyName/get",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "topic=<wert>" in result.lines[0]
+    assert "deviceFriendlyName" not in result.lines[0]
 
 
 def test_meross_login_failure_masks_exception_text() -> None:
@@ -502,7 +656,7 @@ def test_unusable_command_rejection_masks_exception_text() -> None:
         "WARNING",
         "thermoctl.app",
         "Unbrauchbarer Befehl verworfen: Unbekannte Betriebsart: 'Anna ist im Urlaub'",
-        extra="topic=thermoctl/zones/3/command/mode",
+        extra="topic=thermoctl/zones/3/command/setpoint",
     )
 
     result = filter_log_lines([line])
@@ -511,7 +665,7 @@ def test_unusable_command_rejection_masks_exception_text() -> None:
     output = result.lines[0]
     assert "Anna ist im Urlaub" not in output
     assert "Unbrauchbarer Befehl verworfen: <wert>" in output
-    assert "topic=thermoctl/zones/3/command/mode" in output
+    assert "topic=<wert>/zones/3/command/setpoint" in output
 
 
 def test_rejected_command_masks_exception_text() -> None:
