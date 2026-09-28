@@ -211,6 +211,38 @@ def test_backup_now_reports_honest_failure_when_unconfigured(tmp_path: Path) -> 
     assert command.id in state.executed_ids
 
 
+def test_execute_command_turns_an_unexpected_handler_exception_into_a_failed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-review: a handler raising anything uncaught used to propagate
+    straight out of `execute_command`, which would crash `run`'s own main
+    loop -- every command after the offending one would then never
+    execute either. `execute_command` itself must be the safety net, for
+    every handler, not only `backup_now`'s own (separately tested,
+    narrower) case."""
+
+    import agent.loop as loop_module
+
+    def _boom(_command: Command, _ctx: ExecutionContext) -> None:
+        raise RuntimeError("an unanticipated handler bug")
+
+    monkeypatch.setitem(loop_module._HANDLERS, CommandType.REPORT_NOW, _boom)
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.REPORT_NOW)
+
+    outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert outcome.result is not None
+    assert outcome.result.successful is False
+    assert "unerwarteter Fehler" in (outcome.result.error_text or "")
+    assert "an unanticipated handler bug" in (outcome.result.error_text or "")
+    # Still recorded as executed -- a redelivery of the same id must not
+    # retry (and potentially crash on) the same broken handler again.
+    assert command.id in state.executed_ids
+
+
 # --- agent_restart: really executed -------------------------------------
 
 

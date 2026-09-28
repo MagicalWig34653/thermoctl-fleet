@@ -535,6 +535,86 @@ def test_handle_backup_now_reports_failure_on_an_http_error_from_the_fleet(
     assert list(staging_dir.iterdir()) == []
 
 
+def test_handle_backup_now_survives_an_unanticipated_tarfile_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-review: `_handle_backup_now`'s own per-kind `except` clause
+    used to name four specific exception types
+    (`RecipientsError`/`OSError`/`sqlite3.Error`/`ValueError`) --
+    `tarfile.TarError` (e.g. a corrupted intermediate tar) is none of
+    those, and used to propagate straight out of this handler, which would
+    have crashed `agent.loop.run`'s own main loop entirely (see
+    `tests/test_agent_loop_execution.py::
+    test_execute_command_turns_an_unexpected_handler_exception_into_a_failed_result`
+    for the equally-fixed, more general safety net one level up). Proven
+    here by injecting a real `tarfile.TarError` from inside `create_backup`'s
+    own `tarfile.open(...)` call for the operational-data half -- the
+    device-configuration half is unaffected and still succeeds, exactly
+    like the HTTP-error test above."""
+
+    import tarfile
+
+    def _boom(*_args: object, **_kwargs: object) -> tarfile.TarFile:
+        raise tarfile.TarError("simulated corrupted tar")
+
+    monkeypatch.setattr("agent.loop.tarfile.open", _boom)
+
+    uploaded_kinds: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        kind = request.url.params["kind"]
+        uploaded_kinds.append(kind)
+        body = request.read()
+        return httpx.Response(
+            201,
+            json={
+                "id": "backup-1", "kind": kind, "received_at": NOW.isoformat(),
+                "size_bytes": len(body), "content_hash": request.url.params["content_hash"],
+            },
+        )
+
+    client = httpx.Client(
+        base_url="https://fleet.example", transport=httpx.MockTransport(handler)
+    )
+    db_path = tmp_path / "thermoctl.db"
+    _write_fake_thermoctl_db(db_path)
+    z2m_dir = tmp_path / "zigbee2mqtt"
+    _write_fake_zigbee2mqtt_dir(z2m_dir)
+    recipients_file = tmp_path / "backup-recipients.txt"
+    _write_recipients_file(recipients_file)
+    staging_dir = tmp_path / "staging"
+
+    backup_config = BackupConfig(
+        apartment_id="apt-7",
+        agent_version="0.1.0-dev",
+        staging_dir=staging_dir,
+        thermoctl_db_path=db_path,
+        zigbee2mqtt_dir=z2m_dir,
+        client=client,
+        recipients_file=recipients_file,
+    )
+    ctx = ExecutionContext(
+        watchdog_state_path=tmp_path / "state.env",
+        local_log_path=tmp_path / "agent.log",
+        now=lambda: NOW,
+        backup_config=backup_config,
+    )
+
+    # Not `pytest.raises` -- the whole point is that this call returns
+    # normally, with a failed result, instead of propagating the
+    # `TarError`.
+    result = _handle_backup_now(_backup_command(), ctx)
+
+    assert result.successful is False
+    assert "Betriebsdaten" in (result.error_text or "")
+    assert "simulated corrupted tar" in (result.error_text or "")
+    assert uploaded_kinds == ["device_config"]
+    # `create_backup`'s own internal `finally` still cleaned up the
+    # plaintext sqlite snapshot it had already written before the tar step
+    # failed -- nothing plaintext left behind under staging_dir.
+    assert list(staging_dir.iterdir()) == []
+
+
 # --- create_backup: cleanup on a write/encryption failure --------------------
 
 

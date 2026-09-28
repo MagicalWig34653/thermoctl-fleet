@@ -89,12 +89,7 @@ from agent.commands_channel import (
 from agent.commands_channel import flush_outbox as _flush_outbox
 from agent.commands_channel import receive_commands as _receive_commands
 from agent.commands_channel import report_result as _report_result
-from agent.encryption import (
-    DEFAULT_RECIPIENTS_FILE,
-    RecipientsError,
-    encrypt_stream,
-    load_recipients,
-)
+from agent.encryption import DEFAULT_RECIPIENTS_FILE, encrypt_stream, load_recipients
 from agent.safe_io import append_bytes_safe, read_text_safe
 from protocol import Command, CommandResult, DesiredState, Heartbeat
 from protocol.backups import BackupKind, BackupUploadAccepted
@@ -549,7 +544,25 @@ def _handle_backup_now(command: Command, ctx: ExecutionContext) -> _HandlerResul
                 zigbee2mqtt_dir=ctx.backup_config.zigbee2mqtt_dir,
                 recipients_file=ctx.backup_config.recipients_file,
             )
-        except (RecipientsError, OSError, sqlite3.Error, ValueError) as error:
+        except Exception as error:
+            # **Cross-review finding: broadened from a narrow
+            # `(RecipientsError, OSError, sqlite3.Error, ValueError)` tuple
+            # to a plain `Exception`.** `create_backup` can also raise
+            # `tarfile.TarError` (a corrupted intermediate tar, e.g. from a
+            # concurrently-modified thermoctl database file) or other,
+            # genuinely unanticipated exceptions from its own file/database/
+            # cryptography operations -- none of that tuple's members. A
+            # command handler raising anything uncaught here would
+            # propagate straight out of `execute_command`'s `handler(...)`
+            # call and crash the whole agent process (`run`'s own
+            # `for item in commands:` loop has no other safety net around
+            # it) -- exactly the "one bad backup attempt takes down command
+            # execution for every command after it" failure mode section 7
+            # already rules out for a *reported* result. `create_backup`'s
+            # own internal cleanup (the plaintext tar/db-snapshot temp
+            # files) already runs via its own unconditional `finally`
+            # regardless of which exception type propagates out of it, so
+            # widening this catch here changes nothing about that.
             all_successful = False
             summaries.append(f"{label}: fehlgeschlagen ({error}).")
             continue
@@ -745,7 +758,31 @@ def execute_command(
 
     handler = _HANDLERS[command.command]
     start = time.monotonic()
-    handler_result = handler(command, ctx)
+    try:
+        handler_result = handler(command, ctx)
+    except Exception as error:
+        # **Cross-review finding:** a handler raising an exception this
+        # broad `except` did not yet exist for used to propagate straight
+        # out of `execute_command`, out of `run`'s own `for item in
+        # commands:` loop, and crash the whole agent process -- one bad
+        # command (a backup attempt hitting an unanticipated `tarfile
+        # .TarError`, for instance) would then take execution of every
+        # later command down with it, exactly the failure mode section 7's
+        # "the agent keeps running" already rules out for a rejected or
+        # expired command. Every handler already fails *closed* on its own
+        # anticipated error paths (see `_handle_backup_now`'s own,
+        # similarly broadened `except Exception` around `create_backup`)
+        # -- this is the last-resort net underneath all of them, for
+        # whatever a handler's own author did not anticipate. `repr(error)`,
+        # not `str(error)`, mirrors `_append_local_log`'s own reasoning for
+        # `RejectedCommand.reason` elsewhere in this module: an exception
+        # message can itself contain newlines or other control characters,
+        # and `repr()` already escapes those before this text ever reaches
+        # the local log or the cloud.
+        handler_result = _HandlerResult(
+            successful=False,
+            error_text=f"unerwarteter Fehler bei der Ausführung: {error!r}",
+        )
     duration_s = time.monotonic() - start
 
     _record_executed(state, command.id, state_path)

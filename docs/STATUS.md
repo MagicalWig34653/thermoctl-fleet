@@ -1,6 +1,124 @@
 # Status
 
-Last updated: 2026-09-27.
+Last updated: 2026-09-28.
+
+## P5.5a cross-review fixes: duplicate recipients, a memory DoS on the upload endpoint, an insufficient age-file check, and an unhandled handler exception
+
+Cross-review of P5.5a (commit `167bc63`) confirmed the no-plaintext path,
+the recipients source, the image mounts, the retention scheme, apartment
+scoping, and security principle 3 -- even decrypting a test artifact with
+the real `age` CLI. It found two required fixes and asked for two further
+ones (main-session decision), all four addressed in this follow-up commit:
+
+1. **Required -- duplicate recipients counted as two.** `agent.encryption
+   .load_recipients` only checked `len(recipients) >= MIN_RECIPIENTS`
+   after parsing -- the same public key listed twice on the boot-partition
+   file satisfied that count without providing a genuine second,
+   independent recipient, silently degrading "either key alone restores
+   it" to a single point of failure. Fixed by deduplicating on each
+   recipient's own **canonical string form** (`str(recipient)`, the
+   normalized `age1...` encoding `pyrage.x25519.Recipient.__str__` always
+   returns, comparing the *parsed* recipients rather than the raw input
+   lines) before the count check, so a case-varied or otherwise
+   differently-formatted duplicate of the same key cannot slip past
+   either. Tested: two identical lines, two lines differing only in case,
+   three lines naming only two distinct keys, and the positive case (a
+   duplicate alongside two genuinely different recipients is accepted,
+   still returning exactly the two distinct ones).
+
+2. **Required -- a memory DoS on `POST /v1/backups`.** The endpoint used
+   to `await request.body()`, buffering the *entire* declared body into
+   memory before `MAX_BACKUP_UPLOAD_BYTES` was ever checked at all -- a
+   caller that simply ignored the documented limit could exhaust memory
+   regardless of what the eventual `413` said. Fixed two ways, together:
+   a declared `Content-Length` above the cap is refused, `413`, before a
+   single byte is read (a malformed `Content-Length` is not rejected for
+   that alone -- the second check below still applies regardless); the
+   body is streamed via `Request.stream()` straight into a temp file
+   (`fleet.backup_storage.BackupBlobStorage.begin_upload`/
+   `PendingBackupUpload`, new), hashed incrementally, with a running total
+   checked on every chunk -- the moment it exceeds the cap, the upload is
+   aborted (`413`), having held at most one chunk in memory and written at
+   most the cap's worth to disk. The actual streaming loop is factored out
+   into its own function, `fleet.app._stream_backup_body`, specifically so
+   its "does it stop reading, not merely stop *accepting*, once the cap is
+   exceeded" property is unit-testable directly against a synthetic async
+   generator -- **verified empirically while building this fix that
+   Starlette's own `TestClient` buffers a request body fully before an app
+   ever sees it**, which would have made that property untestable through
+   an HTTP call alone; an HTTP-level test (a generator body with no
+   `Content-Length`, a monkeypatched small cap) additionally proves the
+   real endpoint's own outer exception handling (abort-then-reraise) is
+   wired correctly end to end. `BackupBlobStorage.store` (the
+   non-streaming convenience method other tests and the retention job's
+   fixtures use) is now itself implemented in terms of the same
+   `begin_upload`/`PendingBackupUpload` primitives, not a second, separate
+   write path.
+
+3. **Fleet plausibility check for operational data, strengthened.**
+   Checking only `AGE_HEADER_MAGIC` (`age-encryption.org/v1`) let
+   `age-encryption.org/v1\n` followed by arbitrary plaintext through -- a
+   buggy or malicious agent only had to prepend one fixed, public string.
+   `fleet.app._looks_like_an_age_file` now also requires a syntactically
+   plausible recipient stanza line (`-> ...`, the age format's own
+   `Stanza` syntax) immediately after the header line -- still not a
+   decrypt attempt (principle 3: the fleet has no private key to decrypt
+   with even if it wanted to), but the uploaded bytes now have to actually
+   look like the beginning of a real age file's *structure*. Reads only a
+   bounded prefix (4096 bytes) back from the temp file for this check, not
+   the whole body a second time. Tested: header line immediately followed
+   by plaintext with no stanza line -> `422`; header magic with no
+   newline at all -> `422`.
+
+4. **Main-session decision -- an unexpected exception inside a command
+   handler must never crash the agent.** Two related but independent
+   gaps, both closed:
+   - `agent.loop.execute_command`'s own `handler(command, ctx)` call had
+     no `try`/`except` around it at all -- any handler raising anything
+     uncaught propagated straight out of `execute_command`, out of
+     `run`'s own `for item in commands:` loop, crashing the whole agent
+     process (every command after the offending one would then never
+     execute either, exactly the failure mode section 7's "the agent
+     keeps running" already rules out for a rejected/expired command).
+     Fixed with a generic `except Exception` around the dispatch itself,
+     turning any handler's unexpected exception into a failed
+     `CommandResult` (`repr(error)` in `error_text`, the same
+     control-character-escaping reasoning `_append_local_log` already
+     documents for a cloud-echoed rejection reason) -- a safety net
+     underneath every handler, not just `backup_now`'s own.
+   - `_handle_backup_now`'s own per-kind `except` clause named four
+     specific exception types (`RecipientsError`/`OSError`/`sqlite3
+     .Error`/`ValueError`) -- `tarfile.TarError` (e.g. a corrupted
+     intermediate tar) is none of those, and used to propagate past this
+     handler's own boundary too. Widened to `except Exception`;
+     `create_backup`'s own internal plaintext cleanup (the sqlite
+     snapshot, the tar) is unaffected, since it already runs via its own
+     unconditional `finally` regardless of which exception type
+     propagates out of it. Tested by injecting a real `tarfile.TarError`
+     from inside `create_backup`'s own `tarfile.open(...)` call -- the
+     device-configuration half of `backup_now` still succeeds
+     independently, the combined result is reported as a failure, and no
+     plaintext is left behind under the staging directory.
+
+**Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`): `ruff check .` -- `All checks passed!`; `mypy .` --
+`Success: no issues found in 93 source files`; `mypy protocol fleet agent
+tools` -- `Success: no issues found in 51 source files`; `python -m tools
+.check_image_config` -- `Image configuration plausible`; `python -m
+pytest -W ignore::ResourceWarning -rA` **2x**, both exit code 0, **1149
+passed, 1 skipped** each run (the one skip: no `age` CLI binary on this
+machine), coverage **99%** both runs (4492 statements; run 1: 14 missed;
+run 2: 13 missed) -- the one-line difference is `fleet/storage.py`'s own
+pre-existing `remove_device` concurrent-race branch, the same
+timing-based coverage wobble already documented in this file's P5.1b
+cross-review entry, unrelated to this fix; every remaining miss in both
+runs is pre-existing and unrelated (`agent.loop`'s own still-open
+`collect_heartbeat`/`send_heartbeat`/`reconcile_desired_state`
+placeholders, `fleet/admin.py`'s own pre-existing gap, `tools
+/check_image_config.py`'s own pre-existing CLI-entry-point gaps). In
+`watchdog/`: `go vet ./...` clean, `go test ./...` -- all three packages
+`ok`, `bash check_contract.sh` -- "Contract test passed" (run with the
+`agent` extra installed on `PATH`; `watchdog/`'s own `go.mod` untouched).
 
 ## P5.5a -- end-to-end encrypted backups to two recipients (sections 15.1, 15.2, 15.3)
 

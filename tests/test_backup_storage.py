@@ -32,26 +32,47 @@ def test_store_cleans_up_the_temp_file_on_write_failure(
 ) -> None:
     storage = BackupBlobStorage(tmp_path / "blobs")
 
-    class _BoomOnWrite:
-        def write(self, _data: bytes) -> int:
-            raise OSError("simulated disk failure")
+    def _boom(_fd: int, _data: bytes) -> int:
+        raise OSError("simulated disk failure")
 
-        def close(self) -> None:
-            pass
-
-        def __enter__(self) -> _BoomOnWrite:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            pass
-
-    monkeypatch.setattr("fleet.backup_storage.os.fdopen", lambda *_a, **_k: _BoomOnWrite())
+    monkeypatch.setattr("fleet.backup_storage.os.write", _boom)
 
     with pytest.raises(OSError, match="simulated disk failure"):
         storage.store("apt-1", BackupKind.DEVICE_CONFIG, b"content")
 
     directory = storage.root / "apt-1" / "device_config"
     assert not directory.exists() or list(directory.glob("*.tmp")) == []
+
+
+def test_begin_upload_streams_chunks_and_finalize_returns_the_relative_path(
+    tmp_path: Path,
+) -> None:
+    storage = BackupBlobStorage(tmp_path / "blobs")
+    pending = storage.begin_upload("apt-1", BackupKind.OPERATIONAL_DATA)
+
+    pending.write(b"chunk-one-")
+    pending.write(b"chunk-two")
+    relative_path = pending.finalize()
+
+    assert storage.read(relative_path) == b"chunk-one-chunk-two"
+    assert not Path(relative_path).is_absolute()
+
+
+def test_begin_upload_abort_removes_the_temp_file_and_is_idempotent(tmp_path: Path) -> None:
+    storage = BackupBlobStorage(tmp_path / "blobs")
+    pending = storage.begin_upload("apt-1", BackupKind.OPERATIONAL_DATA)
+    pending.write(b"partial")
+
+    temp_path = pending.temp_path
+    assert temp_path.exists()
+
+    pending.abort()
+    assert not temp_path.exists()
+    pending.abort()  # idempotent -- no error on a second call
+
+    # Nothing was ever finalized under a permanent name.
+    directory = storage.root / "apt-1" / "operational_data"
+    assert not directory.exists() or list(directory.glob("*.bin")) == []
 
 
 def test_delete_a_missing_blob_is_not_an_error(tmp_path: Path) -> None:

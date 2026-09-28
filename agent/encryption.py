@@ -15,7 +15,10 @@ this module is where they are enforced, not only where they are described:**
   apartment's operational data as it arrives.
 - **Two recipients, always**: the landlord's everyday key and a second key
   kept offline. Every encrypted artifact is encrypted to **both** --
-  `load_recipients` below refuses fewer than `MIN_RECIPIENTS` (2).
+  `load_recipients` below refuses fewer than `MIN_RECIPIENTS` (2) **distinct**
+  recipients (cross-review: the same key listed twice used to satisfy the
+  count without providing a genuine second recipient -- deduplicated by
+  each recipient's own canonical string form before the count check).
 - **Real `age` format**, so `age -d -i key.txt <file>` decrypts it without
   this project's own tooling (the fleet UI will show that exact command
   next to a download, P5.5a's own UI point). This module uses `pyrage`
@@ -129,7 +132,32 @@ def load_recipients(path: Path = DEFAULT_RECIPIENTS_FILE) -> list[pyrage.x25519.
             f"least {MIN_RECIPIENTS} (project owner decision: the everyday key "
             "and one offline key)."
         )
-    return recipients
+
+    # **Cross-review finding:** the same public key listed twice (by
+    # accident -- a copy-paste mistake while preparing the file -- or on
+    # purpose, by an attacker who controls the file but wants the count
+    # check above to still pass) used to satisfy `MIN_RECIPIENTS` without
+    # actually providing a second, independent recipient -- silently
+    # defeating the whole point of "two recipients, either alone restores
+    # a backup years from now": encrypting to the same key twice is
+    # functionally identical to encrypting to it once. Deduplicated by
+    # each recipient's own **canonical string form** (`str(recipient)`,
+    # the same normalized `age1...` bech32 encoding `pyrage.x25519
+    # .Recipient.__str__` always returns regardless of how the input line
+    # was cased/formatted) -- comparing the parsed recipients, not the raw
+    # input lines, so two lines that differ only in whitespace or
+    # (invalid, but never reached here since `from_str` already rejects
+    # it) letter case cannot slip past a naive string-line comparison
+    # either.
+    distinct_recipients = {str(recipient): recipient for recipient in recipients}
+    if len(distinct_recipients) < MIN_RECIPIENTS:
+        raise RecipientsError(
+            f"{path} contains {len(recipients)} recipient line(s) but only "
+            f"{len(distinct_recipients)} distinct recipient(s) -- need at least "
+            f"{MIN_RECIPIENTS} *different* recipients (project owner decision: "
+            "the everyday key and one offline key, not the same key twice)."
+        )
+    return list(distinct_recipients.values())
 
 
 def encrypt_stream(

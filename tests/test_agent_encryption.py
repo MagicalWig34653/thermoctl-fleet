@@ -89,6 +89,77 @@ def test_fewer_than_two_recipients_is_refused(tmp_path: Path) -> None:
         load_recipients(recipients_file)
 
 
+def test_the_same_recipient_listed_twice_is_refused(tmp_path: Path) -> None:
+    """Cross-review finding: two lines is not the same as two *distinct*
+    recipients -- the same public key twice must not satisfy
+    `MIN_RECIPIENTS`, or "either recipient alone restores it" silently
+    degrades to a single point of failure."""
+
+    identity_one, _ = _generate_identity_pair()
+    recipient = str(identity_one.to_public())
+    recipients_file = tmp_path / "backup-recipients.txt"
+    recipients_file.write_text(f"{recipient}\n{recipient}\n", encoding="utf-8")
+
+    with pytest.raises(RecipientsError, match="distinct"):
+        load_recipients(recipients_file)
+
+
+def test_the_same_recipient_listed_twice_in_different_case_is_still_refused(
+    tmp_path: Path,
+) -> None:
+    """Deduplication compares each recipient's own canonical string form
+    (`str(recipient)`, after parsing), not the raw input lines -- an
+    upper-cased duplicate of an otherwise-valid recipient must not slip
+    past as "different" merely because the two lines differ in case."""
+
+    identity_one, _ = _generate_identity_pair()
+    recipient = str(identity_one.to_public())
+    recipients_file = tmp_path / "backup-recipients.txt"
+    recipients_file.write_text(f"{recipient}\n{recipient.upper()}\n", encoding="utf-8")
+
+    with pytest.raises(RecipientsError, match="distinct"):
+        load_recipients(recipients_file)
+
+
+def test_three_lines_two_distinct_recipients_is_refused(tmp_path: Path) -> None:
+    """Not merely "count >= 2" -- three lines naming only two distinct
+    keys (one repeated) must still be refused, the same as two identical
+    lines."""
+
+    identity_one, identity_two = _generate_identity_pair()
+    recipients_file = tmp_path / "backup-recipients.txt"
+    recipients_file.write_text(
+        f"{identity_one.to_public()}\n{identity_one.to_public()}\n{identity_one.to_public()}\n",
+        encoding="utf-8",
+    )
+    # (deliberately never referencing identity_two -- this file only ever
+    # names one actual key, repeated three times)
+    del identity_two
+
+    with pytest.raises(RecipientsError, match="distinct"):
+        load_recipients(recipients_file)
+
+
+def test_two_distinct_recipients_among_a_duplicate_are_accepted(tmp_path: Path) -> None:
+    """The positive counterpart: a duplicate line alongside two genuinely
+    different recipients is fine -- the duplicate is just redundant, not
+    disqualifying, and the two distinct recipients are still returned."""
+
+    identity_one, identity_two = _generate_identity_pair()
+    recipients_file = tmp_path / "backup-recipients.txt"
+    recipients_file.write_text(
+        f"{identity_one.to_public()}\n{identity_one.to_public()}\n{identity_two.to_public()}\n",
+        encoding="utf-8",
+    )
+
+    recipients = load_recipients(recipients_file)
+
+    assert len(recipients) == 2
+    assert {str(r) for r in recipients} == {
+        str(identity_one.to_public()), str(identity_two.to_public())
+    }
+
+
 def test_empty_recipients_file_is_refused(tmp_path: Path) -> None:
     recipients_file = tmp_path / "backup-recipients.txt"
     recipients_file.write_text("# nothing here\n\n", encoding="utf-8")
