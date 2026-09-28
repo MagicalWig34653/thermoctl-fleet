@@ -511,8 +511,8 @@ storage, heartbeat sending **SR**
   re-executed and never re-reported (no synthetic second result).
 - Per-command follow-ups, each an honest failed result naming the package
   that will replace it: `report_now` needs P2.3 heartbeat acquisition;
-  `fetch_logs`/`diagnostic_bundle` need P5.3 masking/upload; `backup_now`
-  needs P5.5.
+  `fetch_logs` needed P5.3a masking/upload (done, see below);
+  `diagnostic_bundle` needs P5.3b; `backup_now` needs P5.5.
 - LED `cloud_contact` follows the command channel's own already-existing
   WARNING log (no change to `agent/commands_channel.py`); `fault`/`control`
   stay honestly unknown (not a fabricated "no fault") via a deliberately
@@ -525,28 +525,61 @@ storage, heartbeat sending **SR**
 - **Depends on:** P5.1. **Read back by:** main session (principle 5).
 
 ### P5.3 -- Result reporting and `create_diagnostic_bundle`
-- **Goal:** complete `fetch_logs` and `create_diagnostic_bundle` (stage 1),
-  including masking of credentials/tenant data in the collected logs.
-  **SR** because of the masking (section 21.5, docstring in `loop.py`).
-- Result *transport* (`POST /v1/commands/{id}/result`, buffering, retry) is
-  already complete since P5.1/P5.2 -- what is missing here is producing the
-  actual, masked *content* for these two commands in the first place, and
-  wiring their `agent/loop.py::_HANDLERS` entries to call it instead of
-  today's honest "not yet available" failure.
-- **Files:** `agent/loop.py`, content upload endpoints.
-- **Section:** 21.5.
-- **Acceptance:** test demonstrates that a known secret pattern (example
-  token, not real) appears masked in the generated bundle.
-- **Depends on:** P5.2.
-- **Read back by:** main session (masking is security-relevant).
-- **P5.3b (a later, encrypted diagnostic bundle, not yet split out as its
-  own package here) depends on P5.5a's `agent/encryption.py`**: the
-  project owner's 2026-09-26/27 backup decision explicitly asks for the
-  same encryption mechanism to be "reused later by the encrypted
-  diagnostic bundle" -- `load_recipients`/`encrypt_stream` are already
-  general-purpose (recipients file path, byte stream in, byte stream out),
-  not backup-specific, precisely so a future diagnostic-bundle package can
-  call them directly instead of duplicating the recipients-file handling.
+
+Split, 2026-09-27 (project owner), into P5.3a (`fetch_logs`, done) and P5.3b
+(`diagnostic_bundle`, still open) -- the two commands need unrelated
+machinery (an on-device allowlist filter vs. end-to-end encryption) and
+were never a single unit of work to begin with; see
+`docs/specification.md` 21.5's own "Decided afterward" paragraph for why
+they must also stay conceptually separate, not just separately scheduled.
+
+#### P5.3a -- `fetch_logs` with an on-device allowlist filter **SR** -- done
+- **Goal:** complete `fetch_logs` (stage 1): read the thermoctl container's
+  own log, filter it through an on-device allowlist (never a denylist,
+  never cloud-side filtering), upload the result, and show it in "Eine
+  Wohnung". **SR** because of the filtering itself (section 21.5, project
+  owner decision 2026-09-27).
+- [x] done -- see `docs/STATUS.md`'s P5.3a section for the full design
+  (allowlist shapes, placeholders, retention) and verification output.
+- **Files:** `agent/log_filter.py` (new), `agent/loop.py`
+  (`_handle_fetch_logs`, `read_container_log_lines`), `protocol/commands.py`
+  (`LogExcerpt`, `PROTOCOL_VERSION` bumped to 4), `fleet/app.py`
+  (`POST /v1/commands/{id}/logs`, retention loop), `fleet/storage.py`
+  (`command_log_excerpts` table), `fleet/ui_apartment.py`/
+  `fleet/templates/ui/apartment.html` (display).
+- **Section:** 6, 7, 21.5.
+- **Acceptance:** a test feeding a log with a tenant name, °C values, a
+  token, a setpoint, and a free-text note demonstrates none of it appears
+  in the output, with an accurate dropped-line count.
+- **Depends on:** P5.2. **Read back by:** main session (filtering is
+  security-relevant).
+
+#### P5.3b -- `create_diagnostic_bundle`, end-to-end encrypted **SR** -- open
+- **Goal:** complete `create_diagnostic_bundle` (stage 1): logs of the four
+  services, versions/digests, container states, memory/disk usage, Zigbee
+  network state, the last control decisions -- packaged and **end-to-end
+  encrypted** (a key the cloud does not possess, mirroring the
+  operational-data backup's own section-15.1 treatment), delivered once,
+  never accumulated in the cloud's running storage the way `fetch_logs`'s
+  own retention window does. **Must not** carry a *series* of control
+  decisions or heat-demand readings over time (section 6, section 21.5's
+  own "Decided afterward" paragraph) -- a bundle is a snapshot over a few
+  hours, not a channel.
+- **Files:** `agent/loop.py` (`create_diagnostic_bundle`), reusing
+  `agent/encryption.py` (P5.5a, done) directly rather than duplicating its
+  own recipients-file handling -- the project owner's 2026-09-26/27 backup
+  decision explicitly asks for the same encryption mechanism to be "reused
+  later by the encrypted diagnostic bundle", and `load_recipients`/
+  `encrypt_stream` are already general-purpose (a recipients file path, a
+  byte stream in, a byte stream out), not backup-specific, precisely for
+  this.
+- **Section:** 15.1, 21.5.
+- **Acceptance:** test demonstrates the cloud never sees plaintext content,
+  and that a series of bundles cannot be used to reconstruct a heat-demand
+  timeline (only ever one bundle at a time, no accumulation).
+- **Depends on:** P5.2, P5.5a (done -- `agent/encryption.py`).
+- **Read back by:** main session (encryption and the "never a series"
+  boundary are both security-relevant).
 
 ### P5.4 -- Desired-state reconciliation **SR**
 - **Goal:** complete `agent/loop.py::reconcile_desired_state` (pre-check,

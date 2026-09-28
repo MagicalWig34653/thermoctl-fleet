@@ -21,8 +21,22 @@ instead of building an image from scratch.
 
 Entirely missing:
 
-- a pi-gen configuration (a `config` file plus its own stage) that installs
-  `image/common/packages.txt`, applies `image/common/udev/` and
+- a pi-gen configuration (a `config` file plus its own stage) that, in
+  order (see `image/common/README.md`, "Docker's official apt repository",
+  for the full reasoning): installs `ca-certificates` first; runs
+  `image/common/apt/fetch-docker-key.sh` to fetch and fingerprint-verify
+  Docker's signing key; places `image/common/apt/docker.sources` at
+  `/etc/apt/sources.list.d/docker.sources` and
+  `image/common/apt/preferences.d/docker` at
+  `/etc/apt/preferences.d/docker` (pins everything else from that
+  repository to `Pin-Priority: -1`, never merely a low positive value --
+  see `image/common/README.md`); runs `apt-get update`; installs `docker-ce
+  docker-ce-cli containerd.io docker-compose-plugin` from that repository
+  with `apt-get install --no-install-recommends` (required, not optional --
+  `docker-ce` itself Recommends `docker-buildx-plugin` and
+  `docker-ce-rootless-extras`, neither of which this image ships); then
+  installs the rest of `image/common/packages.txt` the normal way --
+  applies `image/common/udev/` and
   `image/common/unattended-upgrades/`, installs
   `image/common/tmpfiles.d/thermoctl-agent.conf` at
   `/etc/tmpfiles.d/thermoctl-agent.conf` (P5.7 hot-fix, `docs/STATUS.md` --
@@ -41,8 +55,10 @@ Entirely missing:
   unlike `/run/thermoctl-agent` above, this is `/var/lib`, not tmpfs, so
   it is created once here rather than recreated by a tmpfiles.d entry,
 - writes `/etc/thermoctl-agent/.env` with `DOCKER_GID=$(getent group
-  docker | cut -d: -f3)` after `image/common/packages.txt`'s container
-  runtime package is installed (P5.7 hot-fix round 2) --
+  docker | cut -d: -f3)` **after** `docker-ce` (from Docker's official apt
+  repository, see `image/common/README.md`) is installed (P5.7 hot-fix
+  round 2) -- the `docker` group does not exist before that package is
+  installed, so this step must run after the whole apt sequence above --
   `agent-compose.yml`'s `group_add: ["${DOCKER_GID:?...}"]` reads this
   file automatically and fails loud if it is missing,
 - preloading the agent container image (section 19.3),

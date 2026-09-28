@@ -173,6 +173,16 @@
             <span class="command-history__meta">von {{ cmd.created_by }}, erstellt {{ cmd.created_text }}, läuft ab {{ cmd.expires_text }}</span>
             {% if cmd.duration_text %}<span class="command-history__meta">Dauer: {{ cmd.duration_text }}</span>{% endif %}
             {% if cmd.error_text %}<p class="command-history__error">{{ cmd.error_text }}</p>{% endif %}
+            {% if cmd.log_excerpt %}
+            <div class="command-history__log">
+                <p class="command-history__meta">Erfasst {{ cmd.log_excerpt.captured_text }}, Quelle: {{ cmd.log_excerpt.source }} -- {{ cmd.log_excerpt.dropped_lines }} Zeile(n) entfernt</p>
+                {% if cmd.log_excerpt.lines %}
+                <pre class="command-history__log-lines">{{ cmd.log_excerpt.lines | join("\n") }}</pre>
+                {% else %}
+                <p>Keine Zeilen entsprachen der Positivliste.</p>
+                {% endif %}
+            </div>
+            {% endif %}
         </li>
         {% endfor %}
     </ul>

@@ -69,6 +69,170 @@ def check_package_list(path: Path) -> list[str]:
     return packages
 
 
+# The four packages that actually provide "docker compose" (the v2 CLI
+# subcommand watchdog/runtime.go invokes) and the container runtime it
+# swaps -- from Docker's own apt repository (image/common/apt/), per the
+# project owner's 2026-09-27 decision, not from Debian. Checked in one
+# place so a future edit of packages.txt can't silently drop one of the
+# four without a test failing.
+_DOCKER_REPO_PACKAGES = frozenset(
+    {"docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin"}
+)
+
+# Names that must never reappear in packages.txt: docker.io is Debian's own
+# (obsolete for this purpose) Docker package, and docker-compose-v2 never
+# existed as a Debian 13 "trixie" package at all (the P5.E finding this
+# fix responds to, docs/STATUS.md).
+_FORBIDDEN_DOCKER_PACKAGES = frozenset({"docker.io", "docker-compose-v2"})
+
+
+def check_docker_packages_from_official_repo(packages: list[str]) -> None:
+    """Checks that `packages.txt` names the Docker-repo packages (section 19,
+    P5.E fix) instead of Debian's own `docker.io`/`docker-compose-v2` --
+    the latter either only provides the legacy v1 script or, for
+    `docker-compose-v2`, does not exist in Debian 13 "trixie" at all
+    (`docs/STATUS.md`, P5.E). Does not by itself check *where* apt would
+    install these four packages from -- that is `check_docker_apt_source`
+    and `check_docker_apt_preferences` below.
+    """
+
+    missing = sorted(_DOCKER_REPO_PACKAGES - set(packages))
+    if missing:
+        raise ImageError(
+            f"packages.txt: missing Docker-repo package(s) {missing!r} "
+            f"(image/common/apt/, section 19)."
+        )
+
+    present_forbidden = sorted(_FORBIDDEN_DOCKER_PACKAGES & set(packages))
+    if present_forbidden:
+        raise ImageError(
+            f"packages.txt: forbidden package(s) still present {present_forbidden!r} -- "
+            f"docker.io is Debian's own package and docker-compose-v2 does not exist "
+            f"in Debian 13 'trixie' at all (docs/STATUS.md, P5.E)."
+        )
+
+
+# Docker's published release key fingerprint, pinned here so a change to it
+# in image/common/apt/fetch-docker-key.sh cannot silently drift from what
+# this check expects -- see that script's own comment for how to verify it
+# against Docker's documentation before ever changing this value.
+_DOCKER_KEY_FINGERPRINT = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+
+
+def check_docker_apt_source(path: Path) -> None:
+    """Checks the deb822 repository definition for Docker's official apt
+    repository (image/common/apt/docker.sources).
+
+    Asserts the file exists, is a deb822 stanza naming Docker's repository,
+    and uses `Signed-By:` (a keyring file, not a system-wide `apt-key add`,
+    which would trust the key for every repository on the system) rather
+    than being unsigned.
+    """
+
+    if not path.is_file():
+        raise ImageError(f"{path}: Docker apt repository definition is missing.")
+    content = path.read_text(encoding="utf-8")
+    required = [
+        "URIs: https://download.docker.com/linux/debian",
+        "Suites: trixie",
+        "Signed-By:",
+    ]
+    missing = [line for line in required if line not in content]
+    if missing:
+        raise ImageError(f"{path}: missing required field(s): {missing!r}.")
+
+
+def check_docker_apt_preferences(path: Path) -> None:
+    """Checks the apt pinning file that restricts Docker's official apt
+    repository to exactly the four packages it is meant to provide
+    (`_DOCKER_REPO_PACKAGES`), not arbitrary packages that happen to share
+    a name with something published there.
+
+    Cross-review finding: a low-but-*positive* priority for "everything
+    else from this origin" (e.g. 1) still lets apt install a package that
+    exists ONLY at that origin -- exactly what would happen for docker-ce's
+    own Recommends (`docker-ce-rootless-extras`, `docker-buildx-plugin`) if
+    they were ever pulled in. Only a **negative** priority
+    (`apt_preferences(5)`: "never installed") actually forecloses that, so
+    this asserts the wildcard stanza is pinned to exactly `-1`, not merely
+    "some low number" -- and that nothing is left at the old, too-permissive
+    `1`.
+    """
+
+    if not path.is_file():
+        raise ImageError(f"{path}: Docker apt preferences file is missing.")
+    content = path.read_text(encoding="utf-8")
+    if 'origin "download.docker.com"' not in content:
+        raise ImageError(f"{path}: does not pin origin \"download.docker.com\".")
+
+    priorities = [
+        line.split(":", 1)[1].strip()
+        for line in content.splitlines()
+        if line.strip().startswith("Pin-Priority:")
+    ]
+    if "-1" not in priorities:
+        raise ImageError(
+            f"{path}: does not pin everything else from this origin to -1 -- a "
+            f"low-but-positive priority would still let apt install a "
+            f"Docker-repo-only package (e.g. docker-buildx-plugin via Recommends)."
+        )
+    if "600" not in priorities:
+        raise ImageError(f"{path}: does not pin the named Docker-repo packages to 600.")
+    if "1" in priorities:
+        raise ImageError(
+            f"{path}: still pins something at priority 1 -- too permissive, must be -1."
+        )
+
+    missing_packages = [pkg for pkg in _DOCKER_REPO_PACKAGES if pkg not in content]
+    if missing_packages:
+        raise ImageError(
+            f"{path}: does not name Docker-repo package(s) {sorted(missing_packages)!r}."
+        )
+
+
+def check_docker_key_fetch(path: Path) -> None:
+    """Checks the documented, verified fetch step for Docker's apt signing
+    key (image/common/apt/fetch-docker-key.sh) -- the keyring itself is not
+    committed to this repository (a stale or silently-replaced binary blob
+    is a worse failure mode than a fetch step that fails loudly), so this
+    script has to actually verify what it fetches.
+
+    Asserts the pinned fingerprint (`_DOCKER_KEY_FINGERPRINT`) appears in
+    the script, and that the script both fetches a key from Docker's
+    repository and refuses to proceed on a mismatch -- not just that a
+    fingerprint-looking string is quoted somewhere for documentation.
+
+    Cross-review finding: also asserts the script actually rejects a
+    download containing more than one primary key. Comparing only the
+    *first* fingerprint in the download is not enough -- a file can validly
+    contain several concatenated OpenPGP key blocks, and the whole raw file
+    still gets installed as the keyring even if only the first key's
+    fingerprint was ever checked, letting an unverified second key ride
+    along and be trusted by apt for this repository too.
+    `tests/test_fetch_docker_key.py` exercises this behaviourally (with a
+    real `gpg`, if installed); this only checks the script's own source for
+    the "exactly one primary key" enforcement so a regression can't drop it
+    silently.
+    """
+
+    if not path.is_file():
+        raise ImageError(f"{path}: Docker apt key fetch script is missing.")
+    content = path.read_text(encoding="utf-8")
+    if _DOCKER_KEY_FINGERPRINT not in content:
+        raise ImageError(
+            f"{path}: pinned fingerprint {_DOCKER_KEY_FINGERPRINT!r} not found."
+        )
+    if "download.docker.com/linux/debian/gpg" not in content:
+        raise ImageError(f"{path}: does not fetch Docker's published key.")
+    if "exit 1" not in content:
+        raise ImageError(f"{path}: does not appear to refuse a fingerprint mismatch.")
+    if "PUB_COUNT" not in content or "pub:" not in content:
+        raise ImageError(
+            f"{path}: does not appear to reject a download containing more than "
+            f"one primary key (no primary-key count check found)."
+        )
+
+
 def check_udev_rule(path: Path) -> None:
     """Checks that the Zigbee stick rule contains at least one real rule line."""
 
@@ -241,7 +405,11 @@ def check_all(root: Path = IMAGE_DIR) -> None:
     """Runs all checks; raises on the first failure."""
 
     common = root / "common"
-    check_package_list(common / "packages.txt")
+    packages = check_package_list(common / "packages.txt")
+    check_docker_packages_from_official_repo(packages)
+    check_docker_apt_source(common / "apt" / "docker.sources")
+    check_docker_apt_preferences(common / "apt" / "preferences.d" / "docker")
+    check_docker_key_fetch(common / "apt" / "fetch-docker-key.sh")
     check_udev_rule(common / "udev" / "99-zigbee-stick.rules")
     check_agent_registration_template(common / "agent-registration.empty.json")
     check_watchdog_unit(root.parent / "watchdog" / "thermoctl-watchdog.service")

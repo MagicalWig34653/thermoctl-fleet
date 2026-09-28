@@ -1,0 +1,30 @@
+# Docker's official apt repository (Debian), for docker-ce, docker-ce-cli,
+# containerd.io and docker-compose-plugin only -- everything else keeps
+# coming from the Debian archive. image/common/apt/preferences.d/docker
+# pins exactly these four package names to this repository and nothing
+# else, so this file being present does not widen what the Debian archive
+# itself provides for any other package.
+#
+# deb822 format (RFC822-style stanza, ".sources" extension) rather than a
+# one-line ".list" entry, so `Signed-By` can point at a keyring file
+# instead of a system-wide `apt-key add` (deprecated, and would trust the
+# key for every repository on the system, not just this one).
+#
+# `Suites: trixie` -- Raspberry Pi OS 64-bit is Debian 13 "trixie" arm64
+# (image/README.md), and image/x86/ is Debian 13 "trixie" amd64 directly,
+# so both targets use the same suite name. No `Architectures:` field is
+# pinned here: each image is built natively for its own single target
+# architecture (arm64 for image/pi/, amd64 for image/x86/), so apt already
+# only ever considers the system's own architecture -- one unmodified file
+# serves both images, exactly as image/common/README.md's "same core step
+# twice" describes for everything else in this directory.
+#
+# The keyring this points at is not committed to this repository (see
+# image/common/apt/fetch-docker-key.sh, run before this file is used) --
+# `Signed-By` still works with the keyring installed there at build time,
+# because it names a path, not embedded key material.
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: trixie
+Components: stable
+Signed-By: /etc/apt/keyrings/docker.asc

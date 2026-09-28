@@ -90,8 +90,9 @@ from agent.commands_channel import flush_outbox as _flush_outbox
 from agent.commands_channel import receive_commands as _receive_commands
 from agent.commands_channel import report_result as _report_result
 from agent.encryption import DEFAULT_RECIPIENTS_FILE, encrypt_stream, load_recipients
+from agent.log_filter import filter_log_lines
 from agent.safe_io import append_bytes_safe, read_text_safe
-from protocol import Command, CommandResult, DesiredState, Heartbeat
+from protocol import Command, CommandResult, DesiredState, Heartbeat, LogExcerpt
 from protocol.backups import BackupKind, BackupUploadAccepted
 from protocol.commands import CommandType
 
@@ -131,6 +132,24 @@ DEFAULT_LED_STATUS_FILE = Path("/run/thermoctl-agent/led-status.env")
 # .MAX_OUTBOX_RESULTS`, applied to bytes instead of items because a log
 # line's length is not fixed the way a command id is.
 DEFAULT_LOCAL_LOG_MAX_BYTES = 1_000_000
+
+# `fetch_logs` (P5.3a, section 7/21.5): the thermoctl container's own name,
+# as fixed by `image/common/agent-compose.yml`'s sibling (thermoctl's own
+# compose service) and `protocol.desired_state.Services.thermoctl` -- read
+# via the Docker Engine API over the local Unix socket the agent already
+# needs group access to for `agent-compose.yml`'s own reasoning (security
+# principles 2/5/6: this only ever *reads* another container's log, it
+# never starts, stops, or reconfigures anything, and it never reaches a
+# registry or the network at all).
+DEFAULT_THERMOCTL_CONTAINER = "thermoctl"
+DEFAULT_DOCKER_SOCKET = Path("/var/run/docker.sock")
+
+# `fetch_logs` (section 7: "the last n lines ... capped at 500 lines") --
+# used as the request's own upper bound when `Command.lines` is somehow
+# missing (never produced by `fleet.storage.Storage.create_command`, but
+# `protocol.commands.Command.lines` is `Optional` at the model level, see
+# that field's own docstring).
+DEFAULT_FETCH_LOGS_LINES = 200
 
 # **Cross-review finding, main-session decision:** `protocol.commands
 # .Command.id` carries no charset restriction at the model level
@@ -324,6 +343,85 @@ def _as_aware_utc(value: datetime) -> datetime:
     return value
 
 
+# `fetch_logs` (P5.3a): reads the last `n` raw (unfiltered) lines of
+# `container`'s own log -- `agent.log_filter.filter_log_lines` is what
+# actually decides what may leave the device, this type only describes
+# where the *candidate* lines come from. Injectable so
+# `tests/test_agent_fetch_logs.py` can supply a stub source (a fixed list
+# of lines) instead of a real Docker socket -- CLAUDE.md's own "every
+# function gets a test" would otherwise force every test onto a real
+# container.
+LogReader = Callable[[str, int], list[str]]
+
+
+def _demultiplex_docker_log_stream(raw: bytes) -> list[str]:
+    """Splits the Docker Engine API's own multiplexed log stream format
+    (used whenever the container was **not** started with a TTY, which
+    `image/common/agent-compose.yml`'s sibling for thermoctl does not) back
+    into plain text lines.
+
+    Each frame is an 8-byte header (1 byte stream type -- stdout/stderr,
+    ignored here, `fetch_logs` wants both interleaved in log order, not
+    split by stream -- 3 reserved zero bytes, 4 bytes big-endian payload
+    length) followed by that many bytes of payload
+    (https://docs.docker.com/engine/api/v1.43/#tag/Container/operation/
+    ContainerLogs -- read directly, not via a Docker SDK: **the agent
+    package intentionally has no Docker SDK dependency**, the same
+    "no new third-party dependency beyond the agent extra" constraint this
+    work package was given, mirroring CLAUDE.md security principle 6's
+    "no Docker SDK" for the watchdog, applied here for a different reason
+    -- one more dependency the agent's own supply chain would have to
+    trust for eight bytes of framing this function replaces directly).
+
+    Tolerant of a truncated final frame (fewer than 8 header bytes, or a
+    declared payload length longer than what remains) -- `--tail`-limited
+    output should never produce one, but a malformed or unexpected response
+    must not crash `fetch_logs` outright; it is treated as "read this far,
+    then stop" rather than raising.
+    """
+
+    lines: list[str] = []
+    buffer = b""
+    offset = 0
+    while offset + 8 <= len(raw):
+        length = int.from_bytes(raw[offset + 4 : offset + 8], "big")
+        payload_start = offset + 8
+        payload_end = payload_start + length
+        if payload_end > len(raw):
+            break
+        buffer += raw[payload_start:payload_end]
+        offset = payload_end
+    text = buffer.decode("utf-8", errors="replace")
+    lines.extend(text.splitlines())
+    return lines
+
+
+def read_container_log_lines(
+    container: str, n: int, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> list[str]:
+    """The real `LogReader`: the last `n` lines of `container`'s log, read
+    from the local Docker Engine API over the Unix socket
+    (`GET /containers/{container}/logs?stdout=1&stderr=1&tail={n}`) --
+    never a registry, never the network (security principles 2/6 apply to
+    this call too, even though it only ever reads, not swaps, an image).
+
+    Raises `httpx.HTTPError`/`OSError` on any failure (socket missing, not
+    running as a user in the `docker` group, container not found, ...) --
+    `_handle_fetch_logs` turns that into an honest failed `CommandResult`,
+    never a fabricated empty log.
+    """
+
+    transport = httpx.HTTPTransport(uds=str(socket_path))
+    with httpx.Client(transport=transport, base_url="http://docker") as client:
+        response = client.get(
+            f"/containers/{container}/logs",
+            params={"stdout": "1", "stderr": "1", "tail": str(n)},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        return _demultiplex_docker_log_stream(response.content)
+
+
 @dataclass(frozen=True)
 class BackupConfig:
     """Everything `_handle_backup_now` (and the scheduled jobs,
@@ -362,12 +460,26 @@ class ExecutionContext:
     dedup state itself -- paths and a clock, all overridable, so no
     function in this module ever reaches for a hidden global or the real
     wall clock directly (CLAUDE.md: nothing hard-coded; also what makes the
-    expiry check testable without a real 15-minute wait)."""
+    expiry check testable without a real 15-minute wait).
+
+    `client`/`log_reader`/`thermoctl_container` (P5.3a addition): what
+    `_handle_fetch_logs` needs beyond the command itself -- the fleet
+    client to upload a `LogExcerpt` to, where to read the raw log from
+    (defaults to the real Docker-socket reader, `read_container_log_lines`,
+    overridable for tests), and which container's log counts as "the
+    service log" (section 7). `client` is `None` in every context that
+    never executes `fetch_logs` (most existing tests of the other four
+    handlers) -- see that handler's own docstring for why a missing client
+    is an honest failure, not a crash.
+    """
 
     watchdog_state_path: Path
     local_log_path: Path
     now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
     backup_config: BackupConfig | None = None
+    client: httpx.Client | None = None
+    log_reader: LogReader = read_container_log_lines
+    thermoctl_container: str = DEFAULT_THERMOCTL_CONTAINER
 
 
 @dataclass(frozen=True)
@@ -486,12 +598,83 @@ def _handle_report_now(command: Command, ctx: ExecutionContext) -> _HandlerResul
 
 
 def _handle_fetch_logs(command: Command, ctx: ExecutionContext) -> _HandlerResult:
-    """`fetch_logs` needs masking before any log content may leave the
-    device (section 7: "content, hence masked and capped at 500 lines") --
-    that masking is P5.3's job (security-relevant, main-session read-back),
-    not invented here."""
+    """`fetch_logs` (P5.3a, sections 6, 7, 21.5): reads the last
+    `command.lines` (falling back to `DEFAULT_FETCH_LOGS_LINES` if somehow
+    absent, see `Command.lines`'s own docstring) lines of `ctx
+    .thermoctl_container`'s log via `ctx.log_reader`, filters them through
+    `agent.log_filter.filter_log_lines` -- **the only place this or any
+    other function in this module decides what leaves the device** (project
+    owner, 2026-09-27: filtering happens on the device, never in the
+    cloud) -- and uploads the result as a `protocol.commands.LogExcerpt` via
+    `POST /v1/commands/{id}/logs`.
 
-    return _HandlerResult(successful=False, error_text=f"fetch_logs {_HANDLER_MESSAGE_P53}")
+    **Every failure here is reported as an honest failed result, never a
+    fake success** (this module's own top docstring): no `ctx.client`
+    configured, the log source raising (missing Docker socket, container
+    not found, permission denied), or the upload itself failing (transport
+    error or a non-204 response) all end the same way -- `successful=False`
+    with a short, non-sensitive `error_text`. None of these paths ever
+    raise out of this function; `execute_command`'s own dispatch loop must
+    keep running regardless of why one command's execution failed.
+    """
+
+    if ctx.client is None:
+        return _HandlerResult(
+            successful=False,
+            error_text="fetch_logs abgelehnt: kein Fleet-Client konfiguriert.",
+        )
+
+    requested_lines = command.lines if command.lines is not None else DEFAULT_FETCH_LOGS_LINES
+
+    try:
+        raw_lines = ctx.log_reader(ctx.thermoctl_container, requested_lines)
+    except Exception as error:  # noqa: BLE001 -- any log-source failure is reported, not raised
+        return _HandlerResult(
+            successful=False,
+            error_text=f"fetch_logs: Log konnte nicht gelesen werden ({error}).",
+        )
+
+    filtered = filter_log_lines(raw_lines)
+    excerpt = LogExcerpt(
+        command_id=command.id,
+        lines=filtered.lines,
+        dropped_lines=filtered.dropped,
+        source=ctx.thermoctl_container,
+        captured_at=ctx.now(),
+    )
+
+    try:
+        response = ctx.client.post(
+            f"/v1/commands/{command.id}/logs", json=excerpt.model_dump(mode="json")
+        )
+    except httpx.TransportError as error:
+        return _HandlerResult(
+            successful=False,
+            error_text=f"fetch_logs: Hochladen fehlgeschlagen ({error}).",
+        )
+
+    if response.status_code != 204:
+        return _HandlerResult(
+            successful=False,
+            error_text=(
+                f"fetch_logs: Hochladen wurde abgelehnt "
+                f"({response.status_code})."
+            ),
+        )
+
+    # `protocol.commands.CommandResult` has no separate "summary" field --
+    # `error_text` is the only free-text slot the wire model offers, and a
+    # short success summary ("N lines, M dropped") is exactly the kind of
+    # non-sensitive, already-derived text (counts only, no log content)
+    # `fleet/ui_apartment.py`'s "Befehle" history already displays for a
+    # successful command via that same field.
+    return _HandlerResult(
+        successful=True,
+        error_text=(
+            f"{len(filtered.lines)} Zeile(n) übertragen, "
+            f"{filtered.dropped} Zeile(n) entfernt."
+        ),
+    )
 
 
 def _handle_diagnostic_bundle(command: Command, ctx: ExecutionContext) -> _HandlerResult:
@@ -1035,6 +1218,7 @@ def run(
         watchdog_state_path=watchdog_state_path,
         local_log_path=local_log_path,
         backup_config=backup_config,
+        client=client,
     )
 
     def _on_contact(ok: bool) -> None:

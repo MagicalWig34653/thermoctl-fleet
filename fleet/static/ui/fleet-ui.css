@@ -354,3 +354,20 @@ ul.backup-list li {
 .backup-list__kind {
     font-weight: bold;
 }
+
+.command-history__log {
+    margin: 0.5rem 0 0;
+}
+
+.command-history__log-lines {
+    font-family: monospace;
+    font-size: 0.85em;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #8881;
+    border-radius: 0.25rem;
+    padding: 0.5rem;
+    max-height: 24rem;
+    overflow-y: auto;
+    margin: 0.35rem 0 0;
+}

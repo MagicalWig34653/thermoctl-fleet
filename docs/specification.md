@@ -163,6 +163,11 @@ This is not caution for its own sake: exactly this combination would be the diff
 between "distributed operational data" and "behavioral profile of twelve households in one
 place", with everything in legal consequences that hangs off that.
 
+**"Heat demand yes/no per zone" is the same trap in miniature -- see section 21.5's own
+"Decided afterward" paragraph** for why a single such reading is harmless but a series of
+them in the cloud's running storage is not, and where the line accordingly runs between
+`fetch_logs` and the on-demand `diagnostic_bundle`.
+
 ---
 
 ## 7. Commands: a short, closed list
@@ -1075,6 +1080,31 @@ logs of the four services, versions and digests, container states, memory and di
 Zigbee network state, the last control decisions -- masked, packaged, uploaded. In the vast
 majority of cases this answers the question someone wanted to log in for, and leaves behind a
 file you can show a second person.
+
+**Decided afterward (project owner, 2026-09-27):** `fetch_logs` (this section, P5.3a) is read
+in the cloud and therefore filtered on the device by an **allowlist**, not a denylist -- a
+denylist bets that every possible leak has been enumerated; logs change with every library
+version and a missed pattern leaks silently and irreversibly. An allowlist fails the other
+way instead: something expected is missing, and that is noticed at once. Filtering happens
+exclusively in the agent, never in the cloud; every value a placeholder replaces (a
+temperature, a setpoint, a name, ...) gets a fixed, dumb placeholder, never a stable hash,
+which would let values be correlated across lines even after masking; every dropped line is
+counted and the count travels with the excerpt, so nobody debugs a log with an invisible gap;
+and the cloud enforces its own retention period on what it stores from this command (14 days
+by default, configurable), so `fetch_logs` uploads do not slowly turn the fleet service into
+the data store section 6 was written to exclude.
+
+This is also where `diagnostic_bundle` (this section, still open, P5.5b) must stay
+categorically different, not just "more of the same, encrypted": a single reading of "heat
+demand yes/no per zone" is operationally harmless, exactly like the aggregate zone counts the
+heartbeat already carries (section 5). A **series** of such readings over time is a presence
+detector -- absence is directly what section 6 excludes. `diagnostic_bundle` may therefore
+carry a control-decision snapshot covering a few hours, end-to-end encrypted, delivered once,
+like the operational-data backups (section 15.1) -- but it must never become a channel the
+cloud's *running* storage accumulates the way `fetch_logs`'s own retention window does. The
+distinction is between a bundle and a series, not between "masked" and "encrypted": encrypting
+a series would only hide today's presence detector from today's cloud operator, not stop it
+from being one.
 
 ---
 
