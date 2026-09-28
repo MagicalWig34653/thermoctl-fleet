@@ -1,5 +1,5 @@
 """Tests for `fleet.storage.Storage`'s diagnostic-bundle metadata methods
-(P5.3b) -- `fleet/migrations/versions/0012_diagnostic_bundles.py`'s own ORM
+(P5.3b) -- `fleet/migrations/versions/0013_diagnostic_bundles.py`'s own ORM
 counterpart. Mirrors `tests/test_storage_backups.py`'s own pattern, plus
 the ownership/type/duplicate scoping `store_diagnostic_bundle` itself
 enforces (mirroring `Storage.store_log_excerpt`'s own tests in

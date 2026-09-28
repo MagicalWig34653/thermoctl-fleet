@@ -496,6 +496,52 @@ storage, heartbeat sending **SR**
 - [x] done -- see `docs/STATUS.md`'s P5.1b section for the double-submit
   design decision and the full verification output.
 
+### P5.1c -- SSE resume survives a fleet database restore
+- **Goal:** fix a defect found during the P5.E end-to-end run
+  (2026-09-28): after the fleet database is reset or restored from an
+  older backup, `commands.id` (the SSE stream's own global sequence
+  counter, what `Last-Event-ID` resumes from) starts over, so a reused
+  sequence number can make a resuming agent silently skip a brand-new
+  command instead of receiving it.
+- **Files:** `fleet/migrations/versions/0012_fleet_epoch.py` (new --
+  one-row `fleet_epoch` table), `fleet/storage.py`
+  (`FleetEpochRecord`, `Storage.get_epoch`, `Storage.rotate_epoch`),
+  `fleet/app.py` (`_last_event_id`, `_stream_command_events`,
+  `commands_stream` -- SSE event id becomes `<epoch>.<sequence>`),
+  `fleet/admin.py` (`rotate-epoch` CLI subcommand), `agent/commands_channel.py`
+  (`_read_last_event_id` bounded in length/charset before ever being sent
+  in a header). `protocol/` and `PROTOCOL_VERSION` untouched -- the SSE id
+  is transport metadata, never a wire model field.
+- **Section:** 3, 7.
+- **Acceptance:** epoch created once by the migration's own data insert,
+  stable across restarts and across separate `Storage` instances; SSE ids
+  carry it; a `Last-Event-ID` with the current epoch and the apartment's
+  own sequence resumes correctly (`Storage.pending_commands`'s existing
+  membership check, unchanged); the reproduction -- persist a bookmark,
+  simulate a restore (a brand-new database, its own fresh epoch, its own
+  sequence counter starting back at 1) -- delivers the new, reused-sequence
+  command instead of skipping it
+  (`test_commands_stream_sse_survives_a_simulated_restore_new_command_not_skipped`);
+  a bare pre-P5.1c integer id, a wrong-epoch id, and garbage/header-
+  injection attempts all fall back to `0`, never a 500; `rotate-epoch`
+  replaces the stored epoch and is visible from a separate `Storage`
+  instance; migration 0012 up/down and `compare_metadata` clean. Agent
+  side: the persisted value round-trips opaquely (never parsed as an
+  integer), and an invalid persisted value (too long, wrong charset, a
+  CR/LF header-injection attempt) is never sent, treated exactly like no
+  bookmark at all.
+- **Operator note:** rotating the epoch is a manual step, not automatic --
+  a freshly migrated database gets its own epoch for free, but a database
+  *restored* from an existing backup file also restores whatever epoch was
+  in that backup verbatim (`fleet_epoch` is an ordinary table). **After
+  restoring a backup, run `python -m fleet.admin rotate-epoch` once**, so
+  every agent's already-persisted `Last-Event-ID` stops matching and
+  resumes from `0` -- safe, since redelivery of still-pending commands is
+  always harmless, unlike the silent skip this package fixes.
+- **Depends on:** P5.1.
+- [x] done -- see `docs/STATUS.md`'s P5.1c section for the full reasoning
+  and verification output.
+
 ### P5.2 -- Command execution in the agent **SR**
 - [x] done -- see `docs/STATUS.md`'s P5.2 section (including its provenance
   note: a first, uncommitted draft of this package came from an interrupted
@@ -582,7 +628,8 @@ they must also stay conceptually separate, not just separately scheduled.
   `fleet/upload_streaming.py` (new, factored out of P5.5a's own
   `upload_backup` so both endpoints share the streaming-cap/age-plausibility
   logic), `fleet/bundle_storage.py` (new), `fleet/storage.py`
-  (`diagnostic_bundles` table, migration `0012_diagnostic_bundles.py`),
+  (`diagnostic_bundles` table, migration `0013_diagnostic_bundles.py`,
+  re-chained onto P5.1c's parallel `0012_fleet_epoch.py` at merge time),
   `fleet/ui_apartment.py`/`fleet/ui_routes.py`/`fleet/templates/ui/
   apartment.html` (shown next to its command in "Befehle", not a separate
   list).

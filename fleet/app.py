@@ -104,6 +104,28 @@ _DEFAULT_COMMANDS_SSE_RETRY_MS = 5_000
 _COMMANDS_SSE_PING_INTERVAL_ENV = "FLEET_COMMANDS_SSE_PING_INTERVAL_S"
 _DEFAULT_COMMANDS_SSE_PING_INTERVAL_S = 15.0
 
+# P5.1c: a well-formed SSE event id is `<epoch>.<sequence>` -- `<epoch>`
+# exactly matching `fleet.storage._generate_epoch`'s own shape (16 random
+# bytes, hex-encoded, always 32 lowercase hex characters), `<sequence>` a
+# run of digits bounded well short of where `int()` would need to reject it
+# for `Storage.pending_commands`'s own `_MAX_COMMAND_SEQUENCE` guard (20
+# digits comfortably covers `2**63 - 1`, 19 digits, with room to spare).
+# Anything that does not match this shape at all -- an old, pre-P5.1c plain
+# integer id, another epoch's id, or outright garbage/header-injection
+# attempts -- is handled the same way `_last_event_id` always handled an
+# unparsable value: fall back to `0`, never a crash (CLAUDE.md security
+# principle 5 applied to a client-supplied header).
+#
+# **Matched with `.fullmatch()`, not `.match()`** (cross-review): a
+# `$`-anchored pattern used with `.match()` still matches a value with a
+# trailing `\n` (`re`'s `$` matches "end of string, or just before a
+# trailing newline" unless `re.MULTILINE`/other flags change that) -- e.g.
+# `"<32 hex>.1\n"` would have matched despite not being the exact header
+# value. `.fullmatch()` requires the entire string to match, trailing
+# newline included, closing that gap; the pattern itself carries no
+# `^`/`$` anchors since `.fullmatch()` makes them redundant.
+_EVENT_ID_PATTERN = re.compile(r"([0-9a-f]{32})\.([0-9]{1,20})")
+
 # P5.5a, section 15.2: "enforced by a periodic cleanup". A long default --
 # unlike the alarm/command polls above, retention is bounded by *days*
 # (14 daily) and *weeks* (8 weekly), so running it every few minutes would
@@ -281,7 +303,76 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     instead means a bad configuration raises `NotifierConfigError` straight
     out of application startup -- loud, not silent -- before the task (and
     therefore any alarm evaluation at all) ever begins.
+
+    **P5.1c, cross-review: rotates the fleet database epoch on every
+    service start, before any request is served** (`Storage.rotate_epoch`).
+    The manual `python -m fleet.admin rotate-epoch` CLI (`fleet/admin.py`)
+    already covers a restore performed while the service keeps running,
+    but a restore of an **older** backup of a database that was never
+    manually rotated brings back the *same* epoch that was already current
+    at backup time -- and a forgotten manual step after restoring would
+    silently reintroduce exactly the "reused sequence looks like a
+    legitimate resume point" skip this whole package exists to prevent.
+    Restoring a backup always involves stopping and restarting the fleet
+    service around the restore itself (there is no way to swap the
+    database file under a running process), so rotating unconditionally
+    here closes that gap without depending on anyone remembering a
+    separate step -- at the cost of every restart (**not just a restore**)
+    causing every currently-connected agent to redeliver its still-pending
+    commands once, which `Storage.pending_commands`'s own idempotent-
+    redelivery reasoning already makes harmless. The manual command stays
+    useful for the one case this does not cover: restoring a backup file
+    directly into a database whose fleet service process is deliberately
+    kept running throughout (e.g. restoring into a warm standby instance
+    that this process is not itself).
+
+    **Multi-process note:** if more than one fleet service process is ever
+    run against the same database (not currently how this service is
+    deployed -- see `docker/Dockerfile.fleet`, one container, one process),
+    each process's own start rotates the epoch again, invalidating the
+    `Last-Event-ID` every agent connected to any *other* process was
+    holding -- harmless for the same reason a single restart is: every
+    affected agent simply redelivers its still-pending commands on its
+    next reconnect, never silently skips one.
+
+    **Resolves storage via `app.dependency_overrides`, not a bare
+    `get_storage()` call** (unlike `_alarm_check_loop`/
+    `_backup_retention_loop`/`_log_retention_loop` just above): mirrors
+    exactly what `Depends(get_storage)` already does for every ordinary
+    request, falling back to the real `get_storage()` singleton whenever no
+    override is registered (every real deployment). Needed because every
+    real end-to-end test in `tests/test_agent_commands_channel.py`/`tests
+    /tls_support.py` boots the real app via a real `uvicorn` server wired
+    up purely through `app.dependency_overrides[get_storage]`, deliberately
+    never setting `FLEET_DATABASE_URL` at all -- a bare `get_storage()` call
+    here would raise for every one of them.
+
+    **A failed rotation aborts startup, uncaught, exactly like a
+    misconfigured alert channel just above** (main-session decision,
+    cross-review round 2 -- an intermediate version of this caught every
+    exception here and only logged, which was rejected: a silently failed
+    rotation would mean the restore protection this whole package exists
+    to provide is gone, in production, without anyone noticing -- the
+    wrong trade to make for a *test*-fixture ordering problem). If storage
+    cannot be resolved (no override registered and no
+    `FLEET_DATABASE_URL`) or `Storage.rotate_epoch` itself fails, this
+    raises straight out of application startup, the same as
+    `NotifierConfigError` above. **The test-fixture-ordering problem this
+    used to work around is fixed on the test side instead**:
+    `tests/test_agent_fetch_logs.py::fleet_base_url` used to start its own
+    real server from a module-scoped fixture while the storage override
+    was registered by a function-scoped, `autouse` one -- pytest sets up
+    higher-scoped fixtures before lower-scoped ones for a given test
+    regardless of declaration order, so that server's own `lifespan` used
+    to run before anything was registered in `app.dependency_overrides` at
+    all. Fixed there by making the override itself module-scoped and
+    having `fleet_base_url` depend on it, so the override is guaranteed to
+    be in place before the server -- and therefore this rotation -- ever
+    starts.
     """
+
+    storage_for_epoch_rotation = app.dependency_overrides.get(get_storage, get_storage)()
+    await asyncio.to_thread(storage_for_epoch_rotation.rotate_epoch, datetime.now(UTC))
 
     interval_s = float(os.environ.get(_ALARM_CHECK_INTERVAL_ENV, _DEFAULT_ALARM_CHECK_INTERVAL_S))
     notifiers = load_notifiers_from_env(os.environ)
@@ -498,27 +589,50 @@ def receive_event(
     storage.save_event(apartment, event, datetime.now(UTC))
 
 
-def _last_event_id(request: Request) -> int:
+def _last_event_id(request: Request, current_epoch: str) -> int:
     """Parses the `Last-Event-ID` request header (section 3: "reconnection,
     event numbering, and catch-up delivery are already fixed in the
     format") into the sequence number to resume after.
 
+    **P5.1c: the header is now `<epoch>.<sequence>`, not a plain integer**
+    (`_EVENT_ID_PATTERN`, `fleet.storage.Storage.get_epoch`) -- see
+    `0012_fleet_epoch.py`'s own docstring for why: after the fleet
+    database is reset or restored from an older backup, a plain sequence
+    number can be *reused* by a brand-new command, which a bare integer
+    `Last-Event-ID` cannot be told apart from. The epoch part must equal
+    `current_epoch` (this request's own, freshly read `Storage.get_epoch`)
+    for the sequence part to be honoured at all -- an older epoch (a
+    restored backup) or no epoch at all (a value from before this package
+    existed, still a bare integer) can therefore never resume past a
+    command that only exists because of the reset/restore.
+
     Absent (a fresh connection, or a client that does not support
-    resumption at all) or unparsable (a malformed or forged header --
-    CLAUDE.md security principle 5 applied to a client-supplied value, the
-    same reasoning `agent.registration._parse_and_clamp_retry_after`
-    already applies to a *server*-supplied one) both fall back to `0`,
-    meaning "everything still pending", never a crash or a 500 -- a client
-    with no valid resume point should simply see every pending command
-    again, not be refused.
+    resumption at all), a bare pre-P5.1c integer, an epoch that does not
+    match `current_epoch`, or anything else that fails `_EVENT_ID_PATTERN`
+    outright (a malformed or forged header, including a header-injection
+    attempt -- CLAUDE.md security principle 5 applied to a client-supplied
+    value, the same reasoning `agent.registration
+    ._parse_and_clamp_retry_after` already applies to a *server*-supplied
+    one) all fall back to `0`, meaning "everything still pending", never a
+    crash or a 500 -- a client with no valid resume point should simply see
+    every pending command again, not be refused. `Storage.pending_commands`
+    own membership check (P5.1 cross-review) is unchanged and still applies
+    on top of this -- the epoch check only decides *whether the sequence
+    part is even worth asking that question about*.
     """
 
     raw = request.headers.get("last-event-id")
     if raw is None:
         return 0
+    match = _EVENT_ID_PATTERN.fullmatch(raw)
+    if match is None:
+        return 0
+    epoch_part, sequence_part = match.groups()
+    if epoch_part != current_epoch:
+        return 0
     try:
-        return int(raw)
-    except ValueError:
+        return int(sequence_part)
+    except ValueError:  # pragma: no cover -- unreachable, the pattern is digits-only
         return 0
 
 
@@ -529,6 +643,7 @@ async def _stream_command_events(
     poll_interval_s: float,
     retry_ms: int,
     is_disconnected: Callable[[], Awaitable[bool]],
+    epoch: str,
 ) -> AsyncIterator[dict[str, object]]:
     """The actual SSE event generator for `commands_stream`'s open-connection
     case -- pulled out as a plain, directly testable module-level function
@@ -543,6 +658,16 @@ async def _stream_command_events(
     SSE event dict (`event`, `id`, `data`, `retry`) per pending command,
     then `asyncio.sleep(poll_interval_s)` before the next poll -- see
     `commands_stream`'s own docstring for the full reasoning.
+
+    **P5.1c:** `id` is `<epoch>.<sequence>`, not a bare sequence -- `epoch`
+    is read once by the caller (`Storage.get_epoch`) and threaded through
+    unchanged for the whole connection's lifetime (a `rotate-epoch` run
+    mid-connection does not retroactively change ids already sent, it only
+    ever changes what a *future* connection's own `Last-Event-ID` is
+    checked against). `after_sequence` itself is still a bare int here --
+    the epoch check already happened once, in `_last_event_id`, before this
+    generator was ever created; `Storage.pending_commands`'s own membership
+    check is unchanged.
     """
 
     sequence = after_sequence
@@ -556,7 +681,7 @@ async def _stream_command_events(
             sequence = item.sequence
             yield {
                 "event": "message",
-                "id": str(item.sequence),
+                "id": f"{epoch}.{item.sequence}",
                 "data": item.command.model_dump_json(),
                 "retry": retry_ms,
             }
@@ -595,21 +720,27 @@ async def commands_stream(
     challenge` already uses for its own 60 s poll interval.
 
     **The open-connection case** writes one SSE event per pending command:
-    `id: <sequence>` (`Last-Event-ID` resumes from this on reconnection),
-    `data: <Command JSON>`, plus a `retry:` hint (section 3: "reconnection
-    ... already fixed in the format"). **Expired commands are never
-    delivered** (section 7) -- filtered inside `Storage.pending_commands`
-    itself, not here. The stream **polls storage at a small, configurable
-    interval** (`_COMMANDS_POLL_INTERVAL_ENV`) rather than busy-looping,
-    and ends cleanly on client disconnect (`request.is_disconnected()`,
-    checked before every poll -- `sse_starlette.EventSourceResponse` itself
-    also stops iterating the moment the underlying connection closes, this
-    check just avoids one needless poll in between). **Keep-alive
-    comments** (`: ping`) are `EventSourceResponse`'s own built-in
-    mechanism (`ping=`), not reimplemented here.
+    `id: <epoch>.<sequence>` (`Last-Event-ID` resumes from this on
+    reconnection -- **P5.1c**: prefixed with this fleet database's own
+    stable epoch id, `Storage.get_epoch`, so a `Last-Event-ID` from before
+    a database reset/restore can never be confused with one issued after
+    it, even if the bare sequence number was reused -- see
+    `0012_fleet_epoch.py`'s own docstring), `data: <Command JSON>`, plus a
+    `retry:` hint (section 3: "reconnection ... already fixed in the
+    format"). **Expired commands are never delivered** (section 7) --
+    filtered inside `Storage.pending_commands` itself, not here. The stream
+    **polls storage at a small, configurable interval**
+    (`_COMMANDS_POLL_INTERVAL_ENV`) rather than busy-looping, and ends
+    cleanly on client disconnect (`request.is_disconnected()`, checked
+    before every poll -- `sse_starlette.EventSourceResponse` itself also
+    stops iterating the moment the underlying connection closes, this check
+    just avoids one needless poll in between). **Keep-alive comments**
+    (`: ping`) are `EventSourceResponse`'s own built-in mechanism (`ping=`),
+    not reimplemented here.
     """
 
-    after_sequence = _last_event_id(request)
+    epoch = await asyncio.to_thread(storage.get_epoch)
+    after_sequence = _last_event_id(request, epoch)
     poll_interval_s = float(
         os.environ.get(_COMMANDS_POLL_INTERVAL_ENV, _DEFAULT_COMMANDS_POLL_INTERVAL_S)
     )
@@ -644,6 +775,7 @@ async def commands_stream(
         poll_interval_s,
         retry_ms,
         request.is_disconnected,
+        epoch,
     )
     return EventSourceResponse(events, ping=ping_interval_s)
 

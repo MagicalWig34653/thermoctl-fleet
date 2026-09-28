@@ -32,16 +32,16 @@ Three indexes: one unique on `bundle_id` (the wire id lookup), one unique
 on `command_id` (the "one bundle per command" enforcement and the download
 route's own lookup), one on `apartment_id` (every apartment-scoped list).
 
-`down_revision` **"0011"** -- chained onto `0011_backups.py` (P5.5a), the
-current head at the time this package started. Named `0012` per the P5.3b
-work order's own instruction ("another package may also take 0012 in
-parallel; the main session re-chains" -- unlike P5.3a/P5.5a's own parallel
-`0010` collision, no such conflict was found at the time this migration
-was written, but the same main-session re-chaining convention applies if
-one turns up later).
+**`down_revision` "0012"** -- originally chained onto `0011_backups.py`
+(P5.5a, the head at the time this package started) as this migration's own
+`0012`. P5.1c's own `0012_fleet_epoch.py` landed on `main` in parallel,
+also numbered `0012` (the same "another package may also take this number
+in parallel" collision P5.3a/P5.5a's own `0010` already had, per the work
+order's own anticipation of it) -- re-chained at merge time (main-session
+convention) onto `0012_fleet_epoch.py`, this migration renumbered `0013`.
 
-Revision ID: 0012
-Revises: 0011
+Revision ID: 0013
+Revises: 0012
 Create Date: 2026-09-28
 """
 
@@ -52,8 +52,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0012"
-down_revision: str | Sequence[str] | None = "0011"
+revision: str = "0013"
+down_revision: str | Sequence[str] | None = "0012"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

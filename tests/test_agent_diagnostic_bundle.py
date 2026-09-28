@@ -623,7 +623,32 @@ def _override_dependencies(
 
 
 @pytest.fixture(scope="module")
-def fleet_base_url() -> Iterator[str]:
+def _server_bootstrap_storage(tmp_path_factory: pytest.TempPathFactory) -> Storage:
+    """Storage for the one moment the module-scoped server starts: since
+    P5.1c, `fleet.app.lifespan` rotates the SSE epoch at every start and a
+    failed rotation aborts startup loudly -- same reasoning as
+    `tests/test_agent_fetch_logs.py::_server_bootstrap_db_url`."""
+
+    url = f"sqlite:///{tmp_path_factory.mktemp('bundle-server-bootstrap')}/bootstrap.db"
+    upgrade(url)
+    return create_storage(url)
+
+
+@pytest.fixture(scope="module")
+def _override_storage_for_server_startup(
+    _server_bootstrap_storage: Storage,
+) -> Iterator[None]:
+    """Registers `get_storage`'s override before `fleet_base_url` starts the
+    server; the function-scoped `_override_dependencies` above still
+    overwrites it per test for the test bodies themselves."""
+
+    app.dependency_overrides[get_storage] = lambda: _server_bootstrap_storage
+    yield
+    app.dependency_overrides.pop(get_storage, None)
+
+
+@pytest.fixture(scope="module")
+def fleet_base_url(_override_storage_for_server_startup: None) -> Iterator[str]:
     """A real `fleet.app.app`, over plain HTTP -- mirrors
     `tests/test_agent_fetch_logs.py::fleet_base_url` exactly (TLS pinning
     is P5.0's own orthogonal concern, not exercised again here)."""
