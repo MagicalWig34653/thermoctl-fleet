@@ -26,11 +26,34 @@ install -m 0644 /repo/image/common/apt/preferences.d/docker /etc/apt/preferences
 echo "== apt-get update again, now with Docker's official apt repository present =="
 apt-get update -qq
 
-grep -vE '^\s*#|^\s*$' /repo/image/common/packages.txt > /tmp/e2e-packages.txt
+echo "== installing the four Docker-repo packages with --no-install-recommends =="
+# Required, not optional: docker-ce itself Recommends
+# docker-ce-rootless-extras and docker-buildx-plugin, neither of which
+# image/common/packages.txt lists or this image ships -- without this flag
+# apt would pull both in anyway. image/common/apt/preferences.d/docker's
+# Pin-Priority: -1 for everything else from this origin is the second,
+# independent line of defense in case this flag is ever dropped.
+apt-get install -y --no-install-recommends \
+  docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+echo "== confirming the Recommends were NOT pulled in (both lines of defense) =="
+# NOTE: `dpkg -s pkg` alone exits 0 even for a package that is merely
+# KNOWN (e.g. "not-installed", or removed-but-not-purged residual config)
+# -- only grepping the actual Status: line tells installed from not.
+for extra in docker-buildx-plugin docker-ce-rootless-extras; do
+  if dpkg -s "$extra" 2>/dev/null | grep -q '^Status: install ok installed'; then
+    echo "DISCREPANCY: $extra got installed even though it is not in packages.txt and --no-install-recommends was used." >&2
+    exit 1
+  fi
+done
+
+grep -vE '^\s*#|^\s*$' /repo/image/common/packages.txt \
+  | grep -vxE 'docker-ce|docker-ce-cli|containerd\.io|docker-compose-plugin' \
+  > /tmp/e2e-packages.txt
 FAILED=""
 while read -r pkg; do
   if ! apt-get install -y "$pkg"; then
-    echo "DISCREPANCY (image/common/packages.txt): package '$pkg' does not exist in a real Debian 13 'trixie' apt repository (or Docker's official one) -- continuing without it." >&2
+    echo "DISCREPANCY (image/common/packages.txt): package '$pkg' does not exist in a real Debian 13 'trixie' apt repository -- continuing without it." >&2
     FAILED="$FAILED $pkg"
   fi
 done < /tmp/e2e-packages.txt

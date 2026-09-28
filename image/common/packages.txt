@@ -16,9 +16,16 @@
 # den veralteten docker-compose-Befehl (v1), den watchdog/runtime.go nicht
 # aufruft (`execCommand(r.bin, "compose", ...)`). Repository-Definition,
 # Schlüssel-Fingerabdruck und apt-Pinning (nur diese vier Pakete kommen aus
-# diesem Repository) liegen unter image/common/apt/ -- die genaue
-# Reihenfolge der Bauschritte steht in image/common/README.md und
-# image/pi/README.md / image/x86/README.md.
+# diesem Repository, alles andere von dort ist auf Pin-Priority -1 gesetzt
+# -- ein niedriger aber positiver Wert würde ein Paket, das NUR dort
+# existiert, z. B. über eine Recommends-Abhaengigkeit trotzdem erlauben)
+# liegen unter image/common/apt/ -- die genaue Reihenfolge der Bauschritte
+# steht in image/common/README.md und image/pi/README.md /
+# image/x86/README.md. Installiert mit `apt-get install
+# --no-install-recommends`, damit docker-ce's eigene Recommends
+# (docker-buildx-plugin, docker-ce-rootless-extras) gar nicht erst
+# angefordert werden -- das apt-Pinning oben ist die zweite, unabhaengige
+# Verteidigungslinie, falls dieses Flag jemals entfaellt.
 docker-ce
 docker-ce-cli
 containerd.io

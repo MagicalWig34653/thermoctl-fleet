@@ -147,6 +147,16 @@ def check_docker_apt_preferences(path: Path) -> None:
     repository to exactly the four packages it is meant to provide
     (`_DOCKER_REPO_PACKAGES`), not arbitrary packages that happen to share
     a name with something published there.
+
+    Cross-review finding: a low-but-*positive* priority for "everything
+    else from this origin" (e.g. 1) still lets apt install a package that
+    exists ONLY at that origin -- exactly what would happen for docker-ce's
+    own Recommends (`docker-ce-rootless-extras`, `docker-buildx-plugin`) if
+    they were ever pulled in. Only a **negative** priority
+    (`apt_preferences(5)`: "never installed") actually forecloses that, so
+    this asserts the wildcard stanza is pinned to exactly `-1`, not merely
+    "some low number" -- and that nothing is left at the old, too-permissive
+    `1`.
     """
 
     if not path.is_file():
@@ -154,8 +164,25 @@ def check_docker_apt_preferences(path: Path) -> None:
     content = path.read_text(encoding="utf-8")
     if 'origin "download.docker.com"' not in content:
         raise ImageError(f"{path}: does not pin origin \"download.docker.com\".")
-    if "Pin-Priority:" not in content:
-        raise ImageError(f"{path}: does not set a Pin-Priority.")
+
+    priorities = [
+        line.split(":", 1)[1].strip()
+        for line in content.splitlines()
+        if line.strip().startswith("Pin-Priority:")
+    ]
+    if "-1" not in priorities:
+        raise ImageError(
+            f"{path}: does not pin everything else from this origin to -1 -- a "
+            f"low-but-positive priority would still let apt install a "
+            f"Docker-repo-only package (e.g. docker-buildx-plugin via Recommends)."
+        )
+    if "600" not in priorities:
+        raise ImageError(f"{path}: does not pin the named Docker-repo packages to 600.")
+    if "1" in priorities:
+        raise ImageError(
+            f"{path}: still pins something at priority 1 -- too permissive, must be -1."
+        )
+
     missing_packages = [pkg for pkg in _DOCKER_REPO_PACKAGES if pkg not in content]
     if missing_packages:
         raise ImageError(
@@ -174,6 +201,18 @@ def check_docker_key_fetch(path: Path) -> None:
     the script, and that the script both fetches a key from Docker's
     repository and refuses to proceed on a mismatch -- not just that a
     fingerprint-looking string is quoted somewhere for documentation.
+
+    Cross-review finding: also asserts the script actually rejects a
+    download containing more than one primary key. Comparing only the
+    *first* fingerprint in the download is not enough -- a file can validly
+    contain several concatenated OpenPGP key blocks, and the whole raw file
+    still gets installed as the keyring even if only the first key's
+    fingerprint was ever checked, letting an unverified second key ride
+    along and be trusted by apt for this repository too.
+    `tests/test_fetch_docker_key.py` exercises this behaviourally (with a
+    real `gpg`, if installed); this only checks the script's own source for
+    the "exactly one primary key" enforcement so a regression can't drop it
+    silently.
     """
 
     if not path.is_file():
@@ -187,6 +226,11 @@ def check_docker_key_fetch(path: Path) -> None:
         raise ImageError(f"{path}: does not fetch Docker's published key.")
     if "exit 1" not in content:
         raise ImageError(f"{path}: does not appear to refuse a fingerprint mismatch.")
+    if "PUB_COUNT" not in content or "pub:" not in content:
+        raise ImageError(
+            f"{path}: does not appear to reject a download containing more than "
+            f"one primary key (no primary-key count check found)."
+        )
 
 
 def check_udev_rule(path: Path) -> None:

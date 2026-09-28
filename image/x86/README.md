@@ -31,11 +31,16 @@ Entirely missing:
   `image/common/apt/docker.sources` at
   `/etc/apt/sources.list.d/docker.sources` and
   `image/common/apt/preferences.d/docker` at
-  `/etc/apt/preferences.d/docker`; runs `apt-get update`; then installs the
-  rest of `image/common/packages.txt` (including `docker-ce`,
-  `docker-ce-cli`, `containerd.io`, `docker-compose-plugin` from that
-  repository) -- applies the udev rule and the `unattended-upgrades`
-  configuration, installing
+  `/etc/apt/preferences.d/docker` (pins everything else from that
+  repository to `Pin-Priority: -1`, never merely a low positive value --
+  see `image/common/README.md`); runs `apt-get update`; installs `docker-ce
+  docker-ce-cli containerd.io docker-compose-plugin` from that repository
+  with `apt-get install --no-install-recommends` (required, not optional --
+  `docker-ce` itself Recommends `docker-buildx-plugin` and
+  `docker-ce-rootless-extras`, neither of which this image ships); then
+  installs the rest of `image/common/packages.txt` the normal way --
+  applies the udev rule and the `unattended-upgrades` configuration,
+  installing
   `image/common/tmpfiles.d/thermoctl-agent.conf` (P5.7 hot-fix, needed on
   this target too -- `/run/thermoctl-agent` is required by the agent
   container's own bind mount regardless of whether the LED display is

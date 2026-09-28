@@ -57,19 +57,35 @@ either way, per the shared-recipe reasoning above):
 3. Place `apt/docker.sources` at `/etc/apt/sources.list.d/docker.sources`
    and `apt/preferences.d/docker` at `/etc/apt/preferences.d/docker`
    (`install -m 0644` for both -- plain configuration files, not secrets).
+   The preferences file pins everything else from `download.docker.com` to
+   `Pin-Priority: -1` (apt's own "never installed", not merely
+   deprioritized -- a low-but-positive value would still let a
+   Docker-repo-only package through) and the four packages named below to
+   `600`.
 4. `apt-get update`.
-5. Install the rest of `packages.txt`, including the four Docker-repo
-   packages named above -- apt's own dependency resolution pulls them from
-   `download.docker.com` because of the pinning in step 3, from Debian's
-   archive for everything else.
-6. **Only after this**, per section 19.3's `DOCKER_GID` step below: the
+5. Install the four Docker-repo packages with
+   `apt-get install --no-install-recommends docker-ce docker-ce-cli
+   containerd.io docker-compose-plugin` -- **`--no-install-recommends` is
+   required here**, not optional: `docker-ce` itself `Recommends:
+   docker-ce-rootless-extras` and `docker-buildx-plugin`, and without this
+   flag apt would pull both in even though neither is listed in
+   `packages.txt`. This is the first of two independent lines of defense;
+   the `-1` pin from step 3 is the second, in case this flag is ever
+   dropped from the build step by mistake.
+6. Install the rest of `packages.txt` (everything that is not one of the
+   four Docker-repo packages) the normal way -- apt's own dependency
+   resolution pulls these from Debian's archive, never from
+   `download.docker.com` (the `-1` pin forecloses that regardless).
+7. **Only after this**, per section 19.3's `DOCKER_GID` step below: the
    `docker` group did not exist before `docker-ce` was installed in step 5,
    so `getent group docker` has nothing to read before then.
 
-`docker-buildx-plugin` is deliberately **not** installed: the base station
-never builds an image (section 19.3's "Agent image already preloaded" --
-`docker pull`/`docker load` at build time, not a `docker build` at
-runtime), so buildx buys nothing here.
+`docker-buildx-plugin` and `docker-ce-rootless-extras` are deliberately
+**not** installed: the base station never builds an image (section 19.3's
+"Agent image already preloaded" -- `docker pull`/`docker load` at build
+time, not a `docker build` at runtime) and never runs Docker rootless, so
+neither buys anything here -- and per step 5/6 above, neither is pulled in
+by accident either.
 
 ## What else belongs in both images per section 19.3
 

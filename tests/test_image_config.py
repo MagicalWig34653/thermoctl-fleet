@@ -316,7 +316,34 @@ def test_docker_apt_preferences_without_all_four_packages_is_rejected(
     # must still be rejected, not just when the whole stanza is missing.
     path = tmp_path / "docker"
     path.write_text(
+        'Package: *\n'
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: -1\n\n"
         'Package: docker-ce docker-ce-cli containerd.io\n'
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: 600\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_apt_preferences(path)
+
+
+def test_docker_apt_preferences_with_too_permissive_wildcard_pin_is_rejected(
+    tmp_path: Path,
+) -> None:
+    # Cross-review finding: a low-but-POSITIVE priority (1) for "everything
+    # else from this origin" still lets apt install a package that exists
+    # only there (e.g. docker-ce's own Recommends: docker-buildx-plugin,
+    # docker-ce-rootless-extras) -- only a negative priority (-1) actually
+    # forecloses that. Must be rejected even though the four named packages
+    # are all present and correctly pinned at 600.
+    path = tmp_path / "docker"
+    path.write_text(
+        'Package: *\n'
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: 1\n\n"
+        "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\n"
         'Pin: origin "download.docker.com"\n'
         "Pin-Priority: 600\n",
         encoding="utf-8",
@@ -331,7 +358,7 @@ def test_docker_apt_preferences_naming_the_four_packages_passes(tmp_path: Path) 
     path.write_text(
         'Package: *\n'
         'Pin: origin "download.docker.com"\n'
-        "Pin-Priority: 1\n\n"
+        "Pin-Priority: -1\n\n"
         "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\n"
         'Pin: origin "download.docker.com"\n'
         "Pin-Priority: 600\n",
@@ -366,6 +393,26 @@ def test_docker_key_fetch_without_mismatch_refusal_is_rejected(tmp_path: Path) -
     path.write_text(
         "DOCKER_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88\n"
         "curl -fsSL https://download.docker.com/linux/debian/gpg -o key.asc\n"
+        "PUB_COUNT=1\n"
+        "install -m 0644 key.asc /etc/apt/keyrings/docker.asc\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_key_fetch(path)
+
+
+def test_docker_key_fetch_without_multi_key_rejection_is_rejected(tmp_path: Path) -> None:
+    # Cross-review finding: fingerprint check present and enforced, but
+    # nothing in the script rejects a download containing more than one
+    # primary key -- see tests/test_fetch_docker_key.py for the
+    # behavioural version of this same finding.
+    path = tmp_path / "fetch-docker-key.sh"
+    path.write_text(
+        "DOCKER_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88\n"
+        "curl -fsSL https://download.docker.com/linux/debian/gpg -o key.asc\n"
+        "FETCHED=$(gpg --with-colons --show-keys key.asc | awk -F: '/^fpr:/{print $10;exit}')\n"
+        'if [ "$FETCHED" != "$DOCKER_KEY_FINGERPRINT" ]; then exit 1; fi\n'
         "install -m 0644 key.asc /etc/apt/keyrings/docker.asc\n",
         encoding="utf-8",
     )
