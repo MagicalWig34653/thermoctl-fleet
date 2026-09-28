@@ -233,6 +233,44 @@ def _build_log_excerpt_display(storage: Storage, record: CommandRecord) -> LogEx
 
 
 @dataclass(frozen=True)
+class DiagnosticBundleDisplay:
+    """A stored `diagnostic_bundle` upload (P5.3b), shown next to its
+    command in the "Befehle" history -- mirrors `LogExcerptDisplay`'s own
+    shape (size/time, no content: unlike `fetch_logs`, this bundle's own
+    content is end-to-end encrypted, the fleet UI has nothing to render
+    from it beyond what `Storage.get_diagnostic_bundle_for_command` already
+    exposes). `age_decrypt_command` is the ready-made command the landlord
+    can paste after downloading (project owner: "a cumbersome path leads to
+    weakening the filter instead", the same reasoning `BackupDisplay
+    .age_decrypt_command` already documents for the operational-data
+    backup -- this bundle uses the exact same encryption mechanism, so the
+    exact same command decrypts it)."""
+
+    command_id: str
+    size_text: str
+    created_text: str
+    content_hash: str
+    age_decrypt_command: str
+
+
+def _build_diagnostic_bundle_display(
+    storage: Storage, record: CommandRecord
+) -> DiagnosticBundleDisplay | None:
+    if CommandType(record.command_type) != CommandType.DIAGNOSTIC_BUNDLE:
+        return None
+    stored = storage.get_diagnostic_bundle_for_command(record.command_id)
+    if stored is None:
+        return None
+    return DiagnosticBundleDisplay(
+        command_id=stored.command_id,
+        size_text=_format_size_bytes(stored.size_bytes),
+        created_text=_format_timestamp(stored.created_at),
+        content_hash=stored.content_hash,
+        age_decrypt_command="age -d -i <dein-schluessel.txt> -o diagnose.tar <datei>",
+    )
+
+
+@dataclass(frozen=True)
 class CommandDisplay:
     """One row of the "Befehle" history list (P5.1b, section 9) -- already
     derived and German-rendered, same rule every other `*Display`
@@ -240,7 +278,8 @@ class CommandDisplay:
 
     `log_excerpt` (P5.3a): the stored `fetch_logs` upload for this command,
     or `None` for every other command type, or for a `fetch_logs` command
-    whose agent has not (yet, or ever) uploaded one."""
+    whose agent has not (yet, or ever) uploaded one. `bundle` (P5.3b):
+    the same idea for a stored `diagnostic_bundle` upload."""
 
     command_label: str
     created_by: str
@@ -250,6 +289,7 @@ class CommandDisplay:
     duration_text: str | None
     error_text: str | None
     log_excerpt: LogExcerptDisplay | None = None
+    bundle: DiagnosticBundleDisplay | None = None
 
 
 def _build_command_display(
@@ -270,6 +310,7 @@ def _build_command_display(
             _truncate_error_text(record.error_text) if record.error_text else None
         ),
         log_excerpt=_build_log_excerpt_display(storage, record),
+        bundle=_build_diagnostic_bundle_display(storage, record),
     )
 
 
@@ -801,6 +842,7 @@ __all__ = [
     "ApartmentDetail",
     "BackupDisplay",
     "CommandDisplay",
+    "DiagnosticBundleDisplay",
     "LogExcerptDisplay",
     "OpenFaultDisplay",
     "PastFaultDisplay",

@@ -159,22 +159,22 @@ def test_rejected_command_with_invalid_id_is_not_reported(tmp_path: Path, bad_id
     assert bad_id not in state.executed_ids
 
 
-# --- report_now / fetch_logs / diagnostic_bundle: honest failed results, --
-# --- never a fake success --------------------------------------------------
+# --- report_now: still an honest failed result, never a fake success ------
 
 
 @pytest.mark.parametrize(
     ("command_type", "expected_substring"),
     [
         (CommandType.REPORT_NOW, "P2.3"),
-        (CommandType.DIAGNOSTIC_BUNDLE, "P5.3"),
     ],
 )
 def test_not_yet_available_commands_report_honest_failure(
     tmp_path: Path, command_type: CommandType, expected_substring: str
 ) -> None:
-    """`fetch_logs` is no longer in this list -- P5.3a gave it a real
-    handler, see `tests/test_agent_fetch_logs.py`."""
+    """`fetch_logs` (P5.3a) and `diagnostic_bundle` (P5.3b) are no longer in
+    this list -- both now have real handlers, see
+    `tests/test_agent_fetch_logs.py` and
+    `tests/test_agent_diagnostic_bundle.py` respectively."""
 
     state = AgentState()
     ctx = _ctx(tmp_path)
@@ -203,6 +203,30 @@ def test_backup_now_reports_honest_failure_when_unconfigured(tmp_path: Path) -> 
     state = AgentState()
     ctx = _ctx(tmp_path)
     command = _command(CommandType.BACKUP_NOW)
+
+    outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert outcome.result is not None
+    assert outcome.result.successful is False
+    assert "Backup-Konfiguration" in (outcome.result.error_text or "")
+    assert outcome.exit_after_report is False
+    assert command.id in state.executed_ids
+
+
+# --- diagnostic_bundle (P5.3b): genuinely executed, honest failure only ----
+# --- when unconfigured -------------------------------------------------------
+
+
+def test_diagnostic_bundle_reports_honest_failure_when_unconfigured(tmp_path: Path) -> None:
+    """Same precondition as `backup_now` above -- `ctx.backup_config is
+    None` refuses cleanly, naming the missing CLI configuration, never a
+    crash and never a fake success. Real end-to-end behaviour (a
+    configured `backup_config`, real recipients, real crypto) is covered in
+    `tests/test_agent_diagnostic_bundle.py`."""
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.DIAGNOSTIC_BUNDLE)
 
     outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
 
