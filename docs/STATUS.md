@@ -155,36 +155,80 @@ in this package's own tests is freshly generated at test runtime
 **Tests** (`tests/test_agent_diagnostic_bundle.py`,
 `tests/test_fleet_diagnostic_bundle.py`,
 `tests/test_storage_diagnostic_bundles.py`, `tests/test_bundle_storage.py`,
-`tests/test_ui_diagnostic_bundle.py`; plus small updates to
-`tests/test_agent_loop.py`, `tests/test_agent_loop_execution.py`, and
-`tests/test_fleet_backups.py`, see below) -- real cryptography throughout,
-never a mock of `pyrage`/age: two freshly generated X25519 identities, each
-decrypts alone; a marker string planted in fake service logs/state is
-asserted absent from every staged plaintext file, every uploaded request
-body, and every stored blob, in both the success and every failure case
-(missing recipients, only one recipient, an encryption failure); a single
-service's log/state read failing is proven to still produce a bundle for
-the other three, with an honest per-service note; an oversized plaintext
-bundle (monkeypatched cap) is refused before encryption, cleanly, with
-every plaintext file removed; the fleet endpoint rejects a non-age upload
-(with and without a recipient stanza), a content-hash mismatch, an
-oversized body (both a declared-`Content-Length` check and a genuinely
-streamed-oversized body with no `Content-Length` at all, mirroring P5.5a's
-own two-pronged streaming-cap tests), another apartment's command, a
-non-`diagnostic_bundle` command, and a second upload for the same command
-(`409`, first upload's content unchanged); retention is proven with an
-injected clock (only expired rows/paths returned, fresh ones untouched);
-the UI download route requires login, returns the exact stored bytes
-unmodified, and is 404 for an unknown or another apartment's command id;
-handler-level tests prove `_handle_diagnostic_bundle`'s own two
+`tests/test_ui_diagnostic_bundle.py`, `tests/test_agent_docker_socket.py`
+(new, cross-review addition, see below), `tests/docker_api_support.py` (new,
+not a test file itself); plus small updates to `tests/test_agent_loop.py`,
+`tests/test_agent_loop_execution.py`, and `tests/test_fleet_backups.py`, see
+below) -- real cryptography throughout, never a mock of `pyrage`/age: two
+freshly generated X25519 identities, each decrypts alone; a marker string
+planted in fake service logs/state is asserted absent from every staged
+plaintext file, every uploaded request body, and every stored blob, in both
+the success and every failure case (missing recipients, only one recipient,
+an encryption failure); a single service's log/state read failing is proven
+to still produce a bundle for the other three, with an honest per-service
+note; an oversized plaintext bundle (monkeypatched cap) is refused before
+encryption, cleanly, with every plaintext file removed; the fleet endpoint
+rejects a non-age upload (with and without a recipient stanza), a
+content-hash mismatch, an oversized body (both a declared-`Content-Length`
+check and a genuinely streamed-oversized body with no `Content-Length` at
+all, mirroring P5.5a's own two-pronged streaming-cap tests), another
+apartment's command, a non-`diagnostic_bundle` command, and a second upload
+for the same command (`409`, first upload's content unchanged); retention is
+proven with an injected clock (only expired rows/paths returned, fresh ones
+untouched); the UI download route requires login, returns the exact stored
+bytes unmodified, and is 404 for an unknown or another apartment's command
+id; handler-level tests prove `_handle_diagnostic_bundle`'s own two
 preconditions (`backup_config`/`client` missing) and that an unanticipated
 `create_diagnostic_bundle` failure is caught, reported as a failed result
-(never propagated to crash the agent's main loop), with cleanup still
-having run; one true end-to-end test drives the command through
-`execute_command` against the real `fleet.app.app`, with stub (never real
-Docker-socket) log/state readers standing in for the four services, and
-proves the stored blob decrypts, with either generated identity, to a tar
-containing the manifest.
+(never propagated to crash the agent's main loop), with cleanup still having
+run; one true end-to-end test drives the command through `execute_command`
+against the real `fleet.app.app`, with stub (never real Docker-socket)
+log/state readers standing in for the four services, and proves the stored
+blob decrypts, with either generated identity, to a tar containing the
+manifest.
+
+**Cross-review addition: a real Docker-socket test double, plus two
+directly-testable branches the first draft of this section incorrectly
+called "unreachable".** Cross-review confirmed the plaintext path, the
+shared-streaming reuse, apartment/command-type/duplicate scoping, the fixed
+6-hour window, and the migration chain, but required two fixes:
+
+1. **`tests/docker_api_support.py`** (new) -- a small, real Docker Engine
+   API double (`FakeDockerAPI`, a raw ASGI callable, no FastAPI/Starlette
+   dependency needed for two routes) served by `uvicorn` over a **real Unix
+   domain socket**, short-named directly under the system temp directory
+   (not pytest's own nested `tmp_path`, whose path can exceed
+   `sockaddr_un.sun_path`'s own length limit). **`tests/test_agent_docker_socket.py`**
+   (new) uses it to exercise `read_container_log_lines` (P5.3a),
+   `read_container_log_window`, and `read_container_state` (both P5.3b)
+   against a real socket and a real HTTP response for the first time -- not
+   only via the stub readers every other test in this package (and P5.3a's
+   own `tests/test_agent_fetch_logs.py`) deliberately uses instead: the
+   normal case; byte-cap truncation where a single real chunk read from the
+   wire already overruns the cap (`FakeDockerAPI`'s single-`bytes` logs
+   value); byte-cap truncation where the cap is exactly reached by an
+   earlier chunk and a later, separate chunk must be discarded entirely (a
+   distinct branch in `read_container_log_window`'s own read loop --
+   `FakeDockerAPI`'s `logs` value can also be a `list[bytes]`, sent as
+   genuinely separate ASGI body frames with a short sleep between them, so
+   the two chunks are not coalesced into one read on the client side); the
+   line-cap truncation, keeping the newest lines; an unknown container
+   (`404` -> `httpx.HTTPStatusError`, an `HTTPError`); and a connection
+   error (no socket listening at all).
+2. **Two branches this section's first draft called unreachable were, in
+   fact, directly testable, and are now tested**: `_read_disk_usage`'s own
+   `except OSError: return None` (`shutil.disk_usage` on a path that does
+   not exist, no monkeypatching needed) and `_read_memory_usage`'s
+   malformed-value `except ValueError: continue` (extended the existing
+   `Path.read_text`-monkeypatched `/proc/meminfo` fixture with one
+   deliberately non-numeric value line, and asserted the earlier, valid
+   value for the same key survives unharmed). Both were only ever
+   "unreachable *from `create_diagnostic_bundle`'s own call sites* on this
+   development machine" -- calling either function directly with a
+   constructed input reaches them without any artificial trick, which is
+   exactly what a direct unit test is for; the original wording
+   conflated "not naturally reached by this package's own higher-level
+   tests" with "not testable", which cross-review correctly rejected.
 
 **Small, adjacent test/doc fixes, not weakening what any existing test
 protects:**
@@ -205,33 +249,33 @@ protects:**
 
 **Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
 ".[dev,fleet,agent]"`): `ruff check .` -- `All checks passed!`; `mypy .` --
-`Success: no issues found in 107 source files`; `mypy protocol fleet agent
+`Success: no issues found in 109 source files`; `mypy protocol fleet agent
 tools` -- `Success: no issues found in 57 source files`; `python -m
 tools.check_image_config` -- `Image configuration plausible (not a real
 build -- see docstring).`; `python -m pytest -W ignore::ResourceWarning -rA`
-**2x**, both exit code 0, **1302 passed, 1 skipped** each run (the one skip:
+**2x**, both exit code 0, **1316 passed, 1 skipped** each run (the one skip:
 no `age` CLI binary on this machine, same pre-existing case every prior
-package's own verification already notes), coverage **99%** (5185
-statements, 56 missed) identical across both runs -- every one of the 56
-remaining misses is either pre-existing and unrelated to this package
-(`agent.loop`'s own still-open `collect_heartbeat`/`send_heartbeat`/
-`reconcile_desired_state` placeholders, `fleet/admin.py`'s own pre-existing
-gap, `tools/check_image_config.py`'s own pre-existing CLI-entry-point gaps,
-one pre-existing inventory-assignment race branch in `fleet/storage.py`) or
-the same class of gap this package's own new code adds to an
-already-accepted category: the real Docker-socket bodies of
-`read_container_log_window`/`read_container_state` (new) are exercised only
-via stub readers in every test, exactly like `read_container_log_lines`'s
-own real-socket body already was in P5.3a (no real Docker socket anywhere
-in this test suite, by design); two small edge branches inside
-`_read_memory_usage`/`_read_disk_usage` (a malformed `/proc/meminfo` value
-line, `shutil.disk_usage` raising) are unreachable on this development
-machine without an artificial construction narrower than what a direct
-unit test already covers for the rest of each function. In `watchdog/`: `go
-vet ./...` clean, `go test ./...` -- all three packages `ok`, `bash
-check_contract.sh` -- "Contract test passed" (run with the `agent` extra
-installed, same as every prior package since P5.5a -- the watchdog's own
-`go.mod` has and needs no new dependency, untouched by this package).
+package's own verification already notes), coverage **99%** both runs (5185
+statements; run 1: 20 missed; run 2: 19 missed) -- the one-line difference is
+`fleet/storage.py`'s own pre-existing inventory-assignment concurrent-race
+branch (line 3336), the same timing-based coverage wobble this file's own
+P5.1b cross-review entry already documents for a different race branch,
+unrelated to this package. Every remaining miss in both runs is pre-existing
+and unrelated to this package (`agent.loop`'s own still-open
+`collect_heartbeat`/`send_heartbeat` placeholders, P5.3a's own
+`_handle_fetch_logs` transport-error branch, `reconcile_desired_state`'s own
+placeholder, `fleet/admin.py`'s own pre-existing gap, `tools
+/check_image_config.py`'s own pre-existing CLI-entry-point gaps) --
+**none of this package's own new code remains uncovered**, including the
+two branches point 2 above corrects and the real Docker-socket bodies of
+`read_container_log_window`/`read_container_state`, now exercised for real
+by `tests/test_agent_docker_socket.py` rather than only via stub readers;
+that test file also gives `read_container_log_lines`'s own real-socket body
+(P5.3a) its first real-socket coverage. In `watchdog/`: `go vet ./...`
+clean, `go test ./...` -- all three packages `ok`, `bash check_contract.sh`
+-- "Contract test passed" (run with the `agent` extra installed, same as
+every prior package since P5.5a -- the watchdog's own `go.mod` has and needs
+no new dependency, untouched by this package).
 
 ## P5.5a cross-review fixes: duplicate recipients, a memory DoS on the upload endpoint, an insufficient age-file check, and an unhandled handler exception
 

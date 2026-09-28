@@ -41,6 +41,7 @@ from agent.loop import (
     BackupConfig,
     ExecutionContext,
     _handle_diagnostic_bundle,
+    _read_disk_usage,
     _read_memory_usage,
     _read_zigbee_state,
     create_diagnostic_bundle,
@@ -444,6 +445,13 @@ def test_read_memory_usage_parses_a_real_meminfo_shape(
         "MemFree:         2000000 kB\n"
         "MemAvailable:    3000000 kB\n"
         "SwapTotal:        500000 kB\n"
+        # A malformed value line -- `int(rest[:-2].strip())` raises
+        # `ValueError`, caught and skipped (`continue`), not fatal to the
+        # rest of the parse. Real `/proc/meminfo` never actually looks
+        # like this; this only proves the defensive `except ValueError`
+        # branch itself does not crash the function or poison an
+        # already-parsed key.
+        "MemTotal:        notanumber kB\n"
     )
 
     def _fake_read_text(self: Path, encoding: str = "utf-8") -> str:
@@ -454,11 +462,28 @@ def test_read_memory_usage_parses_a_real_meminfo_shape(
 
     result = _read_memory_usage()
 
+    # The malformed `MemTotal` line overwrites the earlier, valid one with
+    # nothing (the `ValueError` branch `continue`s before assigning) --
+    # `values["MemTotal"]` keeps its first, valid value, since the second
+    # line's assignment never happens at all.
     assert result == {
         "MemTotal": 8000000 * 1024,
         "MemFree": 2000000 * 1024,
         "MemAvailable": 3000000 * 1024,
     }
+
+
+def test_read_disk_usage_returns_none_for_a_nonexistent_path() -> None:
+    """`_read_disk_usage`'s own `except OSError: return None` branch --
+    `shutil.disk_usage` raises `FileNotFoundError` (an `OSError` subclass)
+    for a path that does not exist, exercised directly here rather than
+    only indirectly through `create_diagnostic_bundle` (which always calls
+    it with the real, always-existing `/` and therefore never reaches this
+    branch)."""
+
+    result = _read_disk_usage(Path("/this/path/does/not/exist/at/all"))
+
+    assert result is None
 
 
 def test_read_zigbee_state_skips_a_too_large_file(tmp_path: Path) -> None:
