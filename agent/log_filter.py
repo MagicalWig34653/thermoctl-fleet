@@ -130,10 +130,6 @@ _EXTRA_SAFE_KEY_SHAPES: dict[str, re.Pattern[str]] = {
     "schwere": re.compile(r"^(stoerung|entwarnung|test)$"),
     # A zone's numeric primary key, never its display name.
     "zone_id": re.compile(r"^\d+$"),
-    # An MQTT topic -- path-like, no spaces (a free-text payload value
-    # never has this shape, it is carried in its own key instead, always
-    # masked below).
-    "topic": re.compile(r"^[\w/.\-:]+$"),
     # Network/process identifiers from startup/connection log lines --
     # infrastructure configuration, not tenant data.
     "host": re.compile(r"^[\w.-]+$"),
@@ -141,7 +137,50 @@ _EXTRA_SAFE_KEY_SHAPES: dict[str, re.Pattern[str]] = {
     "bind": re.compile(r"^[\w.-]+:\d+$"),
     "instanz": re.compile(r"^[\w.-]+$"),
     "faehigkeitscode": re.compile(r"^[\w-]+$"),
+    # Retry/connection-duration seconds (`mqtt/client.py::run`) -- a plain
+    # float, never a name.
+    "wartezeit_s": re.compile(r"^\d+(?:\.\d+)?$"),
+    "verbindungsdauer_s": re.compile(r"^\d+(?:\.\d+)?$"),
+    # `topic` is deliberately **not** in this table -- see `_mask_topic`
+    # below for why a shape check on the key alone is not enough for it.
 }
+
+# `topic` (an MQTT topic) needs its own check, not a generic shape regex in
+# `_EXTRA_SAFE_KEY_SHAPES` above -- **cross-review correction**: a first
+# version allowed any space-free, path-like topic verbatim
+# (`^[\w/.\-:]+$`), reasoning that a free-text payload value would never
+# have that shape. That missed thermoctl's own Zigbee2MQTT actuator topics
+# (`integrations/actuators.py::Zigbee2MqttValve`/`ThermostatValve.__init__`:
+# `f"{base}/{device_name}/set"`; `services/publishing.py`'s own
+# `f"{base}/{device.external_id}/set"` publish calls), which embed the
+# device's Zigbee2MQTT **friendly name** -- Z2M's own convention is to use
+# `_`/`-` instead of spaces in that name, so e.g.
+# `zigbee2mqtt/Kinderzimmer_Mia/set` is exactly as path-like and space-free
+# as any id-based topic, and passed through unchanged. Reproduced and
+# fixed: a topic is now kept verbatim **only** if it fully matches one of
+# thermoctl's own numeric-id, non-device-name control-topic shapes (both
+# read from the sibling repository); every other topic -- including every
+# Zigbee2MQTT device/actuator topic -- becomes `<wert>`.
+_SAFE_TOPIC_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # `integrations/mqtt/commands.py::_PATTERN` -- Home Assistant's own
+    # command topics: "<prefix>/zones/<zone id>/command/<kind>[/<key>]".
+    # `prefix` is `settings.mqtt_prefix` (operator configuration, not
+    # tenant data) but still shape-restricted (no slash, no whitespace) --
+    # this is a structural safety net, not a trust decision about the
+    # prefix's content.
+    re.compile(r"^[^/\s]+/zones/\d+/command/[a-z_]+(?:/[A-Za-z0-9_]+)?$"),
+    # `domain/legacy_system.py`'s own fixed topic shape:
+    # "heizung/thermostate/<id>/<attribute>/get" -- `<id>` numeric,
+    # `<attribute>` one of `_NUMBER_ATTRIBUTE`/`_TEXT_ATTRIBUTE`'s closed,
+    # letters-only vocabulary, never a device name.
+    re.compile(r"^heizung/thermostate/\d+/[A-Za-z]+/get$"),
+)
+
+
+def _mask_topic(value: str) -> str:
+    if any(pattern.fullmatch(value) for pattern in _SAFE_TOPIC_PATTERNS):
+        return value
+    return "<wert>"
 
 # A key on this list is **always** replaced by `<wert>`, regardless of its
 # value's shape -- either it is explicitly a display name (`geraet`,
@@ -169,6 +208,12 @@ _EXTRA_ALWAYS_MASKED_KEYS = frozenset(
         "mieter",
         "note",
         "hinweis",
+        # `mqtt/client.py`'s own `THERMOCTL_MQTT_CLIENT_ID` -- operator
+        # configuration, not tenant data, but with no shape this table
+        # trusts enough to declare safe (an arbitrary operator-chosen
+        # string) -- masked defensively, the same "when in doubt, mask"
+        # default this table already applies everywhere else.
+        "client_id",
     }
 )
 
@@ -195,6 +240,9 @@ def _mask_extra_tail(tail: str) -> str:
 
     kept: list[str] = []
     for key, value in _split_extra_tail(tail):
+        if key == "topic":
+            kept.append(f"topic={_mask_topic(value)}")
+            continue
         shape = _EXTRA_SAFE_KEY_SHAPES.get(key)
         if shape is not None:
             kept.append(f"{key}={value}" if shape.match(value) else f"{key}=<wert>")
@@ -297,6 +345,24 @@ _WARN_FIXED_MESSAGES = frozenset(
         "Das Schema wurde nicht über Alembic angelegt, der Versionsvergleich entfällt",
         "Meross-Anmeldung abgelehnt -- Aktoren bleiben diesen Zyklus unerreichbar",
         "Meross-Geräteliste nicht abrufbar",
+        # `integrations/mqtt/client.py::run` -- logged through the
+        # `melden = log.exception if short_lived == 0 else log.error` alias
+        # (both branches log this exact message; `melden`'s own call site
+        # is what determines the level, not the message text, so one
+        # allowlist entry covers both). Reviewer-found coverage gap, not a
+        # leak -- `host`/`port` are already safe keys, `wartezeit_s` added
+        # alongside this entry.
+        "MQTT-Verbindung verloren; neuer Versuch folgt",
+        # `integrations/mqtt/client.py::run`'s message-handler `except`
+        # clause -- `topic` here is the raw *incoming* subscription topic
+        # (could be a Zigbee2MQTT device-state topic), already covered by
+        # `_mask_topic`'s own strict safe-shape check above.
+        "MQTT-Nachricht konnte nicht verarbeitet werden",
+        # `integrations/mqtt/client.py::run` -- `client_id` masked
+        # (`_EXTRA_ALWAYS_MASKED_KEYS`), `host`/`verbindungsdauer_s` safe.
+        "MQTT-Verbindung bricht sofort wieder ab. Haeufigste Ursache: ein zweiter "
+        "Client mit derselben Kennung -- dann werfen sich beide gegenseitig hinaus, "
+        "endlos. Jede Instanz braucht eine eigene THERMOCTL_MQTT_CLIENT_ID.",
         "Störungsmeldung konnte nicht an Home Assistant gesendet werden",
         "Fenster-Alarm konnte nicht an Home Assistant gesendet werden",
         "Störungsmeldung konnte nicht an den Webhook gesendet werden",

@@ -310,16 +310,19 @@ def test_unsafe_write_channel_masks_device_name() -> None:
 
 
 def test_legacy_system_unreadable_temperature_masks_raw_value_keeps_topic() -> None:
-    """`domain/legacy_system.py:71-91` -- fixed message, `topic` (path-like,
-    safe) and `wert` (the raw, unvalidated MQTT payload -- always masked)
-    in the tail. This is the exact "wert=21.5" shape cross-review
-    reproduced."""
+    """`domain/legacy_system.py:71-91` -- fixed message, `wert` (the raw,
+    unvalidated MQTT payload -- always masked) and `topic` in the tail.
+    This is the exact "wert=21.5" shape cross-review reproduced. `topic`
+    here has thermoctl's own real, fixed legacy-system shape
+    (`heizung/thermostate/<id>/<attribute>/get`, `domain/legacy_system.py`'s
+    own `_PRAEFIX`/`_SUFFIX`) -- kept verbatim, since it carries a numeric
+    id and a closed-vocabulary attribute name, never a device/zone name."""
 
     line = _line(
         "WARNING",
         "thermoctl.domain.legacy_system",
         "Altsystem-Temperaturwert ist nicht lesbar",
-        extra="topic=altsystem/thermostat/12/ist wert=21.5",
+        extra="topic=heizung/thermostate/12/temperatureActual/get wert=21.5",
     )
 
     result = filter_log_lines([line])
@@ -328,7 +331,67 @@ def test_legacy_system_unreadable_temperature_masks_raw_value_keeps_topic() -> N
     output = result.lines[0]
     assert "wert=21.5" not in output
     assert "wert=<wert>" in output
-    assert "topic=altsystem/thermostat/12/ist" in output
+    assert "topic=heizung/thermostate/12/temperatureActual/get" in output
+
+
+def test_zigbee2mqtt_actuator_topic_with_device_name_is_masked() -> None:
+    """**Cross-review correction**: `integrations/actuators.py
+    ::Zigbee2MqttValve.__init__`/`ThermostatValve.__init__` build the
+    publish topic as `f"{base}/{device_name}/set"`, where `device_name` is
+    the Zigbee2MQTT **friendly name** -- Z2M's own convention uses `_`/`-`
+    instead of spaces, so this topic is exactly as path-like and
+    space-free as a real id-based control topic. A first version of this
+    filter's `topic` shape check (`^[\\w/.\\-:]+$`) let it through verbatim;
+    fixed by restricting `topic` to an explicit set of thermoctl's own
+    numeric-id control-topic shapes (`_mask_topic`) instead of a generic
+    "looks path-like" regex. Covers both a plain underscore name and one
+    with an umlaut and a hyphen (Z2M friendly names may contain either)."""
+
+    for device_name in ("Kinderzimmer_Mia", "Büro-von-Frau-Müller"):
+        line = _line(
+            "WARNING",
+            "thermoctl.integrations.mqtt.client",
+            "Trockenlauf: Schaltbefehl abgewiesen, obwohl der Aufrufer ihn verlangt hat",
+            extra=f"topic=zigbee2mqtt/{device_name}/set",
+        )
+
+        result = filter_log_lines([line])
+
+        assert len(result.lines) == 1, device_name
+        assert device_name not in result.lines[0], device_name
+        assert "topic=<wert>" in result.lines[0], device_name
+
+
+def test_home_assistant_command_topic_is_kept_verbatim() -> None:
+    """`integrations/mqtt/commands.py::_PATTERN`'s own shape -- a numeric
+    zone id and a closed-vocabulary command kind, never a device/zone
+    name."""
+
+    line = _line(
+        "WARNING",
+        "thermoctl.app",
+        "Befehl für unbekannte Zone verworfen",
+        extra="topic=thermoctl/zones/7/command/setpoint",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "topic=thermoctl/zones/7/command/setpoint" in result.lines[0]
+
+
+def test_unknown_topic_shape_is_masked() -> None:
+    line = _line(
+        "WARNING",
+        "thermoctl.app",
+        "Befehl für unbekannte Zone verworfen",
+        extra="topic=some/other/topic/shape",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "topic=<wert>" in result.lines[0]
 
 
 def test_meross_login_failure_masks_exception_text() -> None:
@@ -366,6 +429,66 @@ def test_unknown_extra_key_is_dropped_from_the_tail() -> None:
     assert "zone_id=3" in output
 
 
+def test_mqtt_connection_lost_via_the_melden_alias_is_kept_verbatim() -> None:
+    """`integrations/mqtt/client.py::run` -- both branches of
+    `melden = log.exception if short_lived == 0 else log.error` log this
+    exact message; the alias only decides the *level* (both `ERROR`), not
+    the message text, so one allowlist entry covers both (reviewer-found
+    coverage gap, not a leak: `host`/`port` were already safe keys)."""
+
+    for level in ("ERROR", "CRITICAL"):
+        line = _line(
+            level,
+            "thermoctl.integrations.mqtt.client",
+            "MQTT-Verbindung verloren; neuer Versuch folgt",
+            extra="host=broker.local port=8883 wartezeit_s=2.0",
+        )
+
+        result = filter_log_lines([line])
+
+        assert result.lines == [line], level
+        assert result.dropped == 0, level
+
+
+def test_mqtt_message_handler_failure_masks_the_incoming_topic() -> None:
+    """`integrations/mqtt/client.py::run`'s message-handler `except`
+    clause -- `topic` here is the raw *incoming* subscription topic, which
+    can be a Zigbee2MQTT device-state topic (device name embedded);
+    already covered by `_mask_topic`'s own strict safe-shape check."""
+
+    line = _line(
+        "ERROR",
+        "thermoctl.integrations.mqtt.client",
+        "MQTT-Nachricht konnte nicht verarbeitet werden",
+        extra="topic=zigbee2mqtt/Kinderzimmer_Mia/availability",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "Kinderzimmer_Mia" not in result.lines[0]
+    assert "topic=<wert>" in result.lines[0]
+
+
+def test_mqtt_repeated_immediate_disconnect_masks_client_id() -> None:
+    line = _line(
+        "ERROR",
+        "thermoctl.integrations.mqtt.client",
+        "MQTT-Verbindung bricht sofort wieder ab. Haeufigste Ursache: ein zweiter "
+        "Client mit derselben Kennung -- dann werfen sich beide gegenseitig hinaus, "
+        "endlos. Jede Instanz braucht eine eigene THERMOCTL_MQTT_CLIENT_ID.",
+        extra="client_id=hausA-42 host=broker.local verbindungsdauer_s=1.2",
+    )
+
+    result = filter_log_lines([line])
+
+    assert len(result.lines) == 1
+    assert "hausA-42" not in result.lines[0]
+    assert "client_id=<wert>" in result.lines[0]
+    assert "host=broker.local" in result.lines[0]
+    assert "verbindungsdauer_s=1.2" in result.lines[0]
+
+
 # --- message-embedded exception text (app.py) -----------------------------
 
 
@@ -379,7 +502,7 @@ def test_unusable_command_rejection_masks_exception_text() -> None:
         "WARNING",
         "thermoctl.app",
         "Unbrauchbarer Befehl verworfen: Unbekannte Betriebsart: 'Anna ist im Urlaub'",
-        extra="topic=thermoctl/zone/3/cmd",
+        extra="topic=thermoctl/zones/3/command/mode",
     )
 
     result = filter_log_lines([line])
@@ -388,7 +511,7 @@ def test_unusable_command_rejection_masks_exception_text() -> None:
     output = result.lines[0]
     assert "Anna ist im Urlaub" not in output
     assert "Unbrauchbarer Befehl verworfen: <wert>" in output
-    assert "topic=thermoctl/zone/3/cmd" in output
+    assert "topic=thermoctl/zones/3/command/mode" in output
 
 
 def test_rejected_command_masks_exception_text() -> None:
@@ -398,7 +521,7 @@ def test_rejected_command_masks_exception_text() -> None:
         "WARNING",
         "thermoctl.app",
         "Befehl abgelehnt: Sollwert außerhalb des zulässigen Bereichs: 99",
-        extra="topic=thermoctl/zone/3/cmd zone_id=3",
+        extra="topic=thermoctl/zones/3/command/setpoint zone_id=3",
     )
 
     result = filter_log_lines([line])

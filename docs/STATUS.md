@@ -33,10 +33,36 @@ template shows up as "some lines carried no approved content" rather than a sile
 `INFO` keeps the narrower original rule: an unrecognised shape is dropped outright, not
 reduced. The `extra=` tail itself is parsed independently (`_mask_extra_tail`): a small
 allowlist of keys with a known-safe value shape is kept verbatim (`schluessel`, `zone_id`,
-`topic`, `host`/`port`/`bind`, ...), a fixed list of always-name-or-value-shaped keys
-(`geraet`, `zone_name`, `device_name`, `wert`, `value`, `messwert`, `grund`, `fehler`, ...)
-is always replaced by `<wert>`, and any other, unrecognised key is dropped from the tail
-entirely rather than shown either raw or masked.
+`host`/`port`/`bind`, `wartezeit_s`/`verbindungsdauer_s`, ...), a fixed list of
+always-name-or-value-shaped keys (`geraet`, `zone_name`, `device_name`, `wert`, `value`,
+`messwert`, `grund`, `fehler`, `client_id`, ...) is always replaced by `<wert>`, and any
+other, unrecognised key is dropped from the tail entirely rather than shown either raw or
+masked.
+
+**Second cross-review correction: `topic` needs its own check, not a shape regex.** The
+first fix above still let `topic` through verbatim whenever its value looked path-like and
+space-free (`^[\w/.\-:]+$`). Reproduced: thermoctl's own Zigbee2MQTT actuator topics
+(`integrations/actuators.py::Zigbee2MqttValve`/`ThermostatValve.__init__`,
+`services/publishing.py`'s own publish calls) are built as `f"{base}/{device_name}/set"`,
+where `device_name` is the Zigbee2MQTT **friendly name** -- Z2M's own convention uses `_`/`-`
+instead of spaces, so `zigbee2mqtt/Kinderzimmer_Mia/set` is exactly as path-like and
+space-free as a real id-based topic, and passed through unchanged (e.g. via
+`integrations/mqtt/client.py::run`'s own `extra={"topic": topic}` on a disallowed switching
+attempt). **Fixed** (`_mask_topic`): `topic` is now kept verbatim **only** if it fully
+matches one of two explicit, real thermoctl control-topic shapes --
+`<prefix>/zones/<digits>/command/<kind>[/<key>]` (`integrations/mqtt/commands.py::_PATTERN`)
+or `heizung/thermostate/<digits>/<attribute>/get` (`domain/legacy_system.py`'s own fixed
+shape) -- every other topic, including every Zigbee2MQTT device/actuator topic, becomes
+`<wert>`.
+
+**Coverage gap closed, not a leak**: `integrations/mqtt/client.py::run` logs two of its own
+messages ("MQTT-Verbindung verloren; neuer Versuch folgt", "MQTT-Nachricht konnte nicht
+verarbeitet werden") through a `melden = log.exception if short_lived == 0 else log.error`
+alias -- the alias only decides the level (both branches log the same message text), so one
+allowlist entry per message covers both branches; a third message from the same function
+("MQTT-Verbindung bricht sofort wieder ab...") was added alongside it while re-reading that
+module. A repository-wide grep for other alias-style log calls (`= log\.(warning|error
+|exception|critical|info)\b`) found no other instance.
 
 **This table is a snapshot of one thermoctl version, not a permanent contract** -- a future
 thermoctl release that adds or rewords a log call does not fall through to being logged in
