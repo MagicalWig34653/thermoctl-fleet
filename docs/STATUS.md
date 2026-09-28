@@ -15,6 +15,13 @@ afterward") and `docs/implementation_plan.md`:
   gate protects against *accidental* arming, not against a compromised
   cloud -- that protection stays with the hard-coded sources, the digest
   check, and the local pre-check (security principles 2 and 5).
+- **P5.5b follow-up decisions (2026-09-28):** (a) the browser-JS limit is
+  accepted and documented (spec 15.3) -- protects against DB leak, logs,
+  backups, passive compromise, not against an actively taken-over fleet
+  server; the UI shows the script's sha256. (b) The agent writes restores
+  only into its own staging directory; thermoctl/Zigbee2MQTT mounts stay
+  read-only; a separate small Go program next to the watchdog (no deps, no
+  network) moves staged data into place, only onto an empty device.
 - **P5.5b** restore key: encrypted in the landlord's browser to a
   device-generated age recipient; the fleet stores and forwards only the
   opaque block and deletes it after fetch or expiry.

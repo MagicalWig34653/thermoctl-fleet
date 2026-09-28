@@ -512,6 +512,22 @@ locally to exactly this device's recipient; the fleet service stores and forward
 opaque block, bound to the assigned device, and deletes it once fetched or expired. A
 compromised fleet server therefore sees neither the key nor the operational data.
 
+**Decided afterward (project owner, 2026-09-28), limit of the browser-side encryption:** the
+script that encrypts the key in the browser is served by the fleet service itself. This
+protects against a leaked database, logs, server backups and passive reading along -- it
+does **not** protect against an *actively* taken-over fleet server that ships a modified
+script and captures the key at the next restore. Accepted deliberately, since restores are
+rare and triggered consciously by the landlord; the UI shows the script's sha256 and the
+operating manual names the expected value, so the landlord can check it.
+
+**Decided afterward (project owner, 2026-09-28), where the restore is written:** the agent
+container never gets write access to the live tenant data. The thermoctl database and the
+Zigbee2MQTT directory stay mounted read-only into the agent; the agent writes the decrypted
+operational data only into its own staging directory. Moving it into the real data
+directories is done by a small, separate Go program on the bare system next to the watchdog
+(same module, no dependency, no network, section 18.4's language rule), and only if no
+operational data exists there yet.
+
 ### 15.4 If the device only has Wi-Fi
 
 A replacement device with a network cable is the simple case -- the registration code sits
