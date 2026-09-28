@@ -30,4 +30,16 @@ between the two packages of this repository and future compatibility checks.
 # paragraph. Originally also numbered 4 (developed in parallel with P5.3a's
 # own `LogExcerpt` addition above) -- re-numbered to 5 when the two
 # branches were merged, since both cannot occupy the same version number.
-PROTOCOL_VERSION = 5
+# 6: reserved by a parallel branch developed alongside P5.5b (not merged as
+# of this package) -- skipped here, not reused, so the two branches never
+# collide on the same number at merge time (the same "re-number, never
+# reuse" precedent set by 5's own note above).
+# 7: adds `protocol.registration.RegistrationRequest.age_recipient` and the
+# wholly new `protocol.restore` module (`AgeRecipientReport`,
+# `PendingRestore`, `RestoreResult`) for P5.5b (section 15.2/15.3's
+# "Decided afterward" paragraph, 2026-09-28: the device generates its own
+# age key pair and registers only the public recipient). An additive field
+# on an existing model counts as "a change to the models" too, per this
+# file's own opening paragraph's literal reading -- see
+# `protocol/registration.py` and `protocol/restore.py`.
+PROTOCOL_VERSION = 7

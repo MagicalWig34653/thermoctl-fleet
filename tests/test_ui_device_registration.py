@@ -229,7 +229,7 @@ def test_prepare_form_renders_for_an_eligible_device(
     assert response.status_code == 200
     assert "vorbereiten" in response.text.lower()
     assert response.headers["Cache-Control"] == "no-store"
-    assert response.headers["Content-Security-Policy"] == "default-src 'self'"
+    assert response.headers["Content-Security-Policy"] == "default-src 'self'; script-src 'self'"
 
 
 def test_prepare_form_unknown_device_is_404(
@@ -561,7 +561,10 @@ def test_security_headers_on_confirm_and_prepare_routes(
     for path in ("/ui/inventory/devices/confirm", "/ui/inventory/devices/sn-1/prepare"):
         response = client.get(path)
         assert response.headers["Cache-Control"] == "no-store"
-        assert response.headers["Content-Security-Policy"] == "default-src 'self'"
+        assert (
+            response.headers["Content-Security-Policy"]
+            == "default-src 'self'; script-src 'self'"
+        )
         assert response.headers["X-Frame-Options"] == "DENY"
         assert response.headers["Referrer-Policy"] == "no-referrer"
 

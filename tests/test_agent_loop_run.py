@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from agent.commands_channel import CommandStreamAuthError
 from agent.loop import load_agent_state, run
+from agent.restore import RestoreTargets
 from agent.transport import build_client, fingerprint_for_certificate
 from fleet.app import app
 from fleet.storage import CommandRecord, Storage, create_storage, get_storage, hash_token, upgrade
@@ -201,6 +202,50 @@ def test_run_executes_agent_restart_end_to_end_and_stops(
 
     log_contents = (tmp_path / "agent.log").read_text(encoding="utf-8")
     assert command.id in log_contents
+
+
+def test_run_starts_and_stops_the_restore_poll_thread_when_configured(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    """P5.5b: `run`'s own `restore_targets` parameter starts a background
+    restore-poll thread (mirroring the daily backup scheduler's own
+    thread) -- real HTTP, real TLS, the same "one command, then exit_fn
+    stops the loop" shape as the test above, just with `restore_targets`
+    also configured so this test actually exercises `agent.loop.run`'s own
+    thread-creation branch, not only `agent.restore`'s own already fully
+    covered internals."""
+
+    token = _issue_token(app_storage)
+    command = app_storage.create_command(
+        APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            restore_targets = RestoreTargets(
+                data_dir=tmp_path / "agent-data",
+                thermoctl_db_path=tmp_path / "thermoctl.db",
+                zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+            )
+            run(
+                client,
+                last_event_id_path=tmp_path / "last-event-id",
+                outbox_path=tmp_path / "outbox.json",
+                executed_ids_path=tmp_path / "executed-ids",
+                local_log_path=tmp_path / "agent.log",
+                watchdog_state_path=tmp_path / "watchdog-state.env",
+                led_status_path=tmp_path / "led-status.env",
+                restore_targets=restore_targets,
+                restore_poll_interval_s=0.05,
+                exit_fn=lambda code: None,
+            )
+
+    with app_storage.session() as session:
+        row = session.scalar(select(CommandRecord).where(CommandRecord.command_id == command.id))
+        assert row is not None
+        assert row.successful is True
 
 
 def test_run_reports_agent_restart_before_calling_exit_fn(

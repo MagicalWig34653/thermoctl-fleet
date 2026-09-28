@@ -909,13 +909,19 @@ def test_apartment_view_carries_the_security_headers(
     response = client.get(f"/ui/apartments/{APARTMENT}")
 
     assert response.status_code == 200
-    assert response.headers["Content-Security-Policy"] == "default-src 'self'"
+    assert response.headers["Content-Security-Policy"] == "default-src 'self'; script-src 'self'"
     assert response.headers["X-Frame-Options"] == "DENY"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert response.headers["Cache-Control"] == "no-store"
 
 
 def test_no_inline_style_or_script_in_the_apartment_template() -> None:
+    """No inline `<style>`/`style=` at all (CSP has no `'unsafe-inline'`).
+    `<script>` tags are now permitted here (P5.5b's restore form loads the
+    vendored age JS) but only ever as **external, same-origin** references
+    -- `src="/ui/static/..."`, never inline JS -- checked directly, not
+    only assumed."""
+
     from pathlib import Path
 
     path = (
@@ -923,5 +929,7 @@ def test_no_inline_style_or_script_in_the_apartment_template() -> None:
     )
     text = path.read_text(encoding="utf-8")
     assert "<style" not in text
-    assert "<script" not in text
     assert " style=" not in text
+    for line in text.splitlines():
+        if "<script" in line:
+            assert 'src="/ui/static/' in line, line

@@ -212,5 +212,48 @@
     {% endif %}
 </section>
 
+<section aria-labelledby="restore-heading">
+    <h2 id="restore-heading">Wiederherstellen</h2>
+    {# P5.5b, section 15.2/15.3's "Decided afterward" paragraph
+       (2026-09-28): only offered once a device is assigned *and* has
+       already reported its own age recipient -- there is nothing this
+       form could encrypt to otherwise. #}
+    {% if detail.restore_pending %}
+    <p>Eine Wiederherstellung wartet bereits auf das Gerät ({{ detail.restore_pending_expires_text }}).</p>
+    {% elif not detail.restore_device_recipient %}
+    <p>Kein Gerät mit gemeldetem Schlüssel für diese Wohnung -- keine Wiederherstellung möglich.</p>
+    {% elif not detail.restore_operational_backups %}
+    <p>Keine Betriebsdaten-Sicherung für diese Wohnung vorhanden.</p>
+    {% else %}
+    <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/restore"
+          id="restore-form" data-recipient="{{ detail.restore_device_recipient }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {# The ciphertext this form actually submits -- written by
+           fleet/static/ui/restore_form.js just before submit, never by
+           the landlord directly. #}
+        <input type="hidden" name="key_block_b64" id="restore-key-block" value="">
+        <label for="restore-backup-id">Sicherung</label>
+        <select name="backup_id" id="restore-backup-id" required>
+            {% for backup in detail.restore_operational_backups %}
+            <option value="{{ backup.backup_id }}">{{ backup.created_text }} ({{ backup.size_text }})</option>
+            {% endfor %}
+        </select>
+        <label for="restore-key-plaintext">Schlüssel des Vermieters</label>
+        {# No `name` attribute (owner decision): this field is never part
+           of the form submission, with or without JavaScript. #}
+        <input type="password" id="restore-key-plaintext" autocomplete="off">
+        <p id="restore-error" role="alert"></p>
+        <button type="submit">Wiederherstellung anstoßen</button>
+    </form>
+    {% endif %}
+</section>
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if detail and detail.restore_device_recipient and detail.restore_operational_backups and not detail.restore_pending %}
+<script src="/ui/static/vendor/age-encryption.vendor.js"></script>
+<script src="/ui/static/restore_form.js"></script>
 {% endif %}
 {% endblock %}

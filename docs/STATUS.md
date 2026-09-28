@@ -19,6 +19,124 @@ afterward") and `docs/implementation_plan.md`:
   device-generated age recipient; the fleet stores and forwards only the
   opaque block and deletes it after fetch or expiry.
 
+## P5.5b -- Restore (sections 15.2, 15.3 step 4, and its "Decided
+afterward" paragraph, 2026-09-28)
+
+**What:** the counterpart to P5.5a: a swapped/freshly-commissioned device
+fetches the device-configuration backup and, on a swap, the encrypted
+operational-data backup -- with the landlord's decryption key never
+reaching the fleet in plain text (owner decision, above).
+
+**Design, end to end:**
+
+1. **Device generates its own age X25519 key pair**, next to its Ed25519
+   device key (`agent/age_identity.py`, stored via `agent/safe_io.py
+   ::write_bytes_safe`, mode `0600`, never logged). Only the **public**
+   recipient is ever reported to the fleet:
+   - as part of registration (`protocol.registration.RegistrationRequest
+     .age_recipient`, new, optional field -- `PROTOCOL_VERSION` bumped to
+     **7**; 6 is reserved for a parallel branch not yet merged, skipped
+     rather than reused, see `protocol/version.py`'s own note);
+   - for a device that registered before this package existed:
+     `POST /v1/device/age-recipient` (`protocol.restore
+     .AgeRecipientReport`, token-authenticated, set-once/idempotent,
+     `Storage.set_device_age_recipient` -- `409` on a genuine conflict,
+     never a silent overwrite).
+   The fleet validates every reported recipient via the real
+   `pyrage.x25519.Recipient.from_str` (`fleet.age_key_block
+   .validate_age_recipient`), plus an explicit, independently tested
+   refusal of anything containing `AGE-SECRET-KEY-` (belt and braces on
+   top of `pyrage` already rejecting it by its own bech32 prefix).
+2. **Fleet UI, login required:** "Wiederherstellen" form on "Eine Wohnung"
+   (`fleet/templates/ui/apartment.html`, `fleet/ui_routes.py
+   ::apartment_restore_create`), offered only when the apartment has a
+   currently assigned, confirmed device with a reported age recipient and
+   at least one `operational_data` backup. The key input field has **no
+   `name` attribute** (never submitted, not even with JS disabled -- no
+   plaintext fallback exists server-side either). A vendored, pinned
+   (`age-encryption@0.3.1`) browser build of `typage`
+   (`fleet/static/ui/vendor/age-encryption.vendor.js`, built with
+   `esbuild`, self-contained, no remaining `import`/external URL, sha256
+   recorded in `fleet.restore_vendor.AGE_VENDOR_JS_SHA256` and checked by
+   a test) encrypts the typed key, in the browser, to the device's own
+   recipient; `fleet/static/ui/restore_form.js` wires the form to it and
+   writes only the ciphertext into a *named* hidden field before
+   submitting. The server (`fleet.age_key_block
+   .validate_single_x25519_stanza`) checks the submission structurally --
+   real age header, **exactly one `X25519`-typed stanza** (a real
+   `pyrage.encrypt` call reliably adds a second, "grease", stanza of some
+   other type; only `X25519`-typed stanzas count toward "exactly one",
+   confirmed directly by a test) -- and the explicit `AGE-SECRET-KEY-`
+   substring refusal again, independent of the recipient-side check.
+   `Storage.create_pending_restore` stores the opaque ciphertext bound to
+   `(apartment, device, backup)`, with a 15-minute (configurable,
+   `FLEET_RESTORE_KEY_BLOCK_TTL_S`) expiry, and an audit-log entry (who,
+   when, which backup id -- never the payload).
+3. **Device fetch, single endpoint:** `GET /v1/restore`
+   (`fleet.app.fetch_pending_restore`, token-authenticated) -- `204` when
+   nothing is pending, otherwise the key block, the chosen operational
+   backup's own bytes, and the apartment's latest device-configuration
+   backup (if any), all base64-in-JSON (`protocol.restore.PendingRestore`)
+   so the fetch is atomic from the agent's point of view. Deleted in the
+   same transaction it is read in (`Storage
+   .fetch_and_delete_pending_restore`) -- single-fetch, and **only the
+   device currently assigned to the apartment** (re-checked against the
+   stored restore's own `device_id`, on top of the apartment bearer token
+   already having been revoked by any device swap in between -- tested
+   directly with a second device). A backstop purge loop
+   (`fleet.app._restore_purge_loop`) deletes anything expired that nobody
+   ever fetched. Not a command -- `protocol.commands.CommandType` is
+   untouched.
+4. **Agent unpack** (`agent/restore.py::apply_pending_restore`, the
+   security boundary, principle 5): refuses if the operational-data store
+   already has content (`_operational_store_is_empty`, checked **before**
+   any decryption) -- otherwise a compromised cloud could roll an
+   apartment back to an old backup. Decrypts the key block with its own
+   identity (landlord identity, in memory only, never written or logged),
+   then the operational backup with that identity, extracts the tar
+   **fully into memory** before writing anything, then writes atomically
+   via `agent.safe_io.write_bytes_safe`. Reports success/failure (a
+   closed, non-sensitive set of `detail` strings, never content) via
+   `POST /v1/restore/result`. Polled for at startup and periodically
+   (`agent.loop.run`'s own `restore_targets`/`restore_poll_interval_s`,
+   default 60s, its own background thread, same shape as the daily backup
+   scheduler).
+
+**Verification (this package's own run):** `ruff check .` clean; `mypy
+protocol fleet agent tools` clean; `pytest` -- 76 new tests across
+`tests/test_age_key_block.py`, `tests/test_age_identity.py`,
+`tests/test_restore_vendor.py` (includes a real `node` + the real
+vendored bundle interop test, decrypted with `pyrage`),
+`tests/test_fleet_restore.py`, `tests/test_agent_restore.py`,
+`tests/test_ui_restore.py`, `tests/test_restore_e2e.py` (full end-to-end
+over the real fleet app and real TLS: browser step simulated with
+`pyrage`, device fetch and unpack for real, restored files compared
+byte-for-byte, and the landlord's key string confirmed absent from the
+fleet's sqlite file, every blob-storage file, and every file under the
+agent's own tmp tree afterward) -- plus fixes to five pre-existing tests
+whose own assertions pinned the *previous* CSP value/"no script anywhere"
+invariant (now: `script-src 'self'`, external same-origin `<script>`
+permitted only for this feature's own vendored files).
+
+**Open points:**
+
+- `image/common/agent-compose.yml` still mounts `--thermoctl-db-file`/
+  `--zigbee2mqtt-dir` **read-only** (P5.5a's own choice, since backups
+  only ever read them) -- a real restore needs write access to those
+  paths, which this package's own agent-side code assumes but does not
+  itself change the compose file for (a deployment/image concern, not
+  exercised by this package's own tests, which write to plain `tmp_path`
+  directories instead).
+- Device-configuration restore is currently "write the fetched JSON to
+  `device_config.json` in the agent's data dir" -- there is no code yet
+  that *applies* any of its fields (broker settings, WireGuard peer,
+  timezone), matching `agent.loop.create_backup`'s own "nothing invented"
+  reasoning for the same fields on the create side; applying it is future
+  work once those features themselves exist.
+- `protocol.version.PROTOCOL_VERSION` re-chaining: this package used 7,
+  leaving 6 for whichever other branch reserved it -- re-verify at merge
+  that no third branch also picked 7 independently.
+
 ## P5.1c -- SSE resume survives a fleet database restore (sections 3, 7)
 
 **The problem** (found during the P5.E end-to-end run, 2026-09-28): the SSE

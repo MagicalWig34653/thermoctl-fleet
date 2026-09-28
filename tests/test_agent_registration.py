@@ -33,6 +33,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from agent.age_identity import load_or_create_identity, recipient_for
 from agent.registration import (
     _MAX_RETRY_AFTER_S,
     _MIN_RETRY_AFTER_S,
@@ -680,7 +681,9 @@ def test_submit_registration_request_non_201_raises(tmp_path: Path) -> None:
         base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
     )
     with pytest.raises(RegistrationError, match="was refused"):
-        _submit_registration_request(client, "some-code", "some-public-key")
+        _submit_registration_request(
+            client, "some-code", "some-public-key", "age1someveryfakerecipient"
+        )
 
 
 def test_submit_registration_request_success_parses_model(tmp_path: Path) -> None:
@@ -690,7 +693,9 @@ def test_submit_registration_request_success_parses_model(tmp_path: Path) -> Non
     client = httpx.Client(
         base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
     )
-    accepted = _submit_registration_request(client, "some-code", "some-public-key")
+    accepted = _submit_registration_request(
+        client, "some-code", "some-public-key", "age1someveryfakerecipient"
+    )
     assert isinstance(accepted, RegistrationAccepted)
     assert accepted.registration_id == "abc-123"
 
@@ -785,9 +790,11 @@ def test_private_key_and_token_never_leak_during_registration(
         private_key = load_or_create_private_key(data_dir)
         raw_private_key_bytes = private_key.private_bytes_raw()
         public_key = encode_bytes(private_key.public_key().public_bytes_raw())
+        age_identity = load_or_create_identity(data_dir)
+        age_recipient = recipient_for(age_identity)
 
         with client:
-            accepted = submit_registration_request(client, raw_code, public_key)
+            accepted = submit_registration_request(client, raw_code, public_key, age_recipient)
             verification_code = verification_code_for(public_key)
             _write_status(data_dir, "waiting_for_assignment", verification_code)
 

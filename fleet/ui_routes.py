@@ -10,6 +10,8 @@ docstring for why this is a completely separate path from agent auth
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import os
 import secrets
@@ -22,6 +24,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from fleet.age_key_block import AgeKeyBlockError, validate_single_x25519_stanza
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
@@ -1346,6 +1349,95 @@ def command_confirm_submit(
     )
 
 
+# P5.5b, owner decision 2026-09-28: "expiry (15 min, configurable)". Env
+# var, not hard-coded, per CLAUDE.md's own "nothing hard-coded" rule
+# applied throughout this codebase to every timing/threshold constant.
+_RESTORE_KEY_BLOCK_TTL_S_ENV = "FLEET_RESTORE_KEY_BLOCK_TTL_S"  # noqa: S105
+_DEFAULT_RESTORE_KEY_BLOCK_TTL_S = 15 * 60.0
+
+
+def _restore_key_block_ttl_s() -> float:
+    return float(
+        os.environ.get(_RESTORE_KEY_BLOCK_TTL_S_ENV, _DEFAULT_RESTORE_KEY_BLOCK_TTL_S)
+    )
+
+
+@router.post("/apartments/{apartment_id:path}/restore")
+def apartment_restore_create(
+    apartment_id: str,
+    backup_id: str = Form(...),
+    key_block_b64: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Creates one pending restore (P5.5b, the "Wiederherstellen" form) --
+    login required, same CSRF check as every other state-changing `/ui`
+    route (`check_csrf`).
+
+    **What this route receives, and does not:** `key_block_b64` is the
+    *ciphertext* the landlord's browser produced
+    (`fleet/static/ui/restore_form.js`, encrypted locally with the
+    vendored age implementation to the assigned device's own recipient) --
+    this route never reads, and `fleet.templates.ui.apartment.html`'s own
+    key-input field never even has a `name` attribute for, the plaintext
+    key itself (owner decision: "the key input field has NO `name`
+    attribute, so it is never submitted, not even with JS disabled").
+
+    **Validated, in order, before anything is stored:**
+
+    1. `key_block_b64` must be valid base64 (`400` otherwise -- a
+       malformed value here means the browser-side encryption step did
+       not run correctly, or JS is disabled and something else posted to
+       this endpoint by hand).
+    2. The decoded bytes must be a real age file with **exactly one**
+       X25519 recipient stanza (`fleet.age_key_block
+       .validate_single_x25519_stanza`) -- refuses a plaintext key, a
+       multi-recipient block, or anything else that does not structurally
+       look like a single-recipient age ciphertext, `400`.
+    3. `Storage.create_pending_restore` re-validates `backup_id` server-
+       side (never trusts the form's own hidden field alone) and requires
+       a currently assigned device -- `400` (`ValueError`'s own message)
+       for either failure.
+
+    Redirects back to the apartment page on success (`303`, the same
+    "POST, then redirect" convention every other `/ui` mutation in this
+    codebase already follows)."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    try:
+        key_block = base64.b64decode(key_block_b64, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise HTTPException(status_code=400, detail="Ungültiger Schlüssel-Block.") from error
+
+    try:
+        validate_single_x25519_stanza(key_block)
+    except AgeKeyBlockError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    try:
+        storage.create_pending_restore(
+            apartment_id,
+            backup_id,
+            key_block,
+            ui_username=authenticated.user.username,
+            now=datetime.now(UTC),
+            ttl_s=_restore_key_block_ttl_s(),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    return RedirectResponse(
+        url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+    )
+
+
 @router.get("/apartments/{apartment_id:path}/backups/{backup_id}/download")
 def apartment_backup_download(
     apartment_id: str,
@@ -1478,7 +1570,18 @@ def install_security_headers(app: object) -> None:
     async def _security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
         response = await call_next(request)
         if request.url.path.startswith("/ui"):
-            response.headers["Content-Security-Policy"] = "default-src 'self'"
+            # `script-src 'self'` explicit, not merely inherited from
+            # `default-src` (P5.5b: the restore form's vendored age JS,
+            # `fleet/static/ui/vendor/age-encryption.vendor.js`, is the
+            # first script this application ever serves) -- same-origin
+            # only, no CDN, no inline (`'unsafe-inline'` is never added).
+            # Redundant with `default-src 'self'` today (no other
+            # `script-src`-governed directive is set), but explicit on
+            # purpose: a future, narrower `default-src` change must not
+            # silently loosen script loading along with it.
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'"
+            )
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["Referrer-Policy"] = "no-referrer"
         return response

@@ -27,6 +27,7 @@ from protocol.registration import (
     ED25519_PUBLIC_KEY_BYTES,
     ED25519_SIGNATURE_BYTES,
     RegistrationAccepted,
+    RegistrationRequest,
     TokenChallenge,
     TokenIssued,
     TokenRequest,
@@ -117,6 +118,44 @@ def test_registration_accepted_requires_nonempty_id() -> None:
     with pytest.raises(ValidationError):
         RegistrationAccepted(registration_id="")
     RegistrationAccepted(registration_id="abc")
+
+
+# -- RegistrationRequest.age_recipient (P5.5b) -------------------------------
+
+
+def test_registration_request_age_recipient_defaults_to_none() -> None:
+    request = RegistrationRequest(registration_code="code", public_key="pubkey")
+    assert request.age_recipient is None
+
+
+def test_registration_request_age_recipient_accepts_a_plausible_recipient() -> None:
+    request = RegistrationRequest(
+        registration_code="code", public_key="pubkey", age_recipient="age1examplerecipient"
+    )
+    assert request.age_recipient == "age1examplerecipient"
+
+
+def test_registration_request_age_recipient_explicit_none_is_allowed() -> None:
+    request = RegistrationRequest(
+        registration_code="code", public_key="pubkey", age_recipient=None
+    )
+    assert request.age_recipient is None
+
+
+def test_registration_request_age_recipient_rejects_a_secret_key() -> None:
+    with pytest.raises(ValidationError, match="private key"):
+        RegistrationRequest(
+            registration_code="code",
+            public_key="pubkey",
+            age_recipient="AGE-SECRET-KEY-1EXAMPLE",
+        )
+
+
+def test_registration_request_age_recipient_rejects_the_wrong_prefix() -> None:
+    with pytest.raises(ValidationError, match="age1"):
+        RegistrationRequest(
+            registration_code="code", public_key="pubkey", age_recipient="not-a-recipient"
+        )
 
 
 def test_token_challenge_round_trips_through_json() -> None:

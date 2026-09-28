@@ -674,19 +674,35 @@ they must also stay conceptually separate, not just separately scheduled.
   P5.1-P5.4.
 - **Read back by:** main session (encryption, security principle 4).
 
-### P5.5b -- Restore -- **open, not started**
+### P5.5b -- Restore **SR**
+- [x] done -- see `docs/STATUS.md`'s P5.5b section for the full design.
 - **Goal:** section 15.2/15.3 step 4's counterpart to P5.5a: "The agent
   fetches the device configuration and, on a swap, the encrypted
   operational data. The landlord enters the decryption key once in the
   fleet UI; it is only passed through, never stored." No stub exists yet
   for either the fleet-side "hand the device its backups on
   (re-)assignment" flow or the agent-side "receive and unpack" flow.
-- **Files:** likely `fleet/ui_routes.py`/`fleet/app.py` (a new endpoint
-  the newly assigned device fetches from) and `agent/loop.py` (unpacking,
-  never storing the passed-through key).
+- **Files:** `protocol/version.py`, `protocol/registration.py` (new
+  `age_recipient` field), `protocol/restore.py` (new), `fleet/app.py`
+  (three new endpoints), `fleet/age_key_block.py` (new), `fleet/storage.py`
+  (`devices.age_recipient`, new `pending_restores` table),
+  `fleet/migrations/versions/0013_restore.py` (new), `fleet/ui_routes.py`/
+  `fleet/ui_apartment.py` (the "Wiederherstellen" form), `fleet/templates
+  /ui/apartment.html`, `fleet/static/ui/vendor/age-encryption.vendor.js`
+  (new, vendored), `fleet/static/ui/restore_form.js` (new),
+  `fleet/restore_vendor.py` (new), `agent/age_identity.py` (new),
+  `agent/restore.py` (new), `agent/registration.py`, `agent/loop.py`,
+  `agent/__main__.py`, `agent/safe_io.py` (new `write_bytes_safe`).
 - **Section:** 15.2, 15.3 step 4 (and its "Decided afterward" paragraph,
   2026-09-28: the browser encrypts the entered key to a device-generated age
   recipient; the fleet only forwards the opaque block, never the plain key).
+- **Acceptance:** real end-to-end test over the real fleet app and real
+  TLS (browser step simulated with `pyrage`, plus a real `node` + the real
+  vendored JS interop test); plaintext key rejected; wrong/second device
+  cannot fetch; expired block gone; block deleted after one fetch; the
+  landlord's key string never appears in the fleet's sqlite file, the
+  blob-storage directory, or the agent's own tmp tree; agent refuses to
+  restore over existing data; wrong key fails clean, nothing written.
 - **Depends on:** P5.5a (this package) -- reuses `protocol.backups`,
   `fleet.backup_storage`, and the same age recipients/identity concept.
 - **Read back by:** main session (security principle 3: the landlord's

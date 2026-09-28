@@ -61,6 +61,7 @@ import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from agent.age_identity import load_or_create_identity, recipient_for
 from agent.transport import build_client
 from protocol.registration import (
     AgentRegistrationFile,
@@ -344,6 +345,15 @@ def register(
     private_key = load_or_create_private_key(data_dir)
     public_key = encode_bytes(private_key.public_key().public_bytes_raw())
 
+    # P5.5b, owner decision 2026-09-28: the age identity is generated "next
+    # to" the Ed25519 key, here, on first registration -- its *public*
+    # recipient is reported alongside `public_key` in the same request, so
+    # a freshly commissioned device never needs the separate
+    # `POST /v1/device/age-recipient` round trip at all (that endpoint
+    # exists only for a device that registered before this field existed).
+    age_identity = load_or_create_identity(data_dir)
+    age_recipient = recipient_for(age_identity)
+
     client = build_client(
         registration_file.fleet_address,
         registration_file.certificate_fingerprint,
@@ -351,7 +361,7 @@ def register(
     )
     with client:
         accepted = _submit_registration_request(
-            client, registration_file.registration_code, public_key
+            client, registration_file.registration_code, public_key, age_recipient
         )
 
         verification_code = verification_code_for(public_key)
@@ -383,15 +393,24 @@ def register(
 
 
 def _submit_registration_request(
-    client: httpx.Client, registration_code: str, public_key: str
+    client: httpx.Client, registration_code: str, public_key: str, age_recipient: str
 ) -> RegistrationAccepted:
     """`POST /v1/registration` (15.3 step 2) -- split out from `register`
     so its non-201 branch is directly unit-testable (`httpx.MockTransport`,
-    no real server needed for this pure HTTP-status-code logic)."""
+    no real server needed for this pure HTTP-status-code logic).
+
+    `age_recipient` (P5.5b): always sent by this codebase's own agent (a
+    freshly generated identity always has one), but the field itself stays
+    optional on the wire (`protocol.registration.RegistrationRequest
+    .age_recipient`) for an older fleet/agent pairing mid-upgrade."""
 
     response = client.post(
         "/v1/registration",
-        json={"registration_code": registration_code, "public_key": public_key},
+        json={
+            "registration_code": registration_code,
+            "public_key": public_key,
+            "age_recipient": age_recipient,
+        },
     )
     if response.status_code != 201:
         raise RegistrationError(

@@ -91,6 +91,11 @@ from agent.commands_channel import receive_commands as _receive_commands
 from agent.commands_channel import report_result as _report_result
 from agent.encryption import DEFAULT_RECIPIENTS_FILE, encrypt_stream, load_recipients
 from agent.log_filter import filter_log_lines
+from agent.restore import (
+    DEFAULT_RESTORE_POLL_INTERVAL_S,
+    RestoreTargets,
+    run_restore_poll_loop,
+)
 from agent.safe_io import append_bytes_safe, read_text_safe
 from protocol import Command, CommandResult, DesiredState, Heartbeat, LogExcerpt
 from protocol.backups import BackupKind, BackupUploadAccepted
@@ -1165,6 +1170,8 @@ def run(
     watchdog_state_path: Path = DEFAULT_WATCHDOG_STATE_FILE,
     led_status_path: Path = DEFAULT_LED_STATUS_FILE,
     backup_config: BackupConfig | None = None,
+    restore_targets: RestoreTargets | None = None,
+    restore_poll_interval_s: float = DEFAULT_RESTORE_POLL_INTERVAL_S,
     exit_fn: Callable[[int], None] = lambda code: sys.exit(code),
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
@@ -1250,6 +1257,24 @@ def run(
         )
         backup_thread.start()
 
+    # P5.5b: the same "own thread, not a branch of the command loop"
+    # reasoning as the backup scheduler above, applied to "is a restore
+    # waiting for me" -- started only if `restore_targets` is actually
+    # configured (`agent.__main__` constructs one from CLI arguments; most
+    # of this module's own existing tests never pass one, and get no
+    # background thread at all).
+    restore_stop_event = threading.Event()
+    restore_thread: threading.Thread | None = None
+    if restore_targets is not None:
+        restore_thread = threading.Thread(
+            target=run_restore_poll_loop,
+            args=(client, restore_targets),
+            kwargs={"interval_s": restore_poll_interval_s, "stop_event": restore_stop_event},
+            daemon=True,
+            name="thermoctl-agent-restore-poll",
+        )
+        restore_thread.start()
+
     commands = receive_commands(
         client, last_event_id_path, sleep=sleep, on_contact=_on_contact
     )
@@ -1280,6 +1305,7 @@ def run(
     finally:
         commands.close()
         backup_stop_event.set()
+        restore_stop_event.set()
 
 
 def reconcile_desired_state(desired: DesiredState) -> None:

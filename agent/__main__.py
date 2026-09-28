@@ -20,6 +20,7 @@ from agent.registration import (
     load_token,
     register,
 )
+from agent.restore import DEFAULT_RESTORE_POLL_INTERVAL_S, RestoreTargets
 from agent.safe_io import UnsafeStateFileError
 from agent.transport import build_client
 from protocol.registration import AgentRegistrationFile
@@ -106,6 +107,19 @@ def _run_agent(args: argparse.Namespace) -> int:
                     client=client,
                     recipients_file=Path(args.backup_recipients_file),
                 )
+            # P5.5b: always configured (unlike `backup_config`, restore has
+            # no meaningful "disabled" state -- a freshly commissioned or
+            # swapped device always needs to be able to notice a pending
+            # restore, section 15.3 step 4). Reuses the same
+            # `--thermoctl-db-file`/`--zigbee2mqtt-dir` paths as backups --
+            # see `docs/STATUS.md`'s P5.5b section for the open point that
+            # `image/common/agent-compose.yml` mounts them read-only today,
+            # which a real restore needs write access to.
+            restore_targets = RestoreTargets(
+                data_dir=data_dir,
+                thermoctl_db_path=Path(args.thermoctl_db_file),
+                zigbee2mqtt_dir=Path(args.zigbee2mqtt_dir),
+            )
             loop.run(
                 client,
                 last_event_id_path=data_dir / loop.DEFAULT_LAST_EVENT_ID_FILE,
@@ -115,6 +129,8 @@ def _run_agent(args: argparse.Namespace) -> int:
                 watchdog_state_path=Path(args.watchdog_state_file),
                 led_status_path=Path(args.led_status_file),
                 backup_config=backup_config,
+                restore_targets=restore_targets,
+                restore_poll_interval_s=args.restore_poll_interval_s,
             )
     except CommandStreamAuthError:
         print(
@@ -212,6 +228,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Zigbee2MQTT's data directory, containing database.db and "
             "coordinator_backup.json (read-only mount, section 15.2)."
+        ),
+    )
+    run_parser.add_argument(
+        "--restore-poll-interval-s",
+        type=float,
+        default=DEFAULT_RESTORE_POLL_INTERVAL_S,
+        help=(
+            "P5.5b: how often to poll the fleet for a pending restore "
+            f"(section 15.3 step 4), default {DEFAULT_RESTORE_POLL_INTERVAL_S}s."
         ),
     )
 

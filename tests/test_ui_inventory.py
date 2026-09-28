@@ -353,7 +353,7 @@ def test_inventory_view_renders_after_login(
     assert response.status_code == 200
     assert "Inventar" in response.text
     assert response.headers["Cache-Control"] == "no-store"
-    assert response.headers["Content-Security-Policy"] == "default-src 'self'"
+    assert response.headers["Content-Security-Policy"] == "default-src 'self'; script-src 'self'"
     assert response.headers["X-Frame-Options"] == "DENY"
     assert response.headers["Referrer-Policy"] == "no-referrer"
 

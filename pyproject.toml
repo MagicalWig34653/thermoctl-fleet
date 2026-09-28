@@ -36,6 +36,17 @@ fleet = [
     # (CLAUDE.md security principle 3) -- that only ever happens in `agent/`
     # (future P2.3), on the base station.
     "cryptography>=43",
+    # Structural validation of age recipients/key blocks (P5.5b, section
+    # 15.2/15.3's "Decided afterward" paragraph) -- `fleet.age_key_block`
+    # parses a submitted recipient string and checks a restore key block's
+    # header shape via the real `pyrage.x25519.Recipient.from_str`, never
+    # a hand-rolled bech32/age parser (CLAUDE.md: "no invented
+    # functionality" for cryptographic code, same reasoning as `agent
+    # .encryption`'s own P5.5a dependency below). The fleet never holds a
+    # private key or decrypts anything with this library -- only
+    # `pyrage.x25519.Recipient.from_str`'s parsing/validation is ever
+    # called from `fleet/`.
+    "pyrage>=1.4",
 ]
 # Device side: HTTP client for heartbeat/events, SSE client for the
 # command channel.

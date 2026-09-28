@@ -77,6 +77,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     and_,
@@ -374,6 +375,22 @@ class DeviceRecord(Base):
     # (`Storage.register_device`) always forces `registered` regardless of
     # what is requested (work package's explicit instruction).
     state: Mapped[str] = mapped_column(String(32), nullable=False)
+    # P5.5b, section 15.3's "Decided afterward" paragraph (2026-09-28): the
+    # device's own age X25519 **public** recipient (never a private key --
+    # CLAUDE.md security principle 3), reported either as part of
+    # registration (`protocol.registration.RegistrationRequest
+    # .age_recipient`, PROTOCOL_VERSION 7) or, for a device already past
+    # that step, via the dedicated `POST /v1/device/age-recipient`
+    # (`Storage.set_device_age_recipient`). Nullable: a device that has
+    # never reported one yet (an older device not upgraded, or one still
+    # mid-registration) simply cannot be the target of a restore -- the
+    # fleet UI's own restore form (`fleet.ui_apartment`) refuses to offer
+    # one for such a device rather than defaulting to anything. Stored on
+    # the device itself, not per registration cycle (unlike `public_key`),
+    # because the age identity is generated once and kept "next to" the
+    # Ed25519 device key for the device's whole lifetime (owner decision),
+    # not regenerated on every re-registration.
+    age_recipient: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 class AssignmentRecord(Base):
@@ -670,6 +687,80 @@ class FleetEpochRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     epoch: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class PendingRestoreRecord(Base):
+    """P5.5b (section 15.2/15.3's "Decided afterward" paragraph,
+    2026-09-28): one landlord-initiated restore request, waiting for the
+    assigned device to fetch it.
+
+    `key_block` is the **age ciphertext** the landlord's browser produced
+    (the landlord's decryption key, encrypted locally to the device's own
+    age recipient) -- never the plain key, which this row, and every other
+    part of the fleet, never sees (CLAUDE.md security principle 3;
+    `fleet.age_key_block.validate_age_key_block` is what
+    `fleet.ui_routes.apartment_restore_create` runs against it *before* it
+    is ever stored here, so an accidentally-submitted plaintext key -- no
+    JS, or a browser extension gone wrong -- is refused, not persisted).
+
+    Bound to `(apartment_id, device_id, backup_id)`, exactly the "Decided
+    afterward" paragraph's own "bound to the assigned device" plus the
+    work order's own "(apartment, device registration, backup id)" --
+    `device_id` is the device **currently** assigned at creation time
+    (`Storage.get_current_assignment`), re-checked again, unchanged, at
+    fetch time (`Storage.fetch_and_delete_pending_restore`): a device swap
+    between creation and fetch invalidates this row implicitly (the new
+    device's id no longer matches), on top of the apartment's own token
+    already having been revoked by that same swap (`Storage.confirm_device`
+    -- belt and braces, the same reasoning applied throughout this
+    codebase's registration/assignment code).
+
+    **Expiry, not permanence** (`expires_at`, 15 minutes by default,
+    `fleet.ui_routes.RESTORE_KEY_BLOCK_TTL_S_ENV`) and **single-fetch**
+    (`fetch_and_delete_pending_restore` deletes the row in the same
+    transaction it reads it in, so a second fetch -- retry, replay, a
+    second device racing the first -- always finds nothing) are this
+    table's only two ways a row ever disappears; there is no "mark
+    fetched" flag to leave stale rows lying around to prune later.
+
+    Deliberately **no column anywhere in this table, or in any log this
+    package writes, ever carries the plaintext key or the decrypted
+    operational data** -- `fleet.ui_routes`'s own audit-log call for
+    "restore requested"/"restore fetched" logs who, when, and which
+    backup, never the payload (CLAUDE.md: "Audit log entry ... never the
+    payload").
+    """
+
+    __tablename__ = "pending_restores"
+
+    # A fresh, random, wire-facing id (mirrors `BackupRecord.backup_id`'s
+    # own reasoning) -- not exposed to any caller in this package yet
+    # (there is exactly one pending restore per apartment at a time, found
+    # by `apartment_id`, not by this id), kept anyway so a future admin
+    # tool has something stable to reference without inventing a second
+    # identifier later.
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    backup_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    key_block: Mapped[bytes] = mapped_column(LargeBinary(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+@dataclass(frozen=True)
+class PendingRestoreSummary:
+    """What `fleet.ui_apartment` (status display) and `fleet.app` (the
+    device's own fetch endpoint) need about one pending restore -- detached
+    from the session, mirrors `BackupSummary`'s own shape."""
+
+    id: str
+    apartment_id: str
+    device_id: str
+    backup_id: str
+    created_at: datetime
+    expires_at: datetime
 
 
 class StoreLogExcerptOutcome(StrEnum):
@@ -1571,6 +1662,279 @@ class Storage:
                     BackupRecord.backup_id == backup_id,
                 )
             )
+
+    # -- age recipient / restore (P5.5b, section 15.2/15.3) -----------------
+
+    def set_device_age_recipient(self, device_id: str, recipient: str) -> bool:
+        """Stores `device_id`'s own age X25519 recipient -- **set-once**:
+        the guarded `UPDATE` below only ever matches a row whose
+        `age_recipient` is still `NULL` or already equal to `recipient`
+        (the same value reported again, e.g. a retried registration or a
+        restarted agent calling the dedicated endpoint again -- harmless,
+        `True`). Returns `False` if the device is unknown, or already has
+        a *different* recipient on file -- a caller (`fleet.app`) turns
+        that into a `409`, never a silent overwrite: this value is what a
+        future restore is encrypted to, so silently replacing it would let
+        a since-compromised device (or a bug) redirect a landlord's key to
+        an attacker-controlled recipient without any of the review a
+        deliberate re-registration already goes through.
+
+        Not wrapped in `fleet.device_lifecycle`'s manual-transition
+        machinery -- this is metadata about the device's own key material,
+        not a lifecycle state."""
+
+        with self.session() as session:
+            device = session.get(DeviceRecord, device_id)
+            if device is None:
+                return False
+            if device.age_recipient is not None and device.age_recipient != recipient:
+                return False
+            device.age_recipient = recipient
+            return True
+
+    def get_operational_data_backups_for_apartment(
+        self, apartment_id: str
+    ) -> list[BackupSummary]:
+        """`list_backups_for_apartment`, filtered to
+        `BackupKind.OPERATIONAL_DATA` -- what the restore form's backup
+        picker offers (a device-configuration backup is never something a
+        landlord "restores" through this flow; it is already plain text
+        and simply fetched by the device directly, see `fleet.app
+        .fetch_pending_restore`)."""
+
+        return [
+            summary
+            for summary in self.list_backups_for_apartment(apartment_id)
+            if summary.kind == str(BackupKind.OPERATIONAL_DATA)
+        ]
+
+    def get_latest_device_config_backup(self, apartment_id: str) -> BackupSummary | None:
+        """The most recent `device_config` backup for `apartment_id`, or
+        `None` -- section 15.3 step 4's "the agent fetches the device
+        configuration and, on a swap, the encrypted operational data":
+        bundled alongside a pending restore's operational-data blob so the
+        device gets both in the one fetch this package's own endpoint
+        provides. `None` is not an error (a brand-new apartment, or one
+        never backed up before this package existed, simply has none
+        yet) -- `fleet.app.fetch_pending_restore` includes it only if
+        present."""
+
+        for summary in self.list_backups_for_apartment(apartment_id):
+            if summary.kind == str(BackupKind.DEVICE_CONFIG):
+                return summary
+        return None
+
+    def create_pending_restore(
+        self,
+        apartment_id: str,
+        backup_id: str,
+        key_block: bytes,
+        *,
+        ui_username: str,
+        now: datetime,
+        ttl_s: float,
+    ) -> PendingRestoreSummary:
+        """Creates one pending restore (the landlord's "Wiederherstellen"
+        form, `fleet.ui_routes.apartment_restore_create`) -- raises
+        `ValueError` (shown to the landlord as-is, same convention as every
+        other validation error in this module) if:
+
+        - the apartment has no currently assigned, confirmed device
+          (`Storage.get_current_assignment`) -- there is nothing to bind
+          this restore to;
+        - `backup_id` does not name an existing `operational_data` backup
+          for *this* apartment (never trusts the form's own hidden field
+          blindly -- the same "re-check server-side" reasoning `fleet.app
+          .upload_backup` already applies to `content_hash`).
+
+        Replaces any still-pending restore for the same apartment (at most
+        one at a time -- a second "Wiederherstellen" submission means the
+        landlord changed their mind, not that two should now race for the
+        same device) -- the previous row, if any, is deleted first, in the
+        same transaction, **before** the key it once held is even
+        overwritten in memory, so the old ciphertext never persists
+        alongside the new one even briefly.
+
+        The audit-log entry this method writes carries **only** who, when,
+        and which backup id (CLAUDE.md: "never the payload") -- `key_block`
+        itself never appears in `before`/`after`.
+        """
+
+        assignment = self.get_current_assignment(apartment_id)
+        if assignment is None:
+            raise ValueError(
+                f"Wohnung {apartment_id!r} hat kein aktuell zugewiesenes Gerät."
+            )
+        device_id = assignment.device_id
+
+        normalized_now = _naive_utc(now)
+        expires_at = normalized_now + timedelta(seconds=ttl_s)
+        restore_id = uuid.uuid4().hex
+
+        with self.session() as session:
+            backup = session.scalar(
+                select(BackupRecord).where(
+                    BackupRecord.apartment_id == apartment_id,
+                    BackupRecord.backup_id == backup_id,
+                    BackupRecord.kind == str(BackupKind.OPERATIONAL_DATA),
+                )
+            )
+            if backup is None:
+                raise ValueError(
+                    f"Backup {backup_id!r} ist kein Betriebsdaten-Backup dieser Wohnung."
+                )
+
+            session.execute(
+                delete(PendingRestoreRecord).where(
+                    PendingRestoreRecord.apartment_id == apartment_id
+                )
+            )
+
+            record = PendingRestoreRecord(
+                id=restore_id,
+                apartment_id=apartment_id,
+                device_id=device_id,
+                backup_id=backup_id,
+                key_block=key_block,
+                created_at=normalized_now,
+                expires_at=expires_at,
+                created_by=ui_username,
+            )
+            session.add(record)
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="restore",
+                entity_id=apartment_id,
+                action="requested",
+                reason=None,
+                before=None,
+                after={"backup_id": backup_id, "device_id": device_id},
+            )
+
+        return PendingRestoreSummary(
+            id=restore_id,
+            apartment_id=apartment_id,
+            device_id=device_id,
+            backup_id=backup_id,
+            created_at=normalized_now.replace(tzinfo=UTC),
+            expires_at=expires_at.replace(tzinfo=UTC),
+        )
+
+    def get_pending_restore_status(self, apartment_id: str) -> PendingRestoreSummary | None:
+        """The currently pending restore for `apartment_id`, if any and not
+        yet expired -- what the apartment detail page shows ("Eine
+        Wiederherstellung wartet auf das Gerät, gültig bis ..."). Never
+        returns `key_block` (not even to this method's own caller -- the
+        summary dataclass has no field for it)."""
+
+        with self.session() as session:
+            row = session.scalar(
+                select(PendingRestoreRecord).where(
+                    PendingRestoreRecord.apartment_id == apartment_id,
+                    PendingRestoreRecord.expires_at > _naive_utc(datetime.now(UTC)),
+                )
+            )
+            if row is None:
+                return None
+            return PendingRestoreSummary(
+                id=row.id,
+                apartment_id=row.apartment_id,
+                device_id=row.device_id,
+                backup_id=row.backup_id,
+                created_at=row.created_at.replace(tzinfo=UTC),
+                expires_at=row.expires_at.replace(tzinfo=UTC),
+            )
+
+    def fetch_and_delete_pending_restore(
+        self, apartment_id: str, device_id: str, now: datetime
+    ) -> tuple[PendingRestoreSummary, bytes] | None:
+        """The device's own fetch (`fleet.app.fetch_pending_restore`) --
+        **atomic delete-then-return**: the row is removed in the same
+        statement that reads it (`DELETE ... RETURNING`), so a concurrent
+        second fetch (a retry, a replay, a second device racing the first)
+        always finds nothing, never the same block twice (owner decision:
+        "deletes it after one fetch").
+
+        Returns `None` for no pending restore, an **expired** one (treated
+        identically to "none" -- also opportunistically deleted here, so
+        an expired row does not linger until some future sweep), or one
+        bound to a **different** device than `device_id` (security
+        principle 5's "only the device currently assigned to that
+        apartment" -- checked here, in storage, not left to the caller to
+        remember; see `PendingRestoreRecord`'s own docstring for why this
+        check is defense in depth on top of the apartment token itself
+        already having been revoked by any device swap in between).
+
+        Returns `(summary, key_block)` on success -- the raw ciphertext
+        bytes, still age-encrypted, never decrypted anywhere in this
+        package (CLAUDE.md security principle 3)."""
+
+        normalized_now = _naive_utc(now)
+        with self.session() as session:
+            row = session.scalar(
+                select(PendingRestoreRecord).where(
+                    PendingRestoreRecord.apartment_id == apartment_id
+                )
+            )
+            if row is None:
+                return None
+            if row.expires_at <= normalized_now:
+                session.execute(
+                    delete(PendingRestoreRecord).where(PendingRestoreRecord.id == row.id)
+                )
+                return None
+            if row.device_id != device_id:
+                # Deliberately **not** deleted here -- a wrong/second
+                # device asking does not consume the legitimate device's
+                # still-pending restore (owner decision: "only the device
+                # currently assigned ... may fetch", not "the first device
+                # to ask, successful or not, consumes it").
+                return None
+
+            summary = PendingRestoreSummary(
+                id=row.id,
+                apartment_id=row.apartment_id,
+                device_id=row.device_id,
+                backup_id=row.backup_id,
+                created_at=row.created_at.replace(tzinfo=UTC),
+                expires_at=row.expires_at.replace(tzinfo=UTC),
+            )
+            key_block = row.key_block
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username="<device>",
+                entity_type="restore",
+                entity_id=apartment_id,
+                action="fetched",
+                reason=None,
+                before=None,
+                after={"backup_id": row.backup_id, "device_id": row.device_id},
+            )
+            session.execute(delete(PendingRestoreRecord).where(PendingRestoreRecord.id == row.id))
+        return summary, key_block
+
+    def purge_expired_pending_restores(self, now: datetime) -> int:
+        """Deletes every pending restore whose `expires_at` has passed --
+        an operator/periodic-loop cleanup on top of the opportunistic
+        deletion `fetch_and_delete_pending_restore` already does for a row
+        it happens to encounter; this is what actually guarantees an
+        abandoned restore (nobody ever fetched it, e.g. a device that
+        never came back up) does not linger forever. Returns how many rows
+        were deleted."""
+
+        with self.session() as session:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(PendingRestoreRecord).where(
+                        PendingRestoreRecord.expires_at <= _naive_utc(now)
+                    )
+                ),
+            )
+            return int(result.rowcount)
 
     def list_all_backups_grouped(self) -> dict[tuple[str, str], list[BackupSummary]]:
         """Every stored backup, grouped by `(apartment_id, kind)` -- what
