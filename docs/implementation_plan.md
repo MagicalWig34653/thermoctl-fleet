@@ -637,7 +637,11 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Section:** 13.
 - **Acceptance:** test demonstrates: a missing digest prevents the start;
   a digest from an unlisted source is rejected; absence of health after
-  15 minutes triggers a rollback.
+  15 minutes triggers a rollback. **Owner decision 2026-09-28 (section 13,
+  "Decided afterward"):** fail-closed pre-check (unreadable thermoctl health
+  or outdoor temperature -> reject) **and** `pilot_mode` required at the
+  target; both rejection paths tested; no new `CommandType`. STATUS.md must
+  record P5.4 as "done but inactive" with both conditions.
 - **Depends on:** P5.1 (the desired state arrives over the same channel as
   commands, see section 13).
 - **Read back by:** main session (the digest check is the central
@@ -680,7 +684,9 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Files:** likely `fleet/ui_routes.py`/`fleet/app.py` (a new endpoint
   the newly assigned device fetches from) and `agent/loop.py` (unpacking,
   never storing the passed-through key).
-- **Section:** 15.2, 15.3 step 4.
+- **Section:** 15.2, 15.3 step 4 (and its "Decided afterward" paragraph,
+  2026-09-28: the browser encrypts the entered key to a device-generated age
+  recipient; the fleet only forwards the opaque block, never the plain key).
 - **Depends on:** P5.5a (this package) -- reuses `protocol.backups`,
   `fleet.backup_storage`, and the same age recipients/identity concept.
 - **Read back by:** main session (security principle 3: the landlord's

@@ -2,6 +2,23 @@
 
 Last updated: 2026-09-28.
 
+## Owner decisions for P5.4 and P5.5b (2026-09-28, main session)
+
+Recorded in `docs/specification.md` (sections 13 and 15.3, "Decided
+afterward") and `docs/implementation_plan.md`:
+
+- **P5.4** is built now but stays inactive: fail-closed pre-check
+  (unreadable thermoctl health/outdoor temperature rejects) plus
+  `pilot_mode` required at the target. No new `CommandType`; `apply_update`
+  stays stage 2. **Open point for P5.4:** `pilot_mode` currently lives only
+  in the fleet inventory; the agent has to learn it from the cloud, so this
+  gate protects against *accidental* arming, not against a compromised
+  cloud -- that protection stays with the hard-coded sources, the digest
+  check, and the local pre-check (security principles 2 and 5).
+- **P5.5b** restore key: encrypted in the landlord's browser to a
+  device-generated age recipient; the fleet stores and forwards only the
+  opaque block and deletes it after fetch or expiry.
+
 ## P5.1c -- SSE resume survives a fleet database restore (sections 3, 7)
 
 **The problem** (found during the P5.E end-to-end run, 2026-09-28): the SSE

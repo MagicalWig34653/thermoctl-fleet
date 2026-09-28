@@ -364,6 +364,21 @@ and even that only within the rules below.
 - **Zigbee2MQTT is the bigger risk than thermoctl**, because a version jump there can change
   device pairings. Its own release, never together with a thermoctl update.
 
+**Decided afterward (project owner, 2026-09-28):** desired-state reconciliation (P5.4) is
+built now, but stays **inactive** until two conditions hold, so that it cannot arm itself
+before the heating season of operational experience section 7 asks for `apply_update`:
+
+1. The pre-check is **fail-closed**: if thermoctl's health or the outdoor temperature cannot
+   be read, the update is rejected -- "unknown" never counts as "fine". Treating an unknown
+   outdoor temperature as permission would remove exactly the protection against updating
+   during a cold spell.
+2. Additionally, the target apartment must carry `pilot_mode` (the existing inventory flag,
+   section 21.4) -- otherwise the agent rejects. This keeps P5.4 from going live
+   automatically the day thermoctl ships its health API.
+
+No new `CommandType`; `apply_update` stays stage 2. Both rejection paths (health missing,
+`pilot_mode` missing) are tested, since they are the only code path that is actually live.
+
 ### Operating system and firmware
 
 Not via the fleet service. Operating-system security updates run unattended on the base
@@ -488,6 +503,14 @@ guesses an id gets an apartment's credentials. Hence:
 Realistic duration for a swap: **10 to 20 minutes**, most of it waiting for the images to
 download. What a person still has to do: drive there, swap the device, move the radio stick
 over.
+
+**Decided afterward (project owner, 2026-09-28), how "passed through" works:** the
+landlord's decryption key never reaches the fleet service in plain text. The device
+generates, next to its Ed25519 key, its own age key pair on the device and registers only
+the **public** recipient. In the fleet UI the landlord's browser encrypts the entered key
+locally to exactly this device's recipient; the fleet service stores and forwards only that
+opaque block, bound to the assigned device, and deletes it once fetched or expired. A
+compromised fleet server therefore sees neither the key nor the operational data.
 
 ### 15.4 If the device only has Wi-Fi
 
