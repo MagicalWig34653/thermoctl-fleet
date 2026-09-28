@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import hmac
 import json
 import logging
@@ -38,11 +37,13 @@ from sse_starlette.sse import EventSourceResponse
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from fleet.backup_retention import run_backup_retention
-from fleet.backup_storage import BackupBlobStorage, PendingBackupUpload, get_backup_storage
+from fleet.backup_storage import BackupBlobStorage, get_backup_storage
+from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
 from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
 from fleet.storage import (
     RecordCommandResultOutcome,
     Storage,
+    StoreDiagnosticBundleOutcome,
     StoreLogExcerptOutcome,
     get_storage,
     hash_token,
@@ -50,12 +51,19 @@ from fleet.storage import (
 from fleet.ui_auth import resolve_client_ip
 from fleet.ui_routes import install_security_headers
 from fleet.ui_routes import router as ui_router
+from fleet.upload_streaming import (
+    AGE_PLAUSIBILITY_PREFIX_BYTES,
+    looks_like_an_age_file,
+    stream_upload_body,
+)
 from protocol import (
     AGE_HEADER_MAGIC,
     MAX_BACKUP_UPLOAD_BYTES,
+    MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES,
     BackupKind,
     BackupUploadAccepted,
     CommandResult,
+    DiagnosticBundleUploadAccepted,
     Event,
     Heartbeat,
     LogExcerpt,
@@ -119,6 +127,23 @@ _LOG_RETENTION_CHECK_INTERVAL_ENV = "FLEET_LOG_RETENTION_CHECK_INTERVAL_S"
 # longer default interval than `_DEFAULT_ALARM_CHECK_INTERVAL_S` is
 # appropriate; still configurable per the same reasoning.
 _DEFAULT_LOG_RETENTION_CHECK_INTERVAL_S = 3600.0
+
+# P5.3b: the same "the fleet enforces its own retention period" rule
+# `fetch_logs` (above) already applies, for `diagnostic_bundle` uploads --
+# otherwise a `diagnostic_bundle` snapshot, however encrypted, would still
+# accumulate indefinitely in the fleet's own storage, exactly the "series
+# instead of a snapshot" section 21.5's own "Decided afterward" paragraph
+# forbids for the *cloud's* copy (the encryption keeps a single bundle's
+# content opaque, it does not by itself bound how many the fleet keeps).
+# Same default (14 days) as `fetch_logs`'s own retention -- an independent
+# constant, not reused, so a future change to one does not silently also
+# move the other.
+_DIAGNOSTIC_BUNDLE_RETENTION_DAYS_ENV = "FLEET_DIAGNOSTIC_BUNDLE_RETENTION_DAYS"
+_DEFAULT_DIAGNOSTIC_BUNDLE_RETENTION_DAYS = 14
+_DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_ENV = (
+    "FLEET_DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_S"
+)
+_DEFAULT_DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_S = 3600.0
 
 
 async def _alarm_check_loop(  # pragma: no cover
@@ -196,6 +221,45 @@ async def _log_retention_loop(interval_s: float, retention_days: int) -> None:  
         await asyncio.sleep(interval_s)
 
 
+async def _diagnostic_bundle_retention_loop(
+    interval_s: float, retention_days: int
+) -> None:  # pragma: no cover
+    """Periodically deletes stored `diagnostic_bundle` blobs (and their
+    metadata rows) older than `retention_days` (P5.3b) -- the same thin
+    scheduling wrapper as `_log_retention_loop`/`_backup_retention_loop`
+    above, deliberately untested here for the identical reason (an infinite
+    loop around a real `asyncio.sleep`); the logic it calls,
+    `Storage.delete_expired_diagnostic_bundles`, is fully covered with an
+    injected clock in `tests/test_storage_diagnostic_bundles.py`.
+
+    **Two-step delete, like backups, unlike log excerpts**: a diagnostic
+    bundle's content lives on the filesystem (`fleet.bundle_storage
+    .DiagnosticBundleBlobStorage`), not in the database the way a
+    `CommandLogExcerptRecord`'s `lines_json` does -- `Storage
+    .delete_expired_diagnostic_bundles` removes the metadata rows and
+    returns each one's `storage_path`; the blob itself is only deleted
+    here, after the database transaction has already committed (mirrors
+    `fleet.backup_retention.run_backup_retention`'s own "row first, then
+    blob" ordering, and `Storage.delete_backups`'s own docstring for why:
+    a blob deleted first and a crash before the row delete follows would
+    leave a dangling row pointing at nothing)."""
+
+    retention = timedelta(days=retention_days)
+    while True:
+        try:
+            paths = await asyncio.to_thread(
+                get_storage().delete_expired_diagnostic_bundles, datetime.now(UTC), retention
+            )
+            bundle_storage = get_bundle_storage()
+            for path in paths:
+                bundle_storage.delete(path)
+            if paths:
+                logger.info("Deleted %d expired diagnostic bundle(s).", len(paths))
+        except Exception:
+            logger.exception("Diagnostic bundle retention cleanup failed")
+        await asyncio.sleep(interval_s)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Starts the absence-alarm background task (P2.2) for the lifetime of
@@ -241,18 +305,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log_retention_task = asyncio.create_task(
         _log_retention_loop(log_retention_interval_s, log_retention_days)
     )
+
+    diagnostic_bundle_retention_interval_s = float(
+        os.environ.get(
+            _DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_ENV,
+            _DEFAULT_DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_S,
+        )
+    )
+    diagnostic_bundle_retention_days = int(
+        os.environ.get(
+            _DIAGNOSTIC_BUNDLE_RETENTION_DAYS_ENV, _DEFAULT_DIAGNOSTIC_BUNDLE_RETENTION_DAYS
+        )
+    )
+    diagnostic_bundle_retention_task = asyncio.create_task(
+        _diagnostic_bundle_retention_loop(
+            diagnostic_bundle_retention_interval_s, diagnostic_bundle_retention_days
+        )
+    )
     try:
         yield
     finally:
         task.cancel()
         backup_retention_task.cancel()
         log_retention_task.cancel()
+        diagnostic_bundle_retention_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
         with contextlib.suppress(asyncio.CancelledError):
             await backup_retention_task
         with contextlib.suppress(asyncio.CancelledError):
             await log_retention_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await diagnostic_bundle_retention_task
 
 
 app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION), lifespan=lifespan)
@@ -632,79 +716,12 @@ def receive_command_result(
 
 _CONTENT_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
-# How many bytes of an `operational_data` upload's own beginning are read
-# back for the age-file plausibility check below -- the header line plus
-# the first recipient stanza line together are well under a kilobyte in
-# practice (a stanza's own base64 payload is short); this is a generous
-# margin, not a tight fit, and is **not** how much of the file is ever
-# held in memory at once during the upload itself (see `upload_backup`'s
-# own docstring, point 1, for that).
-_AGE_PLAUSIBILITY_PREFIX_BYTES = 4096
-
-
-def _looks_like_an_age_file(prefix: bytes) -> bool:
-    """`True` iff `prefix` starts with the real age format's own header
-    line, **followed by at least one recipient stanza line** (`-> ...`,
-    the age format's own `Stanza` syntax -- every real age file has at
-    least one, naming the algorithm and its arguments for one recipient).
-
-    **Cross-review finding:** checking `AGE_HEADER_MAGIC` alone let
-    `b"age-encryption.org/v1\\n" + b"plaintext tenant data..."` through --
-    a buggy or malicious agent only had to prepend one fixed, public
-    string to otherwise-arbitrary plaintext to defeat the entire check.
-    Requiring a syntactically plausible stanza line immediately after is
-    still not a decrypt attempt (principle 3: the fleet has no private key
-    to decrypt with even if it wanted to), but it does mean the uploaded
-    bytes have to actually look like the beginning of a real age file's
-    *structure*, not merely start with a string anyone could copy.
-    """
-
-    if not prefix.startswith(AGE_HEADER_MAGIC):
-        return False
-    rest = prefix[len(AGE_HEADER_MAGIC) :]
-    if not rest.startswith(b"\n"):
-        return False
-    next_line, _, _ = rest[1:].partition(b"\n")
-    return next_line.startswith(b"-> ")
-
-
-async def _stream_backup_body(
-    body_stream: AsyncIterator[bytes], pending: PendingBackupUpload, max_bytes: int
-) -> tuple[int, str]:
-    """Reads `body_stream` chunk by chunk into `pending`, hashing
-    incrementally -- never accumulating the body as one in-memory `bytes`
-    object, and never reading a single chunk beyond the one that pushes
-    the running total over `max_bytes`.
-
-    **The one property this function exists to guarantee, spelled out
-    precisely and pinned by a direct unit test
-    (`tests/test_fleet_backups.py::test_stream_backup_body_stops_reading_as_soon_as_the_cap_is_exceeded`,
-    which counts how many chunks a synthetic async generator actually
-    yields before this function raises): once the running total exceeds
-    `max_bytes`, this function raises `HTTPException(413)` immediately,
-    without ever calling `anext()` on `body_stream` again.** Cross-review
-    of an earlier version of this endpoint found that `await request
-    .body()` buffered the *entire* declared body before the size check
-    ever ran -- this function is the fix, factored out on its own
-    precisely so that guarantee is testable directly, independent of
-    whatever a given ASGI transport's own buffering behaviour happens to
-    be (Starlette's `TestClient`, for one, buffers a request body fully
-    itself before an app ever sees it, which would make this same
-    property untestable through an HTTP call alone).
-    """
-
-    digest = hashlib.sha256()
-    total_bytes = 0
-    async for chunk in body_stream:
-        total_bytes += len(chunk)
-        if total_bytes > max_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Backup upload exceeds {max_bytes} bytes.",
-            )
-        digest.update(chunk)
-        pending.write(chunk)
-    return total_bytes, digest.hexdigest()
+# `_stream_backup_body`/`_looks_like_an_age_file`/`_AGE_PLAUSIBILITY_PREFIX_BYTES`
+# used to live here -- moved to `fleet.upload_streaming` (P5.3b, imported
+# above as `stream_upload_body`/`looks_like_an_age_file`/
+# `AGE_PLAUSIBILITY_PREFIX_BYTES`) so `upload_diagnostic_bundle` below
+# reuses exactly the same streaming-cap and age-file-plausibility logic,
+# rather than a second, copied implementation.
 
 
 @app.post("/v1/backups", status_code=201, response_model=BackupUploadAccepted)
@@ -753,9 +770,9 @@ async def upload_backup(
        truncated or corrupted upload is caught here, immediately, with a
        clear error, rather than stored and only discovered wrong at
        restore time, months later.
-    3. **For `operational_data`: the first `_AGE_PLAUSIBILITY_PREFIX_BYTES`
+    3. **For `operational_data`: the first `AGE_PLAUSIBILITY_PREFIX_BYTES`
        bytes must look like the start of a real age file**
-       (`_looks_like_an_age_file` -- the header line *and* a recipient
+       (`looks_like_an_age_file` -- the header line *and* a recipient
        stanza line, see that function's own docstring for why the header
        line alone, this endpoint's own original check, was not enough) --
        security principle 4's "no tenant data in plain text in the cloud"
@@ -807,8 +824,8 @@ async def upload_backup(
 
     pending = backup_storage.begin_upload(authenticated_apartment, kind)
     try:
-        total_bytes, actual_hash = await _stream_backup_body(
-            request.stream(), pending, MAX_BACKUP_UPLOAD_BYTES
+        total_bytes, actual_hash = await stream_upload_body(
+            request.stream(), pending, MAX_BACKUP_UPLOAD_BYTES, what="Backup upload"
         )
     except BaseException:
         pending.abort()
@@ -827,8 +844,8 @@ async def upload_backup(
 
     if kind == BackupKind.OPERATIONAL_DATA:
         with pending.temp_path.open("rb") as handle:
-            prefix = handle.read(_AGE_PLAUSIBILITY_PREFIX_BYTES)
-        if not _looks_like_an_age_file(prefix):
+            prefix = handle.read(AGE_PLAUSIBILITY_PREFIX_BYTES)
+        if not looks_like_an_age_file(prefix):
             pending.abort()
             raise HTTPException(
                 status_code=422,
@@ -867,6 +884,163 @@ async def upload_backup(
     return BackupUploadAccepted(
         id=summary.backup_id,
         kind=BackupKind(summary.kind),
+        received_at=summary.created_at,
+        size_bytes=summary.size_bytes,
+        content_hash=summary.content_hash,
+    )
+
+
+# P5.3b: `Storage.store_diagnostic_bundle`'s own outcome -> HTTP status,
+# mirroring `_LOG_EXCERPT_STATUS`'s established pattern just below.
+_DIAGNOSTIC_BUNDLE_STATUS: dict[StoreDiagnosticBundleOutcome, int] = {
+    StoreDiagnosticBundleOutcome.NOT_FOUND: 404,
+    StoreDiagnosticBundleOutcome.STORED: 201,
+    StoreDiagnosticBundleOutcome.ALREADY_EXISTS: 409,
+}
+
+
+@app.post(
+    "/v1/commands/{id}/bundle",
+    status_code=201,
+    response_model=DiagnosticBundleUploadAccepted,
+)
+async def upload_diagnostic_bundle(
+    id: str,
+    request: Request,
+    content_hash: str,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    bundle_storage: DiagnosticBundleBlobStorage = Depends(get_bundle_storage),  # noqa: B008
+) -> DiagnosticBundleUploadAccepted:
+    """Accepts one `diagnostic_bundle` upload (P5.3b, sections 15.1, 21.5)
+    -- agent-token-authenticated exactly like `upload_backup` above
+    (`require_apartment_token_by_hash`); `content_hash` is a query
+    parameter, the raw bytes are the body, never wrapped in JSON (same
+    reasoning as `upload_backup`'s own docstring). **Reuses that endpoint's
+    own streaming-cap and age-file-plausibility mechanics directly**
+    (`fleet.upload_streaming.stream_upload_body`/`looks_like_an_age_file`)
+    rather than a second, copied implementation (P5.3b work order).
+
+    **Checked, in order, mirroring `upload_backup`'s own structure:**
+
+    1. `content_hash` is 64 lowercase hex characters -- `400` otherwise,
+       before a single byte of the body is read.
+    2. **Size, enforced while the body is still arriving**: a declared
+       `Content-Length` above `protocol.diagnostics
+       .MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES` is refused, `413`, before any
+       byte is read; independently, the body is streamed straight into a
+       temp file with a running total checked on every chunk
+       (`stream_upload_body`) -- the moment it exceeds the cap, `413`,
+       having never held more than one chunk's worth in memory or written
+       more than the cap's worth to disk.
+    3. `content_hash` must match a fresh SHA-256 of the body actually
+       received -- `400` on a mismatch, same reasoning as `upload_backup`.
+    4. **The body must look like a real age file** (`looks_like_an_age_file`)
+       -- `422` otherwise. Unlike a backup, a diagnostic bundle has only one
+       possible kind (always end-to-end encrypted, project owner decision
+       2026-09-27: "full content, encrypted ... no second procedure"), so
+       this check applies unconditionally, not only for one `BackupKind`
+       branch.
+
+    **Ownership/type/duplicate scoping is `Storage.store_diagnostic_bundle`'s
+    job** (see that method's own docstring and `_DIAGNOSTIC_BUNDLE_STATUS`
+    above for the exact mapping) -- mirrors `receive_log_excerpt`'s own
+    "the command named must belong to this apartment and be the right
+    type, one upload per command" reasoning exactly: unknown command id,
+    another apartment's command id, or an id naming a command that is not
+    `diagnostic_bundle` -> `404` (deliberately indistinguishable, same
+    "an agent must not learn from this response that a given id exists at
+    all" reasoning); a second upload for an already-stored command -> `409`.
+    On either of those outcomes the just-written blob is deleted -- an
+    orphaned file for a row that was never created serves no purpose (same
+    "row first is not possible here, the type/ownership check needs the
+    row to already exist" ordering `receive_log_excerpt` already
+    establishes, applied to a blob instead of a database row).
+    """
+
+    normalized_hash = content_hash.lower()
+    if not _CONTENT_HASH_PATTERN.fullmatch(normalized_hash):
+        raise HTTPException(
+            status_code=400,
+            detail="content_hash must be 64 lowercase hex characters (SHA-256).",
+        )
+
+    declared_length = request.headers.get("content-length")
+    if declared_length is not None:
+        try:
+            if int(declared_length) > MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Diagnostic bundle upload exceeds "
+                        f"{MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES} bytes."
+                    ),
+                )
+        except ValueError:
+            # A malformed Content-Length is not this check's job to
+            # reject -- the streaming running-total check below enforces
+            # the real cap regardless of what this header claims.
+            pass
+
+    pending = bundle_storage.begin_upload(authenticated_apartment)
+    try:
+        total_bytes, actual_hash = await stream_upload_body(
+            request.stream(),
+            pending,
+            MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES,
+            what="Diagnostic bundle upload",
+        )
+    except BaseException:
+        pending.abort()
+        raise
+
+    if total_bytes == 0:
+        pending.abort()
+        raise HTTPException(status_code=400, detail="Diagnostic bundle upload is empty.")
+
+    if not hmac.compare_digest(actual_hash, normalized_hash):
+        pending.abort()
+        raise HTTPException(
+            status_code=400,
+            detail="content_hash does not match the received body.",
+        )
+
+    with pending.temp_path.open("rb") as handle:
+        prefix = handle.read(AGE_PLAUSIBILITY_PREFIX_BYTES)
+    if not looks_like_an_age_file(prefix):
+        pending.abort()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "diagnostic_bundle upload is not a valid age file (missing the "
+                f"{AGE_HEADER_MAGIC!r} header and a recipient stanza) -- refusing "
+                "to store plaintext content (CLAUDE.md security principle 4)."
+            ),
+        )
+
+    storage_path = pending.finalize()
+    outcome, summary = storage.store_diagnostic_bundle(
+        authenticated_apartment,
+        id,
+        size_bytes=total_bytes,
+        content_hash=actual_hash,
+        storage_path=storage_path,
+        now=datetime.now(UTC),
+    )
+    if outcome is StoreDiagnosticBundleOutcome.NOT_FOUND:
+        bundle_storage.delete(storage_path)
+        raise HTTPException(status_code=404, detail="Unknown diagnostic_bundle command.")
+    if outcome is StoreDiagnosticBundleOutcome.ALREADY_EXISTS:
+        bundle_storage.delete(storage_path)
+        raise HTTPException(
+            status_code=409,
+            detail="A diagnostic bundle was already stored for this command.",
+        )
+    assert summary is not None  # STORED always returns a summary -- see that method's docstring
+
+    return DiagnosticBundleUploadAccepted(
+        id=summary.bundle_id,
+        command_id=summary.command_id,
         received_at=summary.created_at,
         size_bytes=summary.size_bytes,
         content_hash=summary.content_hash,

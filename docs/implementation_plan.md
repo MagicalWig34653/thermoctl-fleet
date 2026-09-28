@@ -512,7 +512,8 @@ storage, heartbeat sending **SR**
 - Per-command follow-ups, each an honest failed result naming the package
   that will replace it: `report_now` needs P2.3 heartbeat acquisition;
   `fetch_logs` needed P5.3a masking/upload (done, see below);
-  `diagnostic_bundle` needs P5.3b; `backup_now` needs P5.5.
+  `diagnostic_bundle` needed P5.3b end-to-end encryption (done, see below);
+  `backup_now` needs P5.5.
 - LED `cloud_contact` follows the command channel's own already-existing
   WARNING log (no change to `agent/commands_channel.py`); `fault`/`control`
   stay honestly unknown (not a fabricated "no fault") via a deliberately
@@ -554,7 +555,7 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Depends on:** P5.2. **Read back by:** main session (filtering is
   security-relevant).
 
-#### P5.3b -- `create_diagnostic_bundle`, end-to-end encrypted **SR** -- open
+#### P5.3b -- `create_diagnostic_bundle`, end-to-end encrypted **SR** -- done
 - **Goal:** complete `create_diagnostic_bundle` (stage 1): logs of the four
   services, versions/digests, container states, memory/disk usage, Zigbee
   network state, the last control decisions -- packaged and **end-to-end
@@ -565,18 +566,32 @@ they must also stay conceptually separate, not just separately scheduled.
   decisions or heat-demand readings over time (section 6, section 21.5's
   own "Decided afterward" paragraph) -- a bundle is a snapshot over a few
   hours, not a channel.
-- **Files:** `agent/loop.py` (`create_diagnostic_bundle`), reusing
-  `agent/encryption.py` (P5.5a, done) directly rather than duplicating its
-  own recipients-file handling -- the project owner's 2026-09-26/27 backup
-  decision explicitly asks for the same encryption mechanism to be "reused
-  later by the encrypted diagnostic bundle", and `load_recipients`/
-  `encrypt_stream` are already general-purpose (a recipients file path, a
-  byte stream in, a byte stream out), not backup-specific, precisely for
-  this.
+- [x] done -- see `docs/STATUS.md`'s P5.3b section for the full design
+  (bundle contents, size bounds, retention) and verification output.
+- **Files:** `agent/loop.py` (`create_diagnostic_bundle`, `_handle_diagnostic_bundle`,
+  `upload_diagnostic_bundle`, `read_container_log_window`,
+  `read_container_state`), reusing `agent/encryption.py` (P5.5a, done)
+  directly rather than duplicating its own recipients-file handling -- the
+  project owner's 2026-09-26/27 backup decision explicitly asks for the
+  same encryption mechanism to be "reused later by the encrypted
+  diagnostic bundle", and `load_recipients`/`encrypt_stream` are already
+  general-purpose (a recipients file path, a byte stream in, a byte stream
+  out), not backup-specific, precisely for this. `protocol/diagnostics.py`
+  (new, `DiagnosticBundleUploadAccepted`, `PROTOCOL_VERSION` bumped to 6).
+  `fleet/app.py` (`POST /v1/commands/{id}/bundle`, retention loop),
+  `fleet/upload_streaming.py` (new, factored out of P5.5a's own
+  `upload_backup` so both endpoints share the streaming-cap/age-plausibility
+  logic), `fleet/bundle_storage.py` (new), `fleet/storage.py`
+  (`diagnostic_bundles` table, migration `0012_diagnostic_bundles.py`),
+  `fleet/ui_apartment.py`/`fleet/ui_routes.py`/`fleet/templates/ui/
+  apartment.html` (shown next to its command in "Befehle", not a separate
+  list).
 - **Section:** 15.1, 21.5.
-- **Acceptance:** test demonstrates the cloud never sees plaintext content,
-  and that a series of bundles cannot be used to reconstruct a heat-demand
-  timeline (only ever one bundle at a time, no accumulation).
+- **Acceptance:** test demonstrates the cloud never sees plaintext content
+  (real crypto throughout, marker-scanning tests), and that a bundle stays
+  a one-off snapshot, never accumulated as a series (one bundle per
+  command id, enforced at the database level; 14-day retention deletes the
+  fleet's own stored copy the same way `fetch_logs`'s excerpts expire).
 - **Depends on:** P5.2, P5.5a (done -- `agent/encryption.py`).
 - **Read back by:** main session (encryption and the "never a series"
   boundary are both security-relevant).

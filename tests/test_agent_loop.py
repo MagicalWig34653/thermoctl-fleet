@@ -1,7 +1,11 @@
 """Tests the section-21 stubs in `agent/loop.py`.
 
 `open_access` is the only one with a real check (the `pilot_mode` rejection) --
-accordingly two cases for it, not just one.
+accordingly two cases for it, not just one. `create_diagnostic_bundle` used to
+be one of these stubs (P5.2/P5.3a) -- it is now genuinely implemented (P5.3b);
+its own tests live in `tests/test_agent_diagnostic_bundle.py`, mirroring
+`create_backup`'s own split into `tests/test_agent_backup.py` (unit) and
+`tests/test_agent_backup_e2e.py` (real fleet app, real crypto).
 """
 
 from __future__ import annotations
@@ -9,7 +13,6 @@ from __future__ import annotations
 import pytest
 
 from agent.loop import (
-    create_diagnostic_bundle,
     esim_profile_activate,
     esim_profile_delete,
     esim_profile_load,
@@ -22,11 +25,6 @@ from agent.loop import (
 def test_factory_reset_reports_missing_implementation() -> None:
     with pytest.raises(NotImplementedError):
         factory_reset()
-
-
-def test_create_diagnostic_bundle_reports_missing_implementation() -> None:
-    with pytest.raises(NotImplementedError):
-        create_diagnostic_bundle()
 
 
 def test_open_access_rejects_without_pilot_mode_locally() -> None:
