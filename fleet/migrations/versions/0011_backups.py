@@ -24,14 +24,15 @@ A new `backups` table, one row per backup ever uploaded via `POST
 
 Two indexes: one unique on `backup_id` (the wire id lookup, download and
 retention), one on `apartment_id` (every apartment-scoped list).
-`down_revision` "0009" -- chains onto the most recent migration on `main`
-at the time this package started (P5.1's `0009_commands.py`); a parallel
-package's own migration (if any) is re-chained by the main session at
-merge time, per this repository's own established convention (every
-earlier migration's docstring already states the same rule for itself).
+`down_revision` **"0010"** -- originally chained onto `0009_commands.py`
+(P5.1) at the time this package started, developed in parallel with
+P5.3a's own `0010_command_log_excerpts.py`; re-chained onto that migration
+at merge time (main session, per this repository's own established "the
+main session re-chains" convention, already stated in this docstring's own
+previous revision) -- this migration is now `0011`, not `0010`.
 
-Revision ID: 0010
-Revises: 0009
+Revision ID: 0011
+Revises: 0010
 Create Date: 2026-09-27
 """
 
@@ -42,8 +43,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0010"
-down_revision: str | Sequence[str] | None = "0009"
+revision: str = "0011"
+down_revision: str | Sequence[str] | None = "0010"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -24,8 +24,10 @@ between the two packages of this repository and future compatibility checks.
 # models" too, per the project owner's 2026-09-26 literal reading of this
 # rule (see above) -- see protocol/commands.py and docs/STATUS.md's P5.3a
 # section.
-# 4: adds `protocol.backups` (`BackupKind`, `BackupUploadAccepted`) for
+# 5: adds `protocol.backups` (`BackupKind`, `BackupUploadAccepted`) for
 # `POST /v1/backups` (P5.5a, section 15.1/15.2) -- a wholly new module
 # counts as a change to "the models" too, per this file's own opening
-# paragraph.
-PROTOCOL_VERSION = 4
+# paragraph. Originally also numbered 4 (developed in parallel with P5.3a's
+# own `LogExcerpt` addition above) -- re-numbered to 5 when the two
+# branches were merged, since both cannot occupy the same version number.
+PROTOCOL_VERSION = 5

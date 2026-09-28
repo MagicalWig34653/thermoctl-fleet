@@ -198,9 +198,11 @@ blob (never named after the caller-supplied, unverified-until-just-now
 `content_hash`), written atomically (`O_EXCL` temp file, then
 `os.replace`). Metadata (`backup_id`, `apartment_id`, `kind`, `created_at`,
 `size_bytes`, `content_hash`, `storage_path`) in a new `backups` table
-(`fleet/migrations/versions/0010_backups.py`, chains onto `main`'s
-`0009_commands.py`) -- mirrors `commands`'s own "wire id is a separate,
-random, unique-indexed column, never the primary key" reasoning.
+(`fleet/migrations/versions/0011_backups.py` -- originally `0010`, chained
+onto `main`'s `0009_commands.py`; re-chained at merge time onto P5.3a's own
+parallel `0010_command_log_excerpts.py`, main-session convention) --
+mirrors `commands`'s own "wire id is a separate, random, unique-indexed
+column, never the primary key" reasoning.
 
 **Retention (section 15.2): "the last 14 daily backups, plus one weekly
 backup for each of the last eight weeks", applied per apartment and per
@@ -246,8 +248,10 @@ already tracks).
 **Protocol**: `protocol/backups.py` (new) -- `BackupKind` (closed,
 `device_config`/`operational_data`), `BackupUploadAccepted`,
 `MAX_BACKUP_UPLOAD_BYTES`, `AGE_HEADER_MAGIC`. `PROTOCOL_VERSION` bumped
-**3 -> 4** (a wholly new module counts as a change to "the models", per
-that file's own established reading of section 18.2).
+originally 3 -> 4; at merge time (this package's own change had landed in
+parallel with, and numbered the same as, P5.3a's own `LogExcerpt`
+addition) re-numbered to **5** -- a wholly new module counts as a change
+to "the models", per that file's own established reading of section 18.2.
 
 **Constraints honoured**: `protocol.commands.CommandType` unchanged (no
 new command was needed -- `backup_now` already existed); `watchdog/`
