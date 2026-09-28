@@ -152,6 +152,39 @@ def delete_user(username: str) -> int:
     return 0
 
 
+def rotate_epoch() -> int:
+    """`rotate-epoch` (P5.1c, `docs/specification.md` sections 3, 7) --
+    **run this once, by hand, right after restoring the fleet database
+    from an older backup** (`0012_fleet_epoch.py`'s own operator note).
+
+    A restored backup brings back whatever epoch id was stored in it at
+    backup time, which can still match an agent's own already-persisted
+    `Last-Event-ID` even though the restore just made the underlying
+    sequence numbers reusable again -- exactly the condition this whole
+    package exists to prevent. Rotating replaces the stored epoch with a
+    fresh, random one (`Storage.rotate_epoch`) that cannot possibly match
+    anything any agent has already persisted, so every agent's next
+    reconnect transparently falls back to `Last-Event-ID` `0` and simply
+    sees its still-pending commands again -- harmless redelivery, never a
+    silent skip (`Storage.pending_commands`'s own idempotent-redelivery
+    reasoning, unchanged by this package).
+
+    Not needed after a plain fresh deploy (`0012_fleet_epoch.py`'s own data
+    migration already gives a brand-new database its own epoch at
+    migration time) -- only after restoring an *existing* backup file.
+    """
+
+    storage = create_storage(_require_database_url())
+    new_epoch = storage.rotate_epoch(datetime.now(UTC))
+    print(f"Epoch rotated: {new_epoch}")
+    print(
+        "Every agent's persisted Last-Event-ID will stop matching and resume "
+        "from 0 on its next reconnect (safe: redelivery of still-pending "
+        "commands only, never a skip)."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m fleet.admin", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -172,6 +205,14 @@ def main(argv: list[str] | None = None) -> int:
     delete_parser = subparsers.add_parser("delete-user", help="Delete a UI account.")
     delete_parser.add_argument("username")
 
+    subparsers.add_parser(
+        "rotate-epoch",
+        help=(
+            "Rotate the fleet database's SSE resume epoch -- run once, by hand, "
+            "right after restoring an older backup (P5.1c)."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "create-user":
@@ -182,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         return unlock(args.username)
     if args.command == "delete-user":
         return delete_user(args.username)
+    if args.command == "rotate-epoch":
+        return rotate_epoch()
     raise AssertionError(f"unreachable: unknown command {args.command!r}")  # pragma: no cover
 
 

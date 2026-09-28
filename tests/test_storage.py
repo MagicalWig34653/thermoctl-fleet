@@ -36,6 +36,7 @@ from fleet.storage import (
     Base,
     CommandRecord,
     DeviceRecord,
+    FleetEpochRecord,
     HeartbeatRecord,
     InventoryAuditLogRecord,
     RecordCommandResultOutcome,
@@ -3345,3 +3346,133 @@ def test_migrations_0001_through_0010_match_the_orm_model_exactly(tmp_path: obje
         diff = compare_metadata(context, Base.metadata)
 
     assert diff == []
+
+
+# -----------------------------------------------------------------------------
+# P5.1c -- fleet database epoch (0012_fleet_epoch.py, Storage.get_epoch /
+# Storage.rotate_epoch)
+# -----------------------------------------------------------------------------
+
+
+def test_migration_0012_creates_the_fleet_epoch_table_with_one_row(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+
+    upgrade(url)
+
+    engine = create_storage(url).engine
+    columns = {column["name"] for column in inspect(engine).get_columns("fleet_epoch")}
+    assert columns == {"id", "epoch", "created_at"}
+
+    storage = create_storage(url)
+    with storage.session() as session:
+        rows = session.query(FleetEpochRecord).all()
+    assert len(rows) == 1
+    assert rows[0].id == 1
+    assert len(rows[0].epoch) == 32
+    assert all(char in "0123456789abcdef" for char in rows[0].epoch)
+
+
+def test_migration_0012_downgrade_removes_the_table_upgrade_restores_it(
+    tmp_path: object,
+) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_storage(url).engine
+    assert "fleet_epoch" in inspect(engine).get_table_names()
+
+    downgrade(url, "0011")
+    assert "fleet_epoch" not in inspect(engine).get_table_names()
+
+    upgrade(url)
+    assert "fleet_epoch" in inspect(engine).get_table_names()
+    # Upgrading again after the downgrade re-inserts a (different) row --
+    # exercised here so the round trip is proven end to end, not just that
+    # the table exists.
+    storage = create_storage(url)
+    assert len(storage.get_epoch()) == 32
+
+
+def test_migrations_0001_through_0012_match_the_orm_model_exactly(tmp_path: object) -> None:
+    """Extends the existing migration-vs-ORM coverage to include
+    `0012_fleet_epoch.py` -- see
+    `test_migrations_0001_through_0009_match_the_orm_model_exactly`'s own
+    docstring for why this is its own test."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    engine = create_storage(url).engine
+
+    with engine.connect() as connection:
+        context = MigrationContext.configure(connection)
+        diff = compare_metadata(context, Base.metadata)
+
+    assert diff == []
+
+
+def test_get_epoch_created_once_and_stable_across_repeated_reads(storage: Storage) -> None:
+    first = storage.get_epoch()
+    second = storage.get_epoch()
+
+    assert first == second
+
+
+def test_get_epoch_stable_across_separate_storage_instances(tmp_path: object) -> None:
+    """A fresh `Storage`/engine wrapping the same database file must see
+    the exact same epoch -- it lives in the database, not in per-process
+    memory (the whole point: it must survive a process restart)."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+
+    first_instance = create_storage(url)
+    second_instance = create_storage(url)
+
+    assert first_instance.get_epoch() == second_instance.get_epoch()
+
+
+def test_get_epoch_defensively_creates_a_row_if_the_table_is_empty(storage: Storage) -> None:
+    """Defensive get-or-create (`Storage.get_epoch`'s own docstring): if the
+    one row the migration inserts is somehow missing, a read still returns
+    a usable epoch instead of `None`/an exception, and a second read is
+    stable on the newly created value."""
+
+    with storage.session() as session:
+        session.query(FleetEpochRecord).delete()
+
+    first = storage.get_epoch()
+    second = storage.get_epoch()
+
+    assert first == second
+    assert len(first) == 32
+
+
+def test_rotate_epoch_replaces_the_stored_value(storage: Storage) -> None:
+    before = storage.get_epoch()
+
+    after = storage.rotate_epoch(datetime.now(UTC))
+
+    assert after != before
+    assert storage.get_epoch() == after
+
+
+def test_rotate_epoch_is_visible_from_a_separate_storage_instance(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    other_instance = create_storage(url)
+    before = other_instance.get_epoch()
+
+    rotated = storage.rotate_epoch(datetime.now(UTC))
+
+    assert other_instance.get_epoch() == rotated
+    assert rotated != before
+
+
+def test_rotate_epoch_creates_a_row_if_the_table_is_empty(storage: Storage) -> None:
+    with storage.session() as session:
+        session.query(FleetEpochRecord).delete()
+
+    rotated = storage.rotate_epoch(datetime.now(UTC))
+
+    assert storage.get_epoch() == rotated
+    assert len(rotated) == 32

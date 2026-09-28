@@ -335,3 +335,35 @@ def test_missing_database_url_exits_with_an_error(monkeypatch: pytest.MonkeyPatc
 def test_cli_requires_a_command() -> None:
     with pytest.raises(SystemExit):
         admin_module.main([])
+
+
+def test_rotate_epoch_replaces_the_stored_epoch_and_reports_it(
+    database_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`python -m fleet.admin rotate-epoch` (P5.1c) -- the operator step
+    after restoring an older backup, so every agent's already-persisted
+    `Last-Event-ID` stops matching and resumes from 0."""
+
+    storage = create_storage(database_url)
+    before = storage.get_epoch()
+
+    exit_code = admin_module.main(["rotate-epoch"])
+
+    assert exit_code == 0
+    after = create_storage(database_url).get_epoch()
+    assert after != before
+
+    captured = capsys.readouterr()
+    assert after in captured.out
+    assert "resume from 0" in captured.out
+
+
+def test_rotate_epoch_missing_database_url_exits_with_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FLEET_DATABASE_URL", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        admin_module.main(["rotate-epoch"])
+
+    assert excinfo.value.code == 2

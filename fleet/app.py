@@ -96,6 +96,19 @@ _DEFAULT_COMMANDS_SSE_RETRY_MS = 5_000
 _COMMANDS_SSE_PING_INTERVAL_ENV = "FLEET_COMMANDS_SSE_PING_INTERVAL_S"
 _DEFAULT_COMMANDS_SSE_PING_INTERVAL_S = 15.0
 
+# P5.1c: a well-formed SSE event id is `<epoch>.<sequence>` -- `<epoch>`
+# exactly matching `fleet.storage._generate_epoch`'s own shape (16 random
+# bytes, hex-encoded, always 32 lowercase hex characters), `<sequence>` a
+# run of digits bounded well short of where `int()` would need to reject it
+# for `Storage.pending_commands`'s own `_MAX_COMMAND_SEQUENCE` guard (20
+# digits comfortably covers `2**63 - 1`, 19 digits, with room to spare).
+# Anything that does not match this shape at all -- an old, pre-P5.1c plain
+# integer id, another epoch's id, or outright garbage/header-injection
+# attempts -- is handled the same way `_last_event_id` always handled an
+# unparsable value: fall back to `0`, never a crash (CLAUDE.md security
+# principle 5 applied to a client-supplied header).
+_EVENT_ID_PATTERN = re.compile(r"^([0-9a-f]{32})\.([0-9]{1,20})$")
+
 # P5.5a, section 15.2: "enforced by a periodic cleanup". A long default --
 # unlike the alarm/command polls above, retention is bounded by *days*
 # (14 daily) and *weeks* (8 weekly), so running it every few minutes would
@@ -414,27 +427,50 @@ def receive_event(
     storage.save_event(apartment, event, datetime.now(UTC))
 
 
-def _last_event_id(request: Request) -> int:
+def _last_event_id(request: Request, current_epoch: str) -> int:
     """Parses the `Last-Event-ID` request header (section 3: "reconnection,
     event numbering, and catch-up delivery are already fixed in the
     format") into the sequence number to resume after.
 
+    **P5.1c: the header is now `<epoch>.<sequence>`, not a plain integer**
+    (`_EVENT_ID_PATTERN`, `fleet.storage.Storage.get_epoch`) -- see
+    `0012_fleet_epoch.py`'s own docstring for why: after the fleet
+    database is reset or restored from an older backup, a plain sequence
+    number can be *reused* by a brand-new command, which a bare integer
+    `Last-Event-ID` cannot be told apart from. The epoch part must equal
+    `current_epoch` (this request's own, freshly read `Storage.get_epoch`)
+    for the sequence part to be honoured at all -- an older epoch (a
+    restored backup) or no epoch at all (a value from before this package
+    existed, still a bare integer) can therefore never resume past a
+    command that only exists because of the reset/restore.
+
     Absent (a fresh connection, or a client that does not support
-    resumption at all) or unparsable (a malformed or forged header --
-    CLAUDE.md security principle 5 applied to a client-supplied value, the
-    same reasoning `agent.registration._parse_and_clamp_retry_after`
-    already applies to a *server*-supplied one) both fall back to `0`,
-    meaning "everything still pending", never a crash or a 500 -- a client
-    with no valid resume point should simply see every pending command
-    again, not be refused.
+    resumption at all), a bare pre-P5.1c integer, an epoch that does not
+    match `current_epoch`, or anything else that fails `_EVENT_ID_PATTERN`
+    outright (a malformed or forged header, including a header-injection
+    attempt -- CLAUDE.md security principle 5 applied to a client-supplied
+    value, the same reasoning `agent.registration
+    ._parse_and_clamp_retry_after` already applies to a *server*-supplied
+    one) all fall back to `0`, meaning "everything still pending", never a
+    crash or a 500 -- a client with no valid resume point should simply see
+    every pending command again, not be refused. `Storage.pending_commands`
+    own membership check (P5.1 cross-review) is unchanged and still applies
+    on top of this -- the epoch check only decides *whether the sequence
+    part is even worth asking that question about*.
     """
 
     raw = request.headers.get("last-event-id")
     if raw is None:
         return 0
+    match = _EVENT_ID_PATTERN.match(raw)
+    if match is None:
+        return 0
+    epoch_part, sequence_part = match.groups()
+    if epoch_part != current_epoch:
+        return 0
     try:
-        return int(raw)
-    except ValueError:
+        return int(sequence_part)
+    except ValueError:  # pragma: no cover -- unreachable, the pattern is digits-only
         return 0
 
 
@@ -445,6 +481,7 @@ async def _stream_command_events(
     poll_interval_s: float,
     retry_ms: int,
     is_disconnected: Callable[[], Awaitable[bool]],
+    epoch: str,
 ) -> AsyncIterator[dict[str, object]]:
     """The actual SSE event generator for `commands_stream`'s open-connection
     case -- pulled out as a plain, directly testable module-level function
@@ -459,6 +496,16 @@ async def _stream_command_events(
     SSE event dict (`event`, `id`, `data`, `retry`) per pending command,
     then `asyncio.sleep(poll_interval_s)` before the next poll -- see
     `commands_stream`'s own docstring for the full reasoning.
+
+    **P5.1c:** `id` is `<epoch>.<sequence>`, not a bare sequence -- `epoch`
+    is read once by the caller (`Storage.get_epoch`) and threaded through
+    unchanged for the whole connection's lifetime (a `rotate-epoch` run
+    mid-connection does not retroactively change ids already sent, it only
+    ever changes what a *future* connection's own `Last-Event-ID` is
+    checked against). `after_sequence` itself is still a bare int here --
+    the epoch check already happened once, in `_last_event_id`, before this
+    generator was ever created; `Storage.pending_commands`'s own membership
+    check is unchanged.
     """
 
     sequence = after_sequence
@@ -472,7 +519,7 @@ async def _stream_command_events(
             sequence = item.sequence
             yield {
                 "event": "message",
-                "id": str(item.sequence),
+                "id": f"{epoch}.{item.sequence}",
                 "data": item.command.model_dump_json(),
                 "retry": retry_ms,
             }
@@ -511,21 +558,27 @@ async def commands_stream(
     challenge` already uses for its own 60 s poll interval.
 
     **The open-connection case** writes one SSE event per pending command:
-    `id: <sequence>` (`Last-Event-ID` resumes from this on reconnection),
-    `data: <Command JSON>`, plus a `retry:` hint (section 3: "reconnection
-    ... already fixed in the format"). **Expired commands are never
-    delivered** (section 7) -- filtered inside `Storage.pending_commands`
-    itself, not here. The stream **polls storage at a small, configurable
-    interval** (`_COMMANDS_POLL_INTERVAL_ENV`) rather than busy-looping,
-    and ends cleanly on client disconnect (`request.is_disconnected()`,
-    checked before every poll -- `sse_starlette.EventSourceResponse` itself
-    also stops iterating the moment the underlying connection closes, this
-    check just avoids one needless poll in between). **Keep-alive
-    comments** (`: ping`) are `EventSourceResponse`'s own built-in
-    mechanism (`ping=`), not reimplemented here.
+    `id: <epoch>.<sequence>` (`Last-Event-ID` resumes from this on
+    reconnection -- **P5.1c**: prefixed with this fleet database's own
+    stable epoch id, `Storage.get_epoch`, so a `Last-Event-ID` from before
+    a database reset/restore can never be confused with one issued after
+    it, even if the bare sequence number was reused -- see
+    `0012_fleet_epoch.py`'s own docstring), `data: <Command JSON>`, plus a
+    `retry:` hint (section 3: "reconnection ... already fixed in the
+    format"). **Expired commands are never delivered** (section 7) --
+    filtered inside `Storage.pending_commands` itself, not here. The stream
+    **polls storage at a small, configurable interval**
+    (`_COMMANDS_POLL_INTERVAL_ENV`) rather than busy-looping, and ends
+    cleanly on client disconnect (`request.is_disconnected()`, checked
+    before every poll -- `sse_starlette.EventSourceResponse` itself also
+    stops iterating the moment the underlying connection closes, this check
+    just avoids one needless poll in between). **Keep-alive comments**
+    (`: ping`) are `EventSourceResponse`'s own built-in mechanism (`ping=`),
+    not reimplemented here.
     """
 
-    after_sequence = _last_event_id(request)
+    epoch = await asyncio.to_thread(storage.get_epoch)
+    after_sequence = _last_event_id(request, epoch)
     poll_interval_s = float(
         os.environ.get(_COMMANDS_POLL_INTERVAL_ENV, _DEFAULT_COMMANDS_POLL_INTERVAL_S)
     )
@@ -560,6 +613,7 @@ async def commands_stream(
         poll_interval_s,
         retry_ms,
         request.is_disconnected,
+        epoch,
     )
     return EventSourceResponse(events, ping=ping_interval_s)
 

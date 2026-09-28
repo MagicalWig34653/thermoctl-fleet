@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
@@ -85,6 +86,24 @@ logger = logging.getLogger(__name__)
 
 # Section 3's own fallback cadence: "the agent polls every 60 s".
 DEFAULT_FALLBACK_POLL_INTERVAL_S = 60.0
+
+# P5.1c: a persisted `Last-Event-ID` is sent verbatim into an HTTP request
+# header (`_stream_once`/`_poll_once`) -- bounded in both length and
+# charset before that ever happens, so a corrupted or tampered state file
+# can never smuggle a CR/LF or other unexpected byte into a header
+# (header-injection). `fleet.app`'s own current shape is `<epoch>.<sequence>`
+# (`_EVENT_ID_PATTERN` there: 32 hex characters, a dot, up to 20 digits --
+# 53 characters at most), but this agent treats the value as opaque and
+# does not hard-code that exact shape; the charset (`[0-9a-f.]`) and a
+# generous length ceiling are the only properties actually needed to rule
+# out header injection, not a specific format this module has no business
+# assuming will never change server-side.
+_MAX_LAST_EVENT_ID_LENGTH = 64
+_LAST_EVENT_ID_PATTERN = re.compile(r"^[0-9a-f.]+$")
+
+
+def _is_bounded_last_event_id(value: str) -> bool:
+    return len(value) <= _MAX_LAST_EVENT_ID_LENGTH and bool(_LAST_EVENT_ID_PATTERN.match(value))
 
 # Bounded, the same reasoning as `agent.heartbeat_sender`'s own buffer cap
 # (`protocol.heartbeat.MAX_CATCH_UP_HEARTBEATS`): an agent that can never
@@ -237,7 +256,22 @@ def _read_last_event_id(path: Path) -> str | None:
     already-delivered commands on the next resume, which P5.2's own id
     de-duplication (`AgentState.executed_ids`) already makes harmless (see
     this module's own docstring); it is not an execution-safety mechanism,
-    so there is nothing to fail *closed* about here."""
+    so there is nothing to fail *closed* about here.
+
+    **P5.1c:** this value is still treated as an opaque bookmark string
+    end to end -- it is never parsed as an integer here, only persisted and
+    replayed verbatim (`fleet.app._last_event_id` is the only place that
+    ever interprets its structure, `<epoch>.<sequence>`). It *is*, however,
+    sent straight into an HTTP request header (`_stream_once`/`_poll_once`,
+    `headers["Last-Event-ID"] = last_event_id`) -- so before it is ever
+    returned to a caller, `_is_bounded_last_event_id` checks it is short
+    and plain enough (`[0-9a-f.]`, at most `_MAX_LAST_EVENT_ID_LENGTH`
+    characters) to rule out header injection (a CR/LF or otherwise
+    unexpected byte smuggled into the persisted file, whether from a
+    corrupted write or a tampered state file) before it is ever bound as a
+    header value. A value that fails this check is treated exactly like a
+    missing one: `None`, "everything still pending" -- never propagated as
+    a malformed header, and never a reason to crash this channel."""
 
     try:
         raw = read_text_safe(path)
@@ -246,7 +280,15 @@ def _read_last_event_id(path: Path) -> str | None:
     if raw is None:
         return None
     raw = raw.strip()
-    return raw or None
+    if not raw:
+        return None
+    if not _is_bounded_last_event_id(raw):
+        logger.warning(
+            "Persisted Last-Event-ID failed the charset/length check; "
+            "ignoring it and resuming from 0."
+        )
+        return None
+    return raw
 
 
 def _write_last_event_id(path: Path, value: str) -> None:

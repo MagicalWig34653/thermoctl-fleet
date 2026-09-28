@@ -654,6 +654,24 @@ class CommandLogExcerptRecord(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
 
+class FleetEpochRecord(Base):
+    """P5.1c: the one-row `fleet_epoch` table -- see
+    `0012_fleet_epoch.py`'s own docstring for the full reasoning (SSE
+    resume across a fleet database restore/reset). `id` is always
+    `_FLEET_EPOCH_ROW_ID` -- a real primary key, not merely a convention,
+    so a second row can never accidentally exist. `epoch` is what
+    `fleet.app.commands_stream` prefixes every SSE event id with
+    (`<epoch>.<sequence>`) and what an incoming `Last-Event-ID` must match
+    the epoch part of to be honoured at all (`Storage.get_epoch`,
+    `fleet.app._last_event_id`)."""
+
+    __tablename__ = "fleet_epoch"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    epoch: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
 class StoreLogExcerptOutcome(StrEnum):
     """What `Storage.store_log_excerpt` actually did -- `fleet.app`'s new
     `POST /v1/commands/{id}/logs` route maps each value to its own HTTP
@@ -754,6 +772,18 @@ _MAX_COMMAND_HISTORY_ROWS = 200
 # depending on dialect, rather than the ordinary "not a valid resume point"
 # fallback every other out-of-range value already gets.
 _MAX_COMMAND_SEQUENCE = 2**63 - 1
+
+# P5.1c: the pinned row id `fleet_epoch` ever holds -- see
+# `FleetEpochRecord`'s own docstring.
+_FLEET_EPOCH_ROW_ID = 1
+
+# 16 random bytes, hex-encoded (32 characters) -- matches
+# `0012_fleet_epoch.py`'s own migration-time generation exactly, so a
+# defensively-created epoch (`Storage.get_epoch`'s fallback, see there) and
+# `Storage.rotate_epoch` produce values indistinguishable in shape from the
+# one the migration itself inserts.
+def _generate_epoch() -> str:
+    return secrets.token_hex(16)
 
 
 @dataclass(frozen=True)
@@ -1777,6 +1807,78 @@ class Storage:
             record.error_text = result.error_text
             record.result_received_at = _naive_utc(now)
             return RecordCommandResultOutcome.STORED
+
+    # -- fleet database epoch (P5.1c, sections 3, 7) -----------------------------
+
+    def get_epoch(self) -> str:
+        """This fleet database's own stable epoch id (`FleetEpochRecord`,
+        `0012_fleet_epoch.py`) -- `fleet.app.commands_stream` prefixes every
+        SSE event id with it (`<epoch>.<sequence>`) and only ever honours a
+        `Last-Event-ID` whose epoch part still matches this value (see the
+        migration's own docstring for the restore/reset reasoning this
+        exists for).
+
+        **Defensive get-or-create, not a plain read:** the migration
+        already inserts the one row this reads back, so the normal path
+        here is a lookup that always succeeds; this only falls back to
+        creating a fresh row if that row is somehow missing (e.g. a
+        database whose `fleet_epoch` table exists -- migrated -- but whose
+        data insert never ran, or was manually removed) -- the same "never
+        crash the SSE endpoint over a missing value, only ever fall back to
+        the safe default" reasoning `fleet.app._last_event_id` already
+        applies to a malformed header: a database with no epoch at all
+        behaves exactly like one that was just reset, which is correct --
+        no agent could possibly hold a `Last-Event-ID` naming an epoch
+        that never existed.
+        """
+
+        with self.session() as session:
+            record = session.get(FleetEpochRecord, _FLEET_EPOCH_ROW_ID)
+            if record is None:
+                record = FleetEpochRecord(
+                    id=_FLEET_EPOCH_ROW_ID,
+                    epoch=_generate_epoch(),
+                    created_at=_naive_utc(datetime.now(UTC)),
+                )
+                session.add(record)
+                session.flush()
+            return record.epoch
+
+    def rotate_epoch(self, now: datetime) -> str:
+        """Replaces the stored epoch with a fresh, random one -- the
+        operator-facing half of P5.1c (`python -m fleet.admin
+        rotate-epoch`, `fleet.admin.rotate_epoch`). **Not automatic**: a
+        database restored from an existing backup file restores whatever
+        epoch was already in that backup verbatim (`fleet_epoch` is an
+        ordinary table, backed up and restored like any other) -- this must
+        be run by hand, once, right after a restore, per the operator note
+        in `0012_fleet_epoch.py`'s own docstring.
+
+        A fresh epoch can never match what any agent has already persisted
+        (`secrets.token_hex(16)`, the same 16-random-bytes generation the
+        migration itself uses), so every agent's own `Last-Event-ID`
+        transparently stops being honoured and falls back to `0` on its
+        next reconnect -- redelivery of everything still pending, never a
+        skip (`Storage.pending_commands`'s own "redelivery is always safe"
+        reasoning, unchanged by this package).
+
+        Returns the new epoch, so the CLI can echo it back for the
+        operator's own records.
+        """
+
+        new_epoch = _generate_epoch()
+        with self.session() as session:
+            record = session.get(FleetEpochRecord, _FLEET_EPOCH_ROW_ID)
+            if record is None:
+                session.add(
+                    FleetEpochRecord(
+                        id=_FLEET_EPOCH_ROW_ID, epoch=new_epoch, created_at=_naive_utc(now)
+                    )
+                )
+            else:
+                record.epoch = new_epoch
+                record.created_at = _naive_utc(now)
+        return new_epoch
 
     # -- fetch_logs uploads (P5.3a, sections 6, 7, 21.5) --------------------------
 

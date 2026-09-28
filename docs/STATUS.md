@@ -2,6 +2,129 @@
 
 Last updated: 2026-09-28.
 
+## P5.1c -- SSE resume survives a fleet database restore (sections 3, 7)
+
+**The problem** (found during the P5.E end-to-end run, 2026-09-28): the SSE
+event id is `commands.id`, a single autoincrement counter shared by every
+apartment. The server only ever honours a `Last-Event-ID` if it names one
+of *this* apartment's own command sequences (P5.1's cross-review
+membership fix, above). That check is correct as far as it goes, but it
+cannot see the fleet database being **reset or restored from an older
+backup** underneath it: sequence numbers restart, and a sequence an agent
+already persisted can be *reused* by a brand-new, unrelated command for
+the same apartment -- which *does* pass the membership check (it really is
+one of this apartment's own sequences now), so the new command is silently
+skipped instead of delivered. In the E2E run's scenario (f) this hung for
+hours.
+
+**Fix: a random, stable epoch id, created once per database lifetime.**
+New migration `fleet/migrations/versions/0012_fleet_epoch.py`
+(`down_revision="0011"`), a one-row `fleet_epoch` table (`FleetEpochRecord`
+in `fleet/storage.py`): `id` pinned to `1` (a real primary key, so a second
+row can never exist), `epoch` a fresh `secrets.token_hex(16)` generated
+**at migration time** (an empty, just-migrated database gets its own epoch
+immediately), `created_at` for operator visibility only.
+
+`Storage.get_epoch()` reads it back (defensive get-or-create if the row is
+somehow missing -- never a crash, falls back to creating a fresh one, the
+same "fail toward the safe default" reasoning `_last_event_id` already
+applies to a malformed header). `Storage.rotate_epoch(now)` replaces it
+with a fresh random value -- the operator-facing half, `python -m
+fleet.admin rotate-epoch` (new CLI subcommand, `fleet/admin.py`).
+
+**Fleet side (`fleet/app.py`):** the SSE event id is now `<epoch>.<sequence>`,
+not a bare sequence (`_stream_command_events`, threaded through from
+`commands_stream`'s own `epoch = await asyncio.to_thread(storage.get_epoch)`,
+read once per connection/request). `_last_event_id(request, current_epoch)`
+parses `Last-Event-ID` against `_EVENT_ID_PATTERN`
+(`^([0-9a-f]{32})\.([0-9]{1,20})$`) and only returns the sequence part if
+the epoch part equals `current_epoch` -- anything else (an old, bare
+pre-P5.1c integer; a mismatched epoch; garbage; a header-injection
+attempt) falls back to `0`, exactly like every other invalid value this
+function already handled, never a 500. `wait=0` is unchanged otherwise --
+it still does not advance the bookmark, still honours `Last-Event-ID` the
+same way. `Storage.pending_commands`'s own membership check (P5.1
+cross-review) is completely unchanged -- the epoch check only decides
+whether the sequence part is even worth asking that question about; the
+two checks are orthogonal and stack.
+
+**Agent side (`agent/commands_channel.py`):** `_read_last_event_id`
+already treated the persisted value as an opaque string (verified while
+reading this package's own brief -- it was never parsed as an integer
+anywhere in this module). Added: a bound before the value is ever
+returned to a caller that sends it in an HTTP header --
+`_is_bounded_last_event_id` (charset `[0-9a-f.]`, length ≤
+`_MAX_LAST_EVENT_ID_LENGTH` = 64) rejects a too-long or wrong-charset
+value (including a CR/LF header-injection attempt), falling back to
+`None` -- "no bookmark persisted", exactly the same as a genuinely absent
+file, never propagated as an error. Deliberately does **not** hard-code
+the fleet's own `<epoch>.<sequence>` shape here -- only the properties
+actually needed to rule out header injection, since this module has no
+business assuming the exact format will never change server-side again.
+
+**Operator note (documented here and in `0012_fleet_epoch.py`'s own
+docstring):** rotating the epoch is a **manual** step, not automatic -- a
+freshly migrated, empty database gets a new epoch for free (the migration's
+own data insert), but a database *restored* from an existing backup file
+also restores whatever epoch was already in that file verbatim
+(`fleet_epoch` is an ordinary table, backed up and restored like any
+other). **After restoring a backup, run `python -m fleet.admin
+rotate-epoch` once, by hand** -- every agent's already-persisted
+`Last-Event-ID` then stops matching and falls back to `0` on its next
+reconnect, which only ever means redelivery of still-pending commands
+(harmless, P5.1's own original design), never the silent skip this
+package exists to prevent.
+
+**No `protocol/` change, `PROTOCOL_VERSION` unchanged** -- confirmed
+while implementing: the SSE `id:` field is SSE/transport metadata (the
+reconnection mechanism section 3 already describes), never part of
+`protocol.commands.Command` or any other wire model; nothing in
+`protocol/` references it.
+
+**Tested:** epoch created once, stable across repeated reads, across
+separate `Storage` instances, and (implicitly, since it lives in the
+database, not in process memory) across a process restart
+(`tests/test_storage.py`); the defensive get-or-create if the row is
+missing; `rotate_epoch` replaces the value and is visible from a separate
+`Storage` instance (`tests/test_storage.py`); migration 0012 up/down and
+`compare_metadata` against `0001`-`0012` (`tests/test_storage.py`).
+HTTP/SSE level (`tests/test_fleet.py`): `wait=0` and the direct
+`_stream_command_events` generator both carry the epoch-prefixed id; a
+current-epoch `Last-Event-ID` with the apartment's own sequence resumes
+correctly; a bare pre-P5.1c integer id, a wrong-epoch id, and a
+parametrized set of garbage/header-injection attempts (empty string, a
+lone dot, a too-short/too-long/uppercase epoch, a negative sequence, a
+CR/LF injection attempt, a missing sequence) all fall back to `0`, never a
+500; **the core reproduction**
+(`test_commands_stream_sse_survives_a_simulated_restore_new_command_not_skipped`):
+persist a bookmark from one database, "restore" (a brand-new, separately
+migrated database at a different path -- its own fresh epoch, its own
+`commands.id` counter starting back at 1), create a new command that
+reuses sequence 1, confirm it is delivered, not skipped. CLI
+(`tests/test_admin.py`): `rotate-epoch` replaces the epoch and reports it;
+missing `FLEET_DATABASE_URL` exits `2`. Agent
+(`tests/test_agent_commands_channel.py`): the persisted `<epoch>.<sequence>`
+value round-trips opaquely; a parametrized set of out-of-bounds/injection
+values (too long, CR/LF, uppercase, embedded whitespace, a NUL byte) are
+all refused and treated as no bookmark; a value at exactly the length
+ceiling is still accepted; `_stream_once` never sends an invalid persisted
+value as a header at all; the existing end-to-end SSE tests updated to
+assert the epoch-prefixed persisted value
+(`test_receive_commands_holds_an_sse_connection_and_receives_a_command`).
+
+**Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`): `ruff check .` and `mypy .` / `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning -rA`
+**2x**: **1278 passed, 1 skipped** (the pre-existing `age` CLI skip)
+identical both runs, coverage **99%** (4889 statements, 25 missed)
+identical both runs -- `fleet/app.py`, `fleet/storage.py`'s new epoch
+methods, `fleet/admin.py`'s `rotate_epoch`,
+`fleet/migrations/versions/0012_fleet_epoch.py`, and
+`agent/commands_channel.py` all at 100% for this package's own new/changed
+lines (checked via a targeted `--cov` run against exactly those modules).
+`watchdog/` and `protocol/` untouched by this package (`git diff --stat`
+confirms).
+
 ## P5.5a cross-review fixes: duplicate recipients, a memory DoS on the upload endpoint, an insufficient age-file check, and an unhandled handler exception
 
 Cross-review of P5.5a (commit `167bc63`) confirmed the no-plaintext path,

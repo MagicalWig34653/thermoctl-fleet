@@ -975,7 +975,12 @@ def test_commands_stream_wait_0_honours_last_event_id(
 ) -> None:
     """`Last-Event-ID` resumption applies to the `wait=0` fallback too, not
     only to an open SSE connection -- a polling client that already saw
-    the first command must not see it again."""
+    the first command must not see it again.
+
+    **P5.1c:** the header is now `<epoch>.<sequence>`, not a bare sequence
+    -- `storage.get_epoch()` is this test database's own current epoch,
+    exactly what `fleet.app.commands_stream` itself reads and compares
+    against."""
 
     first = storage.create_command(
         APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
@@ -994,10 +999,11 @@ def test_commands_stream_wait_0_honours_last_event_id(
     pending = storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
     assert [item.command.id for item in pending] == [first.id, second.id]
     first_sequence = pending[0].sequence
+    epoch = storage.get_epoch()
 
     response = client.get(
         "/v1/commands?wait=0",
-        headers={**_bearer(token), "Last-Event-ID": str(first_sequence)},
+        headers={**_bearer(token), "Last-Event-ID": f"{epoch}.{first_sequence}"},
     )
 
     assert response.status_code == 200
@@ -1024,10 +1030,11 @@ def test_commands_stream_wait_0_out_of_range_last_event_id_does_not_hide_own_com
         APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
         now=datetime.now(UTC),
     )
+    epoch = storage.get_epoch()
 
     response = client.get(
         "/v1/commands?wait=0",
-        headers={**_bearer(token), "Last-Event-ID": "16"},
+        headers={**_bearer(token), "Last-Event-ID": f"{epoch}.16"},
     )
 
     assert response.status_code == 200
@@ -1059,10 +1066,14 @@ def test_commands_stream_wait_0_between_range_last_event_id_does_not_hide_own_co
     all_pending = storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
     assert [item.command.id for item in all_pending] == [first.id, eleventh.id]
     other_apartments_between_sequence = all_pending[0].sequence + 1
+    epoch = storage.get_epoch()
 
     response = client.get(
         "/v1/commands?wait=0",
-        headers={**_bearer(token), "Last-Event-ID": str(other_apartments_between_sequence)},
+        headers={
+            **_bearer(token),
+            "Last-Event-ID": f"{epoch}.{other_apartments_between_sequence}",
+        },
     )
 
     assert response.status_code == 200
@@ -1090,6 +1101,169 @@ def test_commands_stream_wait_0_with_a_malformed_last_event_id_is_treated_as_0(
     assert [entry["id"] for entry in response.json()] == [command.id]
 
 
+# -----------------------------------------------------------------------------
+# P5.1c -- SSE resume survives a fleet database restore (epoch id)
+# -----------------------------------------------------------------------------
+
+
+def test_epoch_is_created_once_and_stable_across_repeated_reads(storage: Storage) -> None:
+    """`Storage.get_epoch` returns the same value on every call -- the
+    epoch inserted once by `0012_fleet_epoch.py`'s own data migration, not
+    regenerated per read."""
+
+    first = storage.get_epoch()
+    second = storage.get_epoch()
+
+    assert first == second
+    assert len(first) == 32
+    assert all(char in "0123456789abcdef" for char in first)
+
+
+def test_commands_stream_wait_0_old_style_plain_integer_last_event_id_is_treated_as_0(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """A bare integer `Last-Event-ID` (the pre-P5.1c shape, e.g. from an
+    agent that has not yet reconnected since this package's fleet-side
+    upgrade) no longer matches `<epoch>.<sequence>` at all -- treated
+    exactly like a malformed header, falling back to `0`, never trusted as
+    a sequence number without an epoch to check it against."""
+
+    first = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    second = storage.create_command(
+        APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    pending = storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
+    first_sequence = pending[0].sequence
+
+    response = client.get(
+        "/v1/commands?wait=0",
+        headers={**_bearer(token), "Last-Event-ID": str(first_sequence)},
+    )
+
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [first.id, second.id]
+
+
+@pytest.mark.parametrize(
+    "raw_header",
+    [
+        "not-a-number",
+        "",
+        ".",
+        "1",
+        "deadbeef.1",  # too short an epoch
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef.1",  # too long an epoch
+        "DEADBEEFDEADBEEFDEADBEEFDEADBEEF.1",  # uppercase, never generated
+        "deadbeefdeadbeefdeadbeefdeadbeef.-1",  # negative sequence
+        "deadbeefdeadbeefdeadbeefdeadbeef.1\r\nX-Injected: yes",  # header injection attempt
+        "deadbeefdeadbeefdeadbeefdeadbeef.",  # missing sequence
+    ],
+)
+def test_commands_stream_wait_0_garbage_last_event_id_is_treated_as_0(
+    client: TestClient, storage: Storage, token: str, raw_header: str
+) -> None:
+    """Garbage, an out-of-shape epoch, or a header-injection attempt in
+    `Last-Event-ID` -- all fall back to `0`, never a 500 and never treated
+    as a valid resume point (CLAUDE.md security principle 5)."""
+
+    command = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.get(
+        "/v1/commands?wait=0",
+        headers={**_bearer(token), "Last-Event-ID": raw_header},
+    )
+
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [command.id]
+
+
+def test_commands_stream_wait_0_a_different_epoch_is_treated_as_0(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """A `Last-Event-ID` naming a real sequence but the *wrong* epoch (a
+    bookmark persisted before a database restore/reset that produced a new
+    epoch) must not be honoured -- exactly the case `0012_fleet_epoch.py`
+    exists for."""
+
+    own_command = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    pending = storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
+    sequence = pending[0].sequence
+    wrong_epoch = "0" * 32
+    assert wrong_epoch != storage.get_epoch()
+
+    response = client.get(
+        "/v1/commands?wait=0",
+        headers={**_bearer(token), "Last-Event-ID": f"{wrong_epoch}.{sequence}"},
+    )
+
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [own_command.id]
+
+
+def test_commands_stream_sse_survives_a_simulated_restore_new_command_not_skipped(
+    tmp_path: object, token: str
+) -> None:
+    """**The core P5.1c reproduction.** An agent persists a bookmark from
+    one fleet database ("before the restore"); the fleet database is then
+    reset ("simulated restore" -- a brand-new, freshly migrated database at
+    a different path, which gets its own fresh epoch and starts its own
+    `commands.id` autoincrement counter back at 1, exactly like a restored
+    or reset database would). A brand-new command for the same apartment
+    then reuses sequence 1 -- the exact scenario that hung for hours in the
+    P5.E end-to-end run (2026-09-28): the pre-P5.1c bare-integer
+    `Last-Event-ID` would have matched this reused sequence and hidden the
+    new command. With the epoch check in place, the mismatched epoch part
+    makes the persisted bookmark invalid, `after_sequence` falls back to
+    `0`, and the new command is delivered."""
+
+    old_url = f"sqlite:///{tmp_path}/fleet-before-restore.db"
+    upgrade(old_url)
+    old_storage = create_storage(old_url)
+    old_storage.set_apartment_token(APARTMENT, token)
+    old_storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    old_pending = old_storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
+    persisted_last_event_id = f"{old_storage.get_epoch()}.{old_pending[0].sequence}"
+
+    # "Restore": a brand-new database, own fresh epoch, own sequence
+    # counter starting back at 1.
+    new_url = f"sqlite:///{tmp_path}/fleet-after-restore.db"
+    upgrade(new_url)
+    new_storage = create_storage(new_url)
+    new_storage.set_apartment_token(APARTMENT, token)
+    new_command = new_storage.create_command(
+        APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    new_pending = new_storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
+    assert new_pending[0].sequence == 1  # the reused sequence number
+
+    app.dependency_overrides[get_storage] = lambda: new_storage
+    try:
+        with TestClient(app, raise_server_exceptions=True) as restored_client:
+            response = restored_client.get(
+                "/v1/commands?wait=0",
+                headers={**_bearer(token), "Last-Event-ID": persisted_last_event_id},
+            )
+    finally:
+        app.dependency_overrides.pop(get_storage, None)
+
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [new_command.id]
+
+
 def test_commands_stream_sse_delivers_pending_command_with_correct_id_and_data(
     storage: Storage, token: str
 ) -> None:
@@ -1099,7 +1273,7 @@ def test_commands_stream_sse_delivers_pending_command_with_correct_id_and_data(
     rather than through `TestClient`'s own streaming transport, which does
     not read an `EventSourceResponse` incrementally.
 
-    Asserts the SSE event's `id:` is the storage sequence number (what
+    Asserts the SSE event's `id:` is `<epoch>.<sequence>` (P5.1c -- what
     `Last-Event-ID` resumes from) and `data:` round-trips to the exact
     `Command` that was created.
     """
@@ -1108,6 +1282,7 @@ def test_commands_stream_sse_delivers_pending_command_with_correct_id_and_data(
         APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
         now=datetime.now(UTC),
     )
+    epoch = storage.get_epoch()
 
     calls = {"n": 0}
 
@@ -1118,7 +1293,7 @@ def test_commands_stream_sse_delivers_pending_command_with_correct_id_and_data(
     async def run() -> list[dict[str, object]]:
         events = []
         async for event in fleet_app._stream_command_events(
-            storage, APARTMENT, 0, 0.001, 5000, is_disconnected
+            storage, APARTMENT, 0, 0.001, 5000, is_disconnected, epoch
         ):
             events.append(event)
         return events
@@ -1127,7 +1302,7 @@ def test_commands_stream_sse_delivers_pending_command_with_correct_id_and_data(
 
     assert len(events) == 1
     assert events[0]["event"] == "message"
-    assert events[0]["id"] == "1"
+    assert events[0]["id"] == f"{epoch}.1"
     raw_data = events[0]["data"]
     assert isinstance(raw_data, str)
     delivered = protocol_commands.Command.model_validate_json(raw_data)
@@ -1150,6 +1325,7 @@ def test_commands_stream_sse_last_event_id_resume_skips_older_ones(
         now=datetime.now(UTC),
     )
 
+    epoch = storage.get_epoch()
     calls = {"n": 0}
 
     async def is_disconnected() -> bool:
@@ -1159,7 +1335,7 @@ def test_commands_stream_sse_last_event_id_resume_skips_older_ones(
     async def run() -> list[dict[str, object]]:
         events = []
         async for event in fleet_app._stream_command_events(
-            storage, APARTMENT, 1, 0.001, 5000, is_disconnected
+            storage, APARTMENT, 1, 0.001, 5000, is_disconnected, epoch
         ):
             events.append(event)
         return events
@@ -1180,6 +1356,7 @@ def test_commands_stream_sse_never_delivers_another_apartments_command(
         OTHER_APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
         now=datetime.now(UTC),
     )
+    epoch = storage.get_epoch()
 
     async def is_disconnected() -> bool:
         return True
@@ -1187,7 +1364,7 @@ def test_commands_stream_sse_never_delivers_another_apartments_command(
     async def run() -> list[dict[str, object]]:
         events = []
         async for event in fleet_app._stream_command_events(
-            storage, APARTMENT, 0, 0.001, 5000, is_disconnected
+            storage, APARTMENT, 0, 0.001, 5000, is_disconnected, epoch
         ):
             events.append(event)
         return events

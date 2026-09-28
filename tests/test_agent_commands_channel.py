@@ -241,8 +241,12 @@ def test_receive_commands_holds_an_sse_connection_and_receives_a_command(
                 gen.close()
 
             assert item == command
-            # Persisted after the item was handed over.
-            assert last_event_id_path.read_text(encoding="utf-8").strip() == "1"
+            # Persisted after the item was handed over -- P5.1c: `<epoch>.1`,
+            # not a bare sequence.
+            assert (
+                last_event_id_path.read_text(encoding="utf-8").strip()
+                == f"{app_storage.get_epoch()}.1"
+            )
 
 
 def test_receive_commands_last_event_id_resume_skips_the_already_seen_command(
@@ -972,6 +976,88 @@ def test_read_last_event_id_refuses_a_fifo_quickly_not_a_hang(tmp_path: Path) ->
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
+
+
+# -----------------------------------------------------------------------------
+# P5.1c: the persisted `Last-Event-ID` round-trips opaquely, but is bounded
+# in length/charset before it is ever sent in a header (header injection).
+# -----------------------------------------------------------------------------
+
+
+def test_read_last_event_id_round_trips_an_epoch_dot_sequence_value_opaquely(
+    tmp_path: Path,
+) -> None:
+    """The value is never parsed as an integer anywhere in this module --
+    only persisted and replayed verbatim (`fleet.app._last_event_id` is the
+    only place that ever interprets its structure)."""
+
+    path = tmp_path / "commands_last_event_id"
+    value = "0123456789abcdef0123456789abcdef.42"
+    path.write_text(value, encoding="utf-8")
+
+    assert _read_last_event_id(path) == value
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "a" * 65,  # one over the length ceiling
+        "abc\r\nX-Injected: yes",  # header injection attempt (CR/LF)
+        "ABCDEF.1",  # uppercase, never a value this agent itself persisted
+        "abc def",  # whitespace inside the value
+        "abc\x00def",  # a NUL byte
+    ],
+)
+def test_read_last_event_id_refuses_an_out_of_bounds_or_injection_value(
+    tmp_path: Path, raw: str
+) -> None:
+    """An invalid persisted value (too long, wrong charset, or an outright
+    header-injection attempt) is never returned -- treated exactly like no
+    bookmark at all, never sent in a header, and never a reason to crash
+    this channel (CLAUDE.md security principle 5)."""
+
+    path = tmp_path / "commands_last_event_id"
+    path.write_text(raw, encoding="utf-8")
+
+    assert _read_last_event_id(path) is None
+
+
+def test_read_last_event_id_accepts_a_value_at_exactly_the_length_ceiling(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "commands_last_event_id"
+    value = "0" * 64
+    path.write_text(value, encoding="utf-8")
+
+    assert _read_last_event_id(path) == value
+
+
+def test_stream_once_never_sends_an_invalid_persisted_last_event_id(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    """An invalid persisted value is not sent at all -- `_stream_once`
+    simply omits the `Last-Event-ID` header (same as "nothing persisted
+    yet"), rather than forwarding a value `_read_last_event_id` already
+    refused."""
+
+    token = _issue_token(app_storage)
+    command = app_storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    last_event_id_path = tmp_path / "last-event-id"
+    last_event_id_path.write_text("not\r\nvalid", encoding="utf-8")
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            gen = _stream_once(client, last_event_id_path)
+            try:
+                item = next(gen)
+            finally:
+                gen.close()  # type: ignore[attr-defined]
+
+    assert item == command
 
 
 def test_load_outbox_degrades_on_a_fifo_quickly_not_a_hang(tmp_path: Path) -> None:
