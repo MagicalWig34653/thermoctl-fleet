@@ -18,6 +18,10 @@ from tools.check_image_config import (
     check_agent_compose_file,
     check_agent_registration_template,
     check_all,
+    check_docker_apt_preferences,
+    check_docker_apt_source,
+    check_docker_key_fetch,
+    check_docker_packages_from_official_repo,
     check_leds_unit,
     check_package_list,
     check_tmpfiles_entry,
@@ -211,3 +215,207 @@ def test_tmpfiles_entry_owned_by_the_agent_uid_gid_passes(tmp_path: Path) -> Non
     )
 
     check_tmpfiles_entry(path)
+
+
+# -- Docker's official apt repository (P5.E fix, docs/STATUS.md) --------------
+
+
+def test_docker_packages_from_official_repo_accepts_the_real_list() -> None:
+    packages = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin"]
+    check_docker_packages_from_official_repo(packages)
+
+
+def test_docker_packages_missing_repo_package_is_rejected() -> None:
+    packages = ["docker-ce", "docker-ce-cli", "containerd.io"]  # no compose plugin
+
+    with pytest.raises(ImageError):
+        check_docker_packages_from_official_repo(packages)
+
+
+def test_docker_packages_still_naming_docker_io_is_rejected() -> None:
+    packages = [
+        "docker-ce",
+        "docker-ce-cli",
+        "containerd.io",
+        "docker-compose-plugin",
+        "docker.io",
+    ]
+
+    with pytest.raises(ImageError):
+        check_docker_packages_from_official_repo(packages)
+
+
+def test_docker_packages_still_naming_docker_compose_v2_is_rejected() -> None:
+    packages = [
+        "docker-ce",
+        "docker-ce-cli",
+        "containerd.io",
+        "docker-compose-plugin",
+        "docker-compose-v2",
+    ]
+
+    with pytest.raises(ImageError):
+        check_docker_packages_from_official_repo(packages)
+
+
+def test_docker_apt_source_missing_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ImageError):
+        check_docker_apt_source(tmp_path / "does-not-exist.sources")
+
+
+def test_docker_apt_source_without_signed_by_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "docker.sources"
+    path.write_text(
+        "Types: deb\n"
+        "URIs: https://download.docker.com/linux/debian\n"
+        "Suites: trixie\n"
+        "Components: stable\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_apt_source(path)
+
+
+def test_docker_apt_source_with_wrong_suite_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "docker.sources"
+    path.write_text(
+        "Types: deb\n"
+        "URIs: https://download.docker.com/linux/debian\n"
+        "Suites: bookworm\n"
+        "Components: stable\n"
+        "Signed-By: /etc/apt/keyrings/docker.asc\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_apt_source(path)
+
+
+def test_docker_apt_preferences_missing_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ImageError):
+        check_docker_apt_preferences(tmp_path / "does-not-exist")
+
+
+def test_docker_apt_preferences_without_origin_pin_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "docker"
+    path.write_text(
+        "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\n"
+        "Pin-Priority: 600\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_apt_preferences(path)
+
+
+def test_docker_apt_preferences_without_all_four_packages_is_rejected(
+    tmp_path: Path,
+) -> None:
+    # Cross-review-style finding: only three of the four packages named --
+    # must still be rejected, not just when the whole stanza is missing.
+    path = tmp_path / "docker"
+    path.write_text(
+        'Package: *\n'
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: -1\n\n"
+        'Package: docker-ce docker-ce-cli containerd.io\n'
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: 600\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_apt_preferences(path)
+
+
+def test_docker_apt_preferences_with_too_permissive_wildcard_pin_is_rejected(
+    tmp_path: Path,
+) -> None:
+    # Cross-review finding: a low-but-POSITIVE priority (1) for "everything
+    # else from this origin" still lets apt install a package that exists
+    # only there (e.g. docker-ce's own Recommends: docker-buildx-plugin,
+    # docker-ce-rootless-extras) -- only a negative priority (-1) actually
+    # forecloses that. Must be rejected even though the four named packages
+    # are all present and correctly pinned at 600.
+    path = tmp_path / "docker"
+    path.write_text(
+        'Package: *\n'
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: 1\n\n"
+        "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\n"
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: 600\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_apt_preferences(path)
+
+
+def test_docker_apt_preferences_naming_the_four_packages_passes(tmp_path: Path) -> None:
+    path = tmp_path / "docker"
+    path.write_text(
+        'Package: *\n'
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: -1\n\n"
+        "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\n"
+        'Pin: origin "download.docker.com"\n'
+        "Pin-Priority: 600\n",
+        encoding="utf-8",
+    )
+
+    check_docker_apt_preferences(path)
+
+
+def test_docker_key_fetch_missing_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ImageError):
+        check_docker_key_fetch(tmp_path / "does-not-exist.sh")
+
+
+def test_docker_key_fetch_without_pinned_fingerprint_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "fetch-docker-key.sh"
+    path.write_text(
+        "curl -fsSL https://download.docker.com/linux/debian/gpg -o key.asc\n"
+        "install -m 0644 key.asc /etc/apt/keyrings/docker.asc\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_key_fetch(path)
+
+
+def test_docker_key_fetch_without_mismatch_refusal_is_rejected(tmp_path: Path) -> None:
+    # The pinned fingerprint is quoted, but nothing in the script actually
+    # refuses to proceed if the fetched key does not match it -- a
+    # fingerprint that is only documentation, not enforced.
+    path = tmp_path / "fetch-docker-key.sh"
+    path.write_text(
+        "DOCKER_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88\n"
+        "curl -fsSL https://download.docker.com/linux/debian/gpg -o key.asc\n"
+        "PUB_COUNT=1\n"
+        "install -m 0644 key.asc /etc/apt/keyrings/docker.asc\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_key_fetch(path)
+
+
+def test_docker_key_fetch_without_multi_key_rejection_is_rejected(tmp_path: Path) -> None:
+    # Cross-review finding: fingerprint check present and enforced, but
+    # nothing in the script rejects a download containing more than one
+    # primary key -- see tests/test_fetch_docker_key.py for the
+    # behavioural version of this same finding.
+    path = tmp_path / "fetch-docker-key.sh"
+    path.write_text(
+        "DOCKER_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88\n"
+        "curl -fsSL https://download.docker.com/linux/debian/gpg -o key.asc\n"
+        "FETCHED=$(gpg --with-colons --show-keys key.asc | awk -F: '/^fpr:/{print $10;exit}')\n"
+        'if [ "$FETCHED" != "$DOCKER_KEY_FINGERPRINT" ]; then exit 1; fi\n'
+        "install -m 0644 key.asc /etc/apt/keyrings/docker.asc\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImageError):
+        check_docker_key_fetch(path)

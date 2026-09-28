@@ -1,8 +1,10 @@
 #!/bin/bash
-# Provisions the base station VM: packages, compose plugin, local registry,
-# the shipped v1 agent image, uid/gid 10002 directories, the build-time
-# state file, the fixed compose file + .env, the watchdog + thermoctl-leds
-# binaries and units. Run once after tools/e2e/00_create_vm.sh.
+# Provisions the base station VM: packages (including docker-ce/
+# docker-ce-cli/containerd.io/docker-compose-plugin from Docker's official
+# apt repository, image/common/apt/ -- see image/common/README.md), local
+# registry, the shipped v1 agent image, uid/gid 10002 directories, the
+# build-time state file, the fixed compose file + .env, the watchdog +
+# thermoctl-leds binaries and units. Run once after tools/e2e/00_create_vm.sh.
 #
 # Cross-compiles the watchdog on the HOST (CGO_ENABLED=0 GOARCH=arm64,
 # section 18.3's "nothing is compiled on the device") -- requires a host Go
@@ -34,11 +36,8 @@ lima_sudo chmod 777 /tmp/build
 lima_copy "$WORK/thermoctl-watchdog" /tmp/build/thermoctl-watchdog
 lima_copy "$WORK/thermoctl-leds" /tmp/build/thermoctl-leds
 
-echo "== installing packages.txt + docker.service (DISCREPANCY 0/0a recorded inline) =="
+echo "== installing packages.txt (Docker's official apt repository for docker-ce/docker-ce-cli/containerd.io/docker-compose-plugin, per image/common/README.md) + docker.service =="
 lima_sudo bash /repo/tools/e2e/provision/install-packages.sh
-
-echo "== installing the docker compose v2 CLI plugin (workaround for DISCREPANCY 0a, see README) =="
-lima_sudo bash /repo/tools/e2e/provision/install-compose-plugin.sh
 
 echo "== local registry + the shipped v1 agent image, by digest =="
 SHIPPED_DIGEST="$(lima_sudo bash /repo/tools/e2e/provision/build-agent-v1.sh | tail -1)"
