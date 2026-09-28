@@ -43,7 +43,7 @@ from fleet.ui_apartment import (
 )
 from fleet.ui_auth import generate_totp_secret, hash_password
 from fleet.ui_inventory import MAX_REASON_LENGTH
-from protocol import CommandResult
+from protocol import CommandResult, LogExcerpt
 from protocol.commands import CommandType
 
 USERNAME = "landlord"
@@ -729,3 +729,90 @@ def test_command_record_import_is_the_storage_orm_row() -> None:
     depends on."""
 
     assert CommandRecord.__tablename__ == "commands"
+
+
+# -- fetch_logs display (P5.3a) -----------------------------------------------
+
+
+def test_build_command_history_log_excerpt_none_for_a_non_fetch_logs_command(
+    storage: Storage,
+) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username=USERNAME, now=now
+    )
+
+    [display] = build_command_history(storage, APARTMENT, now + timedelta(seconds=1))
+
+    assert display.log_excerpt is None
+
+
+def test_build_command_history_log_excerpt_none_before_upload(storage: Storage) -> None:
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    storage.create_command(
+        APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username=USERNAME, now=now
+    )
+
+    [display] = build_command_history(storage, APARTMENT, now + timedelta(seconds=1))
+
+    assert display.log_excerpt is None
+
+
+def test_build_command_history_log_excerpt_present_after_upload(storage: Storage) -> None:
+
+    _make_apartment(storage)
+    now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+    command = storage.create_command(
+        APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username=USERNAME, now=now
+    )
+    storage.store_log_excerpt(
+        APARTMENT,
+        LogExcerpt(
+            command_id=command.id,
+            lines=["<temperatur>", "<name>"],
+            dropped_lines=3,
+            source="thermoctl",
+            captured_at=now,
+        ),
+        now,
+    )
+
+    [display] = build_command_history(storage, APARTMENT, now + timedelta(seconds=1))
+
+    assert display.log_excerpt is not None
+    assert display.log_excerpt.lines == ["<temperatur>", "<name>"]
+    assert display.log_excerpt.dropped_lines == 3
+    assert display.log_excerpt.source == "thermoctl"
+
+
+def test_apartment_page_shows_log_excerpt_and_dropped_count_escaped(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+
+    _make_apartment(storage)
+    now = datetime.now(UTC)
+    command = storage.create_command(
+        APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username=USERNAME, now=now
+    )
+    storage.store_log_excerpt(
+        APARTMENT,
+        LogExcerpt(
+            command_id=command.id,
+            lines=["<script>alert(1)</script>", "harmlose Zeile"],
+            dropped_lines=7,
+            source="thermoctl",
+            captured_at=now,
+        ),
+        now,
+    )
+
+    _login(client, password, totp_secret)
+    response = client.get(f"/ui/apartments/{APARTMENT}")
+
+    assert response.status_code == 200
+    assert "harmlose Zeile" in response.text
+    assert "<script>alert(1)</script>" not in response.text
+    assert "&lt;script&gt;" in response.text
+    assert "7 Zeile" in response.text

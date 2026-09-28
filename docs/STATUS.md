@@ -2,6 +2,170 @@
 
 Last updated: 2026-09-27.
 
+## P5.3a -- `fetch_logs` with an on-device allowlist filter (sections 6, 7, 21.5)
+
+Built per the project owner's 2026-09-27 decision (recorded in `docs/specification.md`
+21.5's own "Decided afterward" paragraph): `fetch_logs` now has a real agent-side handler,
+not the P5.2 placeholder.
+
+**Allowlist, not denylist** (`agent/log_filter.py`): a line only ever leaves the device if
+(1) it structurally matches thermoctl's own text log line shape
+(`thermoctl/logging.py::TextFormatter`, read from the sibling repository) **and** (2) its
+message (and, for `WARNING`/`ERROR`/`CRITICAL`, its `extra=` tail) matches an explicit,
+per-level table of known thermoctl message templates.
+
+**Cross-review correction (this section rewritten after a first, incorrect version):** the
+first version of this filter let *any* `WARNING`/`ERROR`/`CRITICAL` line through unmasked,
+reasoning that severity alone implied safety. Cross-review reproduced real leaks this let
+through unchanged -- `thermoctl/integrations/notification.py::_attempt_delivery` logs every
+fault notice's title/text at `WARNING` unconditionally (e.g. "Sensorstörung in Kinderzimmer
+Mia"), several call sites carry a device's display name in an `extra={"geraet": ...}` field
+(`domain/controller_channels.py`, `services/device_commands.py`, `services/publishing.py`),
+and `domain/legacy_system.py` logs a raw, unvalidated sensor payload under `extra={"wert":
+...}`. **Fixed:** every level now goes through the same explicit template table
+(`_WARN_FIXED_MESSAGES`/`_WARN_TEMPLATES` for `WARNING`+, four fixed messages for `INFO`) --
+each template names exactly which of its own parameters are safe to keep (a numeric id, a
+closed enum value) and which must be replaced by a fixed placeholder (a zone/device name, an
+exception's rendered text). A `WARNING`+ line matching **no** template is not silently
+dropped -- it is *reduced* to `<timestamp> <LEVEL> <logger>: <nicht freigegebene Meldung>`
+(message and `extra` tail both discarded) and still counted in `dropped`, so a missing
+template shows up as "some lines carried no approved content" rather than a silent gap.
+`INFO` keeps the narrower original rule: an unrecognised shape is dropped outright, not
+reduced. The `extra=` tail itself is parsed independently (`_mask_extra_tail`): a small
+allowlist of keys with a known-safe value shape is kept verbatim (`schluessel`, `zone_id`,
+`host`/`port`/`bind`, `wartezeit_s`/`verbindungsdauer_s`, ...), a fixed list of
+always-name-or-value-shaped keys (`geraet`, `zone_name`, `device_name`, `wert`, `value`,
+`messwert`, `grund`, `fehler`, `client_id`, ...) is always replaced by `<wert>`, and any
+other, unrecognised key is dropped from the tail entirely rather than shown either raw or
+masked.
+
+**Second cross-review correction: `topic` needs its own check, not a shape regex.** The
+first fix above still let `topic` through verbatim whenever its value looked path-like and
+space-free (`^[\w/.\-:]+$`). Reproduced: thermoctl's own Zigbee2MQTT actuator topics
+(`integrations/actuators.py::Zigbee2MqttValve`/`ThermostatValve.__init__`,
+`services/publishing.py`'s own publish calls) are built as `f"{base}/{device_name}/set"`,
+where `device_name` is the Zigbee2MQTT **friendly name** -- Z2M's own convention uses `_`/`-`
+instead of spaces, so `zigbee2mqtt/Kinderzimmer_Mia/set` is exactly as path-like and
+space-free as a real id-based topic, and passed through unchanged (e.g. via
+`integrations/mqtt/client.py::run`'s own `extra={"topic": topic}` on a disallowed switching
+attempt). **Fixed** (`_mask_topic`): `topic` is now kept verbatim **only** if it fully
+matches one of two explicit, real thermoctl control-topic shapes --
+`<prefix>/zones/<digits>/command/<kind>[/<key>]` (`integrations/mqtt/commands.py::_PATTERN`)
+or `heizung/thermostate/<digits>/<attribute>/get` (`domain/legacy_system.py`'s own fixed
+shape) -- every other topic, including every Zigbee2MQTT device/actuator topic, becomes
+`<wert>`.
+
+**Third cross-review correction: the leading segment of a command topic was still kept
+verbatim.** The second fix's `<prefix>/zones/<digits>/command/<kind>[/<key>]` pattern
+checked the *shape* of the leading segment (`[^/\s]+`, no slash or whitespace) but not its
+*content* -- `integrations/mqtt/commands.py::split_topic` additionally requires that segment
+to equal the deployment's own configured `mqtt_prefix` exactly, a check this agent-side
+filter cannot perform (it does not know the prefix, and must not guess it from what it
+sees). On a shared local MQTT broker, any other publisher can put an arbitrary name there,
+and `thermoctl/app.py`'s own "Unbrauchbarer Befehl verworfen"/"Befehl für unbekannte Zone
+verworfen" log lines fire *precisely* for such a foreign topic -- reproduced with
+`topic=Kinderzimmer-Mia/zones/999/command/boost` and
+`topic=AnnaMustermann/zones/7/command/boost`, both kept unchanged by the second fix. **Fixed
+for real** (`_mask_zone_command_topic`): the leading segment is now **never** kept, under
+any circumstances -- only `zone` (numeric), `kind` (verified against the exact closed set
+`split_topic` itself accepts: `setpoint`/`operating_mode`/`boost`/`cancel_override`/`mode`/
+`parameter`), and, where applicable, `key` (a digit-only mode id for `mode`, or one of the
+15 real control parameter names from `domain/zone_settings.py::PARAMETERS` for
+`parameter` -- never a bare shape match like `split_topic`'s own `[a-z][a-z0-9_]*`
+validation, which a room or device name could satisfy just as well) are ever kept, each
+independently verified against thermoctl's real, closed vocabulary; anything that does not
+check out, including an unrecognised `kind` (e.g. a Zigbee2MQTT name crafted to end in
+`/command/set/set`), collapses the **whole** topic to `<wert>`, not just its prefix. The
+same "verify the actual vocabulary, not just the shape" correction was applied to the
+legacy-system pattern's `<attribute>` (`_LEGACY_ATTRIBUTES`, restricted to
+`_NUMBER_ATTRIBUTE`/`_TEXT_ATTRIBUTE`'s own 7 names) even though that pattern's other
+segments are all fixed literals with no equivalent spoofing risk.
+
+**Coverage gap closed, not a leak**: `integrations/mqtt/client.py::run` logs two of its own
+messages ("MQTT-Verbindung verloren; neuer Versuch folgt", "MQTT-Nachricht konnte nicht
+verarbeitet werden") through a `melden = log.exception if short_lived == 0 else log.error`
+alias -- the alias only decides the level (both branches log the same message text), so one
+allowlist entry per message covers both branches; a third message from the same function
+("MQTT-Verbindung bricht sofort wieder ab...") was added alongside it while re-reading that
+module. A repository-wide grep for other alias-style log calls (`= log\.(warning|error
+|exception|critical|info)\b`) found no other instance.
+
+**This table is a snapshot of one thermoctl version, not a permanent contract** -- a future
+thermoctl release that adds or rewords a log call does not fall through to being logged in
+full; it simply stops matching any template and becomes `<nicht freigegebene Meldung>` until
+this table is updated. This is the allowlist working as intended (fails visibly, by
+omission, never silently by leaking), but it means **`agent/log_filter.py`'s template table
+must be revisited with every thermoctl upgrade** -- a stale table does not leak, it quietly
+loses signal instead, which is the failure mode to watch for.
+
+**Placeholders, within an already-allowed template's declared-unsafe parameters:**
+temperatures/setpoints (`21,5 °C`) -> `<temperatur>`/`<sollwert>`; a zone/device display name
+-> `<name>`; an exception's rendered text, a raw sensor/config payload value, or a display
+name in the `extra` tail -> `<wert>`. Every placeholder is fixed and dumb -- never a stable
+hash of the underlying value, so two lines carrying the same reading cannot be correlated
+across the log even after masking (verified by
+`tests/test_log_filter.py::test_placeholders_are_identical_across_different_values_no_correlation`).
+
+**Agent** (`agent/loop.py`): `_handle_fetch_logs` reads the last `Command.lines` lines of
+the `thermoctl` container's log via the local Docker Engine API over the Unix socket
+(`read_container_log_lines`, own hand-rolled demultiplexer for Docker's multiplexed log
+stream framing -- **no Docker SDK dependency**, mirroring CLAUDE.md security principle 6's
+reasoning for the watchdog, applied here for the same "no dependency this package does not
+need" reason), filters through `agent.log_filter.filter_log_lines`, and uploads the result
+as `protocol.commands.LogExcerpt` via `POST /v1/commands/{id}/logs`. Every failure path
+(no client configured, the log source raising, the upload being refused) is an honest
+failed `CommandResult`, never a fabricated success -- matching this module's own existing
+"never an invented stopgap" rule.
+
+**Protocol**: `protocol.commands.LogExcerpt` (`command_id`, `lines` -- already filtered on
+the device, documented as such --, `dropped_lines`, `source`, `captured_at`), capped at
+`MAX_LOG_EXCERPT_LINES` (500, reusing `Command.lines`'s own bound) and a per-line length
+cap. `PROTOCOL_VERSION` bumped to 4 (a wholly new model counts as a model change, per the
+project owner's own literal reading of "any change to the models" from P5.1/18.2).
+
+**Fleet**: `POST /v1/commands/{id}/logs` (`fleet/app.py::receive_log_excerpt`, agent token,
+`require_apartment_token_by_hash`) -- the command named must belong to the authenticated
+apartment and be a `fetch_logs` command (otherwise 404, deliberately indistinguishable from
+"unknown", mirroring `receive_command_result`'s own reasoning), one excerpt per command
+(a second upload is 409), and a cheap aggregate-size backstop (413) independent of the
+per-field model bounds -- **the fleet does no filtering of its own**, only this size cap.
+Storage: `command_log_excerpts` table (`fleet/migrations/versions/0010_command_log_excerpts.py`,
+`fleet.storage.Storage.store_log_excerpt`/`get_log_excerpt_for_command`).
+
+**Retention** (project owner condition 4): `Storage.delete_expired_log_excerpts`, run
+periodically by a background loop in `fleet/app.py::lifespan` (`_log_retention_loop`, the
+same "thin scheduling wrapper, tested via an injected clock on the logic it calls" pattern
+`_alarm_check_loop` already established) -- 14 days by default, both the retention window
+(`FLEET_LOG_RETENTION_DAYS`) and the check interval (`FLEET_LOG_RETENTION_CHECK_INTERVAL_S`)
+env-configurable, per CLAUDE.md ("nothing hard-coded").
+
+**UI**: "Eine Wohnung"'s "Befehle" history shows a `fetch_logs` row's stored excerpt
+alongside it -- capture time, source, the dropped-line count shown plainly ("N Zeilen
+entfernt"), and the filtered lines themselves in a monospace, escaped block
+(`fleet/ui_apartment.py::LogExcerptDisplay`, `fleet/templates/ui/apartment.html`).
+
+**Tests**: `tests/test_log_filter.py` -- one fixture line per real thermoctl call site (not
+a synthetic composite), built the way `TextFormatter` would actually emit it: every
+`fault_notice`/`problem_report` title+text shape (zone/device name masked, in both the
+`WARNING`-level entry and the all-clear), the tenant-report shape (name masked in both the
+title and the body's first line; every later line of the tenant's own free text dropped
+outright, having no log-format prefix at all), the `extra`-tail leaks cross-review
+reproduced (`geraet`/`wert`/`grund` masked, `zone_id`/`topic`/`schluessel` kept), the two
+`app.py` call sites that embed an exception's text directly in the message (always masked),
+the migration-lock env-var warning, the legacy-data count/index warnings (kept verbatim), an
+unrecognised `WARNING` line (reduced to the fixed placeholder and counted), an unrecognised
+`INFO` line (dropped outright), and the placeholder-identity/no-correlation test. `tests/test_agent_fetch_logs.py` (the
+Docker log-stream demultiplexer; the handler against a stub log reader and a real,
+locally-run `fleet.app.app` end to end; every honest-failure path),
+`tests/test_storage.py`/`tests/test_fleet.py`/`tests/test_ui_commands.py` (storage
+ownership/duplicate rules and the retention cleanup with an injected clock; the endpoint's
+auth/ownership/type/size checks; the UI display, escaped).
+
+**Open for P5.3b** (a separate, later package, not built here): the end-to-end encrypted
+`diagnostic_bundle` -- see `docs/specification.md` 21.5's own "Decided afterward" paragraph
+for why it must stay a one-off, encrypted snapshot and never grow into the cloud's running
+storage the way `fetch_logs`'s own retention window does.
+
 ## P5.E: local end-to-end test environment (base station VM + scenarios)
 
 Built per the project owner's 2026-09-27 offer ("you can set up a VM

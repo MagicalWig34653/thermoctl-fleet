@@ -192,10 +192,44 @@ def _command_status_label(record: CommandRecord, now: datetime) -> str:
 
 
 @dataclass(frozen=True)
+class LogExcerptDisplay:
+    """A stored `fetch_logs` upload (P5.3a), already rendered for the
+    "Befehle" history -- `lines` are the agent's own already-filtered,
+    already-masked content (`agent.log_filter`); this module escapes
+    nothing further (Jinja2's autoescaping already covers the template),
+    it only formats the two timestamps and carries the dropped-line count
+    through unchanged so the template can show "N Zeilen entfernt"
+    plainly, never silently."""
+
+    lines: list[str]
+    dropped_lines: int
+    source: str
+    captured_text: str
+
+
+def _build_log_excerpt_display(storage: Storage, record: CommandRecord) -> LogExcerptDisplay | None:
+    if CommandType(record.command_type) != CommandType.FETCH_LOGS:
+        return None
+    stored = storage.get_log_excerpt_for_command(record.command_id)
+    if stored is None:
+        return None
+    return LogExcerptDisplay(
+        lines=stored.lines,
+        dropped_lines=stored.dropped_lines,
+        source=stored.source,
+        captured_text=_format_timestamp(stored.captured_at),
+    )
+
+
+@dataclass(frozen=True)
 class CommandDisplay:
     """One row of the "Befehle" history list (P5.1b, section 9) -- already
     derived and German-rendered, same rule every other `*Display`
-    dataclass in this module follows."""
+    dataclass in this module follows.
+
+    `log_excerpt` (P5.3a): the stored `fetch_logs` upload for this command,
+    or `None` for every other command type, or for a `fetch_logs` command
+    whose agent has not (yet, or ever) uploaded one."""
 
     command_label: str
     created_by: str
@@ -204,9 +238,12 @@ class CommandDisplay:
     status_label: str
     duration_text: str | None
     error_text: str | None
+    log_excerpt: LogExcerptDisplay | None = None
 
 
-def _build_command_display(record: CommandRecord, now: datetime) -> CommandDisplay:
+def _build_command_display(
+    storage: Storage, record: CommandRecord, now: datetime
+) -> CommandDisplay:
     return CommandDisplay(
         command_label=COMMAND_TYPE_LABELS[CommandType(record.command_type)],
         created_by=record.created_by,
@@ -221,6 +258,7 @@ def _build_command_display(record: CommandRecord, now: datetime) -> CommandDispl
         error_text=(
             _truncate_error_text(record.error_text) if record.error_text else None
         ),
+        log_excerpt=_build_log_excerpt_display(storage, record),
     )
 
 
@@ -233,7 +271,7 @@ def build_command_history(
     since the underlying storage call is itself scoped to `apartment_id`."""
 
     return [
-        _build_command_display(record, now)
+        _build_command_display(storage, record, now)
         for record in storage.list_commands_for_apartment(apartment_id)
     ]
 
@@ -668,6 +706,7 @@ __all__ = [
     "AlarmDisplay",
     "ApartmentDetail",
     "CommandDisplay",
+    "LogExcerptDisplay",
     "OpenFaultDisplay",
     "PastFaultDisplay",
     "TimelineEntry",

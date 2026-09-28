@@ -21,7 +21,7 @@ import logging
 import os
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from cryptography.exceptions import InvalidSignature
@@ -34,7 +34,13 @@ from sse_starlette.sse import EventSourceResponse
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
-from fleet.storage import RecordCommandResultOutcome, Storage, get_storage, hash_token
+from fleet.storage import (
+    RecordCommandResultOutcome,
+    Storage,
+    StoreLogExcerptOutcome,
+    get_storage,
+    hash_token,
+)
 from fleet.ui_auth import resolve_client_ip
 from fleet.ui_routes import install_security_headers
 from fleet.ui_routes import router as ui_router
@@ -42,6 +48,7 @@ from protocol import (
     CommandResult,
     Event,
     Heartbeat,
+    LogExcerpt,
     RegistrationAccepted,
     RegistrationRequest,
     TokenChallenge,
@@ -79,6 +86,22 @@ _DEFAULT_COMMANDS_SSE_RETRY_MS = 5_000
 _COMMANDS_SSE_PING_INTERVAL_ENV = "FLEET_COMMANDS_SSE_PING_INTERVAL_S"
 _DEFAULT_COMMANDS_SSE_PING_INTERVAL_S = 15.0
 
+# P5.3a, project owner condition 4: "a retention period for fetched logs in
+# the cloud (main-session default: 14 days, env-configurable, enforced by a
+# periodic cleanup like the alarm loop)" -- otherwise `fetch_logs` uploads
+# would slowly turn this service into exactly the data store section 6
+# excludes. Both the retention window itself and how often the cleanup runs
+# are configurable, not hard-coded (CLAUDE.md).
+_LOG_RETENTION_DAYS_ENV = "FLEET_LOG_RETENTION_DAYS"
+_DEFAULT_LOG_RETENTION_DAYS = 14
+_LOG_RETENTION_CHECK_INTERVAL_ENV = "FLEET_LOG_RETENTION_CHECK_INTERVAL_S"
+# Once an hour by default -- this cleanup has none of the absence alarm's
+# urgency (a `fetch_logs` upload a few hours past its retention window is
+# not an operational risk the way a missed alarm check would be), so a much
+# longer default interval than `_DEFAULT_ALARM_CHECK_INTERVAL_S` is
+# appropriate; still configurable per the same reasoning.
+_DEFAULT_LOG_RETENTION_CHECK_INTERVAL_S = 3600.0
+
 
 async def _alarm_check_loop(  # pragma: no cover
     interval_s: float, notifiers: Sequence[Notifier]
@@ -113,6 +136,29 @@ async def _alarm_check_loop(  # pragma: no cover
         await asyncio.sleep(interval_s)
 
 
+async def _log_retention_loop(interval_s: float, retention_days: int) -> None:  # pragma: no cover
+    """Periodically deletes stored `fetch_logs` excerpts older than
+    `retention_days` (P5.3a, project owner condition 4) -- the same thin
+    scheduling wrapper as `_alarm_check_loop` above, deliberately untested
+    here for the identical reason (an infinite loop around a real
+    `asyncio.sleep`); the logic it calls,
+    `Storage.delete_expired_log_excerpts`, is fully covered with an
+    injected clock in `tests/test_storage.py`.
+    """
+
+    retention = timedelta(days=retention_days)
+    while True:
+        try:
+            deleted = await asyncio.to_thread(
+                get_storage().delete_expired_log_excerpts, datetime.now(UTC), retention
+            )
+            if deleted:
+                logger.info("Deleted %d expired log excerpt(s).", deleted)
+        except Exception:
+            logger.exception("Log excerpt retention cleanup failed")
+        await asyncio.sleep(interval_s)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Starts the absence-alarm background task (P2.2) for the lifetime of
@@ -139,12 +185,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     interval_s = float(os.environ.get(_ALARM_CHECK_INTERVAL_ENV, _DEFAULT_ALARM_CHECK_INTERVAL_S))
     notifiers = load_notifiers_from_env(os.environ)
     task = asyncio.create_task(_alarm_check_loop(interval_s, notifiers))
+
+    retention_interval_s = float(
+        os.environ.get(
+            _LOG_RETENTION_CHECK_INTERVAL_ENV, _DEFAULT_LOG_RETENTION_CHECK_INTERVAL_S
+        )
+    )
+    retention_days = int(
+        os.environ.get(_LOG_RETENTION_DAYS_ENV, _DEFAULT_LOG_RETENTION_DAYS)
+    )
+    retention_task = asyncio.create_task(
+        _log_retention_loop(retention_interval_s, retention_days)
+    )
     try:
         yield
     finally:
         task.cancel()
+        retention_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        with contextlib.suppress(asyncio.CancelledError):
+            await retention_task
 
 
 app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION), lifespan=lifespan)
@@ -520,6 +581,90 @@ def receive_command_result(
     # `_COMMAND_RESULT_STATUS`'s own docstring for why a plain retry is not
     # an error.
     response.status_code = _COMMAND_RESULT_STATUS[outcome]
+
+
+# P5.3a: `Storage.store_log_excerpt`'s own outcome -> HTTP status, mirroring
+# `_COMMAND_RESULT_STATUS`'s established pattern for the sibling `/result`
+# endpoint.
+_LOG_EXCERPT_STATUS: dict[StoreLogExcerptOutcome, int] = {
+    StoreLogExcerptOutcome.NOT_FOUND: 404,
+    StoreLogExcerptOutcome.STORED: 204,
+    StoreLogExcerptOutcome.ALREADY_EXISTS: 409,
+}
+
+# A cheap, aggregate-size backstop (project owner: "the fleet does no
+# filtering of its own -- but it must refuse obviously oversized input"),
+# independent of and stricter than what `protocol.commands.LogExcerpt`
+# already bounds per-field (`MAX_LOG_EXCERPT_LINES` lines, each individually
+# capped by `_LogLine`'s own `StringConstraints`) -- a payload technically
+# within both of those per-field bounds can still be unreasonably large in
+# aggregate (many lines each near the per-line cap); `fetch_logs`'s own
+# `Command.lines` is capped at 500 to begin with (section 7), so a real,
+# well-behaved agent's upload is nowhere near this size.
+_MAX_LOG_EXCERPT_TOTAL_BYTES = 262_144
+
+
+@app.post("/v1/commands/{id}/logs")
+def receive_log_excerpt(
+    id: str,
+    excerpt: LogExcerpt,
+    response: Response,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> None:
+    """Accepts a `fetch_logs` upload (P5.3a, sections 6, 7, 21.5):
+    `LogExcerpt`, already filtered on the device (`agent.log_filter`,
+    project owner condition 1: filtering happens on the device, **never**
+    here) -- this endpoint does **no** filtering of its own, only a size
+    cap and the same ownership/type checks `receive_command_result` above
+    already applies to a command id.
+
+    **The path `id` must equal `excerpt.command_id`** -- checked here,
+    before `Storage.store_log_excerpt` is ever called, `400` on a mismatch,
+    the same reasoning `receive_command_result` already documents for its
+    own path/body id check.
+
+    **Size cap, before storage is ever touched** (project owner: "the
+    fleet does no filtering of its own -- but it must refuse obviously
+    oversized input"): `protocol.commands.LogExcerpt` already bounds
+    `lines` to `MAX_LOG_EXCERPT_LINES` and each line's own length at the
+    model level (`_LogLine`'s own `StringConstraints`) -- a payload
+    exceeding either is already a `422` from FastAPI's own request
+    validation, before this function body ever runs. What is checked here
+    in addition is **cheap and cannot be expressed as a per-field Pydantic
+    constraint**: the excerpt's total serialized size, guarding against a
+    body technically within the per-line and per-count bounds but still
+    unreasonably large in aggregate (many lines each near the per-line
+    cap).
+
+    Every remaining outcome is `Storage.store_log_excerpt`'s job (see its
+    own docstring and `_LOG_EXCERPT_STATUS` above for the exact mapping):
+    unknown command id, another apartment's command id, or an id naming a
+    command that is not `fetch_logs` -> 404 (deliberately
+    indistinguishable, same reasoning as `receive_command_result`'s own
+    404); an id that already has a stored excerpt -> 409; a fresh upload ->
+    204.
+    """
+
+    if id != excerpt.command_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Path id and excerpt.command_id must match.",
+        )
+
+    total_bytes = sum(len(line.encode("utf-8")) for line in excerpt.lines)
+    if total_bytes > _MAX_LOG_EXCERPT_TOTAL_BYTES:
+        raise HTTPException(status_code=413, detail="Log excerpt is too large.")
+
+    outcome = storage.store_log_excerpt(authenticated_apartment, excerpt, datetime.now(UTC))
+    if outcome is StoreLogExcerptOutcome.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="Unknown fetch_logs command.")
+    if outcome is StoreLogExcerptOutcome.ALREADY_EXISTS:
+        raise HTTPException(
+            status_code=409,
+            detail="A log excerpt was already stored for this command.",
+        )
+    response.status_code = _LOG_EXCERPT_STATUS[outcome]
 
 
 # -----------------------------------------------------------------------------

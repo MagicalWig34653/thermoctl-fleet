@@ -103,7 +103,7 @@ from fleet.device_lifecycle import (
     STALE_ASSIGNMENT_MESSAGE,
     validate_manual_device_transition,
 )
-from protocol import Event, Heartbeat, fault_kind_from_key
+from protocol import Event, Heartbeat, LogExcerpt, fault_kind_from_key
 from protocol.commands import Command, CommandResult, CommandType
 from protocol.version import PROTOCOL_VERSION
 
@@ -584,6 +584,56 @@ class CommandRecord(Base):
     duration_s: Mapped[float | None] = mapped_column(Float(), nullable=True)
     error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
     result_received_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
+
+class CommandLogExcerptRecord(Base):
+    """P5.3a: one stored `protocol.commands.LogExcerpt` upload -- see
+    `0010_command_log_excerpts.py`'s own docstring for the full column-by-
+    column reasoning."""
+
+    __tablename__ = "command_log_excerpts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    command_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    lines_json: Mapped[str] = mapped_column(Text(), nullable=False)
+    dropped_lines: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(String(255), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class StoreLogExcerptOutcome(StrEnum):
+    """What `Storage.store_log_excerpt` actually did -- `fleet.app`'s new
+    `POST /v1/commands/{id}/logs` route maps each value to its own HTTP
+    status, mirroring `RecordCommandResultOutcome`'s own established
+    pattern for the sibling `/result` endpoint."""
+
+    # No `fetch_logs` command with this id at all, for *this* apartment --
+    # an unknown id, an id belonging to a different apartment, and an id
+    # naming a different command type are all deliberately the same
+    # outcome (see `store_log_excerpt`'s own docstring for why).
+    NOT_FOUND = "not_found"
+    # Stored for the first time.
+    STORED = "stored"
+    # An excerpt already exists for this command id -- refused, not
+    # overwritten and not silently accepted a second time (one excerpt per
+    # command, this package's own scope).
+    ALREADY_EXISTS = "already_exists"
+
+
+@dataclass(frozen=True)
+class StoredLogExcerpt:
+    """One stored `fetch_logs` upload, read back for display (P5.3a,
+    `fleet/ui_apartment.py`'s "Befehle" history)."""
+
+    lines: list[str]
+    dropped_lines: int
+    source: str
+    captured_at: datetime
+    received_at: datetime
 
 
 @dataclass(frozen=True)
@@ -1518,6 +1568,128 @@ class Storage:
             record.error_text = result.error_text
             record.result_received_at = _naive_utc(now)
             return RecordCommandResultOutcome.STORED
+
+    # -- fetch_logs uploads (P5.3a, sections 6, 7, 21.5) --------------------------
+
+    def store_log_excerpt(
+        self, apartment_id: str, excerpt: LogExcerpt, now: datetime
+    ) -> StoreLogExcerptOutcome:
+        """Stores one `LogExcerpt` upload (`POST /v1/commands/{id}/logs`).
+
+        **Scoped exactly like `record_command_result`**: the command named
+        by `excerpt.command_id` must exist, belong to `apartment_id`, and be
+        a `fetch_logs` command -- any other case (unknown id, another
+        apartment's id, or an id naming a different command type) is
+        `NOT_FOUND`, deliberately indistinguishable (mirrors `fleet/auth
+        .py`'s "wrong token vs. unknown apartment" reasoning, applied here
+        to "wrong command type" too: an agent must not learn from this
+        endpoint's response that a given id exists at all, just as the
+        wrong type).
+
+        **No filtering happens here** (project owner, condition 1: "filtering
+        happens on the device before sending, never in the cloud") -- this
+        method stores `excerpt.lines` verbatim, exactly as the already-
+        validated wire model carries them; `fleet.app`'s route is the one
+        place that rejects an oversized upload before it ever reaches this
+        call.
+
+        **One excerpt per command** -- a second upload for a command that
+        already has one is `ALREADY_EXISTS`, not silently overwritten
+        (mirrors `fetch_logs`'s own section-7 at-most-once execution
+        contract on the agent side, applied here to storage: if the agent
+        never saw its own `204` and legitimately retries, the honest answer
+        is "already stored", not a second, possibly different, row).
+        """
+
+        with self.session() as session:
+            command = session.scalar(
+                select(CommandRecord).where(
+                    CommandRecord.command_id == excerpt.command_id,
+                    CommandRecord.apartment_id == apartment_id,
+                    CommandRecord.command_type == str(CommandType.FETCH_LOGS),
+                )
+            )
+            if command is None:
+                return StoreLogExcerptOutcome.NOT_FOUND
+
+            exists_already = session.scalar(
+                select(CommandLogExcerptRecord.id).where(
+                    CommandLogExcerptRecord.command_id == excerpt.command_id
+                )
+            )
+            if exists_already is not None:
+                return StoreLogExcerptOutcome.ALREADY_EXISTS
+
+            session.add(
+                CommandLogExcerptRecord(
+                    command_id=excerpt.command_id,
+                    apartment_id=apartment_id,
+                    lines_json=json.dumps(list(excerpt.lines), ensure_ascii=False),
+                    dropped_lines=excerpt.dropped_lines,
+                    source=excerpt.source,
+                    captured_at=_naive_utc(excerpt.captured_at),
+                    received_at=_naive_utc(now),
+                )
+            )
+            return StoreLogExcerptOutcome.STORED
+
+    def get_log_excerpt_for_command(self, command_id: str) -> StoredLogExcerpt | None:
+        """The stored excerpt for `command_id`, or `None` if none was ever
+        uploaded -- `fleet/ui_apartment.py`'s "Befehle" history calls this
+        once per `fetch_logs` row it renders. Not itself scoped to an
+        apartment: every caller already reads this only for command rows it
+        obtained from `list_commands_for_apartment` (already scoped), the
+        same "storage supplies raw data, the caller already knows the
+        scope" split `Storage.get_house_overview` follows."""
+
+        with self.session() as session:
+            row = session.scalar(
+                select(CommandLogExcerptRecord).where(
+                    CommandLogExcerptRecord.command_id == command_id
+                )
+            )
+            if row is None:
+                return None
+            return StoredLogExcerpt(
+                lines=json.loads(row.lines_json),
+                dropped_lines=row.dropped_lines,
+                source=row.source,
+                captured_at=row.captured_at.replace(tzinfo=UTC),
+                received_at=row.received_at.replace(tzinfo=UTC),
+            )
+
+    def delete_expired_log_excerpts(self, now: datetime, retention: timedelta) -> int:
+        """Deletes every stored excerpt whose `received_at` is older than
+        `retention` before `now` -- the periodic cleanup project owner
+        condition 4 requires ("a retention period for fetched logs in the
+        cloud ... enforced by a periodic cleanup like the alarm loop"), so
+        `fetch_logs` uploads do not slowly turn this service into the data
+        store section 6 was written to exclude. Returns the number of rows
+        deleted, for the caller's own logging (mirrors
+        `fleet.alarms.check_absence_alarms`'s own return-a-count
+        convention, nothing this caller needs to act on beyond that).
+
+        Counted from `received_at` (the fleet's own clock), not
+        `captured_at` (the agent's) -- see `CommandLogExcerptRecord
+        .received_at`'s own docstring for why.
+        """
+
+        cutoff = _naive_utc(now) - retention
+        with self.session() as session:
+            # `Session.execute` is typed to return the generic `Result[Any]`
+            # (no `rowcount`) even for a Core DELETE, which always actually
+            # returns a `CursorResult` at runtime -- narrowed explicitly,
+            # same pattern this module already uses elsewhere (e.g.
+            # `remove_assignment`).
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(CommandLogExcerptRecord).where(
+                        CommandLogExcerptRecord.received_at < cutoff
+                    )
+                ),
+            )
+            return result.rowcount
 
     # -- alarms (P2.2, section 8) -------------------------------------------------
 

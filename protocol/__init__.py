@@ -13,7 +13,7 @@ because they mirror thermoctl's real, unmodified webhook payload byte for byte
 (see that module's docstring) -- this is not an oversight.
 """
 
-from protocol.commands import Command, CommandResult, CommandType
+from protocol.commands import Command, CommandResult, CommandType, LogExcerpt
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 from protocol.events import (
     Event,
@@ -68,6 +68,7 @@ __all__ = [
     "FaultEvent",
     "FaultKind",
     "Heartbeat",
+    "LogExcerpt",
     "OpenFault",
     "Property",
     "RegistrationAccepted",

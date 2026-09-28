@@ -24,6 +24,7 @@ import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
+import pydantic
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -33,8 +34,15 @@ import fleet.storage as storage_module
 import protocol.commands as protocol_commands
 from fleet.alarms import NotifierConfigError
 from fleet.app import app
-from fleet.storage import CommandRecord, Storage, create_storage, get_storage, upgrade
-from protocol import Heartbeat
+from fleet.storage import (
+    CommandLogExcerptRecord,
+    CommandRecord,
+    Storage,
+    create_storage,
+    get_storage,
+    upgrade,
+)
+from protocol import Heartbeat, LogExcerpt
 from protocol.commands import CommandType
 from protocol.version import PROTOCOL_VERSION
 
@@ -1518,3 +1526,188 @@ def test_get_apartment_id_by_token_hash_never_matches_a_null_hash(storage: Stora
     _create_apartment_without_a_token(storage, APARTMENT)
 
     assert storage.get_apartment_id_by_token_hash(storage_module.hash_token("")) is None
+
+
+# --- POST /v1/commands/{id}/logs (P5.3a, sections 6, 7, 21.5) ----------------
+
+
+def _log_excerpt_payload(command_id: str, **overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "command_id": command_id,
+        "lines": ["<temperatur>", "<name>"],
+        "dropped_lines": 2,
+        "source": "thermoctl",
+        "captured_at": "2026-09-27T12:00:00Z",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_log_excerpt_without_a_token_is_401(client: TestClient) -> None:
+    response = client.post(
+        "/v1/commands/abc123/logs", json=_log_excerpt_payload("abc123")
+    )
+
+    assert response.status_code == 401
+
+
+def test_log_excerpt_with_a_wrong_token_is_403(client: TestClient) -> None:
+    response = client.post(
+        "/v1/commands/abc123/logs",
+        json=_log_excerpt_payload("abc123"),
+        headers=_bearer("agent_house7-a03_anything"),
+    )
+
+    assert response.status_code == 403
+
+
+def test_log_excerpt_unknown_command_id_is_404(client: TestClient, token: str) -> None:
+    response = client.post(
+        "/v1/commands/does-not-exist/logs",
+        json=_log_excerpt_payload("does-not-exist"),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 404
+
+
+def test_log_excerpt_another_apartments_command_id_is_404(
+    client: TestClient, storage: Storage, token: str, other_token: str
+) -> None:
+    """The same "unknown vs. not yours" indistinguishability as
+    `receive_command_result`'s own 404 -- an agent must not learn from this
+    endpoint's response that a `fetch_logs` command with this id exists at
+    all for some other apartment."""
+
+    command = storage.create_command(
+        OTHER_APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.post(
+        f"/v1/commands/{command.id}/logs",
+        json=_log_excerpt_payload(command.id),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 404
+
+
+def test_log_excerpt_for_a_non_fetch_logs_command_is_404(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    command = storage.create_command(
+        APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.post(
+        f"/v1/commands/{command.id}/logs",
+        json=_log_excerpt_payload(command.id),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 404
+
+
+def test_log_excerpt_path_and_body_id_mismatch_is_400(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    command = storage.create_command(
+        APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.post(
+        f"/v1/commands/{command.id}/logs",
+        json=_log_excerpt_payload("a-different-id"),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 400
+
+
+def test_log_excerpt_stored_fields(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    command = storage.create_command(
+        APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    response = client.post(
+        f"/v1/commands/{command.id}/logs",
+        json=_log_excerpt_payload(command.id),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 204
+    stored = storage.get_log_excerpt_for_command(command.id)
+    assert stored is not None
+    assert stored.lines == ["<temperatur>", "<name>"]
+    assert stored.dropped_lines == 2
+    assert stored.source == "thermoctl"
+
+    with storage.session() as session:
+        row = session.scalar(
+            select(CommandLogExcerptRecord).where(
+                CommandLogExcerptRecord.command_id == command.id
+            )
+        )
+        assert row is not None
+        assert row.apartment_id == APARTMENT
+
+
+def test_log_excerpt_second_upload_for_the_same_command_is_409(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    command = storage.create_command(
+        APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    payload = _log_excerpt_payload(command.id)
+
+    first = client.post(f"/v1/commands/{command.id}/logs", json=payload, headers=_bearer(token))
+    second = client.post(f"/v1/commands/{command.id}/logs", json=payload, headers=_bearer(token))
+
+    assert first.status_code == 204
+    assert second.status_code == 409
+
+
+def test_log_excerpt_oversized_upload_is_refused(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """Project owner: "the fleet does no filtering of its own -- but it
+    must refuse obviously oversized input" -- an upload technically within
+    `LogExcerpt`'s own per-field bounds (line count, per-line length) but
+    still unreasonably large in aggregate."""
+
+    command = storage.create_command(
+        APARTMENT, CommandType.FETCH_LOGS, lines=100, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    huge_lines = ["x" * 3000 for _ in range(100)]  # 300_000 bytes total
+
+    response = client.post(
+        f"/v1/commands/{command.id}/logs",
+        json=_log_excerpt_payload(command.id, lines=huge_lines, dropped_lines=0),
+        headers=_bearer(token),
+    )
+
+    assert response.status_code == 413
+    assert storage.get_log_excerpt_for_command(command.id) is None
+
+
+def test_log_excerpt_model_rejects_more_than_max_lines() -> None:
+    """`protocol.commands.LogExcerpt`'s own per-field bound -- structural,
+    at the model level, independent of the fleet's own aggregate-size
+    check above."""
+
+    with pytest.raises(pydantic.ValidationError):
+        LogExcerpt(
+            command_id="abc",
+            lines=["x"] * 501,
+            dropped_lines=0,
+            source="thermoctl",
+            captured_at=datetime.now(UTC),
+        )
