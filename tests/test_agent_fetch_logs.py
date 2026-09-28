@@ -37,8 +37,14 @@ from tests.tls_support import _free_port, _UvicornThread
 APARTMENT = "house7-fetch-logs"
 NOW = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
 
+# A real, fixed-text thermoctl WARNING message (`thermoctl/services
+# /reading.py:84`) -- kept verbatim by `agent.log_filter.filter_log_lines`,
+# see `tests/test_log_filter.py` for the exhaustive template coverage;
+# this module only needs one known-good line to prove the handler wires
+# reading -> filtering -> upload together correctly.
 _ALLOWED_LINE = (
-    "2026-09-27 08:00:00,000 ERROR    thermoctl.app: kaputt | grund=Testfall"
+    "2026-09-27 08:00:00,000 WARNING  thermoctl.domain.reading: "
+    "Zigbee2MQTT-Nutzlast ist kein gueltiges JSON"
 )
 _DROPPED_LINE = "2026-09-27 08:00:00,000 INFO     thermoctl.app: nicht gelistet"
 
@@ -185,7 +191,7 @@ def test_fetch_logs_end_to_end_success(
     assert stored is not None
     assert stored.dropped_lines == 1
     assert len(stored.lines) == 1
-    assert "kaputt" in stored.lines[0]
+    assert "Zigbee2MQTT-Nutzlast ist kein gueltiges JSON" in stored.lines[0]
     assert stored.source == "thermoctl"
 
 

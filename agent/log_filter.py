@@ -13,46 +13,67 @@ device for `fetch_logs` -- filtering happens here, on the device, **never**
 in the cloud (`fleet/app.py`'s own upload endpoint does no filtering of its
 own, only a size cap).
 
+**Cross-review correction (main-session decision, this file's second
+version):** the first version of this module let *any* `WARNING`/`ERROR`/
+`CRITICAL` line through unconditionally, on the theory that "important
+enough to log at that level" implied "safe enough to upload". That is a
+**denylist wearing an allowlist's clothes** -- it defines safety by
+severity, not by content, and thermoctl logs plenty of high-severity lines
+that carry a room name, a device's display name, or a raw sensor reading
+mid-message (`thermoctl/integrations/notification.py::_attempt_delivery`
+logs every fault notice's `title`/`text` -- which can read "Sensorstörung
+in Kinderzimmer Mia" -- at `WARNING`, unconditionally). Reproduced and
+fixed here: **every level, `WARNING`/`ERROR`/`CRITICAL` included, is now
+matched against an explicit table of known thermoctl message *templates***
+(`_WARN_FIXED_MESSAGES`, `_WARN_TEMPLATES`), each naming exactly which of
+its own parameters are safe to keep (a zone/device *id*, a count, a closed
+enum value) and which must be replaced by a fixed placeholder (a
+zone/device *name*, an exception's rendered text, a raw payload value). A
+`WARNING`+ line matching **no** template is not silently dropped either --
+it is *reduced* to `<timestamp> <LEVEL> <logger>: <nicht freigegebene
+Meldung>` (the message and its `extra` tail both discarded, only the bare
+fact "something happened in this logger at this level and time" survives)
+and still counted in `dropped`, so an operator sees "some lines had no
+approved content" rather than a silent, complete absence. `INFO` keeps its
+original, narrower rule (only the four known-safe templates; everything
+else dropped outright, not reduced) -- an `INFO` line has no severity
+signal worth preserving in reduced form to begin with.
+
+**This table is a snapshot of one thermoctl version, not a permanent
+contract.** A future thermoctl release that adds a new log call, or
+changes the wording of an existing one, does not "fall through" to being
+logged in full -- it simply stops matching any template here and every
+instance of it becomes `<nicht freigegebene Meldung>` until this table is
+updated to include it. That is the allowlist working as intended (fails
+visibly, by omission, never silently by leaking) but it does mean **this
+table must be revisited whenever thermoctl is upgraded** -- a stale table
+does not leak, it just quietly loses signal, which is the failure mode to
+actively watch for in `docs/STATUS.md`'s own P5.3a section.
+
 **Two independent stages, deliberately not merged into one regex pass:**
 
-1. **Shape allowlist (`_is_allowed_line`).** A line is only ever considered
-   at all if it structurally matches thermoctl's own text log format
-   (`thermoctl/logging.py::TextFormatter`, read from the sibling repository
-   for this package -- `"%(asctime)s %(levelname)-8s %(name)s: %(message)s"`,
-   optionally followed by `" | key=value ..."` for `extra=` fields) **and**
-   its level/message shape is one of a short, explicit list of known-harmless
-   kinds: `WARNING`/`ERROR`/`CRITICAL` (any message -- these are exactly the
-   lines an operator needs to see, and thermoctl's own masking already keeps
-   secrets out of `extra` fields, see below), or one of a handful of
-   known-safe `INFO` message templates (startup/version banner, MQTT
-   connection established, MQTT receiving disabled, cluster leadership
-   state -- restart and connection-lost events surface as `ERROR`/`WARNING`
-   already, see `_INFO_ALLOWLIST`'s own comment for the concrete lines this
-   was derived from). **Anything else -- including a line this module simply
-   cannot parse, e.g. a multi-line traceback's continuation lines -- is
-   dropped, counted, and never partially redacted and passed through.** A
-   denylist that "mostly" masks an unrecognised shape is exactly the failure
-   mode the project owner ruled out; an allowlist that let an unrecognised
-   shape through "just this once" would be the same mistake with an extra
-   step.
-2. **Placeholder masking (`_mask_line`), applied only to a line the shape
-   allowlist already accepted.** Temperatures, setpoints, and other numbers
-   with units are replaced with fixed, **dumb** placeholders (`<temperatur>`,
-   `<sollwert>`) -- never a stable hash of the value, which would let two
-   lines carrying the same underlying reading be correlated across a log
-   even after masking (project owner, condition 2). Names following a known
-   prefix (`Gemeldet von:`, `Raum:`, `Name:`) become `<name>`; a free-text
-   note field (`Hinweis:`) becomes `<hinweis>`; e-mail addresses become
-   `<email>`; anything token-shaped (`agent_...`, a bearer string, a long
-   base64/hex run -- including a literal secret thermoctl's own
-   `TextFormatter` deliberately does **not** redact, see
-   `thermoctl/app.py::create_app`'s one-time setup-token banner) becomes
-   `<token>`; IPv4 addresses and MAC addresses become `<ip>`/`<mac>`.
+1. **Shape allowlist.** A line is only ever considered at all if it
+   structurally matches thermoctl's own text log format
+   (`thermoctl/logging.py::TextFormatter`, read from the sibling
+   repository for this package -- `"%(asctime)s %(levelname)-8s
+   %(name)s: %(message)s"`, optionally followed by `" | key=value ..."`
+   for `extra=` fields), see `_LINE_RE`. Within that, the message (and, if
+   present, the `extra` tail) must match a known template for this line's
+   level -- see `_classify_and_mask` for the exact per-level rules above.
+2. **Placeholder masking**, applied only to the parts of an already-
+   recognised template that are declared unsafe: a zone/device name -> a
+   fixed `<name>`; an exception's rendered text, a raw sensor/config value,
+   or a display name in the `extra` tail -> `<wert>`; a temperature/
+   setpoint reading -> `<temperatur>`/`<sollwert>`. **Never a stable hash**
+   of the value, which would let two lines carrying the same underlying
+   reading be correlated across a log even after masking (project owner,
+   condition 2).
 
-`filter_log_lines` ties both stages together and additionally **counts**
-every dropped line (project owner, condition 3: "N Zeilen entfernt", so
-nobody debugs a log with an invisible gap) -- the count is part of
-`FilteredLog`, uploaded and shown in the UI, never silently swallowed.
+`filter_log_lines` ties both stages together and counts every line whose
+content was reduced or dropped (project owner, condition 3: "N Zeilen
+entfernt", so nobody debugs a log with an invisible gap) -- the count is
+part of `FilteredLog`, uploaded and shown in the UI, never silently
+swallowed.
 """
 
 from __future__ import annotations
@@ -65,136 +86,379 @@ from dataclasses import dataclass
 # optionally followed by " | key=value key2=value2 ..." for `extra=` fields
 # (`TextFormatter.format`'s own `f"{base} | {parts}"`). A line not matching
 # this shape at all (a stack-trace continuation line, a truncated first
-# line after `--tail`, anything else) is never even considered by the level/
-# message allowlist below -- it falls through to "unknown shape, dropped".
+# line after `--tail`, anything else) is never even considered by the
+# per-level template matching below -- it falls straight to "unknown
+# shape, dropped" (never reduced -- there is no logger/level/timestamp to
+# even anchor a reduced line to).
 _LINE_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2}) (?P<time>[0-9:,]+) "
     r"(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+"
     r"(?P<logger>[\w.]+): (?P<rest>.*)$"
 )
 
-# Level names that are always allowed, regardless of message content
-# (project owner: "log level ERROR/WARNING/CRITICAL lines"). These are
-# exactly the lines an operator looks at `fetch_logs` *for* -- a connection
-# lost (`log.exception`/`log.error`, thermoctl's own
-# `integrations/mqtt/client.py::run`), a failed write, a schema mismatch.
-# thermoctl's own `MaskingFilter` (`thermoctl/logging.py`) already keeps
-# every `extra=` field's *secrets* out of these lines before they ever reach
-# stdout; this module's own masking below is an independent, redundant
-# safeguard over the message text itself (which `MaskingFilter` cannot
-# reach, see that module's own docstring) plus everything section 6 forbids
-# (temperatures, names, setpoints), which `MaskingFilter` was never meant to
-# catch in the first place.
 _ALWAYS_ALLOWED_LEVELS = frozenset({"WARNING", "ERROR", "CRITICAL"})
 
-# A short, explicit list of known-safe `INFO`-level message shapes, each
-# traced back to a real, current line in thermoctl's own source (read from
+_UNAPPROVED_MESSAGE_PLACEHOLDER = "<nicht freigegebene Meldung>"
+
+
+# -- `extra=` tail (the "` | key=value ...`" part of a line) ----------------
+#
+# TextFormatter always writes this as space-separated `key=value` tokens, in
+# the order `extra=` was passed. `_split_extra_tail` below tokenizes by
+# finding every `identifier=` occurrence and treating the text up to the
+# next one (or end of string) as that key's value -- not a full parser, but
+# exactly what thermoctl's own deterministic writer produces (a value
+# containing a literal `word=` substring could confuse this, which is a
+# known, accepted limitation: such a value is not a shape any key below
+# treats as safe anyway, so it is masked or dropped either way, never
+# passed through unmasked).
+_EXTRA_KEY_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
+
+# A key on this list is kept **verbatim**, but only if its value also
+# matches the given shape -- a value that does not is masked (`<wert>`),
+# never dropped and never passed through unchecked. Every regex is
+# anchored (`fullmatch` via `^...$`) and deliberately narrow: no key here
+# is a free-text field in thermoctl's own source (verified by reading the
+# call sites this module's own docstring and `docs/STATUS.md`'s P5.3a
+# section cite).
+_EXTRA_SAFE_KEY_SHAPES: dict[str, re.Pattern[str]] = {
+    # `notice.key` (`domain.fault_notice`): thermoctl's own internal
+    # identifier for a fault notice, e.g. "sensor:42", "zigbee2mqtt:brücke"
+    # -- never a display name.
+    "schluessel": re.compile(r"^[\w:äöüÄÖÜß-]+$"),
+    # `notice.severity`: a closed, three-value vocabulary.
+    "schwere": re.compile(r"^(stoerung|entwarnung|test)$"),
+    # A zone's numeric primary key, never its display name.
+    "zone_id": re.compile(r"^\d+$"),
+    # An MQTT topic -- path-like, no spaces (a free-text payload value
+    # never has this shape, it is carried in its own key instead, always
+    # masked below).
+    "topic": re.compile(r"^[\w/.\-:]+$"),
+    # Network/process identifiers from startup/connection log lines --
+    # infrastructure configuration, not tenant data.
+    "host": re.compile(r"^[\w.-]+$"),
+    "port": re.compile(r"^\d+$"),
+    "bind": re.compile(r"^[\w.-]+:\d+$"),
+    "instanz": re.compile(r"^[\w.-]+$"),
+    "faehigkeitscode": re.compile(r"^[\w-]+$"),
+}
+
+# A key on this list is **always** replaced by `<wert>`, regardless of its
+# value's shape -- either it is explicitly a display name (`geraet`,
+# `zone_name`, `device_name`, ...), or its value is an unpredictable,
+# unbounded string in thermoctl's own source (`grund`/`fehler`: an
+# exception's rendered text; `wert`/`value`/`messwert`: a raw sensor or
+# config payload value).
+_EXTRA_ALWAYS_MASKED_KEYS = frozenset(
+    {
+        "geraet",
+        "zone_name",
+        "device_name",
+        "wert",
+        "value",
+        "messwert",
+        "name",
+        "kontakt",
+        "grund",
+        "fehler",
+        "anbindung",
+        "befehl",
+        "merkmal",
+        "ergebnis",
+        "username",
+        "mieter",
+        "note",
+        "hinweis",
+    }
+)
+
+
+def _split_extra_tail(tail: str) -> list[tuple[str, str]]:
+    matches = list(_EXTRA_KEY_RE.finditer(tail))
+    pairs: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        key = match.group(1)
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(tail)
+        pairs.append((key, tail[start:end].rstrip()))
+    return pairs
+
+
+def _mask_extra_tail(tail: str) -> str:
+    """Rebuilds the `extra=` tail keeping only allowlisted keys -- an
+    unlisted key is dropped from the tail entirely (project owner: unknown
+    keys are not shown at all, not even masked), a masked-list key always
+    becomes `<wert>`, and a safe-list key is kept verbatim only if its
+    value matches that key's own expected shape (masked to `<wert>`
+    otherwise -- an unexpected shape is not trusted just because the key
+    name looks familiar)."""
+
+    kept: list[str] = []
+    for key, value in _split_extra_tail(tail):
+        shape = _EXTRA_SAFE_KEY_SHAPES.get(key)
+        if shape is not None:
+            kept.append(f"{key}={value}" if shape.match(value) else f"{key}=<wert>")
+        elif key in _EXTRA_ALWAYS_MASKED_KEYS:
+            kept.append(f"{key}=<wert>")
+        # else: an unrecognised key -- dropped from the tail entirely.
+    return " ".join(kept)
+
+
+# -- INFO: unchanged from the first version -- a short, fixed set of ------
+# -- known-safe message shapes, everything else dropped outright ----------
+
+# Traced back to a real, current line in thermoctl's own source (read from
 # the sibling repository for this package):
 #   - `thermoctl/app.py::create_app`: "thermoctl startet" (version/startup
-#     banner -- the container/service coming up).
+#     banner).
 #   - `thermoctl/integrations/mqtt/client.py::run`: "MQTT-Verbindung
 #     hergestellt" (connection restored) and "MQTT-Empfang ist
-#     deaktiviert" (a fixed, static service-state line, no variable content
-#     at all).
-#   - `thermoctl/app.py::_shadow_loop_needed`'s caller (cluster takeover):
-#     "Verbund: aktive Rolle übernommen"/"... verloren -- jetzt in
+#     deaktiviert" (a fixed, static service-state line).
+#   - `thermoctl/app.py`'s cluster takeover caller: "Verbund: aktive Rolle
+#     übernommen"/"Verbund: aktive Rolle verloren -- jetzt in
 #     Bereitschaft" (container/cluster state).
-# Deliberately **not** a catch-all "any INFO starting with a capital letter"
-# -- an unlisted INFO shape (e.g. thermoctl/app.py's own one-time setup-
-# token banner, which interpolates a real secret straight into the message
-# text and is explicitly *not* covered by thermoctl's own masking, see that
-# function's docstring) must fall through to "unknown shape, dropped", not
-# "allowed, hope the masking below catches it".
-_INFO_ALLOWLIST = [
-    re.compile(r"^thermoctl startet\b"),
-    re.compile(r"^MQTT-Verbindung hergestellt\b"),
-    re.compile(r"^MQTT-Empfang ist deaktiviert\b"),
-    re.compile(r"^Verbund: aktive Rolle (übernommen|verloren)\b"),
+# Exact string equality (not a prefix match) -- deliberately **not** a
+# catch-all "any INFO starting with a capital letter": an unlisted INFO
+# shape (e.g. thermoctl/app.py's own one-time setup-token banner, which
+# interpolates a real secret straight into the message text and is
+# explicitly *not* covered by thermoctl's own masking, see that function's
+# docstring) must fall through to "unknown shape, dropped", not "allowed,
+# hope the masking below catches it".
+_INFO_FIXED_MESSAGES = frozenset(
+    {
+        "thermoctl startet",
+        "MQTT-Verbindung hergestellt",
+        "MQTT-Empfang ist deaktiviert",
+        "Verbund: aktive Rolle übernommen",
+        "Verbund: aktive Rolle verloren -- jetzt in Bereitschaft",
+    }
+)
+
+
+# -- WARNING/ERROR/CRITICAL: an explicit template table --------------------
+
+#: A temperature/setpoint reading as thermoctl's own domain code formats it
+#: (German decimal comma, mandatory `°C` suffix) -- matched as one group so
+#: the value **and** its unit are replaced together.
+_TEMP = r"-?\d+(?:[.,]\d+)?\s?°C"
+#: A display name (zone or device) -- deliberately unbounded (`.+?`, non-
+#: greedy): the surrounding literal text in every template below is fixed
+#: and specific enough to anchor where the name starts and ends without
+#: needing to guess its own shape.
+_NAME = r".+?"
+
+
+@dataclass(frozen=True)
+class _Template:
+    """One known thermoctl `WARNING`+ message shape. `pattern` must
+    `fullmatch` the message (the part of a line before any ` | ` `extra`
+    tail). A named group listed in `placeholders` is replaced by that
+    placeholder text (a name, an exception's rendered text, ...); a named
+    group **not** listed is a deliberate, explicit "keep verbatim" --
+    used only for a group this table's author has checked is a plain
+    count or index (`\\d+`, e.g. `legacy_data.py`'s slot/weekday numbers),
+    never for anything shaped like free text."""
+
+    pattern: re.Pattern[str]
+    placeholders: dict[str, str]
+
+
+def _t(pattern: str, placeholders: dict[str, str] | None = None) -> _Template:
+    return _Template(re.compile(f"^{pattern}$"), placeholders or {})
+
+
+# Exact-match messages with **no** dynamic content at all -- the majority
+# of thermoctl's own `WARNING`/`ERROR` call sites (verified by reading
+# every call site this module's own docstring cites): a fixed literal
+# string, with at most an `extra=` tail (masked independently, see
+# `_mask_extra_tail`). Kept as a plain set (not `_Template` objects, which
+# would need to declare zero placeholders each) purely for readability.
+_WARN_FIXED_MESSAGES = frozenset(
+    {
+        "Wert aus Bediengeraetekanal abgewiesen",
+        "Schalt-Protokolleintrag konnte nicht geschrieben werden",
+        "Aktor an nicht verdrahteter Anbindung wird nicht geschaltet",
+        "Thermostatventil an nicht verdrahteter Anbindung wird nicht geschaltet",
+        "Unsicherer Schreibkanal wird nicht gesendet",
+        "Altsystem-Topic ohne lesbare Thermostat-Kennung",
+        "Altsystem-Nutzlast ist nicht als UTF-8 lesbar",
+        "Altsystem-Temperaturwert ist nicht lesbar",
+        "Zigbee2MQTT-Geraeteliste ist ungültig",
+        "Zigbee2MQTT-Erreichbarkeit ist kein gültiges JSON",
+        "Zigbee2MQTT-Erreichbarkeit enthält keinen Zustand",
+        "Zigbee2MQTT-Nutzlast ist kein gueltiges JSON",
+        "Geraetefaehigkeit fehlt in der Nachschlagetabelle",
+        "Messwertfähigkeit fehlt in der Nachschlagetabelle",
+        "Nachtstunden sind kein gültiges JSON und werden als leer behandelt",
+        "Nachtstunden sind kein Array und werden als leer behandelt",
+        "Sonnenprognose nicht erreichbar -- keine Absenkung in diesem Zyklus",
+        "Trockenlauf: Schaltbefehl abgewiesen, obwohl der Aufrufer ihn verlangt hat",
+        "MQTT-Nachricht kann ohne Verbindung nicht veroeffentlicht werden",
+        "Das Schema wurde nicht über Alembic angelegt, der Versionsvergleich entfällt",
+        "Meross-Anmeldung abgelehnt -- Aktoren bleiben diesen Zyklus unerreichbar",
+        "Meross-Geräteliste nicht abrufbar",
+        "Störungsmeldung konnte nicht an Home Assistant gesendet werden",
+        "Fenster-Alarm konnte nicht an Home Assistant gesendet werden",
+        "Störungsmeldung konnte nicht an den Webhook gesendet werden",
+        "Zigbee2MQTT-Brücke nicht erreichbar: Die Verbindung zur Zigbee2MQTT-Brücke "
+        "ist ausgefallen.",
+        "Zigbee2MQTT-Brücke wieder erreichbar: Die Verbindung zur Zigbee2MQTT-Brücke "
+        "ist wiederhergestellt.",
+        "Testmeldung von thermoctl: Dies ist eine Testmeldung. Keine Störung liegt vor.",
+        "Schattenzyklus für eine Zone gescheitert — übrige Zonen laufen weiter",
+        "Schattenzyklus fehlgeschlagen -- nächster Versuch folgt",
+        "Anspruch auf die aktive Rolle vor dem ersten Schattenzyklus fehlgeschlagen -- "
+        "nächster Versuch mit dem ersten Durchlauf",
+        "Der Dienst ist im Netz erreichbar, aber THERMOCTL_SECURE_COOKIES ist aus. "
+        "Sitzungscookies gehen dann auch unverschlüsselt hinaus. Hinter TLS gehört "
+        "THERMOCTL_SECURE_COOKIES=true; ohne TLS gehört die Bindung auf 127.0.0.1.",
+        "Befehl für unbekannte Zone verworfen",
+    }
+)
+
+# Templates with dynamic content -- each traced to one real call site in
+# thermoctl's own source (`thermoctl/domain/fault_notice.py`,
+# `thermoctl/domain/problem_report.py` via `thermoctl/integrations
+# /notification.py::_attempt_delivery`'s `log.warning("%s: %s", notice
+# .title, notice.text, ...)`; `thermoctl/app.py`'s two `CommandError`-
+# reporting call sites; `thermoctl/db/migration_lock.py`'s malformed-env-
+# var warning; `thermoctl/domain/legacy_data.py`'s three count/index
+# warnings).
+_WARN_TEMPLATES: list[_Template] = [
+    # fault_notice.sensor_notice -- entry (stale reading).
+    _t(
+        r"Sensorstörung in (?P<zone>" + _NAME + r"): Der Temperaturwert ist veraltet\. "
+        r"Die Zone regelt die Heizung bis auf Weiteres gegen den Frostschutz-Sollwert "
+        r"von (?P<temp>" + _TEMP + r")\.",
+        {"zone": "<name>", "temp": "<temperatur>"},
+    ),
+    # fault_notice.sensor_notice -- entry (no source at all).
+    _t(
+        r"Sensorstörung in (?P<zone>" + _NAME + r"): Der Zone ist keine "
+        r"Temperaturquelle zugeordnet\. Ohne Temperaturwert kann sie die Heizung "
+        r"nicht gegen den Frostschutz-Sollwert von (?P<temp>" + _TEMP + r") regeln\.",
+        {"zone": "<name>", "temp": "<temperatur>"},
+    ),
+    # fault_notice.sensor_notice -- all-clear.
+    _t(
+        r"Sensor in (?P<zone>" + _NAME + r") wieder in Ordnung: Die Temperaturquelle "
+        r"liefert wieder aktuelle Werte\. Die Zone regelt die Heizung wieder normal\.",
+        {"zone": "<name>"},
+    ),
+    # fault_notice.stuck_sensor_notice -- entry.
+    _t(
+        r"Messwert in (?P<zone>" + _NAME + r") bewegt sich nicht mehr: Der "
+        r"Temperaturwert hat sich über die eingestellte Dauer nicht verändert\. Das "
+        r"kann ein hängender Sensor sein oder ein tatsächlich sehr stabiler Raum — "
+        r"die Zone regelt unverändert mit diesem Wert weiter, es findet kein Wechsel "
+        r"in den Frostschutz statt\.",
+        {"zone": "<name>"},
+    ),
+    # fault_notice.stuck_sensor_notice -- all-clear.
+    _t(
+        r"Messwert in (?P<zone>" + _NAME + r") bewegt sich wieder: Der Temperaturwert "
+        r"verändert sich wieder — kein Hinweis mehr auf einen festhängenden Sensor\.",
+        {"zone": "<name>"},
+    ),
+    # fault_notice.window_alarm_notice -- entry.
+    _t(
+        r"Fenster in (?P<zone>" + _NAME + r") vergessen offen: Ein Fenster steht seit "
+        r"Längerem offen, während es draußen kalt genug ist, um den Raum in Richtung "
+        r"Frostschutz auskühlen zu lassen\.",
+        {"zone": "<name>"},
+    ),
+    # fault_notice.window_alarm_notice -- all-clear.
+    _t(
+        r"Fenster in (?P<zone>" + _NAME + r") nicht mehr auffällig: Entweder ist das "
+        r"Fenster wieder zu, oder die Außentemperatur liegt wieder über der "
+        r"eingestellten Schwelle\.",
+        {"zone": "<name>"},
+    ),
+    # fault_notice.command_failure_notice -- entry (device name twice).
+    _t(
+        r"Schaltbefehl an (?P<device1>" + _NAME + r") gescheitert: Ein Schaltbefehl "
+        r"an (?P<device2>" + _NAME + r") ist fehlgeschlagen\. Jeder weitere "
+        r"Regelzyklus versucht es erneut, bis er wieder durchgeht\.",
+        {"device1": "<name>", "device2": "<name>"},
+    ),
+    # fault_notice.command_failure_notice -- all-clear (device name twice).
+    _t(
+        r"Schaltbefehl an (?P<device1>" + _NAME + r") geht wieder durch: "
+        r"Schaltbefehle an (?P<device2>" + _NAME + r") werden wieder erfolgreich "
+        r"ausgeführt\.",
+        {"device1": "<name>", "device2": "<name>"},
+    ),
+    # problem_report.build_report -- the tenant-report `FaultNotice`, sent
+    # through the exact same `log.warning("%s: %s", title, text, ...)` call
+    # as every other notice above. Only the title and the *first* line of
+    # `text` ("Raum: ...") ever reach this template -- every following
+    # line of the tenant's own multi-line report (setpoint, note, ...) is
+    # on its own physical line with no log-format prefix at all, and is
+    # therefore already dropped by `_LINE_RE` before any template is even
+    # tried (see the module docstring).
+    _t(
+        r"(?P<zone1>" + _NAME + r"): (?:Raum wird nicht warm|Temperatur wirkt falsch|"
+        r"Raum zu warm|Anderes Problem): Raum: (?P<zone2>" + _NAME + r")",
+        {"zone1": "<name>", "zone2": "<name>"},
+    ),
+    # app.py's two `CommandError`-reporting call sites -- the parameter is
+    # the exception's own rendered text, built from raw MQTT payload
+    # content (`integrations/mqtt/commands.py`'s own `CommandError`
+    # messages embed the unvalidated topic/payload verbatim) and therefore
+    # never safe to keep, regardless of what it happens to say this time.
+    _t(r"Unbrauchbarer Befehl verworfen: (?P<exc>.+)", {"exc": "<wert>"}),
+    _t(r"Befehl abgelehnt: (?P<exc>.+)", {"exc": "<wert>"}),
+    # migration_lock.py -- an operator-set environment variable that
+    # failed to parse as a number; masked all the same (an env var is not
+    # tenant data, but this table does not special-case "probably fine").
+    _t(
+        r"THERMOCTL_MIGRATION_LOCK_TIMEOUT_SECONDS=(?P<raw>.*?) ist keine Zahl, "
+        r"verwende die Vorgabe von (?P<default>\d+)s",
+        {"raw": "<wert>"},
+    ),
+    # legacy_data.py -- pure counts/indices, never a name or a value.
+    _t(
+        r"Nachtstunden haben (?P<n>\d+) statt acht Slots; lesbare Wochentage werden "
+        r"übernommen"
+    ),
+    _t(r"Nachtstunden-Slot (?P<weekday>\d+) ist keine Liste und wird verworfen"),
+    _t(
+        r"Ungültige oder doppelte Nachtstunde in Slot (?P<weekday>\d+) wird verworfen"
+    ),
 ]
 
 
-def _is_allowed_shape(level: str, message: str) -> bool:
-    if level in _ALWAYS_ALLOWED_LEVELS:
-        return True
-    if level == "INFO":
-        return any(pattern.match(message) for pattern in _INFO_ALLOWLIST)
-    # DEBUG (thermoctl's own default level excludes it in production, but a
-    # misconfigured deployment could still emit it) is never allowlisted --
-    # nothing this verbose has been individually vetted.
-    return False
+def _apply_template(message: str, template: _Template) -> str | None:
+    match = template.pattern.fullmatch(message)
+    if match is None:
+        return None
+    replacements: list[tuple[int, int, str]] = []
+    for name, placeholder in template.placeholders.items():
+        start, end = match.span(name)
+        if start == -1:
+            continue
+        replacements.append((start, end, placeholder))
+    # Rightmost first, so an earlier replacement's own offset is never
+    # invalidated by a later one shifting the string underneath it.
+    replacements.sort(key=lambda item: item[0], reverse=True)
+    result = message
+    for start, end, placeholder in replacements:
+        result = result[:start] + placeholder + result[end:]
+    return result
 
 
-# -- placeholder masking, applied only to an already-allowed line -----------
+def _mask_warn_message(message: str) -> str | None:
+    """`None` if `message` matches no known `WARNING`+ template at all --
+    the caller reduces the whole line in that case (see the module
+    docstring)."""
 
-# German decimal comma, optionally with a leading '-', a mandatory '°C'
-# suffix (thermoctl's own `age_in_words`/`resolved_setpoint` formatting,
-# e.g. "21,5 °C", "-3 °C") -- matched *before* the generic token/number
-# patterns below so a temperature is never partially eaten by them first.
-# A preceding "Sollwert" (case-insensitively, thermoctl's own "Sollwert: X
-# °C") gets the more specific `<sollwert>` placeholder; every other
-# temperature-shaped value gets `<temperatur>`.
-_SETPOINT_RE = re.compile(
-    r"(?i)(Sollwert[:\s]*)-?\d+(?:[.,]\d+)?\s?°C"
-)
-_TEMPERATURE_RE = re.compile(r"-?\d+(?:[.,]\d+)?\s?°C")
-
-# E-mail address -- checked before the generic token pattern so an address
-# is never left partially masked by it.
-_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
-
-# MAC address (six colon- or hyphen-separated hex octets) and IPv4 address.
-_MAC_RE = re.compile(r"\b[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}\b")
-_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
-
-# Anything token-shaped: an explicit `agent_...` apartment token
-# (`fleet/auth.py`'s own wire shape), a `Bearer <...>` header value echoed
-# into a message, or a bare run of 20+ mixed letters-and-digits (covers
-# `secrets.token_urlsafe`/`token_hex` output generally, including
-# thermoctl's own one-time setup token -- see `_INFO_ALLOWLIST`'s own
-# comment for why that specific line is not even reached by this masking in
-# the first place, this pattern is the second, independent line of defence
-# for any other place a token-shaped string ends up in an allowed line).
-_AGENT_TOKEN_RE = re.compile(r"\bagent_[A-Za-z0-9_-]+\b")
-_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._-]+")
-_GENERIC_TOKEN_RE = re.compile(
-    r"\b(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{20,}\b"
-)
-
-# A known name-carrying prefix (thermoctl's own tenant-report text,
-# `thermoctl/domain/problem_report.py::build_report`: "Gemeldet von: ...",
-# "Raum: ...") followed by free text up to the next recognised field
-# separator (` | `, another known prefix, or end of line) -- replaced
-# wholesale with `<name>`, never partially.
-_NAME_PREFIX_RE = re.compile(
-    r"(?P<prefix>\b(?:Gemeldet von|Raum|Name|Mieter)\s*:\s*)"
-    r"(?P<value>[^|]+?)(?=(?:\s\||\s*$))"
-)
-
-# A free-text note field (`thermoctl/domain/problem_report.py`'s own
-# "Hinweis: ..." line) -- the tenant's own words, section 6 territory
-# regardless of what they happen to say.
-_NOTE_PREFIX_RE = re.compile(r"(?P<prefix>\bHinweis\s*:\s*)(?P<value>[^|]+?)(?=(?:\s\||\s*$))")
-
-
-def _mask_line(line: str) -> str:
-    """Replaces every recognised sensitive value in `line` with a fixed,
-    dumb placeholder -- see the module docstring for the full list and the
-    "no stable hash" reasoning (project owner, condition 2). Order matters:
-    the more specific patterns (setpoint, email, name/note prefixes) run
-    before the generic ones (temperature, token) that could otherwise eat
-    part of what a more specific pattern was meant to replace whole."""
-
-    masked = _SETPOINT_RE.sub(lambda m: f"{m.group(1)}<sollwert>", line)
-    masked = _TEMPERATURE_RE.sub("<temperatur>", masked)
-    masked = _EMAIL_RE.sub("<email>", masked)
-    masked = _MAC_RE.sub("<mac>", masked)
-    masked = _IPV4_RE.sub("<ip>", masked)
-    masked = _NAME_PREFIX_RE.sub(lambda m: f"{m.group('prefix')}<name>", masked)
-    masked = _NOTE_PREFIX_RE.sub(lambda m: f"{m.group('prefix')}<hinweis>", masked)
-    masked = _AGENT_TOKEN_RE.sub("<token>", masked)
-    masked = _BEARER_RE.sub("<token>", masked)
-    masked = _GENERIC_TOKEN_RE.sub("<token>", masked)
-    return masked
+    if message in _WARN_FIXED_MESSAGES:
+        return message
+    for template in _WARN_TEMPLATES:
+        masked = _apply_template(message, template)
+        if masked is not None:
+            return masked
+    return None
 
 
 @dataclass(frozen=True)
@@ -202,10 +466,12 @@ class FilteredLog:
     """The result of filtering one log excerpt (P5.3a) -- exactly what
     `agent.loop._handle_fetch_logs` uploads (via
     `protocol.commands.LogExcerpt`, plus the command id/source/capture time
-    it alone knows) and what the condition-3 "count dropped lines" decision
-    requires. `lines` are already masked; `dropped` never includes a line
-    this function chose to keep, even if that line's masking left it
-    unchanged."""
+    it alone knows) and what the condition-3 "count dropped lines"
+    decision requires. `lines` are already masked (or, for a `WARNING`+
+    line matching no known template, reduced to the fixed "unapproved
+    message" placeholder); `dropped` counts every input line that either
+    did not survive at all (unknown shape, `DEBUG`, or an unrecognised
+    `INFO` shape) or survived only in that reduced form."""
 
     lines: list[str]
     dropped: int
@@ -214,14 +480,9 @@ class FilteredLog:
 def filter_log_lines(raw_lines: list[str]) -> FilteredLog:
     """Filters `raw_lines` (already tailed to at most the requested line
     count by the caller, in `agent.loop.read_container_log_lines`'s own
-    order) through the shape allowlist, then masks every accepted line.
-
-    A line that does not match thermoctl's own log format at all
-    (`_LINE_RE`), or whose level/message shape is not on the allowlist, is
-    dropped and counted -- never partially redacted and passed through
-    (see the module docstring's "fails the other way" reasoning). The
-    returned `lines` preserve the original order; `dropped` is the number of
-    input lines that did not make it through.
+    order) -- see the module docstring for the full per-level contract.
+    Order is preserved; `dropped` counts every line that did not survive
+    with its real content intact.
     """
 
     kept: list[str] = []
@@ -231,16 +492,37 @@ def filter_log_lines(raw_lines: list[str]) -> FilteredLog:
         if match is None:
             dropped += 1
             continue
+
         level = match.group("level")
         rest = match.group("rest")
-        # Only the message half of `rest` (before a possible " | k=v ..."
-        # `extra=` tail) decides the shape -- the allowlist is about what
-        # thermoctl *said*, not about which structured fields happen to be
-        # attached to it.
-        message = rest.split(" | ", 1)[0]
-        if not _is_allowed_shape(level, message):
-            dropped += 1
+        message, sep, tail = rest.partition(" | ")
+        prefix = raw_line[: match.start("rest")]
+
+        if level == "INFO":
+            if message not in _INFO_FIXED_MESSAGES:
+                dropped += 1
+                continue
+            masked_tail = _mask_extra_tail(tail) if sep else ""
+            kept.append(prefix + message + (f" | {masked_tail}" if masked_tail else ""))
             continue
-        kept.append(_mask_line(raw_line))
+
+        if level in _ALWAYS_ALLOWED_LEVELS:
+            masked_message = _mask_warn_message(message)
+            if masked_message is None:
+                kept.append(f"{prefix}{_UNAPPROVED_MESSAGE_PLACEHOLDER}")
+                dropped += 1
+                continue
+            masked_tail = _mask_extra_tail(tail) if sep else ""
+            kept.append(
+                prefix + masked_message + (f" | {masked_tail}" if masked_tail else "")
+            )
+            continue
+
+        # DEBUG (thermoctl's own default level excludes it in production,
+        # but a misconfigured deployment could still emit it) is never
+        # allowlisted -- nothing this verbose has been individually vetted,
+        # and unlike WARNING+ it carries no severity signal worth
+        # preserving even in reduced form.
+        dropped += 1
 
     return FilteredLog(lines=kept, dropped=dropped)

@@ -11,24 +11,48 @@ not the P5.2 placeholder.
 **Allowlist, not denylist** (`agent/log_filter.py`): a line only ever leaves the device if
 (1) it structurally matches thermoctl's own text log line shape
 (`thermoctl/logging.py::TextFormatter`, read from the sibling repository) **and** (2) its
-level/message is one of a short, explicit list of known-harmless shapes --
-`WARNING`/`ERROR`/`CRITICAL` at any message (thermoctl's own connection-lost/restored
-messages surface at these levels already), or one of four known-safe `INFO` templates
-(version/startup banner, MQTT connection established, MQTT receiving disabled, cluster
-leadership state). Everything else -- an unrecognised `INFO` shape (including thermoctl's
-own one-time setup-token banner, which deliberately is **not** covered by thermoctl's own
-masking, see that function's docstring), `DEBUG`, or a line that does not even match the
-log format at all (e.g. a stack-trace continuation line) -- is dropped and counted, never
-partially redacted and passed through.
+message (and, for `WARNING`/`ERROR`/`CRITICAL`, its `extra=` tail) matches an explicit,
+per-level table of known thermoctl message templates.
 
-**Placeholders, within an already-allowed line:** temperatures and setpoints (`21,5 °C` /
-`Sollwert: 21,5 °C`) -> `<temperatur>`/`<sollwert>`; a name after a known prefix
-(`Gemeldet von:`, `Raum:`, `Name:`, `Mieter:`) -> `<name>`; a free-text note
-(`Hinweis:`) -> `<hinweis>`; an e-mail address -> `<email>`; an IPv4/MAC address ->
-`<ip>`/`<mac>`; anything token-shaped (`agent_...`, `Bearer ...`, or a bare 20+ character
-mixed-alphanumeric run) -> `<token>`. Every placeholder is fixed and dumb -- never a stable
+**Cross-review correction (this section rewritten after a first, incorrect version):** the
+first version of this filter let *any* `WARNING`/`ERROR`/`CRITICAL` line through unmasked,
+reasoning that severity alone implied safety. Cross-review reproduced real leaks this let
+through unchanged -- `thermoctl/integrations/notification.py::_attempt_delivery` logs every
+fault notice's title/text at `WARNING` unconditionally (e.g. "Sensorstörung in Kinderzimmer
+Mia"), several call sites carry a device's display name in an `extra={"geraet": ...}` field
+(`domain/controller_channels.py`, `services/device_commands.py`, `services/publishing.py`),
+and `domain/legacy_system.py` logs a raw, unvalidated sensor payload under `extra={"wert":
+...}`. **Fixed:** every level now goes through the same explicit template table
+(`_WARN_FIXED_MESSAGES`/`_WARN_TEMPLATES` for `WARNING`+, four fixed messages for `INFO`) --
+each template names exactly which of its own parameters are safe to keep (a numeric id, a
+closed enum value) and which must be replaced by a fixed placeholder (a zone/device name, an
+exception's rendered text). A `WARNING`+ line matching **no** template is not silently
+dropped -- it is *reduced* to `<timestamp> <LEVEL> <logger>: <nicht freigegebene Meldung>`
+(message and `extra` tail both discarded) and still counted in `dropped`, so a missing
+template shows up as "some lines carried no approved content" rather than a silent gap.
+`INFO` keeps the narrower original rule: an unrecognised shape is dropped outright, not
+reduced. The `extra=` tail itself is parsed independently (`_mask_extra_tail`): a small
+allowlist of keys with a known-safe value shape is kept verbatim (`schluessel`, `zone_id`,
+`topic`, `host`/`port`/`bind`, ...), a fixed list of always-name-or-value-shaped keys
+(`geraet`, `zone_name`, `device_name`, `wert`, `value`, `messwert`, `grund`, `fehler`, ...)
+is always replaced by `<wert>`, and any other, unrecognised key is dropped from the tail
+entirely rather than shown either raw or masked.
+
+**This table is a snapshot of one thermoctl version, not a permanent contract** -- a future
+thermoctl release that adds or rewords a log call does not fall through to being logged in
+full; it simply stops matching any template and becomes `<nicht freigegebene Meldung>` until
+this table is updated. This is the allowlist working as intended (fails visibly, by
+omission, never silently by leaking), but it means **`agent/log_filter.py`'s template table
+must be revisited with every thermoctl upgrade** -- a stale table does not leak, it quietly
+loses signal instead, which is the failure mode to watch for.
+
+**Placeholders, within an already-allowed template's declared-unsafe parameters:**
+temperatures/setpoints (`21,5 °C`) -> `<temperatur>`/`<sollwert>`; a zone/device display name
+-> `<name>`; an exception's rendered text, a raw sensor/config payload value, or a display
+name in the `extra` tail -> `<wert>`. Every placeholder is fixed and dumb -- never a stable
 hash of the underlying value, so two lines carrying the same reading cannot be correlated
-across the log even after masking.
+across the log even after masking (verified by
+`tests/test_log_filter.py::test_placeholders_are_identical_across_different_values_no_correlation`).
 
 **Agent** (`agent/loop.py`): `_handle_fetch_logs` reads the last `Command.lines` lines of
 the `thermoctl` container's log via the local Docker Engine API over the Unix socket
@@ -68,12 +92,20 @@ alongside it -- capture time, source, the dropped-line count shown plainly ("N Z
 entfernt"), and the filtered lines themselves in a monospace, escaped block
 (`fleet/ui_apartment.py::LogExcerptDisplay`, `fleet/templates/ui/apartment.html`).
 
-**Tests**: `tests/test_log_filter.py` (the condition-6 test -- a tenant name, °C values, a
-token, a setpoint, and a free-text note, none of which appear in the output; placeholder
-identity across different values; unknown shapes dropped, not passed through),
-`tests/test_agent_fetch_logs.py` (the Docker log-stream demultiplexer; the handler against a
-stub log reader and a real, locally-run `fleet.app.app` end to end; every honest-failure
-path), `tests/test_storage.py`/`tests/test_fleet.py`/`tests/test_ui_commands.py` (storage
+**Tests**: `tests/test_log_filter.py` -- one fixture line per real thermoctl call site (not
+a synthetic composite), built the way `TextFormatter` would actually emit it: every
+`fault_notice`/`problem_report` title+text shape (zone/device name masked, in both the
+`WARNING`-level entry and the all-clear), the tenant-report shape (name masked in both the
+title and the body's first line; every later line of the tenant's own free text dropped
+outright, having no log-format prefix at all), the `extra`-tail leaks cross-review
+reproduced (`geraet`/`wert`/`grund` masked, `zone_id`/`topic`/`schluessel` kept), the two
+`app.py` call sites that embed an exception's text directly in the message (always masked),
+the migration-lock env-var warning, the legacy-data count/index warnings (kept verbatim), an
+unrecognised `WARNING` line (reduced to the fixed placeholder and counted), an unrecognised
+`INFO` line (dropped outright), and the placeholder-identity/no-correlation test. `tests/test_agent_fetch_logs.py` (the
+Docker log-stream demultiplexer; the handler against a stub log reader and a real,
+locally-run `fleet.app.app` end to end; every honest-failure path),
+`tests/test_storage.py`/`tests/test_fleet.py`/`tests/test_ui_commands.py` (storage
 ownership/duplicate rules and the retention cleanup with an injected clock; the endpoint's
 auth/ownership/type/size checks; the UI display, escaped).
 
