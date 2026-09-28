@@ -12,6 +12,7 @@ import pydantic
 
 from agent import loop
 from agent.commands_channel import CommandStreamAuthError
+from agent.encryption import DEFAULT_RECIPIENTS_FILE
 from agent.registration import (
     DEFAULT_DATA_DIR,
     DEFAULT_REGISTRATION_FILE,
@@ -22,6 +23,16 @@ from agent.registration import (
 from agent.safe_io import UnsafeStateFileError
 from agent.transport import build_client
 from protocol.registration import AgentRegistrationFile
+
+# `python -m agent --version`/`agent_version` in the device-config backup
+# (P5.5a, `agent.loop._build_device_config_snapshot`) -- this scaffold has
+# no packaging-derived version yet (no `agent/_version.py`, no installed
+# distribution metadata to read), so a literal placeholder string is used
+# rather than inventing a version-detection mechanism this package was not
+# asked to build. Update by hand alongside a real release process, the
+# same "no invented functionality" reasoning as everywhere else in this
+# module.
+AGENT_VERSION = "0.1.0-dev"
 
 
 def _run_register(args: argparse.Namespace) -> int:
@@ -78,6 +89,23 @@ def _run_agent(args: argparse.Namespace) -> int:
         )
         with build_client(config.fleet_address, config.certificate_fingerprint) as client:
             client.headers["Authorization"] = f"Bearer {token}"
+            backup_config = None
+            if args.apartment_id:
+                # See `agent.loop.BackupConfig`'s own docstring for why
+                # `--apartment-id` is a plain CLI argument, not parsed out
+                # of the bearer token -- `backup_now`/the daily scheduler
+                # stay unconfigured (an honest failed result, not a crash)
+                # if it is omitted, exactly like every other still-optional
+                # feature in this CLI.
+                backup_config = loop.BackupConfig(
+                    apartment_id=args.apartment_id,
+                    agent_version=AGENT_VERSION,
+                    staging_dir=Path(args.backup_staging_dir),
+                    thermoctl_db_path=Path(args.thermoctl_db_file),
+                    zigbee2mqtt_dir=Path(args.zigbee2mqtt_dir),
+                    client=client,
+                    recipients_file=Path(args.backup_recipients_file),
+                )
             loop.run(
                 client,
                 last_event_id_path=data_dir / loop.DEFAULT_LAST_EVENT_ID_FILE,
@@ -86,6 +114,7 @@ def _run_agent(args: argparse.Namespace) -> int:
                 local_log_path=data_dir / loop.DEFAULT_LOCAL_LOG_FILE,
                 watchdog_state_path=Path(args.watchdog_state_file),
                 led_status_path=Path(args.led_status_file),
+                backup_config=backup_config,
             )
     except CommandStreamAuthError:
         print(
@@ -145,6 +174,46 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     run_parser.add_argument("--watchdog-state-file", default=str(loop.DEFAULT_WATCHDOG_STATE_FILE))
     run_parser.add_argument("--led-status-file", default=str(loop.DEFAULT_LED_STATUS_FILE))
+    # P5.5a (sections 15.1, 15.2): backups are only created/uploaded if
+    # `--apartment-id` is given -- every other backup-related argument
+    # below has a sensible default (matching `image/common/agent-compose
+    # .yml`'s own read-only mounts) but is otherwise inert without it, see
+    # `agent.loop.BackupConfig`'s own docstring.
+    run_parser.add_argument(
+        "--apartment-id",
+        default=None,
+        help=(
+            "This apartment's id, embedded in the device-configuration "
+            "backup (section 15.1) -- omit to disable backup_now/the daily "
+            "backup scheduler entirely."
+        ),
+    )
+    run_parser.add_argument(
+        "--backup-recipients-file",
+        default=str(DEFAULT_RECIPIENTS_FILE),
+        help=(
+            "Age recipients file on the boot partition (section 15.1, 15.3), "
+            f"default: {DEFAULT_RECIPIENTS_FILE}."
+        ),
+    )
+    run_parser.add_argument(
+        "--backup-staging-dir",
+        default=str(DEFAULT_DATA_DIR / "backup-staging"),
+        help="Directory for temporary (plaintext and encrypted) backup files.",
+    )
+    run_parser.add_argument(
+        "--thermoctl-db-file",
+        default="/var/lib/thermoctl/thermoctl.db",
+        help="thermoctl's SQLite database file (read-only mount, section 15.2).",
+    )
+    run_parser.add_argument(
+        "--zigbee2mqtt-dir",
+        default="/var/lib/zigbee2mqtt",
+        help=(
+            "Zigbee2MQTT's data directory, containing database.db and "
+            "coordinator_backup.json (read-only mount, section 15.2)."
+        ),
+    )
 
     args = parser.parse_args(argv)
     if args.command == "run":

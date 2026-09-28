@@ -565,14 +565,19 @@ they must also stay conceptually separate, not just separately scheduled.
   decisions or heat-demand readings over time (section 6, section 21.5's
   own "Decided afterward" paragraph) -- a bundle is a snapshot over a few
   hours, not a channel.
-- **Files:** `agent/loop.py` (`create_diagnostic_bundle`), an encryption
-  scheme shared with P5.5's own backup encryption where it makes sense not
-  to duplicate.
+- **Files:** `agent/loop.py` (`create_diagnostic_bundle`), reusing
+  `agent/encryption.py` (P5.5a, done) directly rather than duplicating its
+  own recipients-file handling -- the project owner's 2026-09-26/27 backup
+  decision explicitly asks for the same encryption mechanism to be "reused
+  later by the encrypted diagnostic bundle", and `load_recipients`/
+  `encrypt_stream` are already general-purpose (a recipients file path, a
+  byte stream in, a byte stream out), not backup-specific, precisely for
+  this.
 - **Section:** 15.1, 21.5.
 - **Acceptance:** test demonstrates the cloud never sees plaintext content,
   and that a series of bundles cannot be used to reconstruct a heat-demand
   timeline (only ever one bundle at a time, no accumulation).
-- **Depends on:** P5.2, and ideally P5.5 (shared encryption machinery).
+- **Depends on:** P5.2, P5.5a (done -- `agent/encryption.py`).
 - **Read back by:** main session (encryption and the "never a series"
   boundary are both security-relevant).
 
@@ -592,20 +597,48 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Read back by:** main session (the digest check is the central
   safeguard from security principle 2).
 
-### P5.5 -- Backup and restore **SR**
+### P5.5a -- Backup creation and upload **SR**
+- [x] done -- see `docs/STATUS.md`'s P5.5a section.
 - **Goal:** implement `agent/loop.py::create_backup` for both kinds of
-  backup, including encrypting the operational-data backup before upload
-  (security principle 4) plus the counterpart "restore" (section 15.2),
-  which so far has no stub at all.
-- **Files:** `agent/loop.py`, a new module for encryption.
-- **Section:** 15.1, 15.2.
+  backup, encrypting the operational-data backup (real `age` format, two
+  recipients, `agent/encryption.py`) before it ever touches an upload
+  buffer (security principle 4); upload both kinds to new fleet endpoints
+  (`POST /v1/backups`), storing operational data only as the opaque
+  encrypted block; retention (section 15.2, 14 daily + 8 weekly); UI list
+  and download, with the ready-made `age -d ...` command next to it.
+- **Files:** `agent/loop.py`, `agent/encryption.py`, `fleet/app.py`,
+  `fleet/backup_storage.py`, `fleet/backup_retention.py`,
+  `fleet/storage.py`, `fleet/ui_apartment.py`, `fleet/ui_routes.py`,
+  `protocol/backups.py`, `image/common/agent-compose.yml`.
+- **Section:** 15.1, 15.2, 15.3, 19.5.
 - **Acceptance:** test demonstrates that an operational-data backup is not
   readable without a valid local key (real encryption/decryption, no
   mock); device configuration stays plain text, test demonstrates the
-  separate handling.
+  separate handling; fewer than two recipients (or an invalid/missing/
+  unsafe recipients file) refuses the backup, nothing uploaded, no
+  plaintext written anywhere; the fleet rejects a non-age operational
+  upload; retention keeps exactly the documented daily/weekly window;
+  download requires login; end-to-end `backup_now` against the real fleet
+  app over TLS.
 - **Depends on:** nothing from step 5, can start in parallel with
   P5.1-P5.4.
 - **Read back by:** main session (encryption, security principle 4).
+
+### P5.5b -- Restore -- **open, not started**
+- **Goal:** section 15.2/15.3 step 4's counterpart to P5.5a: "The agent
+  fetches the device configuration and, on a swap, the encrypted
+  operational data. The landlord enters the decryption key once in the
+  fleet UI; it is only passed through, never stored." No stub exists yet
+  for either the fleet-side "hand the device its backups on
+  (re-)assignment" flow or the agent-side "receive and unpack" flow.
+- **Files:** likely `fleet/ui_routes.py`/`fleet/app.py` (a new endpoint
+  the newly assigned device fetches from) and `agent/loop.py` (unpacking,
+  never storing the passed-through key).
+- **Section:** 15.2, 15.3 step 4.
+- **Depends on:** P5.5a (this package) -- reuses `protocol.backups`,
+  `fleet.backup_storage`, and the same age recipients/identity concept.
+- **Read back by:** main session (security principle 3: the landlord's
+  decryption key must only ever be passed through, never stored).
 
 ### P5.6 -- Watchdog main loop (`watchdog/watch.go`)
 - **Goal:** actually implement `AgentStopped`, `StartDigest`,

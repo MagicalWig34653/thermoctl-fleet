@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
+from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
 from fleet.storage import Storage, get_storage
 from fleet.ui_apartment import (
@@ -1342,6 +1343,52 @@ def command_confirm_submit(
 
     return RedirectResponse(
         url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+    )
+
+
+@router.get("/apartments/{apartment_id:path}/backups/{backup_id}/download")
+def apartment_backup_download(
+    apartment_id: str,
+    backup_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    backup_storage: BackupBlobStorage = Depends(get_backup_storage),  # noqa: B008
+) -> Response:
+    """Downloads one backup's raw stored bytes (P5.5a) -- **behind login**
+    (`require_ui_user`, same as every other `/ui` route; an unauthenticated
+    request redirects to the login page, never even reaching the lookup
+    below), the work order's own explicit condition.
+
+    Unknown `backup_id`, or one that belongs to a different apartment
+    (`Storage.get_backup_for_apartment` returns `None` for both,
+    deliberately indistinguishable -- see that method's own docstring) ->
+    404. Served as `application/octet-stream` with a `Content-Disposition:
+    attachment` filename that already carries the backup's own kind and id
+    (so a landlord who downloads several does not end up with a folder of
+    identically-named files) -- **not** re-encrypted, re-parsed, or
+    otherwise touched: for `operational_data`, this is exactly the age
+    file the agent produced, decryptable with `age -d -i <key> ...`
+    unchanged (the "real age format" decision, `agent/encryption.py`'s own
+    docstring); for `device_config`, the plain JSON the agent uploaded.
+    """
+
+    summary = storage.get_backup_for_apartment(apartment_id, backup_id)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Unknown backup.")
+    storage_path = storage.get_backup_storage_path(apartment_id, backup_id)
+    if storage_path is None:  # pragma: no cover -- would mean the row above vanished mid-request
+        raise HTTPException(status_code=404, detail="Unknown backup.")
+    content = backup_storage.read(storage_path)
+
+    extension = "age" if summary.kind == "operational_data" else "json"
+    filename = f"{summary.kind}-{summary.backup_id}.{extension}"
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
     )
 
 

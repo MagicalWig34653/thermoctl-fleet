@@ -332,6 +332,29 @@ ul.command-history li {
     word-break: break-word;
 }
 
+/* P5.5a: the backups list reuses `.command-history`'s own row/meta
+ * styling (same "one section, one look" reasoning as the command history
+ * above) -- only the list itself and the kind label get their own rule,
+ * since they are the only two backup-specific classes the template uses.
+ */
+ul.backup-list {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+}
+
+ul.backup-list li {
+    border: 1px solid #8888;
+    border-radius: 0.25rem;
+    padding: 0.5rem 0.75rem;
+}
+
+.backup-list__kind {
+    font-weight: bold;
+}
+
 .command-history__log {
     margin: 0.5rem 0 0;
 }

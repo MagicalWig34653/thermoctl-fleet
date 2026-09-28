@@ -191,5 +191,26 @@
     {% endif %}
 </section>
 
+<section aria-labelledby="backups-heading">
+    <h2 id="backups-heading">Sicherungen</h2>
+    {% if detail.backups %}
+    <ul class="backup-list">
+        {% for backup in detail.backups %}
+        <li>
+            <span class="backup-list__kind">{{ backup.kind_label }}</span>
+            <span class="command-history__meta">{{ backup.created_text }}, {{ backup.size_text }}</span>
+            <span class="command-history__meta">Hash: {{ backup.content_hash }}</span>
+            <a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/backups/{{ backup.backup_id | urlpath }}/download">Herunterladen</a>
+            {% if backup.age_decrypt_command %}
+            <p class="command-history__meta">Entschlüsseln: <code>{{ backup.age_decrypt_command }}</code></p>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>Keine Sicherungen für diese Wohnung.</p>
+    {% endif %}
+</section>
+
 {% endif %}
 {% endblock %}

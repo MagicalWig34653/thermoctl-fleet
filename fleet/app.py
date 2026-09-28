@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
+import json
 import logging
 import os
+import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -33,6 +37,8 @@ from sse_starlette.sse import EventSourceResponse
 
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
+from fleet.backup_retention import run_backup_retention
+from fleet.backup_storage import BackupBlobStorage, PendingBackupUpload, get_backup_storage
 from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
 from fleet.storage import (
     RecordCommandResultOutcome,
@@ -45,6 +51,10 @@ from fleet.ui_auth import resolve_client_ip
 from fleet.ui_routes import install_security_headers
 from fleet.ui_routes import router as ui_router
 from protocol import (
+    AGE_HEADER_MAGIC,
+    MAX_BACKUP_UPLOAD_BYTES,
+    BackupKind,
+    BackupUploadAccepted,
     CommandResult,
     Event,
     Heartbeat,
@@ -85,6 +95,14 @@ _DEFAULT_COMMANDS_SSE_RETRY_MS = 5_000
 # not look dead to an intermediary proxy.
 _COMMANDS_SSE_PING_INTERVAL_ENV = "FLEET_COMMANDS_SSE_PING_INTERVAL_S"
 _DEFAULT_COMMANDS_SSE_PING_INTERVAL_S = 15.0
+
+# P5.5a, section 15.2: "enforced by a periodic cleanup". A long default --
+# unlike the alarm/command polls above, retention is bounded by *days*
+# (14 daily) and *weeks* (8 weekly), so running it every few minutes would
+# only waste cycles; once an hour is already far more often than needed to
+# keep any apartment's backup count from growing unbounded between runs.
+_BACKUP_RETENTION_INTERVAL_ENV = "FLEET_BACKUP_RETENTION_INTERVAL_S"
+_DEFAULT_BACKUP_RETENTION_INTERVAL_S = 3600.0
 
 # P5.3a, project owner condition 4: "a retention period for fetched logs in
 # the cloud (main-session default: 14 days, env-configurable, enforced by a
@@ -133,6 +151,25 @@ async def _alarm_check_loop(  # pragma: no cover
             )
         except Exception:
             logger.exception("Absence alarm check failed")
+        await asyncio.sleep(interval_s)
+
+
+async def _backup_retention_loop(interval_s: float) -> None:  # pragma: no cover
+    # Same reasoning as `_alarm_check_loop` just above: the scheduling
+    # wrapper itself is deliberately untested (an infinite loop around a
+    # real `asyncio.sleep`), the logic it calls
+    # (`fleet.backup_retention.run_backup_retention`) is fully covered with
+    # an injected clock in `tests/test_backup_retention.py`.
+    # `run_backup_retention` does blocking file/database I/O -- run via
+    # `asyncio.to_thread` for the same "do not freeze every other request"
+    # reason `_alarm_check_loop` already documents for itself.
+    while True:
+        try:
+            await asyncio.to_thread(
+                run_backup_retention, get_storage(), get_backup_storage(), datetime.now(UTC)
+            )
+        except Exception:
+            logger.exception("Backup retention cleanup failed")
         await asyncio.sleep(interval_s)
 
 
@@ -186,26 +223,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     notifiers = load_notifiers_from_env(os.environ)
     task = asyncio.create_task(_alarm_check_loop(interval_s, notifiers))
 
-    retention_interval_s = float(
+    backup_retention_interval_s = float(
+        os.environ.get(_BACKUP_RETENTION_INTERVAL_ENV, _DEFAULT_BACKUP_RETENTION_INTERVAL_S)
+    )
+    backup_retention_task = asyncio.create_task(
+        _backup_retention_loop(backup_retention_interval_s)
+    )
+
+    log_retention_interval_s = float(
         os.environ.get(
             _LOG_RETENTION_CHECK_INTERVAL_ENV, _DEFAULT_LOG_RETENTION_CHECK_INTERVAL_S
         )
     )
-    retention_days = int(
+    log_retention_days = int(
         os.environ.get(_LOG_RETENTION_DAYS_ENV, _DEFAULT_LOG_RETENTION_DAYS)
     )
-    retention_task = asyncio.create_task(
-        _log_retention_loop(retention_interval_s, retention_days)
+    log_retention_task = asyncio.create_task(
+        _log_retention_loop(log_retention_interval_s, log_retention_days)
     )
     try:
         yield
     finally:
         task.cancel()
-        retention_task.cancel()
+        backup_retention_task.cancel()
+        log_retention_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
         with contextlib.suppress(asyncio.CancelledError):
-            await retention_task
+            await backup_retention_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await log_retention_task
 
 
 app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION), lifespan=lifespan)
@@ -581,6 +628,249 @@ def receive_command_result(
     # `_COMMAND_RESULT_STATUS`'s own docstring for why a plain retry is not
     # an error.
     response.status_code = _COMMAND_RESULT_STATUS[outcome]
+
+
+_CONTENT_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+# How many bytes of an `operational_data` upload's own beginning are read
+# back for the age-file plausibility check below -- the header line plus
+# the first recipient stanza line together are well under a kilobyte in
+# practice (a stanza's own base64 payload is short); this is a generous
+# margin, not a tight fit, and is **not** how much of the file is ever
+# held in memory at once during the upload itself (see `upload_backup`'s
+# own docstring, point 1, for that).
+_AGE_PLAUSIBILITY_PREFIX_BYTES = 4096
+
+
+def _looks_like_an_age_file(prefix: bytes) -> bool:
+    """`True` iff `prefix` starts with the real age format's own header
+    line, **followed by at least one recipient stanza line** (`-> ...`,
+    the age format's own `Stanza` syntax -- every real age file has at
+    least one, naming the algorithm and its arguments for one recipient).
+
+    **Cross-review finding:** checking `AGE_HEADER_MAGIC` alone let
+    `b"age-encryption.org/v1\\n" + b"plaintext tenant data..."` through --
+    a buggy or malicious agent only had to prepend one fixed, public
+    string to otherwise-arbitrary plaintext to defeat the entire check.
+    Requiring a syntactically plausible stanza line immediately after is
+    still not a decrypt attempt (principle 3: the fleet has no private key
+    to decrypt with even if it wanted to), but it does mean the uploaded
+    bytes have to actually look like the beginning of a real age file's
+    *structure*, not merely start with a string anyone could copy.
+    """
+
+    if not prefix.startswith(AGE_HEADER_MAGIC):
+        return False
+    rest = prefix[len(AGE_HEADER_MAGIC) :]
+    if not rest.startswith(b"\n"):
+        return False
+    next_line, _, _ = rest[1:].partition(b"\n")
+    return next_line.startswith(b"-> ")
+
+
+async def _stream_backup_body(
+    body_stream: AsyncIterator[bytes], pending: PendingBackupUpload, max_bytes: int
+) -> tuple[int, str]:
+    """Reads `body_stream` chunk by chunk into `pending`, hashing
+    incrementally -- never accumulating the body as one in-memory `bytes`
+    object, and never reading a single chunk beyond the one that pushes
+    the running total over `max_bytes`.
+
+    **The one property this function exists to guarantee, spelled out
+    precisely and pinned by a direct unit test
+    (`tests/test_fleet_backups.py::test_stream_backup_body_stops_reading_as_soon_as_the_cap_is_exceeded`,
+    which counts how many chunks a synthetic async generator actually
+    yields before this function raises): once the running total exceeds
+    `max_bytes`, this function raises `HTTPException(413)` immediately,
+    without ever calling `anext()` on `body_stream` again.** Cross-review
+    of an earlier version of this endpoint found that `await request
+    .body()` buffered the *entire* declared body before the size check
+    ever ran -- this function is the fix, factored out on its own
+    precisely so that guarantee is testable directly, independent of
+    whatever a given ASGI transport's own buffering behaviour happens to
+    be (Starlette's `TestClient`, for one, buffers a request body fully
+    itself before an app ever sees it, which would make this same
+    property untestable through an HTTP call alone).
+    """
+
+    digest = hashlib.sha256()
+    total_bytes = 0
+    async for chunk in body_stream:
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Backup upload exceeds {max_bytes} bytes.",
+            )
+        digest.update(chunk)
+        pending.write(chunk)
+    return total_bytes, digest.hexdigest()
+
+
+@app.post("/v1/backups", status_code=201, response_model=BackupUploadAccepted)
+async def upload_backup(
+    request: Request,
+    kind: BackupKind,
+    content_hash: str,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    backup_storage: BackupBlobStorage = Depends(get_backup_storage),  # noqa: B008
+) -> BackupUploadAccepted:
+    """Accepts one backup (P5.5a, section 15.1/15.2) -- the apartment id
+    comes from the token, exactly like every other endpoint with no
+    apartment in its own address (`require_apartment_token_by_hash`, see
+    `fleet/auth.py`); `kind`/`content_hash` are query parameters (section 3:
+    "ordinary POST calls"), the body is the raw bytes themselves, never
+    wrapped in JSON -- a `few megabytes` operational-data blob (section
+    15.1) does not belong inside a JSON string field, and a device-config
+    backup's own content is already JSON *bytes*, which wrapping in a
+    second layer of JSON would only have to unwrap again.
+
+    **What is checked, and why, in order:**
+
+    1. **Size, enforced while the body is still arriving, never after
+       fully buffering it** (cross-review finding: `await request.body()`
+       used to read the *entire* body into memory before the size check
+       ever ran at all -- a caller that simply never bothered to respect
+       `protocol.backups.MAX_BACKUP_UPLOAD_BYTES` could exhaust memory
+       regardless of what the eventual `413` said, since the buffering
+       itself was already unbounded). Fixed two ways, together: a declared
+       `Content-Length` above the cap is refused, `413`, **before a single
+       byte of the body is read at all**; independently (a client can
+       still omit or lie about `Content-Length`), the body is streamed via
+       `request.stream()` straight into a temp file
+       (`BackupBlobStorage.begin_upload`), with a running total checked on
+       every chunk -- the moment it exceeds the cap, the upload is
+       aborted, `413`, having never held more than one chunk's worth of
+       the body in memory at once and never written more than the cap's
+       worth to disk. CLAUDE.md security principle 5 applied to a
+       client-supplied length header either way: never trusted alone.
+    2. **`content_hash` must match a fresh SHA-256 of the body actually
+       received** (computed incrementally, alongside the streaming write
+       above -- never a second full pass over the body) -- `400` on a
+       mismatch. This is not a cryptographic integrity check in the "TLS
+       already covers transport integrity" sense; it exists so a
+       truncated or corrupted upload is caught here, immediately, with a
+       clear error, rather than stored and only discovered wrong at
+       restore time, months later.
+    3. **For `operational_data`: the first `_AGE_PLAUSIBILITY_PREFIX_BYTES`
+       bytes must look like the start of a real age file**
+       (`_looks_like_an_age_file` -- the header line *and* a recipient
+       stanza line, see that function's own docstring for why the header
+       line alone, this endpoint's own original check, was not enough) --
+       security principle 4's "no tenant data in plain text in the cloud"
+       enforced structurally, not merely assumed of a well-behaved agent:
+       a buggy or compromised agent that tried to upload plaintext
+       operational data is refused here, `422`. Deliberately reads only a
+       bounded prefix back from the temp file for this check, not the
+       whole (potentially up-to-the-cap-sized) body a second time.
+    4. **For `device_config`: the body must parse as JSON** -- `422`
+       otherwise. This kind's own body is read back in full for this
+       check (JSON parsing has no bounded-prefix equivalent), but section
+       15.1 already describes this kind as "kilobytes", never the
+       multi-megabyte case the streaming/prefix-only handling above is
+       actually for. This endpoint does not otherwise interpret the
+       JSON's fields (masking or validating their *content* against
+       section 6 is `agent.loop.create_backup`'s job, on the device,
+       before the upload ever happens -- the fleet only ever stores what
+       it receives for this kind).
+
+    Storage itself is two writes in sequence, not one transaction (a
+    blob-then-row ordering, matching `Storage.delete_backups`'s own
+    "row first, then blob" reasoning in reverse: a blob written but the row
+    insert failing leaves an orphaned, harmless file the next retention run
+    ignores; a row referencing a blob that failed to write would instead
+    break every future read of it) -- `PendingBackupUpload.finalize()`
+    first, `Storage.create_backup_record` second.
+    """
+
+    normalized_hash = content_hash.lower()
+    if not _CONTENT_HASH_PATTERN.fullmatch(normalized_hash):
+        raise HTTPException(
+            status_code=400,
+            detail="content_hash must be 64 lowercase hex characters (SHA-256).",
+        )
+
+    declared_length = request.headers.get("content-length")
+    if declared_length is not None:
+        try:
+            if int(declared_length) > MAX_BACKUP_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Backup upload exceeds {MAX_BACKUP_UPLOAD_BYTES} bytes.",
+                )
+        except ValueError:
+            # A malformed Content-Length is not this check's job to
+            # reject -- the streaming running-total check below enforces
+            # the real cap regardless of what this header claims.
+            pass
+
+    pending = backup_storage.begin_upload(authenticated_apartment, kind)
+    try:
+        total_bytes, actual_hash = await _stream_backup_body(
+            request.stream(), pending, MAX_BACKUP_UPLOAD_BYTES
+        )
+    except BaseException:
+        pending.abort()
+        raise
+
+    if total_bytes == 0:
+        pending.abort()
+        raise HTTPException(status_code=400, detail="Backup upload is empty.")
+
+    if not hmac.compare_digest(actual_hash, normalized_hash):
+        pending.abort()
+        raise HTTPException(
+            status_code=400,
+            detail="content_hash does not match the received body.",
+        )
+
+    if kind == BackupKind.OPERATIONAL_DATA:
+        with pending.temp_path.open("rb") as handle:
+            prefix = handle.read(_AGE_PLAUSIBILITY_PREFIX_BYTES)
+        if not _looks_like_an_age_file(prefix):
+            pending.abort()
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "operational_data upload is not a valid age file (missing the "
+                    f"{AGE_HEADER_MAGIC!r} header and a recipient stanza) -- "
+                    "refusing to store plaintext tenant data (CLAUDE.md security "
+                    "principle 4)."
+                ),
+            )
+    else:  # BackupKind.DEVICE_CONFIG
+        with pending.temp_path.open("rb") as handle:
+            content = handle.read()
+        try:
+            json.loads(content)
+        except ValueError as error:
+            pending.abort()
+            raise HTTPException(
+                status_code=422, detail="device_config upload is not valid JSON."
+            ) from error
+
+    storage_path = pending.finalize()
+    try:
+        summary = storage.create_backup_record(
+            authenticated_apartment,
+            kind,
+            size_bytes=total_bytes,
+            content_hash=actual_hash,
+            storage_path=storage_path,
+            now=datetime.now(UTC),
+        )
+    except Exception:
+        backup_storage.delete(storage_path)
+        raise
+
+    return BackupUploadAccepted(
+        id=summary.backup_id,
+        kind=BackupKind(summary.kind),
+        received_at=summary.created_at,
+        size_bytes=summary.size_bytes,
+        content_hash=summary.content_hash,
+    )
 
 
 # P5.3a: `Storage.store_log_excerpt`'s own outcome -> HTTP status, mirroring

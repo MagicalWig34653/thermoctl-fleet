@@ -81,10 +81,21 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fleet.alarms import ABSENCE_THRESHOLD, AlarmKind
-from fleet.storage import AlarmRecord, CommandRecord, HeartbeatHistoryEntry, Storage
+from fleet.storage import AlarmRecord, BackupSummary, CommandRecord, HeartbeatHistoryEntry, Storage
 from fleet.ui_house import FAULT_KIND_LABELS
 from protocol import FaultKind
+from protocol.backups import BackupKind
 from protocol.commands import CommandType
+
+# P5.5a, section 15.1/15.2 -- German label per `protocol.backups.BackupKind`
+# value, the same "covers exactly the enum" reasoning
+# `COMMAND_TYPE_LABELS` below already establishes for
+# `protocol.commands.CommandType`
+# (`tests/test_ui_apartment.py::test_backup_kind_labels_cover_exactly_the_enum`).
+BACKUP_KIND_LABELS: dict[BackupKind, str] = {
+    BackupKind.DEVICE_CONFIG: "Gerätekonfiguration",
+    BackupKind.OPERATIONAL_DATA: "Betriebsdaten (verschlüsselt)",
+}
 
 # Section 9: "heartbeat history of the last few days" -- default and cap for
 # the `days` query parameter (`fleet/ui_routes.py::apartment_detail`).
@@ -276,6 +287,79 @@ def build_command_history(
     ]
 
 
+@dataclass(frozen=True)
+class BackupDisplay:
+    """One row of the "Eine Wohnung" backups list (P5.5a) -- kind, time,
+    size, hash (the work order's own four fields), plus the ready-made
+    `age -d ...` command the landlord can paste after downloading (project
+    owner: "a cumbersome path leads to weakening the filter instead" --
+    shown right there, not on a second page)."""
+
+    backup_id: str
+    kind_label: str
+    created_text: str
+    size_text: str
+    content_hash: str
+    age_decrypt_command: str | None
+
+
+def _format_size_bytes(size_bytes: int) -> str:
+    """`"512 Bytes"`/`"3,4 kB"`/`"2,1 MB"` -- decimal (1000-based, not 1024)
+    units, the same choice most backup/file tools already default to for
+    "how big is this file" (unlike RAM/disk *capacity*, which this
+    codebase already reports in binary percentages elsewhere) -- a comma,
+    not a period, as the decimal separator, matching every other
+    German-rendered number in this module (`_duration_text` et al. use
+    whole numbers only, so this is the first fractional one)."""
+
+    if size_bytes < 1000:
+        return f"{size_bytes} Bytes"
+    if size_bytes < 1_000_000:
+        return f"{size_bytes / 1000:.1f} kB".replace(".", ",")
+    return f"{size_bytes / 1_000_000:.1f} MB".replace(".", ",")
+
+
+def _build_backup_display(summary: BackupSummary) -> BackupDisplay:
+    kind = BackupKind(summary.kind)
+    # Operational data is the one kind this landlord can actually decrypt
+    # locally (device configuration is already plain text, nothing to
+    # decrypt) -- `<file>` is a placeholder the landlord replaces with
+    # wherever the download actually landed, `<your-key-file>` with
+    # whichever of the two recipients' identity files they have at hand
+    # (either decrypts it, project owner: "two recipients ... every
+    # encrypted artifact is encrypted to both").
+    age_decrypt_command = (
+        "age -d -i <your-key-file> -o backup.tar <file>"
+        if kind == BackupKind.OPERATIONAL_DATA
+        else None
+    )
+    return BackupDisplay(
+        backup_id=summary.backup_id,
+        kind_label=BACKUP_KIND_LABELS[kind],
+        created_text=_format_timestamp(summary.created_at),
+        size_text=_format_size_bytes(summary.size_bytes),
+        content_hash=summary.content_hash,
+        age_decrypt_command=age_decrypt_command,
+    )
+
+
+def build_backup_history(storage: Storage, apartment_id: str) -> list[BackupDisplay]:
+    """The apartment's own backups, newest first (`Storage
+    .list_backups_for_apartment` is itself scoped to `apartment_id`) --
+    mirrors `build_command_history`'s own shape exactly. The download URL
+    itself is built in the template (`{{ apartment_id | urlpath }}/backups/
+    {{ backup.backup_id | urlpath }}/download`), the same convention every
+    other `/ui/apartments/{id}/...` link in this codebase already follows
+    (see `fleet/templates/ui/apartment.html`'s own command-button links) --
+    this dataclass carries data, not a URL it would have to encode itself.
+    """
+
+    return [
+        _build_backup_display(summary)
+        for summary in storage.list_backups_for_apartment(apartment_id)
+    ]
+
+
 def clamp_history_days(days: int | str | None) -> int:
     """`None`/non-positive -> `DEFAULT_HISTORY_DAYS`; anything above
     `MAX_HISTORY_DAYS` -> capped there. A malformed or hostile `?days=`
@@ -450,6 +534,12 @@ class ApartmentDetail:
     retired: bool
     available_commands: list[tuple[str, str]]
     commands: list[CommandDisplay]
+    # Backups (P5.5a, section 15.1/15.2) -- independent of `retired`: a
+    # retired apartment's already-uploaded backups are still worth showing
+    # (a landlord restoring a retired apartment's data onto a replacement
+    # still needs them), unlike the command buttons, which a retired
+    # apartment genuinely cannot receive any more.
+    backups: list[BackupDisplay]
 
 
 def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> TimelineEntry:
@@ -592,6 +682,7 @@ def build_apartment_detail(
     label = apartment.label
     retired = apartment.state == "retired"
     commands = build_command_history(storage, apartment_id, now)
+    backups = build_backup_history(storage, apartment_id)
 
     history_days = clamp_history_days(days)
     since = now - timedelta(days=history_days)
@@ -659,6 +750,7 @@ def build_apartment_detail(
             retired=retired,
             available_commands=available_commands(),
             commands=commands,
+            backups=backups,
         )
 
     heartbeat = latest.heartbeat
@@ -692,11 +784,13 @@ def build_apartment_detail(
         retired=retired,
         available_commands=available_commands(),
         commands=commands,
+        backups=backups,
     )
 
 
 __all__ = [
     "ALARM_KIND_LABELS",
+    "BACKUP_KIND_LABELS",
     "COMMAND_TYPE_LABELS",
     "DEFAULT_FETCH_LOGS_LINES",
     "DEFAULT_HISTORY_DAYS",
@@ -705,6 +799,7 @@ __all__ = [
     "MIN_FETCH_LOGS_LINES",
     "AlarmDisplay",
     "ApartmentDetail",
+    "BackupDisplay",
     "CommandDisplay",
     "LogExcerptDisplay",
     "OpenFaultDisplay",
@@ -712,6 +807,7 @@ __all__ = [
     "TimelineEntry",
     "available_commands",
     "build_apartment_detail",
+    "build_backup_history",
     "build_command_history",
     "clamp_history_days",
 ]

@@ -16,18 +16,23 @@ additive, optional parameter for this package (`on_contact`, cross-review
 finding -- see that module's own docstring): every other P5.1 behaviour
 and test is unaffected.
 
-Only `report_now`/`fetch_logs`/`backup_now`/`diagnostic_bundle`'s actual
-*effects* stay honest failures for now (each names the follow-up package
-that will replace it -- P2.3, P5.3, P5.5) -- **never** a fake success.
-`agent_restart` is the one stage-1 command genuinely executed by this
-package. Every other function below this point (`collect_heartbeat`,
-`send_heartbeat`, `reconcile_desired_state`, `create_backup`,
-`factory_reset`, `create_diagnostic_bundle`, `open_access`, the eSIM stubs)
-is still a placeholder with `NotImplementedError` and a reference to the
-relevant section of the specification -- **none** of them contains an
-invented stopgap (such as a `print` instead of a real HTTP call), so that a
-test run immediately and unambiguously shows what is missing, instead of
-faking success.
+Only `report_now`/`fetch_logs`/`diagnostic_bundle`'s actual *effects* stay
+honest failures for now (each names the follow-up package that will
+replace it -- P2.3, P5.3) -- **never** a fake success. `agent_restart` is
+the one stage-1 command genuinely executed since P5.2; **`backup_now` is
+genuinely executed since P5.5a** (`create_backup`, `agent/encryption.py`,
+`_handle_backup_now`) -- both kinds of backup (device configuration,
+plain JSON; operational data, real `age` encryption to two recipients
+before anything touches an upload buffer, security principle 4), plus a
+daily scheduler (`run_daily_backup_scheduler`) and P5.4's future
+before-an-update hook (`run_before_update_backup`). Every other function
+below this point (`collect_heartbeat`, `send_heartbeat`,
+`reconcile_desired_state`, `factory_reset`, `create_diagnostic_bundle`,
+`open_access`, the eSIM stubs) is still a placeholder with
+`NotImplementedError` and a reference to the relevant section of the
+specification -- **none** of them contains an invented stopgap (such as a
+`print` instead of a real HTTP call), so that a test run immediately and
+unambiguously shows what is missing, instead of faking success.
 
 **Provenance note:** an earlier, uncommitted draft of this package's P5.2
 section was produced by a Codex run that was interrupted before it could
@@ -57,11 +62,18 @@ symlink or FIFO (`agent.safe_io`, this module's `load_agent_state`/
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import re
+import sqlite3
 import sys
+import tarfile
+import tempfile
+import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,9 +89,11 @@ from agent.commands_channel import (
 from agent.commands_channel import flush_outbox as _flush_outbox
 from agent.commands_channel import receive_commands as _receive_commands
 from agent.commands_channel import report_result as _report_result
+from agent.encryption import DEFAULT_RECIPIENTS_FILE, encrypt_stream, load_recipients
 from agent.log_filter import filter_log_lines
 from agent.safe_io import append_bytes_safe, read_text_safe
 from protocol import Command, CommandResult, DesiredState, Heartbeat, LogExcerpt
+from protocol.backups import BackupKind, BackupUploadAccepted
 from protocol.commands import CommandType
 
 logger = logging.getLogger(__name__)
@@ -409,6 +423,38 @@ def read_container_log_lines(
 
 
 @dataclass(frozen=True)
+class BackupConfig:
+    """Everything `_handle_backup_now` (and the scheduled jobs,
+    `run_daily_backup_scheduler`/`run_before_update_backup`) need to
+    actually create and upload a backup (P5.5a, sections 15.1, 15.2) --
+    kept as its own dataclass, not more fields directly on
+    `ExecutionContext`, so a caller that never wires up backups (most of
+    this module's own existing tests) is unaffected: `ExecutionContext
+    .backup_config` stays `None` until `agent.__main__` constructs a real
+    one from CLI arguments.
+
+    `apartment_id` is **not** derived from the agent's own bearer token
+    (`agent_<apartment>_<random>`, section 4): `fleet/auth.py`'s own
+    docstring already establishes that splitting that string on `_` is
+    ambiguous (the random suffix can itself contain `_`) -- true for the
+    fleet's *lookup* use of the token and equally true here, so this
+    module does not repeat that mistake for a merely local, "what do I put
+    in my own device-config JSON" purpose either. Passed in explicitly
+    instead (`python -m agent run --apartment-id ...`), the same "nothing
+    hard-coded, no apartment ids in the source" rule CLAUDE.md already
+    applies to a compiled-in constant applied here to a parsed-out one.
+    """
+
+    apartment_id: str
+    agent_version: str
+    staging_dir: Path
+    thermoctl_db_path: Path
+    zigbee2mqtt_dir: Path
+    client: httpx.Client
+    recipients_file: Path = DEFAULT_RECIPIENTS_FILE
+
+
+@dataclass(frozen=True)
 class ExecutionContext:
     """Everything `execute_command` needs beyond the command and the
     dedup state itself -- paths and a clock, all overridable, so no
@@ -430,6 +476,7 @@ class ExecutionContext:
     watchdog_state_path: Path
     local_log_path: Path
     now: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
+    backup_config: BackupConfig | None = None
     client: httpx.Client | None = None
     log_reader: LogReader = read_container_log_lines
     thermoctl_container: str = DEFAULT_THERMOCTL_CONTAINER
@@ -539,7 +586,6 @@ def receive_commands(
 
 _HANDLER_MESSAGE_P23 = "Herzschlag-Erfassung noch nicht verfügbar (P2.3)."
 _HANDLER_MESSAGE_P53 = "noch nicht verfügbar (P5.3: Maskierung und Upload)."
-_HANDLER_MESSAGE_P55 = "noch nicht verfügbar (P5.5)."
 
 
 def _handle_report_now(command: Command, ctx: ExecutionContext) -> _HandlerResult:
@@ -644,10 +690,82 @@ def _handle_diagnostic_bundle(command: Command, ctx: ExecutionContext) -> _Handl
 
 
 def _handle_backup_now(command: Command, ctx: ExecutionContext) -> _HandlerResult:
-    """`backup_now` needs `create_backup`'s encryption of the operational
-    data backup (security principle 4) -- P5.5, not invented here."""
+    """`backup_now` (section 7, 15.2): creates **both** kinds of backup
+    (device configuration and operational data) and uploads each, reporting
+    one combined result -- "report success/failure with a short summary",
+    the work order's own words, not two separate `CommandResult`s for one
+    command id.
 
-    return _HandlerResult(successful=False, error_text=f"backup_now {_HANDLER_MESSAGE_P55}")
+    Refuses cleanly, an honest failed result, if `ctx.backup_config` is
+    `None` -- `python -m agent run` was started without the CLI arguments
+    this needs (`--apartment-id`, `--thermoctl-db-file`,
+    `--zigbee2mqtt-dir`, `--backup-recipients-file`), not a bug in this
+    handler itself.
+    """
+
+    if ctx.backup_config is None:
+        return _HandlerResult(
+            successful=False,
+            error_text=(
+                "backup_now abgelehnt: keine Backup-Konfiguration (fehlende "
+                "CLI-Argumente für 'python -m agent run', siehe --help)."
+            ),
+        )
+
+    summaries: list[str] = []
+    all_successful = True
+    for operational_data, label in ((False, "Gerätekonfiguration"), (True, "Betriebsdaten")):
+        try:
+            artifact = create_backup(
+                operational_data,
+                apartment_id=ctx.backup_config.apartment_id,
+                agent_version=ctx.backup_config.agent_version,
+                staging_dir=ctx.backup_config.staging_dir,
+                now=ctx.now(),
+                watchdog_state_path=ctx.watchdog_state_path,
+                thermoctl_db_path=ctx.backup_config.thermoctl_db_path,
+                zigbee2mqtt_dir=ctx.backup_config.zigbee2mqtt_dir,
+                recipients_file=ctx.backup_config.recipients_file,
+            )
+        except Exception as error:
+            # **Cross-review finding: broadened from a narrow
+            # `(RecipientsError, OSError, sqlite3.Error, ValueError)` tuple
+            # to a plain `Exception`.** `create_backup` can also raise
+            # `tarfile.TarError` (a corrupted intermediate tar, e.g. from a
+            # concurrently-modified thermoctl database file) or other,
+            # genuinely unanticipated exceptions from its own file/database/
+            # cryptography operations -- none of that tuple's members. A
+            # command handler raising anything uncaught here would
+            # propagate straight out of `execute_command`'s `handler(...)`
+            # call and crash the whole agent process (`run`'s own
+            # `for item in commands:` loop has no other safety net around
+            # it) -- exactly the "one bad backup attempt takes down command
+            # execution for every command after it" failure mode section 7
+            # already rules out for a *reported* result. `create_backup`'s
+            # own internal cleanup (the plaintext tar/db-snapshot temp
+            # files) already runs via its own unconditional `finally`
+            # regardless of which exception type propagates out of it, so
+            # widening this catch here changes nothing about that.
+            all_successful = False
+            summaries.append(f"{label}: fehlgeschlagen ({error}).")
+            continue
+
+        try:
+            accepted = upload_backup(ctx.backup_config.client, artifact)
+        except httpx.HTTPError as error:
+            all_successful = False
+            summaries.append(f"{label}: Upload fehlgeschlagen ({error}).")
+            continue
+        finally:
+            artifact.path.unlink(missing_ok=True)
+
+        summaries.append(f"{label}: {accepted.size_bytes} Bytes hochgeladen.")
+
+    # `error_text` carries the short summary regardless of outcome
+    # (successful or not) -- the work order's own "report success/failure
+    # with a short summary", not only a failure message the way every
+    # other handler's `error_text` is used.
+    return _HandlerResult(successful=all_successful, error_text="; ".join(summaries))
 
 
 def _read_watchdog_state(path: Path) -> tuple[str, str] | None:
@@ -823,7 +941,31 @@ def execute_command(
 
     handler = _HANDLERS[command.command]
     start = time.monotonic()
-    handler_result = handler(command, ctx)
+    try:
+        handler_result = handler(command, ctx)
+    except Exception as error:
+        # **Cross-review finding:** a handler raising an exception this
+        # broad `except` did not yet exist for used to propagate straight
+        # out of `execute_command`, out of `run`'s own `for item in
+        # commands:` loop, and crash the whole agent process -- one bad
+        # command (a backup attempt hitting an unanticipated `tarfile
+        # .TarError`, for instance) would then take execution of every
+        # later command down with it, exactly the failure mode section 7's
+        # "the agent keeps running" already rules out for a rejected or
+        # expired command. Every handler already fails *closed* on its own
+        # anticipated error paths (see `_handle_backup_now`'s own,
+        # similarly broadened `except Exception` around `create_backup`)
+        # -- this is the last-resort net underneath all of them, for
+        # whatever a handler's own author did not anticipate. `repr(error)`,
+        # not `str(error)`, mirrors `_append_local_log`'s own reasoning for
+        # `RejectedCommand.reason` elsewhere in this module: an exception
+        # message can itself contain newlines or other control characters,
+        # and `repr()` already escapes those before this text ever reaches
+        # the local log or the cloud.
+        handler_result = _HandlerResult(
+            successful=False,
+            error_text=f"unerwarteter Fehler bei der Ausführung: {error!r}",
+        )
     duration_s = time.monotonic() - start
 
     _record_executed(state, command.id, state_path)
@@ -1022,6 +1164,7 @@ def run(
     local_log_path: Path,
     watchdog_state_path: Path = DEFAULT_WATCHDOG_STATE_FILE,
     led_status_path: Path = DEFAULT_LED_STATUS_FILE,
+    backup_config: BackupConfig | None = None,
     exit_fn: Callable[[int], None] = lambda code: sys.exit(code),
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
@@ -1074,6 +1217,7 @@ def run(
     ctx = ExecutionContext(
         watchdog_state_path=watchdog_state_path,
         local_log_path=local_log_path,
+        backup_config=backup_config,
         client=client,
     )
 
@@ -1083,6 +1227,28 @@ def run(
         )
         if ok:
             _flush_outbox(client, outbox_path)
+
+    # Section 15.2's own daily rhythm, run in its own thread alongside the
+    # synchronous SSE/poll loop below -- see `run_daily_backup_scheduler`'s
+    # own docstring for why this cannot simply be one more branch inside
+    # the `for item in commands:` loop (that loop blocks between commands,
+    # a periodic job sharing its call stack would only ever fire when a
+    # command happens to arrive). Started only if `backup_config` is
+    # actually configured -- a caller that never wires up backups (most of
+    # this module's own tests, `agent run` before P5.5a's CLI arguments are
+    # given) gets no background thread at all, not one that immediately
+    # fails on every iteration.
+    backup_stop_event = threading.Event()
+    backup_thread: threading.Thread | None = None
+    if backup_config is not None:
+        backup_thread = threading.Thread(
+            target=run_daily_backup_scheduler,
+            args=(backup_config,),
+            kwargs={"stop_event": backup_stop_event},
+            daemon=True,
+            name="thermoctl-agent-daily-backup",
+        )
+        backup_thread.start()
 
     commands = receive_commands(
         client, last_event_id_path, sleep=sleep, on_contact=_on_contact
@@ -1113,6 +1279,7 @@ def run(
         raise
     finally:
         commands.close()
+        backup_stop_event.set()
 
 
 def reconcile_desired_state(desired: DesiredState) -> None:
@@ -1233,25 +1400,365 @@ def report_health(path: Path, digest: str, version: str) -> None:
     temp.replace(path)
 
 
-def create_backup(operational_data: bool) -> None:
-    """Creates a backup (sections 15.1, 15.2).
+@dataclass(frozen=True)
+class BackupArtifact:
+    """One backup, staged and ready to upload -- `path` points at a
+    temporary file under `BackupConfig.staging_dir`
+    (`create_backup`'s own caller, `_handle_backup_now`, is responsible for
+    `path.unlink()`-ing it once the upload has been attempted, success or
+    failure, so a staged backup never lingers on disk regardless of what
+    happens to it afterward). `content_hash` is the SHA-256 hex digest of
+    exactly the bytes at `path` -- what `upload_backup` sends as
+    `content_hash` and what `fleet.app.upload_backup` re-checks against the
+    bytes it actually receives.
 
-    `operational_data=False`: device configuration -- lives in the cloud in plain
-    text, contains no tenant data.
+    For `kind=BackupKind.OPERATIONAL_DATA`, `path` already points at the
+    **encrypted** artifact -- there is no `BackupArtifact` value anywhere
+    in this module that represents an unencrypted operational-data
+    backup."""
 
-    `operational_data=True`: thermoctl database including configuration and the
-    Zigbee2MQTT device table with `coordinator_backup.json` -- **must be encrypted
-    on the device before uploading**, with a key the cloud does not possess
-    (section 15.1). This encryption is entirely missing here; it is
-    security-relevant and belongs, in the real implementation, in the main session
-    for cross-reading (thermoctl-CLAUDE.md, principle 7, adopted here analogously),
-    not in an ordinary agent task.
+    kind: BackupKind
+    path: Path
+    content_hash: str
+    size_bytes: int
+
+
+def _sha256_of_file(path: Path, *, chunk_size: int = 1 << 20) -> str:
+    """Streamed SHA-256 (never reads the whole file into memory at once --
+    relevant for the "a few megabytes" operational-data artifact, section
+    15.1)."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _build_device_config_snapshot(
+    apartment_id: str, agent_version: str, now: datetime, watchdog_state_path: Path | None
+) -> bytes:
+    """The device-configuration backup's own content, as UTF-8 JSON bytes
+    (section 15.1's table: "Apartment id, service versions with digests,
+    broker settings, WireGuard peer, timezone, agent settings" -- **exactly
+    what this scaffold actually knows is included below, nothing invented
+    for the rest**, per CLAUDE.md's "no invented functionality"):
+
+    - `apartment_id`, `agent_version`, `created_at` -- always present.
+    - `agent_digest`/`agent_proven_digest` -- the watchdog's own state file
+      (`_read_watchdog_state`, section 17), if present and readable: the
+      one "service version/digest" this scaffold currently tracks at all
+      (the agent's own self-swap digest, not yet the four
+      thermoctl/zigbee2mqtt/mosquitto/agent desired-state digests from
+      section 13, which need P5.4's desired-state reconciliation, not yet
+      built -- see `docs/STATUS.md`).
+
+    **Deliberately absent, not defaulted to a placeholder:** broker
+    settings, WireGuard peer, timezone -- none of this scaffold has built
+    the corresponding feature yet (section 14's WireGuard tunnel, the
+    Mosquitto broker configuration) at all, so there is nothing true to put
+    here. Adding a fabricated value instead of omitting the key would be
+    exactly the "invented stopgap" this codebase's other placeholders
+    (`agent.loop`'s own module docstring) already refuse to produce.
+    Contains **no tenant data** -- no room temperatures, setpoints,
+    schedules, absence periods, or tenant names/contact details anywhere in
+    this function (section 6; `tests/test_agent_backup.py::
+    test_device_config_backup_contains_no_tenant_data_marker` pins this
+    with a planted marker string that must never appear here).
     """
 
-    raise NotImplementedError(
-        "Backup (and for operational data: encryption before upload) is missing -- "
-        "see docs/specification.md sections 15.1 and 15.2."
+    payload: dict[str, object] = {
+        "apartment_id": apartment_id,
+        "agent_version": agent_version,
+        "created_at": now.astimezone(UTC).isoformat(),
+    }
+    if watchdog_state_path is not None:
+        watchdog_state = _read_watchdog_state(watchdog_state_path)
+        if watchdog_state is not None:
+            desired, proven = watchdog_state
+            payload["agent_digest"] = desired
+            payload["agent_proven_digest"] = proven
+
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+
+
+def _snapshot_sqlite_database(source_path: Path, destination_path: Path) -> None:
+    """Copies `source_path` into the already-created, empty
+    `destination_path` via SQLite's own **online backup API**
+    (`sqlite3.Connection.backup`) -- a consistent point-in-time snapshot
+    even while thermoctl has the database open for writes, unlike a plain
+    file copy (which could read a half-written page if a write lands
+    mid-copy). The source is opened **read-only** (`mode=ro` in the URI --
+    section 15.1's own operational-data backup must never itself be the
+    reason thermoctl's database becomes briefly unwritable, and this
+    function has no business writing to it in any case).
+    """
+
+    source_uri = f"file:{source_path}?mode=ro"
+    source_connection = sqlite3.connect(source_uri, uri=True)
+    try:
+        destination_connection = sqlite3.connect(destination_path)
+        try:
+            source_connection.backup(destination_connection)
+        finally:
+            destination_connection.close()
+    finally:
+        source_connection.close()
+
+
+def create_backup(
+    operational_data: bool,
+    *,
+    apartment_id: str,
+    agent_version: str,
+    staging_dir: Path,
+    now: datetime,
+    watchdog_state_path: Path | None = None,
+    thermoctl_db_path: Path | None = None,
+    zigbee2mqtt_dir: Path | None = None,
+    recipients_file: Path = DEFAULT_RECIPIENTS_FILE,
+) -> BackupArtifact:
+    """Creates one backup (sections 15.1, 15.2) and stages it, ready to
+    upload, under `staging_dir` -- the caller (`_handle_backup_now`,
+    `run_daily_backup_scheduler`, `run_before_update_backup`) uploads the
+    returned `BackupArtifact` and then removes its `path`.
+
+    `operational_data=False`: device configuration
+    (`_build_device_config_snapshot`) -- plain JSON, no tenant data, no
+    encryption. Written to a fresh `tempfile.mkstemp` file under
+    `staging_dir` (mode `0600` by construction, the same default every
+    other temporary file this function creates relies on).
+
+    `operational_data=True`: thermoctl's database (a **consistent
+    snapshot** via `_snapshot_sqlite_database`'s online backup API, not a
+    raw file copy) plus Zigbee2MQTT's `database.db`/`coordinator_backup
+    .json` if present, bundled as a tar and **encrypted before it ever
+    touches an upload buffer** (security principle 4) -- `load_recipients`
+    is called **first**, before any of thermoctl's or Zigbee2MQTT's data is
+    even read, so a missing/unsafe/too-few-recipients file (`agent
+    .encryption.RecipientsError`) refuses the whole backup before a single
+    byte of tenant data has been copied anywhere, staged or not. Every
+    intermediate plaintext file this function creates (the sqlite
+    snapshot, the tar) lives under `staging_dir`, mode `0600`
+    (`tempfile.mkstemp`'s own default), and is unconditionally removed in
+    a `finally` block -- **including on every error path** -- so no
+    plaintext operational data ever survives this call, whether it
+    succeeds or not.
+
+    Raises `agent.encryption.RecipientsError` (recipients file missing,
+    unsafe, or insufficient), `ValueError` (missing
+    `thermoctl_db_path`/`zigbee2mqtt_dir` for an operational-data backup),
+    or an `OSError`/`sqlite3.Error` from the underlying file/database
+    operations -- `_handle_backup_now` catches all of these and reports a
+    failed result, never a fabricated success.
+    """
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    if not operational_data:
+        payload = _build_device_config_snapshot(
+            apartment_id, agent_version, now, watchdog_state_path
+        )
+        fd, raw_path = tempfile.mkstemp(
+            dir=staging_dir, prefix="device-config-", suffix=".json"
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+        except BaseException:
+            Path(raw_path).unlink(missing_ok=True)
+            raise
+        return BackupArtifact(
+            kind=BackupKind.DEVICE_CONFIG,
+            path=Path(raw_path),
+            content_hash=hashlib.sha256(payload).hexdigest(),
+            size_bytes=len(payload),
+        )
+
+    if thermoctl_db_path is None or zigbee2mqtt_dir is None:
+        raise ValueError(
+            "thermoctl_db_path and zigbee2mqtt_dir are required for an "
+            "operational-data backup (section 15.2)."
+        )
+
+    # **Recipients validated before any tenant data is touched** (security
+    # principle 4) -- see this function's own docstring.
+    recipients = load_recipients(recipients_file)
+
+    db_snapshot_fd, db_snapshot_path_str = tempfile.mkstemp(
+        dir=staging_dir, prefix="thermoctl-db-", suffix=".sqlite3"
     )
+    os.close(db_snapshot_fd)
+    db_snapshot_path = Path(db_snapshot_path_str)
+    tar_fd, tar_path_str = tempfile.mkstemp(
+        dir=staging_dir, prefix="operational-data-", suffix=".tar"
+    )
+    os.close(tar_fd)
+    tar_path = Path(tar_path_str)
+
+    try:
+        _snapshot_sqlite_database(thermoctl_db_path, db_snapshot_path)
+
+        # `mode="w"` truncates the already-`mkstemp`-created (mode 0600,
+        # `O_EXCL`) tar file in place -- `tarfile` itself never chooses the
+        # path or its permissions here.
+        with tarfile.open(tar_path, mode="w") as tar:
+            tar.add(db_snapshot_path, arcname="thermoctl/thermoctl.db")
+            z2m_database = zigbee2mqtt_dir / "database.db"
+            if z2m_database.is_file():
+                tar.add(z2m_database, arcname="zigbee2mqtt/database.db")
+            coordinator_backup = zigbee2mqtt_dir / "coordinator_backup.json"
+            if coordinator_backup.is_file():
+                tar.add(coordinator_backup, arcname="zigbee2mqtt/coordinator_backup.json")
+
+        enc_fd, enc_path_str = tempfile.mkstemp(
+            dir=staging_dir, prefix="operational-data-", suffix=".age"
+        )
+        os.close(enc_fd)
+        enc_path = Path(enc_path_str)
+        try:
+            with tar_path.open("rb") as source, enc_path.open("wb") as destination:
+                encrypt_stream(source, destination, recipients)
+        except BaseException:
+            enc_path.unlink(missing_ok=True)
+            raise
+
+        return BackupArtifact(
+            kind=BackupKind.OPERATIONAL_DATA,
+            path=enc_path,
+            content_hash=_sha256_of_file(enc_path),
+            size_bytes=enc_path.stat().st_size,
+        )
+    finally:
+        # The plaintext tar and the raw sqlite snapshot -- **never** the
+        # encrypted `enc_path` above, which is this function's actual,
+        # intended return value -- are removed unconditionally, on every
+        # path through this block, success or exception alike.
+        tar_path.unlink(missing_ok=True)
+        db_snapshot_path.unlink(missing_ok=True)
+
+
+def _read_backup_upload_chunks(path: Path, *, chunk_size: int = 1 << 20) -> Iterator[bytes]:
+    """Streams `path` in fixed-size chunks -- `upload_backup`'s own request
+    body, so the encrypted (or plain JSON) artifact is never fully
+    materialized as one `bytes` object in memory before being sent, for the
+    same "a few megabytes should not mean a few megabytes of RAM" reasoning
+    `_sha256_of_file` already applies to hashing."""
+
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+
+
+def upload_backup(client: httpx.Client, artifact: BackupArtifact) -> BackupUploadAccepted:
+    """`POST /v1/backups` (P5.5a) -- streams `artifact.path` as the raw
+    request body (`_read_backup_upload_chunks`), `kind`/`content_hash` as
+    query parameters (mirrors `fleet.app.upload_backup`'s own documented
+    reasoning for why the metadata is not wrapped around the bytes as
+    JSON). Raises `httpx.HTTPError` (via `raise_for_status`) on anything
+    other than `201` -- `_handle_backup_now` is this function's only
+    caller and turns that into a failed `CommandResult`, never a silent
+    "uploaded" that was not."""
+
+    response = client.post(
+        "/v1/backups",
+        params={"kind": str(artifact.kind), "content_hash": artifact.content_hash},
+        content=_read_backup_upload_chunks(artifact.path),
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    response.raise_for_status()
+    return BackupUploadAccepted.model_validate(response.json())
+
+
+def create_and_upload_backup(
+    client: httpx.Client, config: BackupConfig, operational_data: bool, now: datetime
+) -> BackupUploadAccepted:
+    """`create_backup` + `upload_backup`, with the staged artifact always
+    removed afterward -- the shared body behind `_handle_backup_now`'s own
+    two calls, `run_daily_backup_scheduler`, and `run_before_update_backup`
+    (P5.4's future hook, section 15.2: "operational data ... additionally
+    before every update")."""
+
+    artifact = create_backup(
+        operational_data,
+        apartment_id=config.apartment_id,
+        agent_version=config.agent_version,
+        staging_dir=config.staging_dir,
+        now=now,
+        thermoctl_db_path=config.thermoctl_db_path,
+        zigbee2mqtt_dir=config.zigbee2mqtt_dir,
+        recipients_file=config.recipients_file,
+    )
+    try:
+        return upload_backup(client, artifact)
+    finally:
+        artifact.path.unlink(missing_ok=True)
+
+
+def run_before_update_backup(config: BackupConfig, now: datetime) -> BackupUploadAccepted:
+    """**P5.4's hook** (section 13 step 2, "Backup of the database and the
+    configuration, result is reported"; section 15.2, "operational data
+    ... additionally before every update") -- call this immediately before
+    `reconcile_desired_state` swaps a container. Only the operational-data
+    backup, per section 15.2's own wording ("daily and additionally before
+    every update" names operational data, not device configuration a
+    second time). Raises the same exceptions `create_backup`/
+    `upload_backup` raise -- **not caught here**: whether a failed
+    pre-update backup should abort the update itself is section 13's own
+    update sequence's decision (P5.4), not this function's.
+    """
+
+    return create_and_upload_backup(config.client, config, True, now)
+
+
+def run_daily_backup_scheduler(
+    config: BackupConfig,
+    *,
+    interval_s: float = 86400.0,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Section 15.2's own rhythm ("device configuration on every change,
+    operational data daily") -- **applied to both kinds, daily**: "on
+    every change" needs change detection this scaffold does not have yet
+    (there is no local record of the agent's own settings changing, only
+    of the watchdog's digest, which `_build_device_config_snapshot` already
+    reads fresh on every call regardless) -- running it daily is the
+    honest, documented superset of "on every change" for a kilobytes-sized
+    artifact, not a silent narrowing of the requirement.
+
+    Runs forever (real production use) or until `stop_event` is set (tests,
+    and `agent.__main__`'s own shutdown path) -- intended to run in its own
+    `threading.Thread(daemon=True)`, started by `agent.__main__._run_agent`
+    alongside `run`'s own synchronous SSE/poll loop, not inside it: `run`
+    already blocks on `receive_commands` between commands, so a periodic
+    job sharing that same call stack would only fire when a command
+    happens to arrive.
+
+    Every exception from one iteration's backup attempt is logged and
+    swallowed -- a single day's failed backup (a transient network issue,
+    a temporarily unreadable recipients file) must not take down every
+    later day's attempt, mirroring `fleet.app._alarm_check_loop`'s own
+    "log and continue" reasoning for its background task.
+    """
+
+    while stop_event is None or not stop_event.is_set():
+        current_now = now()
+        for operational_data in (False, True):
+            try:
+                create_and_upload_backup(config.client, config, operational_data, current_now)
+            except Exception:
+                logger.exception(
+                    "Scheduled daily backup failed (operational_data=%s)", operational_data
+                )
+        sleep(interval_s)
 
 
 def factory_reset() -> None:

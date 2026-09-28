@@ -159,8 +159,8 @@ def test_rejected_command_with_invalid_id_is_not_reported(tmp_path: Path, bad_id
     assert bad_id not in state.executed_ids
 
 
-# --- report_now / fetch_logs / backup_now / diagnostic_bundle: honest ----
-# --- failed results, never a fake success ---------------------------------
+# --- report_now / fetch_logs / diagnostic_bundle: honest failed results, --
+# --- never a fake success --------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -168,7 +168,6 @@ def test_rejected_command_with_invalid_id_is_not_reported(tmp_path: Path, bad_id
     [
         (CommandType.REPORT_NOW, "P2.3"),
         (CommandType.DIAGNOSTIC_BUNDLE, "P5.3"),
-        (CommandType.BACKUP_NOW, "P5.5"),
     ],
 )
 def test_not_yet_available_commands_report_honest_failure(
@@ -188,6 +187,61 @@ def test_not_yet_available_commands_report_honest_failure(
     assert expected_substring in (outcome.result.error_text or "")
     assert outcome.exit_after_report is False
     # Still recorded as "seen" so a redelivery does not report a second time.
+    assert command.id in state.executed_ids
+
+
+# --- backup_now (P5.5a): genuinely executed, honest failure only when ------
+# --- unconfigured -----------------------------------------------------------
+
+
+def test_backup_now_reports_honest_failure_when_unconfigured(tmp_path: Path) -> None:
+    """`ctx.backup_config is None` (the default `_ctx` helper above builds)
+    -- `backup_now` refuses cleanly, naming the missing CLI configuration,
+    never a `NotImplementedError`/crash and never a fake success (P5.5a
+    replaces P5.2's own placeholder failure for this command)."""
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.BACKUP_NOW)
+
+    outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert outcome.result is not None
+    assert outcome.result.successful is False
+    assert "Backup-Konfiguration" in (outcome.result.error_text or "")
+    assert outcome.exit_after_report is False
+    assert command.id in state.executed_ids
+
+
+def test_execute_command_turns_an_unexpected_handler_exception_into_a_failed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-review: a handler raising anything uncaught used to propagate
+    straight out of `execute_command`, which would crash `run`'s own main
+    loop -- every command after the offending one would then never
+    execute either. `execute_command` itself must be the safety net, for
+    every handler, not only `backup_now`'s own (separately tested,
+    narrower) case."""
+
+    import agent.loop as loop_module
+
+    def _boom(_command: Command, _ctx: ExecutionContext) -> None:
+        raise RuntimeError("an unanticipated handler bug")
+
+    monkeypatch.setitem(loop_module._HANDLERS, CommandType.REPORT_NOW, _boom)
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.REPORT_NOW)
+
+    outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert outcome.result is not None
+    assert outcome.result.successful is False
+    assert "unerwarteter Fehler" in (outcome.result.error_text or "")
+    assert "an unanticipated handler bug" in (outcome.result.error_text or "")
+    # Still recorded as executed -- a redelivery of the same id must not
+    # retry (and potentially crash on) the same broken handler again.
     assert command.id in state.executed_ids
 
 

@@ -2,6 +2,346 @@
 
 Last updated: 2026-09-28.
 
+## P5.5a cross-review fixes: duplicate recipients, a memory DoS on the upload endpoint, an insufficient age-file check, and an unhandled handler exception
+
+Cross-review of P5.5a (commit `167bc63`) confirmed the no-plaintext path,
+the recipients source, the image mounts, the retention scheme, apartment
+scoping, and security principle 3 -- even decrypting a test artifact with
+the real `age` CLI. It found two required fixes and asked for two further
+ones (main-session decision), all four addressed in this follow-up commit:
+
+1. **Required -- duplicate recipients counted as two.** `agent.encryption
+   .load_recipients` only checked `len(recipients) >= MIN_RECIPIENTS`
+   after parsing -- the same public key listed twice on the boot-partition
+   file satisfied that count without providing a genuine second,
+   independent recipient, silently degrading "either key alone restores
+   it" to a single point of failure. Fixed by deduplicating on each
+   recipient's own **canonical string form** (`str(recipient)`, the
+   normalized `age1...` encoding `pyrage.x25519.Recipient.__str__` always
+   returns, comparing the *parsed* recipients rather than the raw input
+   lines) before the count check, so a case-varied or otherwise
+   differently-formatted duplicate of the same key cannot slip past
+   either. Tested: two identical lines, two lines differing only in case,
+   three lines naming only two distinct keys, and the positive case (a
+   duplicate alongside two genuinely different recipients is accepted,
+   still returning exactly the two distinct ones).
+
+2. **Required -- a memory DoS on `POST /v1/backups`.** The endpoint used
+   to `await request.body()`, buffering the *entire* declared body into
+   memory before `MAX_BACKUP_UPLOAD_BYTES` was ever checked at all -- a
+   caller that simply ignored the documented limit could exhaust memory
+   regardless of what the eventual `413` said. Fixed two ways, together:
+   a declared `Content-Length` above the cap is refused, `413`, before a
+   single byte is read (a malformed `Content-Length` is not rejected for
+   that alone -- the second check below still applies regardless); the
+   body is streamed via `Request.stream()` straight into a temp file
+   (`fleet.backup_storage.BackupBlobStorage.begin_upload`/
+   `PendingBackupUpload`, new), hashed incrementally, with a running total
+   checked on every chunk -- the moment it exceeds the cap, the upload is
+   aborted (`413`), having held at most one chunk in memory and written at
+   most the cap's worth to disk. The actual streaming loop is factored out
+   into its own function, `fleet.app._stream_backup_body`, specifically so
+   its "does it stop reading, not merely stop *accepting*, once the cap is
+   exceeded" property is unit-testable directly against a synthetic async
+   generator -- **verified empirically while building this fix that
+   Starlette's own `TestClient` buffers a request body fully before an app
+   ever sees it**, which would have made that property untestable through
+   an HTTP call alone; an HTTP-level test (a generator body with no
+   `Content-Length`, a monkeypatched small cap) additionally proves the
+   real endpoint's own outer exception handling (abort-then-reraise) is
+   wired correctly end to end. `BackupBlobStorage.store` (the
+   non-streaming convenience method other tests and the retention job's
+   fixtures use) is now itself implemented in terms of the same
+   `begin_upload`/`PendingBackupUpload` primitives, not a second, separate
+   write path.
+
+3. **Fleet plausibility check for operational data, strengthened.**
+   Checking only `AGE_HEADER_MAGIC` (`age-encryption.org/v1`) let
+   `age-encryption.org/v1\n` followed by arbitrary plaintext through -- a
+   buggy or malicious agent only had to prepend one fixed, public string.
+   `fleet.app._looks_like_an_age_file` now also requires a syntactically
+   plausible recipient stanza line (`-> ...`, the age format's own
+   `Stanza` syntax) immediately after the header line -- still not a
+   decrypt attempt (principle 3: the fleet has no private key to decrypt
+   with even if it wanted to), but the uploaded bytes now have to actually
+   look like the beginning of a real age file's *structure*. Reads only a
+   bounded prefix (4096 bytes) back from the temp file for this check, not
+   the whole body a second time. Tested: header line immediately followed
+   by plaintext with no stanza line -> `422`; header magic with no
+   newline at all -> `422`.
+
+4. **Main-session decision -- an unexpected exception inside a command
+   handler must never crash the agent.** Two related but independent
+   gaps, both closed:
+   - `agent.loop.execute_command`'s own `handler(command, ctx)` call had
+     no `try`/`except` around it at all -- any handler raising anything
+     uncaught propagated straight out of `execute_command`, out of
+     `run`'s own `for item in commands:` loop, crashing the whole agent
+     process (every command after the offending one would then never
+     execute either, exactly the failure mode section 7's "the agent
+     keeps running" already rules out for a rejected/expired command).
+     Fixed with a generic `except Exception` around the dispatch itself,
+     turning any handler's unexpected exception into a failed
+     `CommandResult` (`repr(error)` in `error_text`, the same
+     control-character-escaping reasoning `_append_local_log` already
+     documents for a cloud-echoed rejection reason) -- a safety net
+     underneath every handler, not just `backup_now`'s own.
+   - `_handle_backup_now`'s own per-kind `except` clause named four
+     specific exception types (`RecipientsError`/`OSError`/`sqlite3
+     .Error`/`ValueError`) -- `tarfile.TarError` (e.g. a corrupted
+     intermediate tar) is none of those, and used to propagate past this
+     handler's own boundary too. Widened to `except Exception`;
+     `create_backup`'s own internal plaintext cleanup (the sqlite
+     snapshot, the tar) is unaffected, since it already runs via its own
+     unconditional `finally` regardless of which exception type
+     propagates out of it. Tested by injecting a real `tarfile.TarError`
+     from inside `create_backup`'s own `tarfile.open(...)` call -- the
+     device-configuration half of `backup_now` still succeeds
+     independently, the combined result is reported as a failure, and no
+     plaintext is left behind under the staging directory.
+
+**Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`): `ruff check .` -- `All checks passed!`; `mypy .` --
+`Success: no issues found in 93 source files`; `mypy protocol fleet agent
+tools` -- `Success: no issues found in 51 source files`; `python -m tools
+.check_image_config` -- `Image configuration plausible`; `python -m
+pytest -W ignore::ResourceWarning -rA` **2x**, both exit code 0, **1149
+passed, 1 skipped** each run (the one skip: no `age` CLI binary on this
+machine), coverage **99%** both runs (4492 statements; run 1: 14 missed;
+run 2: 13 missed) -- the one-line difference is `fleet/storage.py`'s own
+pre-existing `remove_device` concurrent-race branch, the same
+timing-based coverage wobble already documented in this file's P5.1b
+cross-review entry, unrelated to this fix; every remaining miss in both
+runs is pre-existing and unrelated (`agent.loop`'s own still-open
+`collect_heartbeat`/`send_heartbeat`/`reconcile_desired_state`
+placeholders, `fleet/admin.py`'s own pre-existing gap, `tools
+/check_image_config.py`'s own pre-existing CLI-entry-point gaps). In
+`watchdog/`: `go vet ./...` clean, `go test ./...` -- all three packages
+`ok`, `bash check_contract.sh` -- "Contract test passed" (run with the
+`agent` extra installed on `PATH`; `watchdog/`'s own `go.mod` untouched).
+
+## P5.5a -- end-to-end encrypted backups to two recipients (sections 15.1, 15.2, 15.3)
+
+**`backup_now` is genuinely executed, both kinds of backup real.**
+`agent/loop.py::create_backup` builds and stages:
+
+- **Device configuration** (`operational_data=False`): plain JSON,
+  containing exactly `apartment_id`, `agent_version`, `created_at`, and --
+  when the watchdog's own state file is present and readable -- the
+  agent's own self-swap `agent_digest`/`agent_proven_digest`
+  (`_build_device_config_snapshot`). Nothing else: section 15.1's own
+  table also lists broker settings, WireGuard peer, and timezone, but this
+  scaffold has not built any of the features that would make those true
+  yet (section 14's WireGuard tunnel, a Mosquitto broker configuration,
+  P5.4's full desired-state reconciliation) -- adding a fabricated value
+  instead of omitting the key would have been exactly the "invented
+  stopgap" this codebase's placeholders elsewhere already refuse to
+  produce. Contains no tenant data, pinned by a planted-marker test.
+- **Operational data** (`operational_data=True`): thermoctl's SQLite
+  database (a consistent snapshot via `sqlite3.Connection.backup`'s online
+  backup API, opened read-only, never a raw file copy) plus Zigbee2MQTT's
+  `database.db`/`coordinator_backup.json` if present, bundled as a tar and
+  **encrypted before it ever touches an upload buffer** -- real `age`
+  format (`pyrage`, Python bindings to the Rust `age`/`rage`
+  implementation; chosen over hand-rolling the format or its cryptography,
+  per CLAUDE.md's "no invented functionality"), to **two recipients
+  always** (the landlord's everyday key and one offline key, project owner
+  decision 2026-09-26/27) -- `age -d -i <your-key-file> ...` decrypts it
+  with either. Every intermediate plaintext file (the sqlite snapshot, the
+  plaintext tar) lives under a staging directory, mode `0600`
+  (`tempfile.mkstemp`'s own default), and is removed unconditionally --
+  including on every error path -- so no plaintext operational data ever
+  survives a call, success or failure. Streamed both ways (hashing,
+  encryption, upload) rather than materialized as one in-memory `bytes`
+  object.
+
+**`agent/encryption.py`** (new, small, reusable module -- explicitly built
+this way so P5.3b's future encrypted diagnostic bundle can call it
+directly instead of duplicating recipients-file handling): `load_recipients`
+reads the **boot-partition** recipients file
+(`/boot/firmware/thermoctl/backup-recipients.txt`, one age recipient per
+line, `#`-comments allowed) via `agent.safe_io.read_text_safe` (the same
+symlink/non-regular-file hardening `agent.loop`'s own state files already
+get) and validates every line as a real X25519 age recipient
+(`pyrage.x25519.Recipient.from_str`) -- **fails closed**: missing, unsafe,
+containing an invalid line, or fewer than two valid recipients all raise
+`RecipientsError` and refuse the whole backup, never a plaintext fallback.
+The public keys are **written locally onto the boot partition when the
+image is prepared and never taken from the cloud** -- the same "hard-coded
+on the device, not cloud-supplied" reasoning CLAUDE.md's principle 2
+already applies to the image source list; a compromised cloud therefore
+cannot swap in its own recipient and read operational data as it arrives.
+`encrypt_stream` is a thin, single call-site wrapper around
+`pyrage.encrypt_io` (streams both ends).
+
+**Upload -- new fleet endpoint, `POST /v1/backups`** (`fleet/app.py`):
+agent-token-authenticated exactly like every other `/v1/...` endpoint with
+no apartment in its own address (`require_apartment_token_by_hash`);
+`kind`/`content_hash` as query parameters, the raw bytes as the body (no
+JSON wrapping around a multi-megabyte blob). Checked, in order: size
+against `protocol.backups.MAX_BACKUP_UPLOAD_BYTES` (against the actually-
+received body, never a declared `Content-Length` alone); `content_hash`
+matches a fresh SHA-256 of the received body; for `operational_data`, the
+body must start with the real age format's own header line
+(`age-encryption.org/v1`) -- refused, `422`, before a single byte reaches
+disk, so a buggy or compromised agent cannot store plaintext tenant data
+by accident (this is a structural plausibility check on the file's own
+framing, not a decrypt attempt -- the fleet holds no private key to
+decrypt with in the first place, principle 3); for `device_config`, the
+body must parse as JSON. The fleet **never otherwise parses** an
+operational-data upload.
+
+**Storage**: `fleet/backup_storage.py` (new) -- blobs on the filesystem
+under a configurable directory (`FLEET_BACKUP_STORAGE_DIR`, not the
+database), one subdirectory per apartment and kind, a fresh random id per
+blob (never named after the caller-supplied, unverified-until-just-now
+`content_hash`), written atomically (`O_EXCL` temp file, then
+`os.replace`). Metadata (`backup_id`, `apartment_id`, `kind`, `created_at`,
+`size_bytes`, `content_hash`, `storage_path`) in a new `backups` table
+(`fleet/migrations/versions/0011_backups.py` -- originally `0010`, chained
+onto `main`'s `0009_commands.py`; re-chained at merge time onto P5.3a's own
+parallel `0010_command_log_excerpts.py`, main-session convention) --
+mirrors `commands`'s own "wire id is a separate, random, unique-indexed
+column, never the primary key" reasoning.
+
+**Retention (section 15.2): "the last 14 daily backups, plus one weekly
+backup for each of the last eight weeks", applied per apartment and per
+kind.** `fleet/backup_retention.py` (new) -- a classic
+grandfather-father-son rotation: group by UTC calendar date, keep the
+newest of each of the 14 most recent dates; group the *remaining* backups
+(deliberately excluding every ISO week already represented by a
+daily-kept backup -- without that exclusion, a daily upload rhythm would
+always have its two or three most recent weeks entirely covered by the
+daily rule already, silently spending several of the 8 weekly slots on
+weeks that add no additional retained backup and shrinking the real
+retention horizon well under "8 weeks") by ISO calendar week, keep the
+newest of each of the 8 most recent remaining weeks. A pure function
+(`select_backups_to_keep`, clock-injected, tested directly with
+synthetic data spanning 90 days: exactly 22 kept, the rest dropped) plus a
+real I/O wrapper (`run_backup_retention`) run periodically from
+`fleet/app.py`'s own lifespan (mirrors `_alarm_check_loop`'s existing
+shape, default hourly, `FLEET_BACKUP_RETENTION_INTERVAL_S`).
+
+**UI** ("Eine Wohnung", `fleet/ui_apartment.py`/`fleet/ui_routes.py`): a
+"Sicherungen" section lists every backup (kind, time, size, SHA-256 hash),
+each with a download link (`GET /ui/apartments/{id}/backups/{backup_id}
+/download`, behind the P3.0 login like every other `/ui` route, scoped to
+the apartment -- another apartment's backup id is a 404, indistinguishable
+from an unknown one) and, for operational data only, the ready-made
+`age -d -i <your-key-file> -o backup.tar <file>` command right there
+(project owner: "a cumbersome path leads to weakening the filter
+instead").
+
+**Image (`image/common/`)**: `agent-compose.yml` gains three new
+**read-only** bind mounts -- the boot-partition recipients file's own
+directory, thermoctl's data directory (`/var/lib/thermoctl`, this
+repository's own chosen convention pending a real thermoctl/Zigbee2MQTT
+compose file, P5.4/P5.6), and Zigbee2MQTT's data directory
+(`/var/lib/zigbee2mqtt`) -- all justified inline in the compose file's own
+comments. `tools/check_image_config.py::check_agent_compose_file` asserts
+all three lines are present. `image/common/README.md` documents the
+recipients file's path/format and the section 19.5 preparation-tool step
+that writes it (**not built here** -- still a documented TODO, same
+status as the other still-unimplemented image-build steps this file
+already tracks).
+
+**Protocol**: `protocol/backups.py` (new) -- `BackupKind` (closed,
+`device_config`/`operational_data`), `BackupUploadAccepted`,
+`MAX_BACKUP_UPLOAD_BYTES`, `AGE_HEADER_MAGIC`. `PROTOCOL_VERSION` bumped
+originally 3 -> 4; at merge time (this package's own change had landed in
+parallel with, and numbered the same as, P5.3a's own `LogExcerpt`
+addition) re-numbered to **5** -- a wholly new module counts as a change
+to "the models", per that file's own established reading of section 18.2.
+
+**Constraints honoured**: `protocol.commands.CommandType` unchanged (no
+new command was needed -- `backup_now` already existed); `watchdog/`
+untouched (`go vet`/`go test`/`check_contract.sh` all still pass,
+including with the new `agent` extra's `pyrage` dependency installed --
+the watchdog itself has no dependency on it, its own `go.mod` is
+untouched); no private key anywhere in the repo, the image, the agent, or
+the fleet -- every identity generated in this package's own tests is
+freshly generated at test runtime (`pyrage.x25519.Identity.generate()`),
+never committed.
+
+**Open**: **restore (section 15.2/15.3 step 4) is P5.5b, not this
+package** -- "the agent fetches the device configuration and, on a swap,
+the encrypted operational data; the landlord enters the decryption key
+once in the fleet UI, only passed through, never stored" has no stub at
+all yet, fleet-side or agent-side. `docs/implementation_plan.md` splits
+P5.5 into P5.5a (done) / P5.5b (open) accordingly.
+
+**Tests** (`tests/test_agent_encryption.py`, `tests/test_agent_backup.py`,
+`tests/test_agent_backup_e2e.py`, `tests/test_fleet_backups.py`,
+`tests/test_backup_storage.py`, `tests/test_backup_retention.py`,
+`tests/test_storage_backups.py`, `tests/test_ui_backups.py`; plus small
+updates to `tests/test_agent_loop_execution.py` and `tests/
+test_watchdog_contract.py`, see below) -- real cryptography throughout,
+never a mock of `pyrage`/age: two freshly generated X25519 identities,
+each decrypts alone (via `pyrage` directly; the real `age` CLI too, when
+available -- skipped with a stated reason on this development machine,
+which has no `age` binary installed); fewer than two recipients, an
+invalid recipient line, a missing recipients file, and a symlinked/FIFO
+recipients file are each refused, with a marker string planted in a fake
+thermoctl database and Zigbee2MQTT files asserted absent from every file
+under the staging directory in every one of those cases (and from every
+captured request body in the upload-level tests); the fleet endpoint
+rejects a non-age operational-data upload and a non-JSON device-config
+upload, a content-hash mismatch, an oversized body, and an unauthenticated/
+wrong-token request; the device-configuration backup's own content is
+pinned marker-free; retention is proven to keep exactly 14 daily + 8
+weekly (90 days of synthetic data, non-overlapping construction) and to be
+idempotent; the UI download route requires login and is 404 for another
+apartment's backup id; and one true end-to-end test drives `backup_now`
+through `agent.loop.run` against the real `fleet.app.app` over real TLS,
+with a fake thermoctl SQLite database and a fake Zigbee2MQTT directory
+standing in for the real services, asserting both backup rows exist in
+the fleet's database afterward and that the stored operational-data blob
+decrypts, with either generated identity, to a tar containing all three
+expected files.
+
+**Two small, adjacent test fixes, both narrowing an over-broad assertion
+that this package's own legitimate new code would otherwise have
+violated, not weakening what either test actually protects:**
+
+- `tests/test_watchdog_contract.py::test_file_is_not_json` used to assert
+  "`agent.loop` does not import `json` anywhere" as a proxy for "the
+  watchdog-contract files are line-based, not JSON" -- true only by
+  coincidence before this package, since nothing in that module needed
+  `json` for anything. The device-configuration backup's content
+  legitimately is JSON (section 15.1: "device config as JSON"), a
+  different file, never read by the watchdog. Narrowed to check the three
+  watchdog-contract writer functions' own source directly
+  (`inspect.getsource`, asserting none of them contains `"json."`) instead
+  of the whole module's import list.
+- `tests/test_agent_loop_execution.py`'s parametrized "not yet available,
+  honest failure" test used to include `backup_now` (P5.5's own
+  placeholder message) -- removed from that parametrization (`backup_now`
+  is no longer a placeholder) and replaced with a dedicated test for the
+  one honest-failure case that remains: `backup_now` refused, cleanly,
+  when `ExecutionContext.backup_config` is `None` (the CLI's own
+  `--apartment-id` etc. were not given).
+
+**Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`): `ruff check .` -- `All checks passed!`; `mypy .` --
+`Success: no issues found in 93 source files`; `mypy protocol fleet agent
+tools` -- `Success: no issues found in 51 source files`; `python -m
+tools.check_image_config` -- `Image configuration plausible`; `python -m
+pytest -W ignore::ResourceWarning -rA` **2x**, both exit code 0, **1134
+passed, 1 skipped** each run (the one skip: no `age` CLI binary on this
+machine), coverage **99%** (4425 statements, 13 missed) identical across
+both runs -- every one of the 13 remaining misses is pre-existing and
+unrelated to this package (`agent.loop`'s own still-open `collect_heartbeat`/
+`send_heartbeat`/`reconcile_desired_state` placeholders, `fleet/admin.py`'s
+own pre-existing gap, `tools/check_image_config.py`'s own pre-existing
+CLI-entry-point gaps). In `watchdog/`: `go vet ./...` clean, `go test
+./...` -- all three packages `ok`, `bash check_contract.sh` --
+"Contract test passed" (run with the `agent` extra, including `pyrage`,
+installed -- the watchdog's own `go.mod` has and needs no new dependency;
+this only reflects the Python side of the cross-language contract test
+now also depending on the new extra, exactly like the prior commit's own
+"install the agent extra for the contract test" CI fix already
+anticipated).
+
 ## Cross-review fix: single-key enforcement + non-permissive apt pinning (image/, section 19)
 
 Two supply-chain gaps found reading back the Docker-apt-repository fix
