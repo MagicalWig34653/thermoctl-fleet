@@ -2,6 +2,135 @@
 
 Last updated: 2026-09-28.
 
+## P5.4 -- desired-state reconciliation, agent side -- done but inactive
+
+Implements the owner decision below in full: `agent.loop.reconcile_desired_state`
+(pre-check, backup, digest check against the hard-coded sources, pull,
+swap, 15-minute health deadline with automatic rollback, restart-safe via
+a persisted pending-swap record) plus a new `agent/sources.py` (the
+hard-coded, exact-match repository list, CLAUDE.md security principle 2).
+**Stays inactive**, per the 2026-09-28 owner decision restated below: only
+live in production once (1) thermoctl exposes a real health/control-status
+endpoint this scaffold can read (`_default_health_reader`/the pre-check's
+own `outdoor_temp_reader` both currently return "unavailable", which the
+fail-closed pre-check then always rejects on) and (2) `pilot_mode` is set
+for the target apartment. Both rejection paths are tested and reported
+with their reason, and neither pulls an image nor takes a backup first.
+
+**Scope: agent side only.** This package reconciles a `DesiredState` value
+the caller already has in hand -- delivering that value from the fleet to
+the agent over the SSE command channel, fleet-side storage of the desired
+state, and any UI to edit it are **P5.4b**, not started (`agent.commands_channel`
+carries no desired-state event type yet, and `fleet/storage.py` has no
+table for it). `reconcile_desired_state` takes `DesiredState`, `pilot_mode`,
+and every local input (health reader, outdoor-temperature reader, disk
+usage reader, the Docker socket path, the health deadline, a sleep
+function) as explicit parameters -- there is no hidden global, and no
+caller wiring it into `agent.loop.run`'s own command loop exists yet
+either, deliberately, since nothing yet delivers a `DesiredState` to call
+it with.
+
+**Design, section 13:**
+- **Sources** (`agent/sources.py`): `ALLOWED_SOURCES`, one canonical
+  `registry/path` per service, compared via `image_repo_matches_source`
+  after normalizing the cloud-supplied `image` field the same way
+  Docker/OCI references normalize a Docker Hub short form -- **always
+  exact equality against the canonical string, never a prefix/substring
+  match**. Rejects, by construction (`normalize_repository` returns
+  `None`): an embedded digest or tag inside `image` (both belong in
+  `ServiceState`'s own separate fields), any uppercase letter, a leading/
+  trailing/doubled slash, and any `:` at all (which also closes off every
+  registry-port/userinfo trick, since none of the four real sources needs
+  one). Tested case by case in `tests/test_agent_sources.py`, including
+  `ghcr.io/magicalwig34653/thermoctl-evil` (prefix trick) and the `agent`
+  image under the `thermoctl` service name (cross-service trick).
+- **Digest**: `agent.sources.digest_is_well_formed`
+  (`^sha256:[0-9a-f]{64}$`) is `reconcile_desired_state`'s own defense-in-
+  depth check, in addition to `protocol.desired_state.ServiceState.digest`'s
+  already-existing model-level pattern -- exercised by a test that bypasses
+  pydantic validation (`ServiceState.model_construct`) to reach it directly.
+- **Pull, verify** (`pull_image_by_digest`, `verify_pulled_digest`,
+  `image_repo_digests`): strictly `POST /images/create?fromImage=<repo>&tag=<digest>`
+  over the local Docker Engine API Unix socket -- no shell, no `docker`
+  CLI, no Docker SDK, same footing `read_container_log_lines` (P5.3a)
+  already established. Verified afterward via `GET /images/{repo}@{digest}/json`'s
+  own `RepoDigests` -- a mismatch aborts before anything is ever swapped.
+- **Pre-check** (`_reconcile_precheck`): disk space (> 20%, reusing
+  `_read_disk_usage`), the time window, the outdoor-temperature threshold,
+  control health, and `pilot_mode` -- in that order, all before the
+  backup or a single Docker call. The two owner-mandated conditions are
+  checked first.
+- **Backup**: `run_before_update_backup` (existing P5.5a hook), called
+  after the pre-check and before the pull -- its own exception aborts the
+  whole pass, no change made.
+- **Swap** (`_recreate_container_with_image`): **no compose file for
+  thermoctl/zigbee2mqtt/mosquitto exists in this repository yet**
+  (`image/common/README.md`'s own P5.4/P5.6 open point) -- implemented
+  directly against the Docker Engine API's own container lifecycle (stop,
+  remove, create with the same `Config`/`HostConfig` and the new image,
+  start), as the implementation plan explicitly allows for this case.
+  Once such compose files exist, this can move to the same
+  `docker compose ... up -d --pull never --force-recreate <service>`
+  pattern `watchdog/runtime.go` already uses for the agent's own
+  self-swap.
+- **One service per pass** (`_select_service_to_update`, a fixed priority
+  order): zigbee2mqtt and thermoctl are therefore structurally never
+  swapped together, tested with a desired state where both differ.
+- **Health wait and rollback** (`_await_or_rollback_pending_swap`):
+  polls `container_is_healthy` -- honestly limited to Docker's own
+  `State.Health.Status` if the image defines a `HEALTHCHECK`, else plain
+  "is it running", since this scaffold has no thermoctl `/api/v1/health`
+  reader yet (same limitation the pre-check's own health reader already
+  has). Bounded by a deadline **anchored to the swap's own `since`**, not
+  to when the call runs -- the same "resumed, not restarted from zero"
+  reasoning `watchdog/runtime.go`'s own `AwaitHealthReport` uses for its
+  state file (P5.6 cross-review R2). On timeout: rolls back to the
+  previous digest on its own and reports it.
+- **Restart-safe** (`PendingSwap`, `_load_pending_swap`/`_save_pending_swap`):
+  persisted via `agent.safe_io.read_text_safe` on read (fails closed, same
+  reasoning as `load_agent_state`'s own executed-ids file) and an atomic
+  temp-file-plus-replace write, under the agent's own state directory --
+  an agent restart mid-wait resumes waiting/rolling back for the same
+  swap instead of forgetting it, tested with an already-expired persisted
+  swap (immediate rollback on resume) and one that becomes healthy on
+  resume.
+- **Agent service** (security principle 6): never recreates its own
+  container -- pulls and verifies the digest, then hands it to the
+  watchdog via the existing `report_watchdog_state` (keeping
+  `watchdog/check_contract.sh` green, unchanged).
+
+**Tests:** `tests/test_agent_sources.py` (normalization/matching, every
+trick listed above) and `tests/test_agent_reconcile.py` (44 tests) --
+extended `tests/docker_api_support.py`'s `FakeDockerAPI` with
+`POST /images/create`, `GET /images/{ref}/json`, and the container
+`create`/`stop`/`start`/`delete` lifecycle, all over a real Unix socket,
+plus a `run_fake_docker_api_with_app` variant that also yields the app
+for mutating container health / reading its call log. Covers, per the
+plan's own acceptance and the work order's additions: missing digest
+prevents the pull; an unlisted-source image is rejected; no health within
+the deadline rolls back; both owner-mandated rejections (nothing pulled,
+no backup taken, in either case); a `RepoDigests` mismatch aborts before
+any swap; a backup failure aborts before any pull; an agent restart
+resumes rollback (and separately, resumes to a successful confirmation);
+zigbee2mqtt and thermoctl in one desired state only ever change one.
+
+**Files:** `agent/sources.py` (new), `agent/loop.py`
+(`reconcile_desired_state` and its own new helpers: `pull_image_by_digest`,
+`image_repo_digests`, `verify_pulled_digest`, `inspect_container_full`,
+`current_repo_digest`, `container_is_healthy`, `_recreate_container_with_image`,
+`_rollback_to_previous`, `PendingSwap`, `_load_pending_swap`/
+`_save_pending_swap`, `ReconcileOutcome`, `_reconcile_precheck`,
+`_select_service_to_update`, `_await_or_rollback_pending_swap`),
+`tests/docker_api_support.py` (extended), `tests/test_agent_sources.py`
+(new), `tests/test_agent_reconcile.py` (new).
+
+**Verification:** `ruff check .` clean; `mypy .` (113 files) and
+`mypy protocol fleet agent tools` (59 files) clean; pytest:
+**1454 passed, 1 skipped**, TOTAL **5551 stmts / 46 missed / 99%**; Go:
+`go vet ./...`/`go test ./...` clean (unchanged from P5.6/P5.7),
+`watchdog/check_contract.sh` passing (unchanged -- this package never
+touches `watchdog/`).
+
 ## Owner decisions for P5.4 and P5.5b (2026-09-28, main session)
 
 Recorded in `docs/specification.md` (sections 13 and 15.3, "Decided

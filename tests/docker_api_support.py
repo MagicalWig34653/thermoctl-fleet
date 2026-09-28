@@ -5,13 +5,21 @@ pytest), used by `tests/test_agent_docker_socket.py` to exercise
 and `read_container_state` (P5.3b) against a **real local socket and a
 real HTTP response**, not a stubbed reader -- the one class of behaviour
 `tests/test_agent_fetch_logs.py`'s own module docstring explicitly says it
-does *not* cover ("no real Docker socket anywhere in this file").
+does *not* cover ("no real Docker socket anywhere in this file"). Extended
+for P5.4 (`tests/test_agent_reconcile.py`) with the endpoints
+`reconcile_desired_state` needs beyond those three read-only functions:
+pulling an image (`POST /images/create`), inspecting one by reference
+(`GET /images/{ref}/json`), and the container lifecycle
+`_recreate_container_with_image` drives (`stop`/`DELETE`/`create`/`start`).
 
-Implements exactly the two routes those three functions call
-(`GET /containers/{name}/logs`, `GET /containers/{name}/json`), each
-containers's response supplied by the caller -- a raw ASGI callable (no
-FastAPI/Starlette dependency needed for this: two routes, no forms, no
-templating), served by `uvicorn.Config(..., uds=...)`, mirroring
+Implements exactly the routes those functions call
+(`GET /containers/{name}/logs`, `GET /containers/{name}/json`,
+`POST /images/create`, `GET /images/{ref}/json`,
+`POST /containers/{name}/stop`, `DELETE /containers/{name}`,
+`POST /containers/create`, `POST /containers/{name}/start`), each
+container's/image's response supplied by the caller -- a raw ASGI callable
+(no FastAPI/Starlette dependency needed for this: a handful of routes, no
+forms, no templating), served by `uvicorn.Config(..., uds=...)`, mirroring
 `tests/tls_support.py`'s own `_UvicornThread` for a TCP+TLS server.
 
 **Socket path kept short** (a plain filename directly under `/tmp`, not
@@ -31,6 +39,7 @@ import os
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -89,19 +98,56 @@ class FakeDockerAPI:
     """
 
     def __init__(
-        self, logs: dict[str, bytes | list[bytes]], inspect: dict[str, dict[str, Any]]
+        self,
+        logs: dict[str, bytes | list[bytes]],
+        inspect: dict[str, dict[str, Any]],
+        images: dict[str, dict[str, Any]] | None = None,
+        pull_errors: dict[str | tuple[str, str], str] | None = None,
     ) -> None:
         self.logs = logs
+        # `inspect` doubles as the mutable container store for P5.4's own
+        # endpoints below: `create`/`stop`/`start`/`delete` all read and
+        # write this same dict, exactly like the real daemon's own
+        # container table -- a test that pre-seeds a container here is
+        # simulating "already running", and `_recreate_container_with_image`
+        # then mutates it through the same lifecycle the real API exposes.
         self.inspect = inspect
+        # Image store, keyed by whatever reference string a test chooses
+        # (normally `"{repo}@{digest}"`) -- `current_repo_digest` and
+        # `verify_pulled_digest` both resolve through `GET /images/{ref}/json`,
+        # so a test only needs to seed this dict with the `RepoDigests` it
+        # wants that lookup to find, it never has to simulate a real
+        # registry pull's own image-ID indirection.
+        self.images = dict(images or {})
+        # `(fromImage, tag)` -> an error string `POST /images/create` should
+        # stream back as `{"error": ...}` instead of succeeding -- absent, a
+        # pull always "succeeds" (an empty status stream), since whether the
+        # pulled image is actually usable afterward is governed by
+        # `self.images` above, not by this dict.
+        self.pull_errors = dict(pull_errors or {})
+        # `POST /containers/create`'s own default `State.Health.Status` for
+        # a freshly created container, mutable by a test at any point --
+        # `None` (the default) matches "the image defines no HEALTHCHECK",
+        # which `agent.loop.container_is_healthy` then reads as "healthy
+        # iff running" (see that function's own docstring); a test that
+        # wants a post-swap container to never count as healthy sets this
+        # to e.g. `"unhealthy"` before triggering the create.
+        self.default_health_on_create: str | None = None
+        # One entry per request handled, `"{method} {path}"` -- lets a test
+        # assert that a rejected reconciliation pass never touched Docker at
+        # all ("nothing was pulled and no backup was taken").
+        self.calls: list[str] = []
 
     async def __call__(
         self, scope: Mapping[str, Any], receive: ASGIReceive, send: ASGISend
     ) -> None:
         assert scope["type"] == "http"
+        method = str(scope["method"])
         path = str(scope["path"]).strip("/")
         parts = path.split("/")
+        self.calls.append(f"{method} {path}")
 
-        if len(parts) == 3 and parts[0] == "containers" and parts[2] == "logs":
+        if method == "GET" and len(parts) == 3 and parts[0] == "containers" and parts[2] == "logs":
             body = self.logs.get(parts[1])
             if body is None:
                 await _send(send, 404, json.dumps({"message": "no such container"}).encode())
@@ -112,7 +158,7 @@ class FakeDockerAPI:
                 await _send(send, 200, body, content_type=b"application/vnd.docker.raw-stream")
             return
 
-        if len(parts) == 3 and parts[0] == "containers" and parts[2] == "json":
+        if method == "GET" and len(parts) == 3 and parts[0] == "containers" and parts[2] == "json":
             data = self.inspect.get(parts[1])
             if data is None:
                 await _send(send, 404, json.dumps({"message": "no such container"}).encode())
@@ -120,7 +166,134 @@ class FakeDockerAPI:
             await _send(send, 200, json.dumps(data).encode("utf-8"))
             return
 
+        # `GET /images/{ref}/json` -- `ref` (normally `"{repo}@{digest}"`,
+        # occasionally a plain "local image id" surrogate, see
+        # `current_repo_digest`'s own use) can itself contain slashes, so
+        # unlike every other route here this one is not matched by a fixed
+        # `len(parts)`: everything between the fixed `images`/`json`
+        # segments is the reference, joined back together.
+        if method == "GET" and len(parts) >= 3 and parts[0] == "images" and parts[-1] == "json":
+            ref = "/".join(parts[1:-1])
+            data = self.images.get(ref)
+            if data is None:
+                await _send(send, 404, json.dumps({"message": "no such image"}).encode())
+                return
+            await _send(send, 200, json.dumps(data).encode("utf-8"))
+            return
+
+        # `POST /images/create?fromImage=...&tag=...` -- a real pull;
+        # succeeds (an empty newline-delimited status stream) unless
+        # `(fromImage, tag)` is listed in `self.pull_errors`, in which case
+        # a single `{"error": ...}` line is streamed back instead (the
+        # real daemon's own way of reporting a failed pull without an HTTP
+        # error status, see `agent.loop.pull_image_by_digest`'s own
+        # docstring).
+        if method == "POST" and path == "images/create":
+            query = dict(_parse_query_string(scope.get("query_string", b"")))
+            from_image = query.get("fromImage", "")
+            tag = query.get("tag", "")
+            error = self.pull_errors.get((from_image, tag)) or self.pull_errors.get(
+                f"{from_image}:{tag}"
+            )
+            if error is not None:
+                await _send(send, 200, (json.dumps({"error": error}) + "\n").encode())
+            else:
+                await _send(send, 200, (json.dumps({"status": "ok"}) + "\n").encode())
+            return
+
+        # `POST /containers/create?name=...` -- stores the request body
+        # (Docker's own container-create shape: `Image`/`Env`/... at the
+        # top level, `HostConfig` nested) split back into `Config`/
+        # `HostConfig`/`Image`, plus a fresh, not-yet-started `State` --
+        # exactly what `_recreate_container_with_image` reads back via the
+        # next `GET .../json`.
+        if method == "POST" and path == "containers/create":
+            query = dict(_parse_query_string(scope.get("query_string", b"")))
+            name = query.get("name", "")
+            body = await _read_body(receive)
+            request = json.loads(body) if body else {}
+            host_config = request.pop("HostConfig", {})
+            image_ref = request.get("Image")
+            health = (
+                {"Status": self.default_health_on_create}
+                if self.default_health_on_create is not None
+                else None
+            )
+            self.inspect[name] = {
+                "Config": request,
+                "HostConfig": host_config,
+                "Image": image_ref,
+                "State": {"Running": False, "Health": health},
+                "RestartCount": 0,
+            }
+            await _send(send, 201, json.dumps({"Id": name}).encode())
+            return
+
+        if method == "POST" and len(parts) == 3 and parts[0] == "containers" and parts[2] == "stop":
+            name = parts[1]
+            container = self.inspect.get(name)
+            if container is None:
+                await _send(send, 404, json.dumps({"message": "no such container"}).encode())
+                return
+            state = container.setdefault("State", {})
+            if not state.get("Running", False):
+                await _send(send, 304, b"")
+                return
+            state["Running"] = False
+            await _send(send, 204, b"")
+            return
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "containers"
+            and parts[2] == "start"
+        ):
+            name = parts[1]
+            container = self.inspect.get(name)
+            if container is None:
+                await _send(send, 404, json.dumps({"message": "no such container"}).encode())
+                return
+            state = container.setdefault("State", {})
+            if state.get("Running", False):
+                await _send(send, 304, b"")
+                return
+            state["Running"] = True
+            await _send(send, 204, b"")
+            return
+
+        if method == "DELETE" and len(parts) == 2 and parts[0] == "containers":
+            name = parts[1]
+            if name not in self.inspect:
+                await _send(send, 404, json.dumps({"message": "no such container"}).encode())
+                return
+            del self.inspect[name]
+            await _send(send, 204, b"")
+            return
+
         await _send(send, 404, json.dumps({"message": "not found"}).encode())
+
+
+def _parse_query_string(raw: bytes) -> list[tuple[str, str]]:
+    """`scope["query_string"]`'s own raw (still percent-encoded) bytes,
+    parsed and decoded via the standard library -- this fake has no
+    Starlette/FastAPI request object to do it for it, and the values that
+    matter here (image references) contain `/`/`:`/`@`, all of which a
+    real ASGI server (and a real `httpx` client) percent-encode, so a
+    parser that does not decode them back would silently see the wrong
+    string."""
+
+    return urllib.parse.parse_qsl(raw.decode("utf-8"))
+
+
+async def _read_body(receive: ASGIReceive) -> bytes:
+    body = b""
+    more_body = True
+    while more_body:
+        message = await receive()
+        body += message.get("body", b"")
+        more_body = message.get("more_body", False)
+    return body
 
 
 async def _send(
@@ -180,15 +353,40 @@ def unreachable_socket_path() -> Path:
 def run_fake_docker_api(
     logs: dict[str, bytes | list[bytes]] | None = None,
     inspect: dict[str, dict[str, Any]] | None = None,
+    images: dict[str, dict[str, Any]] | None = None,
+    pull_errors: dict[str | tuple[str, str], str] | None = None,
 ) -> Iterator[Path]:
     """Starts `FakeDockerAPI` on a fresh, short-named Unix domain socket
     under `/tmp` and yields its path -- pass this as
     `read_container_log_lines`/`read_container_log_window`/
-    `read_container_state`'s own `socket_path=` keyword argument. Torn
-    down (and the socket file removed) on exit, even on error."""
+    `read_container_state`/`reconcile_desired_state`'s own `socket_path=`
+    keyword argument. Torn down (and the socket file removed) on exit,
+    even on error. See `run_fake_docker_api_with_app` for a variant that
+    also yields the `FakeDockerAPI` instance itself, for a test that needs
+    to mutate container/image state (or read `self.calls`) mid-test."""
+
+    with run_fake_docker_api_with_app(
+        logs=logs, inspect=inspect, images=images, pull_errors=pull_errors
+    ) as (socket_path, _app):
+        yield socket_path
+
+
+@contextmanager
+def run_fake_docker_api_with_app(
+    logs: dict[str, bytes | list[bytes]] | None = None,
+    inspect: dict[str, dict[str, Any]] | None = None,
+    images: dict[str, dict[str, Any]] | None = None,
+    pull_errors: dict[str | tuple[str, str], str] | None = None,
+) -> Iterator[tuple[Path, FakeDockerAPI]]:
+    """Like `run_fake_docker_api`, but also yields the live `FakeDockerAPI`
+    instance -- `tests/test_agent_reconcile.py` uses this to mutate a
+    container's `State.Health.Status` between polls (simulating a service
+    that becomes healthy after a short delay, or one that never does), and
+    to assert on `app.calls` ("nothing was pulled and no backup was taken"
+    for a rejected reconciliation pass)."""
 
     socket_path = Path(tempfile.gettempdir()) / f"tdb-{uuid.uuid4().hex[:12]}.sock"
-    app = FakeDockerAPI(logs or {}, inspect or {})
+    app = FakeDockerAPI(logs or {}, inspect or {}, images=images, pull_errors=pull_errors)
     config = uvicorn.Config(app, uds=str(socket_path), log_level="error")
     thread = _UvicornUdsThread(config)
     thread.start()
@@ -211,8 +409,12 @@ def run_fake_docker_api(
             except httpx.TransportError:
                 time.sleep(0.02)
 
+    # The probe request above landed in `app.calls` -- reset it so a
+    # test's own assertions about "which requests happened" start clean.
+    app.calls.clear()
+
     try:
-        yield socket_path
+        yield socket_path, app
     finally:
         thread.stop()
         os.unlink(socket_path) if socket_path.exists() else None
