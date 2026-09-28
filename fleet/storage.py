@@ -654,6 +654,24 @@ class CommandLogExcerptRecord(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
 
+class FleetEpochRecord(Base):
+    """P5.1c: the one-row `fleet_epoch` table -- see
+    `0012_fleet_epoch.py`'s own docstring for the full reasoning (SSE
+    resume across a fleet database restore/reset). `id` is always
+    `_FLEET_EPOCH_ROW_ID` -- a real primary key, not merely a convention,
+    so a second row can never accidentally exist. `epoch` is what
+    `fleet.app.commands_stream` prefixes every SSE event id with
+    (`<epoch>.<sequence>`) and what an incoming `Last-Event-ID` must match
+    the epoch part of to be honoured at all (`Storage.get_epoch`,
+    `fleet.app._last_event_id`)."""
+
+    __tablename__ = "fleet_epoch"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    epoch: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
 class StoreLogExcerptOutcome(StrEnum):
     """What `Storage.store_log_excerpt` actually did -- `fleet.app`'s new
     `POST /v1/commands/{id}/logs` route maps each value to its own HTTP
@@ -754,6 +772,18 @@ _MAX_COMMAND_HISTORY_ROWS = 200
 # depending on dialect, rather than the ordinary "not a valid resume point"
 # fallback every other out-of-range value already gets.
 _MAX_COMMAND_SEQUENCE = 2**63 - 1
+
+# P5.1c: the pinned row id `fleet_epoch` ever holds -- see
+# `FleetEpochRecord`'s own docstring.
+_FLEET_EPOCH_ROW_ID = 1
+
+# 16 random bytes, hex-encoded (32 characters) -- matches
+# `0012_fleet_epoch.py`'s own migration-time generation exactly, so a
+# defensively-created epoch (`Storage.get_epoch`'s fallback, see there) and
+# `Storage.rotate_epoch` produce values indistinguishable in shape from the
+# one the migration itself inserts.
+def _generate_epoch() -> str:
+    return secrets.token_hex(16)
 
 
 @dataclass(frozen=True)
@@ -1777,6 +1807,123 @@ class Storage:
             record.error_text = result.error_text
             record.result_received_at = _naive_utc(now)
             return RecordCommandResultOutcome.STORED
+
+    # -- fleet database epoch (P5.1c, sections 3, 7) -----------------------------
+
+    def get_epoch(self) -> str:
+        """This fleet database's own stable epoch id (`FleetEpochRecord`,
+        `0012_fleet_epoch.py`) -- `fleet.app.commands_stream` prefixes every
+        SSE event id with it (`<epoch>.<sequence>`) and only ever honours a
+        `Last-Event-ID` whose epoch part still matches this value (see the
+        migration's own docstring for the restore/reset reasoning this
+        exists for).
+
+        **Defensive get-or-create, not a plain read:** the migration
+        already inserts the one row this reads back, so the normal path
+        here is a lookup that always succeeds; this only falls back to
+        creating a fresh row if that row is somehow missing (e.g. a
+        database whose `fleet_epoch` table exists -- migrated -- but whose
+        data insert never ran, or was manually removed) -- the same "never
+        crash the SSE endpoint over a missing value, only ever fall back to
+        the safe default" reasoning `fleet.app._last_event_id` already
+        applies to a malformed header: a database with no epoch at all
+        behaves exactly like one that was just reset, which is correct --
+        no agent could possibly hold a `Last-Event-ID` naming an epoch
+        that never existed.
+
+        **Concurrency (cross-review, reproduced directly with two
+        independent sessions that both read before either writes):** two
+        concurrent callers can both observe "row missing" before either has
+        inserted it -- both then try to insert the same pinned row id
+        (`_FLEET_EPOCH_ROW_ID`), and the loser's insert raises
+        `IntegrityError` (a primary-key/unique violation) at commit time.
+        Left uncaught, that `IntegrityError` used to propagate straight out
+        of `GET /v1/commands` as a `500` -- exactly the kind of crash this
+        method's whole "never fail the SSE endpoint over this" reasoning
+        exists to avoid. **Fixed:** the insert is wrapped in its own `try
+        .../except IntegrityError`, and the loser simply re-reads the row
+        the winner just committed -- which epoch value "wins" this race
+        does not matter (both are equally valid, freshly generated
+        epochs); only "some value, decided once, database-wide" does.
+        """
+
+        with self.session() as session:
+            record = session.get(FleetEpochRecord, _FLEET_EPOCH_ROW_ID)
+            if record is not None:
+                return record.epoch
+
+        try:
+            with self.session() as session:
+                session.add(
+                    FleetEpochRecord(
+                        id=_FLEET_EPOCH_ROW_ID,
+                        epoch=_generate_epoch(),
+                        created_at=_naive_utc(datetime.now(UTC)),
+                    )
+                )
+        except IntegrityError:
+            # Lost the race -- another concurrent caller already inserted
+            # the row. Fall through to the re-read below rather than
+            # propagating.
+            pass
+
+        with self.session() as session:
+            record = session.get(FleetEpochRecord, _FLEET_EPOCH_ROW_ID)
+            if record is None:
+                # Unreachable in practice: either this call's own insert
+                # just committed successfully, or a concurrent caller's did
+                # (the only reason our own insert could have failed with
+                # `IntegrityError` at all) -- either way a row now exists.
+                # Not treated as "fall back to 0 like a bad header" (this
+                # is a storage-layer invariant, not client input), and not
+                # silently swallowed into a freshly *different* epoch
+                # either, which would defeat the "some value, decided once"
+                # property the whole method exists to provide.
+                raise RuntimeError(  # pragma: no cover
+                    "fleet_epoch row missing after insert-or-recover"
+                )
+            return record.epoch
+
+    def rotate_epoch(self, now: datetime) -> str:
+        """Replaces the stored epoch with a fresh, random one.
+
+        **Called two ways** (cross-review): automatically, on every fleet
+        service start (`fleet.app.lifespan`, before any request is
+        served -- a restart always accompanies a restore, since there is
+        no way to swap the database file under a running process, so this
+        alone already covers the restore case unconditionally); and
+        manually, via `python -m fleet.admin rotate-epoch`
+        (`fleet.admin.rotate_epoch`) for the one case the automatic path
+        does not cover -- restoring a backup file into a database whose
+        fleet service process is deliberately kept running throughout
+        (e.g. a warm standby). See `fleet.app.lifespan`'s own docstring for
+        the full reasoning and the multi-process note.
+
+        A fresh epoch can never match what any agent has already persisted
+        (`secrets.token_hex(16)`, the same 16-random-bytes generation the
+        migration itself uses), so every agent's own `Last-Event-ID`
+        transparently stops being honoured and falls back to `0` on its
+        next reconnect -- redelivery of everything still pending, never a
+        skip (`Storage.pending_commands`'s own "redelivery is always safe"
+        reasoning, unchanged by this package).
+
+        Returns the new epoch, so the CLI can echo it back for the
+        operator's own records.
+        """
+
+        new_epoch = _generate_epoch()
+        with self.session() as session:
+            record = session.get(FleetEpochRecord, _FLEET_EPOCH_ROW_ID)
+            if record is None:
+                session.add(
+                    FleetEpochRecord(
+                        id=_FLEET_EPOCH_ROW_ID, epoch=new_epoch, created_at=_naive_utc(now)
+                    )
+                )
+            else:
+                record.epoch = new_epoch
+                record.created_at = _naive_utc(now)
+        return new_epoch
 
     # -- fetch_logs uploads (P5.3a, sections 6, 7, 21.5) --------------------------
 

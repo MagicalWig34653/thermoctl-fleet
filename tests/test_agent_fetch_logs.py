@@ -112,7 +112,59 @@ def _override_storage(storage: Storage):  # type: ignore[no-untyped-def]
 
 
 @pytest.fixture(scope="module")
-def fleet_base_url() -> Iterator[str]:
+def _server_bootstrap_db_url(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A migrated, throwaway database used **only** to give
+    `fleet.app.lifespan`'s own automatic epoch rotation (P5.1c) something
+    valid to resolve at the exact moment `fleet_base_url`'s server starts
+    -- module-scoped, so it exists before any function-scoped, per-test
+    `storage`/`_override_storage` fixture below has run at all (pytest
+    sets up higher-scoped fixtures before lower-scoped ones for a given
+    test, regardless of declaration order). Which epoch value ends up
+    stored here is irrelevant to every test in this file (none of them
+    touch SSE `Last-Event-ID`/epoch behaviour at all) -- this fixture
+    exists purely so the server's own startup has *something* to rotate,
+    since a failed rotation now aborts startup loudly by design
+    (main-session decision, P5.1c cross-review round 2: a silently
+    swallowed rotation failure in production would mean the restore
+    protection this whole package provides is gone without anyone
+    noticing)."""
+
+    url = f"sqlite:///{tmp_path_factory.mktemp('fetch-logs-server-bootstrap')}/bootstrap.db"
+    upgrade(url)
+    return url
+
+
+@pytest.fixture(scope="module")
+def _server_bootstrap_storage(_server_bootstrap_db_url: str) -> Storage:
+    return create_storage(_server_bootstrap_db_url)
+
+
+@pytest.fixture(scope="module")
+def _override_storage_for_server_startup(
+    _server_bootstrap_storage: Storage,
+) -> Iterator[None]:
+    """Registers `get_storage`'s override **before** `fleet_base_url`
+    starts the real server below -- `fleet_base_url` takes this fixture as
+    an explicit parameter (not just relying on module-scoped `autouse`
+    ordering) so the dependency is self-documenting: without this, the
+    module-scoped server used to start with nothing registered in
+    `app.dependency_overrides` and no `FLEET_DATABASE_URL` either, so
+    `fleet.app.lifespan`'s own epoch-rotation call (which resolves storage
+    the same way `Depends(get_storage)` would) raised `RuntimeError`
+    straight out of `uvicorn` startup -- reproduced directly (`SystemExit:
+    3` / `STARTUP_FAILURE`, then every test in this file failing with
+    "Connection refused" since the server thread had already crashed).
+    The function-scoped, `autouse` `_override_storage` fixture below still
+    overwrites this per test for the actual test bodies -- this one only
+    ever matters for the one moment the server itself starts."""
+
+    app.dependency_overrides[get_storage] = lambda: _server_bootstrap_storage
+    yield
+    app.dependency_overrides.pop(get_storage, None)
+
+
+@pytest.fixture(scope="module")
+def fleet_base_url(_override_storage_for_server_startup: None) -> Iterator[str]:
     """A real `fleet.app.app`, over plain HTTP on `127.0.0.1` (no TLS --
     `agent.transport`'s own pinned-TLS client is P5.0's concern, orthogonal
     to what this handler does with whatever `httpx.Client` it is handed) --
@@ -122,7 +174,9 @@ def fleet_base_url() -> Iterator[str]:
     heavier real-TLS harness `tests/test_agent_loop_run.py` needs for the
     SSE channel itself. Module-scoped: starting a server is comparatively
     expensive, and `get_storage` is overridden fresh per test regardless
-    (`_override_storage`), so a shared server is safe to reuse."""
+    (`_override_storage`), so a shared server is safe to reuse. Depends on
+    `_override_storage_for_server_startup` (see that fixture's own
+    docstring for why this ordering matters, P5.1c cross-review)."""
 
     port = _free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
