@@ -81,6 +81,7 @@ import time
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from datetime import time as time_of_day
 from pathlib import Path
 from typing import Literal
 
@@ -1816,6 +1817,31 @@ def run(
 # verifies, and hands off to the watchdog (step 6 below).
 RECONCILE_SERVICE_ORDER: tuple[str, ...] = ("thermoctl", "mosquitto", "zigbee2mqtt", "agent")
 
+# The agent's own fixed service-name -> container-name table (cross-review
+# finding, main session: this used to be computed ad hoc at each call site
+# -- `"thermoctl-agent" if service == "agent" else service` -- and, for a
+# resumed swap, taken from the *persisted* pending-swap file itself. Both
+# are replaced by this one constant: a container/repo to touch is **never**
+# read back from a file `reconcile_desired_state` itself wrote earlier (see
+# `PendingSwap`'s own docstring for why that distinction matters), only
+# ever looked up here, keyed by a `service` value that has itself already
+# been validated against this same table (`_load_pending_swap`).
+SERVICE_CONTAINER_NAMES: dict[str, str] = {
+    "thermoctl": "thermoctl",
+    "zigbee2mqtt": "zigbee2mqtt",
+    "mosquitto": "mosquitto",
+    "agent": "thermoctl-agent",
+}
+
+# The subset of `SERVICE_CONTAINER_NAMES` a `PendingSwap` may ever
+# legitimately name: `agent` is deliberately excluded -- section 13 step 6
+# (security principle 6), the agent never recreates its own container, so
+# `reconcile_desired_state` never persists a pending swap for it; a
+# `PendingSwap` record claiming `service="agent"` is therefore never one
+# this code itself produced, only ever a tampered or corrupted file, and
+# `_load_pending_swap` rejects it on exactly that basis.
+PENDING_SWAP_SERVICES: tuple[str, ...] = ("thermoctl", "zigbee2mqtt", "mosquitto")
+
 # Section 13 step 5: "if the heartbeat fails to arrive for 15 minutes ...
 # the agent falls back to the previous digest on its own". Configurable so
 # tests can exercise the timeout path without a real 15-minute wait.
@@ -1861,11 +1887,25 @@ class PendingSwap:
     waiting for health (or rolling back) instead of forgetting the swap
     ever happened -- section 13 step 5's own "no one has to intervene at
     night", applied to the agent process itself, not only to the
-    apartment's heating."""
+    apartment's heating.
+
+    **Deliberately carries no `container`/`repo` field** (cross-review,
+    main session, security-relevant): this record round-trips through a
+    local JSON file between two calls, so it must be treated the same way
+    every other on-disk value this module reads back is treated --
+    untrusted until checked, never as a trusted source for *which Docker
+    resource to touch*. `_await_or_rollback_pending_swap` (this record's
+    only consumer) always resolves the container name and the source
+    repository itself, from `SERVICE_CONTAINER_NAMES`/
+    `agent.sources.ALLOWED_SOURCES`, keyed by this record's own `service`
+    -- which `_load_pending_swap` has itself already checked against
+    `PENDING_SWAP_SERVICES` before a `PendingSwap` is ever constructed. A
+    tampered file naming a foreign container or a foreign repository
+    therefore has nothing to change: there is no field left in this type
+    for such a value to occupy.
+    """
 
     service: str
-    container: str
-    repo: str
     previous_digest: str
     new_digest: str
     since: float
@@ -1879,23 +1919,61 @@ def _load_pending_swap(path: Path) -> PendingSwap | None:
     "nothing pending" would let a local attacker (or a corrupted disk)
     erase the one record that a swap is still awaiting its health
     deadline, after which a failing new revision would never be rolled
-    back at all. Raises `UnsafeStateFileError`/`OSError`/`json.JSONDecodeError`
-    on an unsafe or corrupt file -- `reconcile_desired_state`'s caller
-    (`agent.__main__`, like `load_agent_state`'s own caller) turns that
-    into a clear, non-zero exit rather than silently starting reconciliation
-    with no memory of an in-flight swap."""
+    back at all.
+
+    **Validates every field before constructing a `PendingSwap` at all**
+    (cross-review, main session, security-relevant) -- `service` must be
+    one of `PENDING_SWAP_SERVICES` (never `"agent"`, see `PendingSwap`'s
+    own docstring; never anything this module itself would not have
+    written), `previous_digest`/`new_digest` must each satisfy
+    `agent.sources.digest_is_well_formed`, and `since` must be a real
+    number. Any extra key an old-format file might still carry (a
+    previous version of this function persisted `repo`/`container`
+    directly) is simply ignored, never read back.
+
+    Raises `UnsafeStateFileError`/`OSError` (an unsafe path) or `ValueError`
+    (missing key, wrong type, or a value that fails one of the checks
+    above -- including `json.JSONDecodeError`, itself a `ValueError`) on
+    an unsafe, corrupt, or tampered file -- **in every one of these
+    cases, this function itself has made no Docker call and returned no
+    `PendingSwap`**, so `reconcile_desired_state`'s caller
+    (`agent.__main__`, like `load_agent_state`'s own caller) sees a clear,
+    non-zero exit instead of a reconciliation pass that silently trusted
+    an invalid record.
+    """
 
     raw = read_text_safe(path)
     if raw is None:
         return None
     data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("pending swap record is not a JSON object.")
+    try:
+        service = data["service"]
+        previous_digest = data["previous_digest"]
+        new_digest = data["new_digest"]
+        since = data["since"]
+    except KeyError as error:
+        raise ValueError(f"pending swap record is missing required field {error}.") from error
+
+    if service not in PENDING_SWAP_SERVICES:
+        raise ValueError(
+            f"pending swap record names an unknown or disallowed service {service!r}."
+        )
+    if not isinstance(since, int | float) or isinstance(since, bool):
+        raise ValueError("pending swap record's 'since' is not a number.")
+    if not isinstance(previous_digest, str) or not agent_sources.digest_is_well_formed(
+        previous_digest
+    ):
+        raise ValueError("pending swap record's previous_digest is not a well-formed digest.")
+    if not isinstance(new_digest, str) or not agent_sources.digest_is_well_formed(new_digest):
+        raise ValueError("pending swap record's new_digest is not a well-formed digest.")
+
     return PendingSwap(
-        service=data["service"],
-        container=data["container"],
-        repo=data["repo"],
-        previous_digest=data["previous_digest"],
-        new_digest=data["new_digest"],
-        since=data["since"],
+        service=service,
+        previous_digest=previous_digest,
+        new_digest=new_digest,
+        since=float(since),
     )
 
 
@@ -1903,7 +1981,10 @@ def _save_pending_swap(path: Path, swap: PendingSwap | None) -> None:
     """Persists (or, `swap=None`, clears) the in-flight swap record --
     written atomically (temporary file plus `Path.replace`), the same
     pattern `save_agent_state`/`report_watchdog_state` already use for
-    every other state file in this module."""
+    every other state file in this module. Only the four fields
+    `PendingSwap` actually carries are ever written -- see that type's own
+    docstring for why `container`/`repo` are deliberately not among
+    them."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if swap is None:
@@ -1911,8 +1992,6 @@ def _save_pending_swap(path: Path, swap: PendingSwap | None) -> None:
         return
     payload = {
         "service": swap.service,
-        "container": swap.container,
-        "repo": swap.repo,
         "previous_digest": swap.previous_digest,
         "new_digest": swap.new_digest,
         "since": swap.since,
@@ -1932,6 +2011,26 @@ class ReconcileOutcome:
     successful: bool
     reason: str
     service: str | None = None
+
+
+def _time_within_update_window(
+    current_time: time_of_day, window_from: time_of_day, window_until: time_of_day
+) -> bool:
+    """`True` iff `current_time` falls within `[window_from, window_until]`
+    -- **supports a window that crosses midnight** (cross-review, main
+    session: `window_from > window_until`, e.g. `22:00`-`06:00`, a
+    plausible "overnight" maintenance window section 13's own JSON example
+    does not rule out): in that case the window is really two pieces of
+    the same day, "from `window_from` to midnight" plus "from midnight to
+    `window_until`", so membership is `current_time >= window_from OR
+    current_time <= window_until` instead of the ordinary single-range
+    `AND`. An ordinary, non-wrapping window (`window_from <= window_until`,
+    including the degenerate case `window_from == window_until`, a single
+    instant) keeps the simple `AND` check."""
+
+    if window_from <= window_until:
+        return window_from <= current_time <= window_until
+    return current_time >= window_from or current_time <= window_until
 
 
 def _reconcile_precheck(
@@ -1989,7 +2088,7 @@ def _reconcile_precheck(
         )
 
     current_time = now.time()
-    if not (desired.window.from_ <= current_time <= desired.window.until):
+    if not _time_within_update_window(current_time, desired.window.from_, desired.window.until):
         return (
             f"current local time {current_time.isoformat()} is outside the "
             f"update window {desired.window.from_.isoformat()}-"
@@ -2021,7 +2120,7 @@ def _select_service_to_update(
     for service in RECONCILE_SERVICE_ORDER:
         service_state = getattr(desired.services, service)
         repo = agent_sources.ALLOWED_SOURCES[service]
-        container = "thermoctl-agent" if service == "agent" else service
+        container = SERVICE_CONTAINER_NAMES[service]
         running_digest = current_repo_digest(container, repo, socket_path=socket_path)
         if running_digest != service_state.digest:
             return service
@@ -2040,13 +2139,21 @@ def _await_or_rollback_pending_swap(
     now: Callable[[], datetime],
 ) -> ReconcileOutcome:
     """Waits, polling `container_is_healthy` every `poll_interval_s`, for
-    `swap.container` to report healthy -- bounded by `health_deadline_s`
-    **anchored to `swap.since`**, the moment the swap was made, not to
-    whenever this call happens to run (the same "resumed, not restarted
-    from zero" reasoning `watchdog/runtime.go`'s own `AwaitHealthReport`
-    applies to its state file's `since`, cross-review R2 on P5.6) -- this
-    is what makes an agent-restart mid-wait resume correctly instead of
-    granting a freshly restarted agent a brand new 15 minutes.
+    the container the record's own `service` names to report healthy --
+    bounded by `health_deadline_s` **anchored to `swap.since`**, the
+    moment the swap was made, not to whenever this call happens to run
+    (the same "resumed, not restarted from zero" reasoning
+    `watchdog/runtime.go`'s own `AwaitHealthReport` applies to its state
+    file's `since`, cross-review R2 on P5.6) -- this is what makes an
+    agent-restart mid-wait resume correctly instead of granting a freshly
+    restarted agent a brand new 15 minutes.
+
+    **The container name and the source repository are resolved here,
+    from `SERVICE_CONTAINER_NAMES`/`agent.sources.ALLOWED_SOURCES`, never
+    read from `swap` itself** -- `PendingSwap` carries no such fields (see
+    its own docstring); `swap.service` has already been checked against
+    `PENDING_SWAP_SERVICES` by `_load_pending_swap` before this function
+    is ever called with it.
 
     On success: clears the pending-swap record, reports success. On
     timeout: **rolls back to `swap.previous_digest` on its own** (section
@@ -2058,9 +2165,12 @@ def _await_or_rollback_pending_swap(
     fresh rather than trusting this stale record any further.
     """
 
+    container = SERVICE_CONTAINER_NAMES[swap.service]
+    repo = agent_sources.ALLOWED_SOURCES[swap.service]
+
     deadline = swap.since + health_deadline_s
     while True:
-        healthy = container_is_healthy(swap.container, socket_path=socket_path)
+        healthy = container_is_healthy(container, socket_path=socket_path)
         if healthy:
             _save_pending_swap(pending_swap_path, None)
             _append_local_log(
@@ -2078,7 +2188,7 @@ def _await_or_rollback_pending_swap(
         f"{health_deadline_s:.0f}s -- rolling back to {swap.previous_digest}."
     )
     rollback_ok = _rollback_to_previous(
-        swap.container, swap.repo, swap.previous_digest, socket_path=socket_path
+        container, repo, swap.previous_digest, socket_path=socket_path
     )
     if not rollback_ok:
         reason += " Rollback itself also failed -- manual intervention required."
@@ -2095,7 +2205,7 @@ def reconcile_desired_state(
     watchdog_state_path: Path,
     pending_swap_path: Path,
     local_log_path: Path,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    now: Callable[[], datetime] = lambda: datetime.now().astimezone(),
     health_reader: HealthReader = _default_health_reader,
     outdoor_temp_reader: OutdoorTempReader = _default_outdoor_temp_reader,
     disk_usage_reader: DiskUsageReader = _read_disk_usage,
@@ -2140,6 +2250,16 @@ def reconcile_desired_state(
     plan's own instruction ("gets the DesiredState plus the pilot_mode
     flag and local inputs as parameters/injected readers so it is
     testable") -- there is no hidden global anywhere in this function.
+
+    **`now`'s default is the base station's own local time**
+    (`datetime.now().astimezone()`, cross-review, main session -- not
+    `datetime.now(UTC)`, which this function used to default to) --
+    `desired.window.from_`/`until` (section 13's own JSON example, a plain
+    `HH:MM` with no offset) are a landlord-facing maintenance window,
+    meant literally as "not in the evening" at the apartment, not at
+    Greenwich; comparing them against a UTC clock would silently shift the
+    window by the base station's own UTC offset. `_time_within_update_window`
+    additionally supports a window that crosses midnight (`from_ > until`).
     """
 
     pending = _load_pending_swap(pending_swap_path)
@@ -2232,7 +2352,7 @@ def reconcile_desired_state(
             successful=True, reason="pulled, verified, handed off to the watchdog.", service=service
         )
 
-    container = service  # `protocol.desired_state.Services`' field names double as container names.
+    container = SERVICE_CONTAINER_NAMES[service]
     previous_digest = current_repo_digest(container, repo, socket_path=socket_path)
     if previous_digest is None:
         reason = (
@@ -2256,8 +2376,6 @@ def reconcile_desired_state(
 
     swap = PendingSwap(
         service=service,
-        container=container,
-        repo=repo,
         previous_digest=previous_digest,
         new_digest=digest,
         since=current_time.timestamp(),

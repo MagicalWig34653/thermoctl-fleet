@@ -66,6 +66,13 @@ def test_normalize_repository_accepts_and_canonicalizes(image: str, expected: st
         "ghcr.io/magicalwig34653//thermoctl",
         "ghcr.io/magicalwig-/thermoctl",
         "ghcr.io/-magicalwig/thermoctl",
+        # Malformed *domain* component (`looks_like_domain` branch) --
+        # rather than a malformed path component (the cases just above):
+        # a double dot (an empty domain label) and a domain label starting
+        # with a hyphen.
+        "ghcr..io/magicalwig34653/thermoctl",
+        "-ghcr.io/magicalwig34653/thermoctl",
+        "ghcr.io-/magicalwig34653/thermoctl",
     ],
 )
 def test_normalize_repository_rejects(image: str) -> None:

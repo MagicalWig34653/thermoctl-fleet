@@ -92,9 +92,14 @@ def normalize_repository(image: str) -> str | None:
     if image.startswith("/") or image.endswith("/") or "//" in image:
         return None
 
+    # No `parts` element can be `""` at this point: that would require two
+    # consecutive `/` (already rejected via `"//" in image` above), or a
+    # leading/trailing `/` (both already rejected too) -- so, unlike the
+    # three checks above, there is no case left for a fourth "reject an
+    # empty component" check to catch; a `# pragma: no cover` guard for
+    # unreachable code would only restate that, not add anything (cross-
+    # review, main session: removed rather than kept as dead code).
     parts = image.split("/")
-    if any(part == "" for part in parts):
-        return None
 
     first = parts[0]
     looks_like_domain = len(parts) > 1 and ("." in first or first == "localhost")

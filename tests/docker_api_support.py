@@ -103,6 +103,8 @@ class FakeDockerAPI:
         inspect: dict[str, dict[str, Any]],
         images: dict[str, dict[str, Any]] | None = None,
         pull_errors: dict[str | tuple[str, str], str] | None = None,
+        pull_raw_body: bytes | None = None,
+        force_status: dict[str, int] | None = None,
     ) -> None:
         self.logs = logs
         # `inspect` doubles as the mutable container store for P5.4's own
@@ -125,6 +127,20 @@ class FakeDockerAPI:
         # pulled image is actually usable afterward is governed by
         # `self.images` above, not by this dict.
         self.pull_errors = dict(pull_errors or {})
+        # Verbatim bytes `POST /images/create` sends back instead of the
+        # ordinary single well-formed status line, when set -- lets a test
+        # exercise `pull_image_by_digest`'s own per-line parsing (a blank
+        # line, a line that is not valid JSON) directly, without needing a
+        # real Docker daemon's own stream framing quirks.
+        self.pull_raw_body = pull_raw_body
+        # Forces a specific, otherwise-impossible-from-this-fake's-own-
+        # logic HTTP status for one of the container lifecycle endpoints
+        # (`"stop"`/`"remove"`/`"start"`) -- lets a test exercise
+        # `_recreate_container_with_image`'s own "unexpected status, not
+        # one of the ones this fake's ordinary logic would ever return"
+        # branch (a real daemon can return a `5xx` for reasons this fake
+        # does not otherwise model, e.g. a briefly locked container).
+        self.force_status = dict(force_status or {})
         # `POST /containers/create`'s own default `State.Health.Status` for
         # a freshly created container, mutable by a test at any point --
         # `None` (the default) matches "the image defines no HEALTHCHECK",
@@ -189,6 +205,9 @@ class FakeDockerAPI:
         # error status, see `agent.loop.pull_image_by_digest`'s own
         # docstring).
         if method == "POST" and path == "images/create":
+            if self.pull_raw_body is not None:
+                await _send(send, 200, self.pull_raw_body)
+                return
             query = dict(_parse_query_string(scope.get("query_string", b"")))
             from_image = query.get("fromImage", "")
             tag = query.get("tag", "")
@@ -231,6 +250,9 @@ class FakeDockerAPI:
 
         if method == "POST" and len(parts) == 3 and parts[0] == "containers" and parts[2] == "stop":
             name = parts[1]
+            if "stop" in self.force_status:
+                await _send(send, self.force_status["stop"], b'{"message": "forced"}')
+                return
             container = self.inspect.get(name)
             if container is None:
                 await _send(send, 404, json.dumps({"message": "no such container"}).encode())
@@ -250,6 +272,9 @@ class FakeDockerAPI:
             and parts[2] == "start"
         ):
             name = parts[1]
+            if "start" in self.force_status:
+                await _send(send, self.force_status["start"], b'{"message": "forced"}')
+                return
             container = self.inspect.get(name)
             if container is None:
                 await _send(send, 404, json.dumps({"message": "no such container"}).encode())
@@ -264,6 +289,9 @@ class FakeDockerAPI:
 
         if method == "DELETE" and len(parts) == 2 and parts[0] == "containers":
             name = parts[1]
+            if "remove" in self.force_status:
+                await _send(send, self.force_status["remove"], b'{"message": "forced"}')
+                return
             if name not in self.inspect:
                 await _send(send, 404, json.dumps({"message": "no such container"}).encode())
                 return
@@ -355,6 +383,8 @@ def run_fake_docker_api(
     inspect: dict[str, dict[str, Any]] | None = None,
     images: dict[str, dict[str, Any]] | None = None,
     pull_errors: dict[str | tuple[str, str], str] | None = None,
+    pull_raw_body: bytes | None = None,
+    force_status: dict[str, int] | None = None,
 ) -> Iterator[Path]:
     """Starts `FakeDockerAPI` on a fresh, short-named Unix domain socket
     under `/tmp` and yields its path -- pass this as
@@ -366,7 +396,12 @@ def run_fake_docker_api(
     to mutate container/image state (or read `self.calls`) mid-test."""
 
     with run_fake_docker_api_with_app(
-        logs=logs, inspect=inspect, images=images, pull_errors=pull_errors
+        logs=logs,
+        inspect=inspect,
+        images=images,
+        pull_errors=pull_errors,
+        pull_raw_body=pull_raw_body,
+        force_status=force_status,
     ) as (socket_path, _app):
         yield socket_path
 
@@ -377,6 +412,8 @@ def run_fake_docker_api_with_app(
     inspect: dict[str, dict[str, Any]] | None = None,
     images: dict[str, dict[str, Any]] | None = None,
     pull_errors: dict[str | tuple[str, str], str] | None = None,
+    pull_raw_body: bytes | None = None,
+    force_status: dict[str, int] | None = None,
 ) -> Iterator[tuple[Path, FakeDockerAPI]]:
     """Like `run_fake_docker_api`, but also yields the live `FakeDockerAPI`
     instance -- `tests/test_agent_reconcile.py` uses this to mutate a
@@ -386,7 +423,14 @@ def run_fake_docker_api_with_app(
     for a rejected reconciliation pass)."""
 
     socket_path = Path(tempfile.gettempdir()) / f"tdb-{uuid.uuid4().hex[:12]}.sock"
-    app = FakeDockerAPI(logs or {}, inspect or {}, images=images, pull_errors=pull_errors)
+    app = FakeDockerAPI(
+        logs or {},
+        inspect or {},
+        images=images,
+        pull_errors=pull_errors,
+        pull_raw_body=pull_raw_body,
+        force_status=force_status,
+    )
     config = uvicorn.Config(app, uds=str(socket_path), log_level="error")
     thread = _UvicornUdsThread(config)
     thread.start()

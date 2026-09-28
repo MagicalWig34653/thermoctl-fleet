@@ -13,8 +13,11 @@ ready the day both conditions are lifted.
 
 from __future__ import annotations
 
+import inspect
 import json
-from datetime import UTC, datetime
+import os
+import time as time_module
+from datetime import UTC, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
 
@@ -22,15 +25,21 @@ import httpx
 import pytest
 from pyrage import x25519
 
+import agent.loop as agent_loop
 from agent.loop import (
     BackupConfig,
     PendingSwap,
     ReconcileOutcome,
     _await_or_rollback_pending_swap,
+    _default_health_reader,
+    _default_outdoor_temp_reader,
     _load_pending_swap,
     _reconcile_precheck,
+    _recreate_container_with_image,
+    _rollback_to_previous,
     _save_pending_swap,
     _select_service_to_update,
+    _time_within_update_window,
     container_is_healthy,
     current_repo_digest,
     image_repo_digests,
@@ -40,7 +49,7 @@ from agent.loop import (
 )
 from agent.sources import ALLOWED_SOURCES
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
-from tests.docker_api_support import run_fake_docker_api_with_app
+from tests.docker_api_support import run_fake_docker_api_with_app, unreachable_socket_path
 
 REPO_THERMOCTL = ALLOWED_SOURCES["thermoctl"]
 REPO_ZIGBEE = ALLOWED_SOURCES["zigbee2mqtt"]
@@ -735,8 +744,6 @@ def test_reconcile_resumes_and_rolls_back_an_already_expired_pending_swap(
         paths["pending"],
         PendingSwap(
             service="thermoctl",
-            container="thermoctl",
-            repo=REPO_THERMOCTL,
             previous_digest=OLD_THERMOCTL,
             new_digest=NEW_THERMOCTL,
             since=NOW.timestamp() - 1000.0,
@@ -783,8 +790,6 @@ def test_reconcile_resumes_and_confirms_a_pending_swap_that_becomes_healthy(
         paths["pending"],
         PendingSwap(
             service="thermoctl",
-            container="thermoctl",
-            repo=REPO_THERMOCTL,
             previous_digest=OLD_THERMOCTL,
             new_digest=NEW_THERMOCTL,
             since=NOW.timestamp(),
@@ -824,8 +829,6 @@ def test_save_and_load_pending_swap_round_trips(tmp_path: Path) -> None:
     path = tmp_path / "pending_swap.json"
     swap = PendingSwap(
         service="mosquitto",
-        container="mosquitto",
-        repo=REPO_MOSQUITTO,
         previous_digest=OLD_MOSQUITTO,
         new_digest=OLD_MOSQUITTO,
         since=123.5,
@@ -907,15 +910,11 @@ def test_image_repo_digests_returns_empty_list_without_repo_digests_key(tmp_path
 
 
 def test_image_repo_digests_raises_on_missing_image() -> None:
-    from tests.docker_api_support import unreachable_socket_path
-
     with pytest.raises(httpx.HTTPError):
         image_repo_digests("nope", socket_path=unreachable_socket_path())
 
 
 def test_verify_pulled_digest_false_on_transport_error() -> None:
-    from tests.docker_api_support import unreachable_socket_path
-
     assert (
         verify_pulled_digest(
             REPO_THERMOCTL, NEW_THERMOCTL, socket_path=unreachable_socket_path()
@@ -971,8 +970,6 @@ def test_await_or_rollback_uses_container_is_healthy_directly(tmp_path: Path) ->
     paths = _paths(tmp_path)
     swap = PendingSwap(
         service="mosquitto",
-        container="mosquitto",
-        repo=REPO_MOSQUITTO,
         previous_digest=OLD_MOSQUITTO,
         new_digest=OLD_MOSQUITTO,
         since=NOW.timestamp(),
@@ -992,3 +989,556 @@ def test_await_or_rollback_uses_container_is_healthy_directly(tmp_path: Path) ->
         )
         assert outcome.successful is True
         assert all("stop" not in call for call in app.calls)
+
+
+# --- cross-review fixes: pending-swap record validation ---------------------
+# `_load_pending_swap` used to trust `service`/`previous_digest`/`new_digest`
+# straight out of the JSON file; it no longer carries `container`/`repo` at
+# all (see `PendingSwap`'s own docstring) and validates every field it does
+# carry before constructing a `PendingSwap`, so a tampered or corrupted file
+# is rejected -- fail closed, exactly like an unsafe path -- before
+# `reconcile_desired_state` can ever resume it and touch Docker.
+
+
+def test_load_pending_swap_rejects_unknown_service(tmp_path: Path) -> None:
+    path = tmp_path / "pending_swap.json"
+    path.write_text(
+        json.dumps(
+            {
+                "service": "not-a-real-service",
+                "previous_digest": OLD_THERMOCTL,
+                "new_digest": NEW_THERMOCTL,
+                "since": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown or disallowed service"):
+        _load_pending_swap(path)
+
+
+def test_load_pending_swap_rejects_agent_service(tmp_path: Path) -> None:
+    """`"agent"` is a real, known service name -- but never one this code
+    itself persists a pending swap for (security principle 6: the agent
+    never recreates its own container). A record naming it is therefore
+    always tampered or corrupt, never genuine, and is rejected the same
+    way an entirely unknown service name is."""
+
+    path = tmp_path / "pending_swap.json"
+    path.write_text(
+        json.dumps(
+            {
+                "service": "agent",
+                "previous_digest": OLD_AGENT,
+                "new_digest": NEW_AGENT,
+                "since": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown or disallowed service"):
+        _load_pending_swap(path)
+
+
+@pytest.mark.parametrize(
+    ("previous_digest", "new_digest"),
+    [
+        ("not-a-digest", NEW_THERMOCTL),
+        (OLD_THERMOCTL, "latest"),
+        ("", NEW_THERMOCTL),
+        (OLD_THERMOCTL, "sha256:" + "g" * 64),
+    ],
+)
+def test_load_pending_swap_rejects_malformed_digests(
+    tmp_path: Path, previous_digest: str, new_digest: str
+) -> None:
+    path = tmp_path / "pending_swap.json"
+    path.write_text(
+        json.dumps(
+            {
+                "service": "thermoctl",
+                "previous_digest": previous_digest,
+                "new_digest": new_digest,
+                "since": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="digest"):
+        _load_pending_swap(path)
+
+
+def test_load_pending_swap_rejects_non_numeric_since(tmp_path: Path) -> None:
+    path = tmp_path / "pending_swap.json"
+    path.write_text(
+        json.dumps(
+            {
+                "service": "thermoctl",
+                "previous_digest": OLD_THERMOCTL,
+                "new_digest": NEW_THERMOCTL,
+                "since": "not-a-number",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="since"):
+        _load_pending_swap(path)
+
+
+def test_load_pending_swap_rejects_missing_field(tmp_path: Path) -> None:
+    path = tmp_path / "pending_swap.json"
+    path.write_text(json.dumps({"service": "thermoctl"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing required field"):
+        _load_pending_swap(path)
+
+
+def test_load_pending_swap_rejects_non_object_json(tmp_path: Path) -> None:
+    path = tmp_path / "pending_swap.json"
+    path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        _load_pending_swap(path)
+
+
+def test_load_pending_swap_ignores_extra_repo_and_container_keys(tmp_path: Path) -> None:
+    """An old-format file (a previous version of `_save_pending_swap`
+    persisted `repo`/`container` directly) -- both extra keys are ignored,
+    never read back into the resulting `PendingSwap`, which no longer even
+    has fields for them."""
+
+    path = tmp_path / "pending_swap.json"
+    path.write_text(
+        json.dumps(
+            {
+                "service": "thermoctl",
+                "container": "evil-container",
+                "repo": "evil.example.com/foo/bar",
+                "previous_digest": OLD_THERMOCTL,
+                "new_digest": NEW_THERMOCTL,
+                "since": 42.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    swap = _load_pending_swap(path)
+    assert swap == PendingSwap(
+        service="thermoctl",
+        previous_digest=OLD_THERMOCTL,
+        new_digest=NEW_THERMOCTL,
+        since=42.0,
+    )
+    assert not hasattr(swap, "repo")
+    assert not hasattr(swap, "container")
+
+
+def test_reconcile_resumes_a_tampered_pending_swap_file_raises_and_touches_no_docker(
+    tmp_path: Path,
+) -> None:
+    """The integration path: a corrupt/tampered pending-swap file makes
+    `reconcile_desired_state` raise before it does anything at all -- in
+    particular, before any Docker call (the same "fails closed" contract
+    `load_agent_state` already has for the executed-ids file)."""
+
+    paths = _paths(tmp_path)
+    paths["pending"].write_text(
+        json.dumps(
+            {"service": "does-not-exist", "previous_digest": "x", "new_digest": "y", "since": 1}
+        ),
+        encoding="utf-8",
+    )
+
+    with run_fake_docker_api_with_app(
+        inspect=_baseline_inspect(), images=_baseline_images()
+    ) as (socket_path, app):
+        with pytest.raises(ValueError, match="unknown or disallowed service"):
+            reconcile_desired_state(
+                _desired_state(thermoctl_digest=NEW_THERMOCTL),
+                pilot_mode=True,
+                backup_config=_backup_config(tmp_path),
+                watchdog_state_path=paths["watchdog"],
+                pending_swap_path=paths["pending"],
+                local_log_path=paths["log"],
+                now=lambda: NOW,
+                health_reader=lambda: "ok",
+                outdoor_temp_reader=lambda: 10.0,
+                disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+                socket_path=socket_path,
+            )
+        assert app.calls == []
+
+
+def test_reconcile_resumes_an_old_format_pending_swap_never_touches_the_foreign_names(
+    tmp_path: Path,
+) -> None:
+    """A tampered/old-format file naming a foreign container and a
+    foreign repository -- resumed successfully (the fields it does carry
+    are valid), but every Docker call made while resuming it names only
+    the agent's own fixed `thermoctl` container/repo, never
+    `"evil-container"`/`"evil.example.com/foo/bar"`."""
+
+    paths = _paths(tmp_path)
+    paths["pending"].write_text(
+        json.dumps(
+            {
+                "service": "thermoctl",
+                "container": "evil-container",
+                "repo": "evil.example.com/foo/bar",
+                "previous_digest": OLD_THERMOCTL,
+                "new_digest": NEW_THERMOCTL,
+                "since": NOW.timestamp(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    inspect = _baseline_inspect()
+    inspect["thermoctl"] = _container(f"{REPO_THERMOCTL}@{NEW_THERMOCTL}", health="healthy")
+
+    with run_fake_docker_api_with_app(inspect=inspect, images=_baseline_images()) as (
+        socket_path,
+        app,
+    ):
+        outcome = reconcile_desired_state(
+            _desired_state(thermoctl_digest=NEW_THERMOCTL),
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW,
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+        assert outcome.successful is True
+        assert all("evil" not in call for call in app.calls)
+
+
+# --- cross-review fixes: main-path swap-recreate failure / rollback --------
+
+
+def test_reconcile_swap_recreate_fails_rollback_succeeds_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    desired = _desired_state(thermoctl_digest=NEW_THERMOCTL)
+    paths = _paths(tmp_path)
+    images = _baseline_images()
+    images[f"{REPO_THERMOCTL}@{NEW_THERMOCTL}"] = {
+        "RepoDigests": [f"{REPO_THERMOCTL}@{NEW_THERMOCTL}"]
+    }
+
+    monkeypatch.setattr(agent_loop, "_recreate_container_with_image", _raise_http_error)
+    monkeypatch.setattr(agent_loop, "_rollback_to_previous", lambda *a, **k: True)
+
+    with run_fake_docker_api_with_app(inspect=_baseline_inspect(), images=images) as (
+        socket_path,
+        _app,
+    ):
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW,
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+        assert outcome.successful is False
+        assert "swapping the container failed" in outcome.reason
+        assert f"Rolled back to {OLD_THERMOCTL}" in outcome.reason
+    assert not paths["pending"].exists()
+
+
+def test_reconcile_swap_recreate_fails_rollback_also_fails_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    desired = _desired_state(thermoctl_digest=NEW_THERMOCTL)
+    paths = _paths(tmp_path)
+    images = _baseline_images()
+    images[f"{REPO_THERMOCTL}@{NEW_THERMOCTL}"] = {
+        "RepoDigests": [f"{REPO_THERMOCTL}@{NEW_THERMOCTL}"]
+    }
+
+    monkeypatch.setattr(agent_loop, "_recreate_container_with_image", _raise_http_error)
+    monkeypatch.setattr(agent_loop, "_rollback_to_previous", lambda *a, **k: False)
+
+    with run_fake_docker_api_with_app(inspect=_baseline_inspect(), images=images) as (
+        socket_path,
+        _app,
+    ):
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW,
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+        assert outcome.successful is False
+        assert "manual intervention required" in outcome.reason
+
+
+def test_await_or_rollback_pending_swap_timeout_rollback_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    swap = PendingSwap(
+        service="mosquitto",
+        previous_digest=OLD_MOSQUITTO,
+        new_digest=OLD_MOSQUITTO,
+        since=NOW.timestamp(),
+    )
+    inspect = {"mosquitto": _container(f"{REPO_MOSQUITTO}@{OLD_MOSQUITTO}", health="unhealthy")}
+    monkeypatch.setattr(agent_loop, "_rollback_to_previous", lambda *a, **k: False)
+
+    with run_fake_docker_api_with_app(inspect=inspect) as (socket_path, _app):
+        outcome = _await_or_rollback_pending_swap(
+            swap,
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            socket_path=socket_path,
+            health_deadline_s=0.0,
+            poll_interval_s=0.01,
+            sleep=lambda _s: None,
+            now=lambda: NOW,
+        )
+        assert outcome.successful is False
+        assert "manual intervention required" in outcome.reason
+    assert not paths["pending"].exists()
+
+
+def _raise_http_error(*_args: object, **_kwargs: object) -> None:
+    raise httpx.HTTPError("boom")
+
+
+def test_reconcile_previous_digest_none_refuses_to_swap(tmp_path: Path) -> None:
+    """The container is currently running an image with no `RepoDigests`
+    entry for the source repository at all -- `current_repo_digest` (both
+    for service *selection* and for this second, rollback-target lookup)
+    returns `None`, and `reconcile_desired_state` refuses to swap without
+    a rollback target, rather than swapping with nothing to roll back to."""
+
+    desired = _desired_state(thermoctl_digest=NEW_THERMOCTL)
+    paths = _paths(tmp_path)
+    inspect = _baseline_inspect()
+    inspect["thermoctl"] = _container("some-local-image-id")
+    images = _baseline_images()
+    images["some-local-image-id"] = {"RepoDigests": []}
+    images[f"{REPO_THERMOCTL}@{NEW_THERMOCTL}"] = {
+        "RepoDigests": [f"{REPO_THERMOCTL}@{NEW_THERMOCTL}"]
+    }
+
+    with run_fake_docker_api_with_app(inspect=inspect, images=images) as (socket_path, app):
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW,
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+        assert outcome.successful is False
+        assert "current running digest could not be determined" in outcome.reason
+        assert all("stop" not in call and "containers/create" not in call for call in app.calls)
+
+
+# --- cross-review fixes: further Docker Engine API helper coverage ---------
+
+
+def test_pull_image_by_digest_tolerates_blank_and_malformed_lines(tmp_path: Path) -> None:
+    raw = b"\n" + b"not json at all\n" + json.dumps({"status": "ok"}).encode() + b"\n"
+    with run_fake_docker_api_with_app(pull_raw_body=raw) as (socket_path, _app):
+        pull_image_by_digest(REPO_THERMOCTL, NEW_THERMOCTL, socket_path=socket_path)  # no raise
+
+
+def test_current_repo_digest_none_when_image_field_missing(tmp_path: Path) -> None:
+    inspect = {"thermoctl": {"Config": {}, "HostConfig": {}, "State": {"Running": True}}}
+    with run_fake_docker_api_with_app(inspect=inspect) as (socket_path, _app):
+        assert current_repo_digest("thermoctl", REPO_THERMOCTL, socket_path=socket_path) is None
+
+
+def test_current_repo_digest_none_when_image_field_not_a_string(tmp_path: Path) -> None:
+    inspect = {
+        "thermoctl": {"Config": {}, "HostConfig": {}, "Image": 12345, "State": {"Running": True}}
+    }
+    with run_fake_docker_api_with_app(inspect=inspect) as (socket_path, _app):
+        assert current_repo_digest("thermoctl", REPO_THERMOCTL, socket_path=socket_path) is None
+
+
+def test_current_repo_digest_none_when_image_repo_digests_lookup_raises(tmp_path: Path) -> None:
+    """The container's own `Image` points at a local id that is not
+    present in the image store at all -- `image_repo_digests` itself
+    raises `httpx.HTTPError`, and `current_repo_digest` turns that into
+    `None` rather than propagating it."""
+
+    inspect = {"thermoctl": _container("sha256-not-in-the-image-store")}
+    with run_fake_docker_api_with_app(inspect=inspect, images={}) as (socket_path, _app):
+        assert current_repo_digest("thermoctl", REPO_THERMOCTL, socket_path=socket_path) is None
+
+
+def test_container_is_healthy_none_when_state_is_not_a_dict(tmp_path: Path) -> None:
+    inspect = {"thermoctl": {"Config": {}, "HostConfig": {}, "Image": "x", "State": "running"}}
+    with run_fake_docker_api_with_app(inspect=inspect) as (socket_path, _app):
+        assert container_is_healthy("thermoctl", socket_path=socket_path) is None
+
+
+@pytest.mark.parametrize("failing_step", ["stop", "remove", "start"])
+def test_recreate_container_with_image_raises_on_unexpected_status(
+    tmp_path: Path, failing_step: str
+) -> None:
+    inspect = {"thermoctl": _container(f"{REPO_THERMOCTL}@{OLD_THERMOCTL}")}
+    with run_fake_docker_api_with_app(
+        inspect=inspect, force_status={failing_step: 500}
+    ) as (socket_path, _app):
+        with pytest.raises(httpx.HTTPStatusError):
+            _recreate_container_with_image(
+                "thermoctl", f"{REPO_THERMOCTL}@{NEW_THERMOCTL}", socket_path=socket_path
+            )
+
+
+def test_rollback_to_previous_false_on_transport_error() -> None:
+    assert (
+        _rollback_to_previous(
+            "thermoctl", REPO_THERMOCTL, OLD_THERMOCTL, socket_path=unreachable_socket_path()
+        )
+        is False
+    )
+
+
+def test_default_health_reader_returns_none() -> None:
+    assert _default_health_reader() is None
+
+
+def test_default_outdoor_temp_reader_returns_none() -> None:
+    assert _default_outdoor_temp_reader() is None
+
+
+# --- cross-review fixes: local time default, midnight-crossing windows -----
+
+
+def test_time_within_update_window_ordinary_range() -> None:
+    window_from = dt_time(9, 0)
+    window_until = dt_time(16, 0)
+    assert _time_within_update_window(dt_time(9, 0), window_from, window_until) is True
+    assert _time_within_update_window(dt_time(12, 0), window_from, window_until) is True
+    assert _time_within_update_window(dt_time(16, 0), window_from, window_until) is True
+    assert _time_within_update_window(dt_time(8, 59), window_from, window_until) is False
+    assert _time_within_update_window(dt_time(16, 1), window_from, window_until) is False
+
+
+def test_time_within_update_window_crossing_midnight_both_sides() -> None:
+    # An overnight window, 22:00 to 06:00.
+    window_from = dt_time(22, 0)
+    window_until = dt_time(6, 0)
+    # Evening side (after `from_`, before midnight).
+    assert _time_within_update_window(dt_time(23, 0), window_from, window_until) is True
+    assert _time_within_update_window(dt_time(22, 0), window_from, window_until) is True
+    # Morning side (after midnight, before `until`).
+    assert _time_within_update_window(dt_time(0, 30), window_from, window_until) is True
+    assert _time_within_update_window(dt_time(6, 0), window_from, window_until) is True
+    # The daytime gap between the two halves is outside the window.
+    assert _time_within_update_window(dt_time(6, 1), window_from, window_until) is False
+    assert _time_within_update_window(dt_time(21, 59), window_from, window_until) is False
+    assert _time_within_update_window(dt_time(12, 0), window_from, window_until) is False
+
+
+def test_time_within_update_window_degenerate_equal_bounds() -> None:
+    instant = dt_time(9, 0)
+    assert _time_within_update_window(instant, instant, instant) is True
+    assert _time_within_update_window(dt_time(9, 1), instant, instant) is False
+
+
+def test_reconcile_accepts_an_update_inside_a_midnight_crossing_window(tmp_path: Path) -> None:
+    desired = _desired_state(
+        thermoctl_digest=NEW_THERMOCTL, window_from=dt_time(22, 0), window_until=dt_time(6, 0)
+    )
+    paths = _paths(tmp_path)
+    with run_fake_docker_api_with_app(
+        inspect=_baseline_inspect(), images=_baseline_images()
+    ) as (socket_path, app):
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW.replace(hour=23, minute=0),
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+        # Rejected only for an unrelated reason (backup), never for the
+        # time window -- proves the window check itself passed.
+        assert "update window" not in outcome.reason
+
+
+def test_reconcile_rejects_the_gap_of_a_midnight_crossing_window(tmp_path: Path) -> None:
+    desired = _desired_state(
+        thermoctl_digest=NEW_THERMOCTL, window_from=dt_time(22, 0), window_until=dt_time(6, 0)
+    )
+    paths = _paths(tmp_path)
+    with run_fake_docker_api_with_app(
+        inspect=_baseline_inspect(), images=_baseline_images()
+    ) as (socket_path, app):
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW.replace(hour=12, minute=0),
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+        assert outcome.successful is False
+        assert "update window" in outcome.reason
+        assert app.calls == []
+
+
+def test_reconcile_default_now_uses_base_station_local_time_not_utc() -> None:
+    """Proves the default `now=` factory is genuinely local-time-aware,
+    not silently `datetime.now(UTC)` -- by actually changing the process's
+    local timezone (`TZ` + `time.tzset()`, POSIX only) to one that is
+    never at a zero UTC offset, and checking the produced value's own
+    offset follows it. If this defaulted to UTC, `utcoffset()` would be
+    zero regardless of `TZ`, and this assertion would fail."""
+
+    if not hasattr(time_module, "tzset"):
+        pytest.skip("time.tzset is not available on this platform.")
+
+    original_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    time_module.tzset()
+    try:
+        default_now = inspect.signature(reconcile_desired_state).parameters["now"].default
+        produced = default_now()
+        assert produced.tzinfo is not None
+        local_now = datetime.now().astimezone()
+        assert produced.utcoffset() == local_now.utcoffset()
+        # New York is UTC-4 (EDT) or UTC-5 (EST), never UTC+0 -- this would
+        # fail if the default factory ignored the local timezone entirely.
+        assert produced.utcoffset() != timedelta(0)
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time_module.tzset()

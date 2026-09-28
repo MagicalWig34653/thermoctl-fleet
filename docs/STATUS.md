@@ -124,11 +124,104 @@ zigbee2mqtt and thermoctl in one desired state only ever change one.
 `tests/docker_api_support.py` (extended), `tests/test_agent_sources.py`
 (new), `tests/test_agent_reconcile.py` (new).
 
-**Verification:** `ruff check .` clean; `mypy .` (113 files) and
-`mypy protocol fleet agent tools` (59 files) clean; pytest:
+**Verification (initial commit `4b21fc4`):** `ruff check .` clean; `mypy .`
+(113 files) and `mypy protocol fleet agent tools` (59 files) clean; pytest:
 **1454 passed, 1 skipped**, TOTAL **5551 stmts / 46 missed / 99%**; Go:
 `go vet ./...`/`go test ./...` clean (unchanged from P5.6/P5.7),
 `watchdog/check_contract.sh` passing (unchanged -- this package never
+touches `watchdog/`).
+
+### P5.4 cross-review fixes (main session)
+
+Cross-review of `4b21fc4` returned **CHANGES REQUIRED**, three points, all
+addressed in the fix-up commit that follows it:
+
+1. **`PendingSwap` no longer carries `container`/`repo` at all** (security
+   -- this was the central finding). It used to persist both directly and
+   `_load_pending_swap` trusted them back out of the file unchecked; a
+   tampered or corrupted `pending_swap.json` could therefore have pointed
+   `_await_or_rollback_pending_swap` at an arbitrary container name and an
+   arbitrary source repository. Fixed **structurally, not just with a
+   check**: the type itself now only has `service`/`previous_digest`/
+   `new_digest`/`since` -- there is no field left for a foreign
+   container/repo to occupy. The container name and the source repository
+   are now always resolved from two fixed, in-code tables
+   (`SERVICE_CONTAINER_NAMES`, `agent.sources.ALLOWED_SOURCES`), keyed by
+   `service` -- which `_load_pending_swap` validates against
+   `PENDING_SWAP_SERVICES` (**not** all four `protocol.desired_state
+   .Services` names: `"agent"` is deliberately excluded, since this code
+   never persists a pending swap for its own container, security
+   principle 6 -- a record naming it is therefore always tampered, never
+   genuine) before a `PendingSwap` is ever constructed. Both digests are
+   checked against `agent.sources.digest_is_well_formed`, `since` against
+   being a real number. Any of these checks failing (or the file being
+   corrupt JSON, or missing a field, or not being a JSON object at all)
+   raises `ValueError` -- **before any Docker call is made** and before a
+   `PendingSwap` exists at all, the same "fails closed" contract
+   `load_agent_state` already has for the executed-ids file; an old-format
+   file that still carries `container`/`repo` (a previous version of
+   `_save_pending_swap` wrote them) loads fine, with both extra keys
+   simply ignored. Tested: unknown service, `"agent"` specifically,
+   malformed digest (four variants), non-numeric `since`, a missing field,
+   non-object JSON, an old-format file with extra keys (values ignored),
+   and the full integration path (a tampered file makes
+   `reconcile_desired_state` raise with zero Docker calls; an old-format
+   file with a foreign container/repo resumes successfully but every
+   Docker call still only ever names the real `thermoctl` container/repo,
+   never the foreign ones) -- `tests/test_agent_reconcile.py`'s own
+   "cross-review fixes: pending-swap record validation" section.
+2. **Test coverage** -- added (see that file's own further "cross-review
+   fixes" sections): main-path swap-recreate failure with a successful
+   rollback, and separately with a failed rollback ("manual intervention
+   required"); the same failed-rollback branch inside
+   `_await_or_rollback_pending_swap`'s own timeout path;
+   `previous_digest is None` refusing to swap; `pull_image_by_digest`
+   tolerating a blank line and a malformed-JSON line in the pull stream;
+   `current_repo_digest` with a missing/non-string `Image` field and with
+   an `image_repo_digests` lookup that itself raises;
+   `container_is_healthy` with a non-dict `State`;
+   `_recreate_container_with_image` raising on an unexpected status from
+   each of `stop`/`remove`/`start` (`tests/docker_api_support.py` gained
+   `force_status`/`pull_raw_body` for this); `_rollback_to_previous`'s own
+   transport-error branch; `_default_health_reader`/
+   `_default_outdoor_temp_reader` returning `None`; `agent.sources`'s
+   domain-component rejection (`ghcr..io/...`, `-ghcr.io/...`,
+   `ghcr.io-/...`). `agent/sources.py`'s own dead "reject an empty path
+   component" check (cross-review finding: unreachable once the
+   leading/trailing/doubled-slash guards already ran) was **removed**, not
+   `# pragma: no cover`-marked -- a one-line comment explains why no case
+   reaches it, which is more honest than pretending a coverage exemption
+   is needed for code that cannot execute at all. `agent/sources.py` is
+   now **100%** covered; every `agent/loop.py` line this package added is
+   covered too (verified line-by-line against the coverage report --
+   `agent/loop.py`'s own 4 remaining repo-wide misses, see below, all
+   predate this package).
+3. **`now`'s default is the base station's own local time**
+   (`datetime.now().astimezone()`, not `datetime.now(UTC)`) -- section
+   13's `window.from_`/`until` are a plain `HH:MM` with no offset, meant as
+   local wall-clock time at the apartment ("not in the evening"), not UTC;
+   comparing them against a UTC clock would silently shift the window by
+   the base station's own UTC offset. Tested by actually changing the
+   process's timezone (`TZ=America/New_York` + `time.tzset()`, POSIX only,
+   skipped otherwise) and checking the produced offset follows it -- a
+   silent revert to `datetime.now(UTC)` would make that assertion fail,
+   since New York is never at a zero UTC offset. **Midnight-crossing
+   windows are now supported**, not rejected: `_time_within_update_window`
+   (new) handles `window.from_ > window.until` (e.g. `22:00`-`06:00`) as
+   the union of "from `from_` to midnight" and "midnight to `until`",
+   tested on both halves and on the daytime gap between them, plus the
+   ordinary non-wrapping case and the degenerate equal-bounds case.
+
+**Verification after the fix-up commit:** `ruff check .` clean; `mypy .`
+(113 files) and `mypy protocol fleet agent tools` (59 files) clean;
+pytest: **1490 passed, 1 skipped**, TOTAL **5573 stmts / 19 missed / 99%**
+(the 19 repo-wide misses: `agent/loop.py`'s own 4 -- `collect_heartbeat`/
+`send_heartbeat`, two pre-existing, unrelated `NotImplementedError`
+placeholders (sections 5/10, project owner deferred 2026-09-24), plus one
+pre-existing P5.3a `fetch_logs` upload-transport-error branch, line
+1108-1109 -- and 15 elsewhere in the repository, all predating this
+package; `agent/sources.py` **100%**); Go: `go vet ./...`/`go test ./...`
+clean, `watchdog/check_contract.sh` passing (this package still never
 touches `watchdog/`).
 
 ## Owner decisions for P5.4 and P5.5b (2026-09-28, main session)
