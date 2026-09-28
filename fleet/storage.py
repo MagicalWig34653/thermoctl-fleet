@@ -1830,29 +1830,74 @@ class Storage:
         behaves exactly like one that was just reset, which is correct --
         no agent could possibly hold a `Last-Event-ID` naming an epoch
         that never existed.
+
+        **Concurrency (cross-review, reproduced directly with two
+        independent sessions that both read before either writes):** two
+        concurrent callers can both observe "row missing" before either has
+        inserted it -- both then try to insert the same pinned row id
+        (`_FLEET_EPOCH_ROW_ID`), and the loser's insert raises
+        `IntegrityError` (a primary-key/unique violation) at commit time.
+        Left uncaught, that `IntegrityError` used to propagate straight out
+        of `GET /v1/commands` as a `500` -- exactly the kind of crash this
+        method's whole "never fail the SSE endpoint over this" reasoning
+        exists to avoid. **Fixed:** the insert is wrapped in its own `try
+        .../except IntegrityError`, and the loser simply re-reads the row
+        the winner just committed -- which epoch value "wins" this race
+        does not matter (both are equally valid, freshly generated
+        epochs); only "some value, decided once, database-wide" does.
         """
 
         with self.session() as session:
             record = session.get(FleetEpochRecord, _FLEET_EPOCH_ROW_ID)
-            if record is None:
-                record = FleetEpochRecord(
-                    id=_FLEET_EPOCH_ROW_ID,
-                    epoch=_generate_epoch(),
-                    created_at=_naive_utc(datetime.now(UTC)),
+            if record is not None:
+                return record.epoch
+
+        try:
+            with self.session() as session:
+                session.add(
+                    FleetEpochRecord(
+                        id=_FLEET_EPOCH_ROW_ID,
+                        epoch=_generate_epoch(),
+                        created_at=_naive_utc(datetime.now(UTC)),
+                    )
                 )
-                session.add(record)
-                session.flush()
+        except IntegrityError:
+            # Lost the race -- another concurrent caller already inserted
+            # the row. Fall through to the re-read below rather than
+            # propagating.
+            pass
+
+        with self.session() as session:
+            record = session.get(FleetEpochRecord, _FLEET_EPOCH_ROW_ID)
+            if record is None:
+                # Unreachable in practice: either this call's own insert
+                # just committed successfully, or a concurrent caller's did
+                # (the only reason our own insert could have failed with
+                # `IntegrityError` at all) -- either way a row now exists.
+                # Not treated as "fall back to 0 like a bad header" (this
+                # is a storage-layer invariant, not client input), and not
+                # silently swallowed into a freshly *different* epoch
+                # either, which would defeat the "some value, decided once"
+                # property the whole method exists to provide.
+                raise RuntimeError(  # pragma: no cover
+                    "fleet_epoch row missing after insert-or-recover"
+                )
             return record.epoch
 
     def rotate_epoch(self, now: datetime) -> str:
-        """Replaces the stored epoch with a fresh, random one -- the
-        operator-facing half of P5.1c (`python -m fleet.admin
-        rotate-epoch`, `fleet.admin.rotate_epoch`). **Not automatic**: a
-        database restored from an existing backup file restores whatever
-        epoch was already in that backup verbatim (`fleet_epoch` is an
-        ordinary table, backed up and restored like any other) -- this must
-        be run by hand, once, right after a restore, per the operator note
-        in `0012_fleet_epoch.py`'s own docstring.
+        """Replaces the stored epoch with a fresh, random one.
+
+        **Called two ways** (cross-review): automatically, on every fleet
+        service start (`fleet.app.lifespan`, before any request is
+        served -- a restart always accompanies a restore, since there is
+        no way to swap the database file under a running process, so this
+        alone already covers the restore case unconditionally); and
+        manually, via `python -m fleet.admin rotate-epoch`
+        (`fleet.admin.rotate_epoch`) for the one case the automatic path
+        does not cover -- restoring a backup file into a database whose
+        fleet service process is deliberately kept running throughout
+        (e.g. a warm standby). See `fleet.app.lifespan`'s own docstring for
+        the full reasoning and the multi-process note.
 
         A fresh epoch can never match what any agent has already persisted
         (`secrets.token_hex(16)`, the same 16-random-bytes generation the

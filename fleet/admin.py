@@ -153,9 +153,19 @@ def delete_user(username: str) -> int:
 
 
 def rotate_epoch() -> int:
-    """`rotate-epoch` (P5.1c, `docs/specification.md` sections 3, 7) --
-    **run this once, by hand, right after restoring the fleet database
-    from an older backup** (`0012_fleet_epoch.py`'s own operator note).
+    """`rotate-epoch` (P5.1c, `docs/specification.md` sections 3, 7).
+
+    **`fleet.app.lifespan` already rotates the epoch automatically on
+    every fleet service start** (cross-review addition, on top of this
+    manual command), which alone already covers a restore -- restoring a
+    backup file always involves stopping and restarting the fleet service
+    process around the swap, since there is no way to replace the database
+    file under a running one. **This manual command is for the one
+    remaining case the automatic path does not cover**: restoring a backup
+    file into a database whose fleet service process is deliberately kept
+    running throughout the restore (e.g. a warm standby instance this
+    process is not itself) -- run it once, by hand, right after that kind
+    of restore.
 
     A restored backup brings back whatever epoch id was stored in it at
     backup time, which can still match an agent's own already-persisted
@@ -168,10 +178,6 @@ def rotate_epoch() -> int:
     sees its still-pending commands again -- harmless redelivery, never a
     silent skip (`Storage.pending_commands`'s own idempotent-redelivery
     reasoning, unchanged by this package).
-
-    Not needed after a plain fresh deploy (`0012_fleet_epoch.py`'s own data
-    migration already gives a brand-new database its own epoch at
-    migration time) -- only after restoring an *existing* backup file.
     """
 
     storage = create_storage(_require_database_url())

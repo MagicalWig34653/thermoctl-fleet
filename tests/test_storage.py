@@ -3446,6 +3446,52 @@ def test_get_epoch_defensively_creates_a_row_if_the_table_is_empty(storage: Stor
     assert len(first) == 32
 
 
+def test_get_epoch_recovers_when_a_concurrent_session_wins_the_insert_race(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-review reproduction (deterministic, not a real thread race):
+    two independent sessions both observe the `fleet_epoch` row missing
+    before either has inserted it. `Storage.get_epoch`'s own insert then
+    raises `IntegrityError` (a primary-key violation on the pinned row id)
+    for whichever session commits second -- left uncaught, this used to
+    propagate straight out of `GET /v1/commands` as a `500`. Reproduced
+    here by making `_generate_epoch` itself -- called from inside the
+    method's own insert, after its own read already found nothing -- have
+    the side effect of a *second*, independent session committing its own
+    competing row first, so the method's own subsequent insert is
+    guaranteed to lose the race."""
+
+    with storage.session() as session:
+        session.query(FleetEpochRecord).delete()
+
+    winner_epoch = "b" * 32
+    real_generate_epoch = storage_module._generate_epoch
+    calls = {"n": 0}
+
+    def _racing_generate_epoch() -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            other = create_storage(str(storage.engine.url))
+            with other.session() as other_session:
+                other_session.add(
+                    storage_module.FleetEpochRecord(
+                        id=storage_module._FLEET_EPOCH_ROW_ID,
+                        epoch=winner_epoch,
+                        created_at=storage_module._naive_utc(datetime.now(UTC)),
+                    )
+                )
+        return real_generate_epoch()
+
+    monkeypatch.setattr(storage_module, "_generate_epoch", _racing_generate_epoch)
+
+    result = storage.get_epoch()
+
+    assert result == winner_epoch
+    # The loser's own insert did not leave any trace/half-applied state --
+    # a plain read afterward is stable on the winner's value.
+    assert storage.get_epoch() == winner_epoch
+
+
 def test_rotate_epoch_replaces_the_stored_value(storage: Storage) -> None:
     before = storage.get_epoch()
 

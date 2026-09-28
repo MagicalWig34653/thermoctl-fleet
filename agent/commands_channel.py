@@ -99,11 +99,19 @@ DEFAULT_FALLBACK_POLL_INTERVAL_S = 60.0
 # out header injection, not a specific format this module has no business
 # assuming will never change server-side.
 _MAX_LAST_EVENT_ID_LENGTH = 64
-_LAST_EVENT_ID_PATTERN = re.compile(r"^[0-9a-f.]+$")
+# **Matched with `.fullmatch()`, not `.match()`** (cross-review): a
+# `$`-anchored pattern used with `.match()` still matches a value with a
+# trailing `\n` (`re`'s `$` matches "end of string, or just before a
+# trailing newline"), which would have let a value like `"<...>.1\n"`
+# through despite not being exactly the persisted bookmark. `.fullmatch()`
+# requires the entire string to match; no `^`/`$` anchors needed.
+_LAST_EVENT_ID_PATTERN = re.compile(r"[0-9a-f.]+")
 
 
 def _is_bounded_last_event_id(value: str) -> bool:
-    return len(value) <= _MAX_LAST_EVENT_ID_LENGTH and bool(_LAST_EVENT_ID_PATTERN.match(value))
+    return len(value) <= _MAX_LAST_EVENT_ID_LENGTH and bool(
+        _LAST_EVENT_ID_PATTERN.fullmatch(value)
+    )
 
 # Bounded, the same reasoning as `agent.heartbeat_sender`'s own buffer cap
 # (`protocol.heartbeat.MAX_CATCH_UP_HEARTBEATS`): an agent that can never

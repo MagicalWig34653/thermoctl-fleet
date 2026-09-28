@@ -62,18 +62,31 @@ the fleet's own `<epoch>.<sequence>` shape here -- only the properties
 actually needed to rule out header injection, since this module has no
 business assuming the exact format will never change server-side again.
 
-**Operator note (documented here and in `0012_fleet_epoch.py`'s own
-docstring):** rotating the epoch is a **manual** step, not automatic -- a
-freshly migrated, empty database gets a new epoch for free (the migration's
-own data insert), but a database *restored* from an existing backup file
-also restores whatever epoch was already in that file verbatim
-(`fleet_epoch` is an ordinary table, backed up and restored like any
-other). **After restoring a backup, run `python -m fleet.admin
-rotate-epoch` once, by hand** -- every agent's already-persisted
-`Last-Event-ID` then stops matching and falls back to `0` on its next
-reconnect, which only ever means redelivery of still-pending commands
-(harmless, P5.1's own original design), never the silent skip this
-package exists to prevent.
+**Operator note (updated by cross-review -- see the fixes section below):**
+the epoch now rotates **automatically on every fleet service start**
+(`fleet.app.lifespan`, before any request is served,
+`Storage.rotate_epoch`), not only via the manual CLI. A restart always
+accompanies a restore (there is no way to swap the database file under a
+running process), so this alone already covers the restore case
+unconditionally -- an operator no longer needs to remember a separate
+step. The cost is that **every** restart (not only a restore) makes every
+currently-connected agent redeliver its still-pending commands once on its
+next reconnect, which `Storage.pending_commands`'s own idempotent-
+redelivery reasoning already makes harmless (P5.1's own original design).
+The manual `python -m fleet.admin rotate-epoch` command stays useful for
+the one case the automatic path does not cover: restoring a backup file
+into a database whose fleet service process is deliberately kept running
+throughout the restore (e.g. a warm standby instance that process is not
+itself) -- run it once, by hand, for that case only.
+
+**Multi-process note:** if more than one fleet service process is ever run
+against the same database (not currently how this service is deployed --
+`docker/Dockerfile.fleet` is one container, one process), each process's
+own start rotates the epoch again, invalidating the `Last-Event-ID` every
+agent connected to any *other* process was holding -- harmless for the
+same reason a single restart is: every affected agent simply redelivers
+its still-pending commands on its next reconnect, never silently skips
+one.
 
 **No `protocol/` change, `PROTOCOL_VERSION` unchanged** -- confirmed
 while implementing: the SSE `id:` field is SSE/transport metadata (the
@@ -124,6 +137,167 @@ methods, `fleet/admin.py`'s `rotate_epoch`,
 lines (checked via a targeted `--cov` run against exactly those modules).
 `watchdog/` and `protocol/` untouched by this package (`git diff --stat`
 confirms).
+
+## P5.1c cross-review fixes: a `get_epoch` insert race, `$`-anchored regexes, and automatic epoch rotation on every service start
+
+Cross-review of P5.1c (commit `19a0371`) confirmed the core restore
+reproduction works, and required three fixes, all made in the same
+follow-up commit.
+
+1. **`Storage.get_epoch()`'s get-or-create had an unguarded insert race**
+   (reproduced deterministically, not via real threads): two sessions can
+   both observe the `fleet_epoch` row missing before either has inserted
+   it; the loser's own insert then raised `IntegrityError` (a primary-key
+   violation on the pinned row id) straight out of the method, which
+   propagated all the way to a `500` on `GET /v1/commands`. **Fixed:**
+   `get_epoch` now reads first; only if the row is missing does it attempt
+   an insert, wrapped in its own `try/except IntegrityError` -- the loser
+   simply re-reads and returns the winner's row instead of raising. Which
+   value wins the race does not matter (any freshly generated epoch is
+   equally valid); only "some value, decided once, database-wide" does.
+   **Tested** (`tests/test_storage.py::
+   test_get_epoch_recovers_when_a_concurrent_session_wins_the_insert_race`):
+   `_generate_epoch` is monkeypatched so that, on its first call --
+   already inside `get_epoch`'s own insert, after its own read already
+   found nothing -- a *second*, independent `Storage` instance commits a
+   competing row first, guaranteeing the method's own subsequent insert
+   loses the race; asserts the method still returns the winner's value
+   rather than raising.
+
+2. **`_EVENT_ID_PATTERN` (`fleet/app.py`) and `_LAST_EVENT_ID_PATTERN`
+   (`agent/commands_channel.py`) were `$`-anchored and matched with
+   `.match()`.** `re`'s `$` matches "end of string, or just before a
+   trailing newline" (without `re.MULTILINE`), so a value like `"<32 hex
+   epoch>.<sequence>\n"` incorrectly matched despite not being the exact
+   header/persisted value. **Fixed:** both patterns dropped their `^`/`$`
+   anchors and are now matched with `.fullmatch()`, which requires the
+   *entire* string to match, trailing newline included. **Tested:**
+   `tests/test_fleet.py::
+   test_commands_stream_wait_0_current_epoch_with_a_trailing_newline_is_treated_as_0`
+   (uses the *real*, current epoch plus a trailing `\n`, not a wrong one,
+   so the test actually exercises the `.fullmatch()` fix rather than the
+   unrelated epoch-mismatch path) and a `\n`-suffixed case added to the
+   existing garbage/injection parametrization; agent side,
+   `tests/test_agent_commands_channel.py::
+   test_is_bounded_last_event_id_rejects_a_trailing_newline` (exercised
+   directly against `_is_bounded_last_event_id`, not through
+   `_read_last_event_id`, which already strips whitespace off whatever it
+   reads from disk before this check ever runs -- stripping would hide the
+   bug the direct test is there to catch).
+
+3. **The epoch now rotates automatically on every fleet service start**
+   (`fleet.app.lifespan`, `Storage.rotate_epoch`, before any request is
+   served), on top of the manual `rotate-epoch` CLI -- **main-session
+   decision, cross-review**: restoring an *older* backup of a database
+   that was never manually rotated brings the *same* epoch back, and a
+   forgotten manual step after restoring would silently reintroduce
+   exactly the "reused sequence looks like a legitimate resume point"
+   skip this whole package exists to prevent. Restoring a backup always
+   involves stopping and restarting the fleet service around the swap (no
+   way to replace the database file under a running process), so rotating
+   unconditionally on every start closes that gap without depending on
+   anyone remembering a separate step -- at the cost of every restart
+   (not only a restore) causing every currently-connected agent to
+   redeliver its still-pending commands once, harmless by
+   `Storage.pending_commands`'s own reasoning. The manual command stays
+   for the one case the automatic path does not cover: a restore into a
+   database whose fleet service process is deliberately kept running
+   throughout. See the updated operator note and multi-process note above
+   (also in `fleet.app.lifespan`'s, `fleet.admin.rotate_epoch`'s, and
+   `0012_fleet_epoch.py`'s own docstrings).
+
+   **Storage resolution must go through `app.dependency_overrides`, not
+   a bare `get_storage()` call.** Every real end-to-end test that boots
+   the app via a real `uvicorn` server (`tests/test_agent_commands
+   _channel.py`, `tests/tls_support.py`) wires storage up purely through
+   `app.dependency_overrides[get_storage]`, deliberately never setting
+   `FLEET_DATABASE_URL` -- a bare `get_storage()` call in `lifespan`
+   raised `RuntimeError` on every one of them, and since this rotation is
+   *awaited directly before `yield`* (unlike `_alarm_check_loop`/
+   `_backup_retention_loop`/`_log_retention_loop`, which are merely
+   scheduled via `asyncio.create_task` and never awaited before `yield`,
+   so a failure inside one of them is caught by that task's own loop, not
+   by anything that could fail startup), the uncaught exception aborted
+   `uvicorn` startup entirely (`SystemExit: 3` / `STARTUP_FAILURE`) on
+   every one of those tests. **Fixed:** resolves storage via
+   `app.dependency_overrides.get(get_storage, get_storage)()` -- mirrors
+   exactly what `Depends(get_storage)` already does for every ordinary
+   request.
+
+   **A failed rotation aborts startup, uncaught -- main-session decision,
+   round 2 of this same cross-review.** An intermediate version wrapped
+   the whole rotation in `try/except Exception`, logged, not fatal
+   (motivated by a second problem below) -- **rejected**: a silently
+   failed rotation would mean the restore protection this whole package
+   exists to provide is gone in production, without anyone noticing, the
+   wrong trade to make for what turned out to be a test-fixture ordering
+   problem, not a production concern at all. `lifespan` now raises
+   straight out of a failed rotation, exactly like `NotifierConfigError`
+   above.
+
+   **The test-fixture ordering problem this used to work around, fixed on
+   the test side instead:** `tests/test_agent_fetch_logs.py::
+   fleet_base_url` starts its own real server from a **module-scoped**
+   fixture, while the storage override used to be registered only by a
+   **function-scoped**, `autouse` fixture -- pytest sets up higher-scoped
+   fixtures before lower-scoped ones for a given test regardless of
+   declaration order, so that module-scoped server's own `lifespan` used
+   to run *before* anything was registered in `app.dependency_overrides`
+   at all, and there was still no `FLEET_DATABASE_URL`. Reproduced
+   directly: `test_fetch_logs_end_to_end_success` and two sibling tests
+   failed with "Connection refused" (the server thread had already
+   crashed at startup). **Fixed:** three new module-scoped fixtures in
+   that file -- `_server_bootstrap_db_url` (a migrated, throwaway
+   database), `_server_bootstrap_storage`, and
+   `_override_storage_for_server_startup` (registers the override) --
+   with `fleet_base_url` now taking `_override_storage_for_server_startup`
+   as an explicit parameter, guaranteeing the override is in place before
+   the server (and therefore this rotation) ever starts. The per-test,
+   function-scoped `_override_storage` fixture is unchanged and still
+   takes over for every individual test body as before; the bootstrap
+   fixtures only ever matter for the one moment the shared server itself
+   starts.
+
+   **Tested:** `tests/test_fleet.py::
+   test_lifespan_fails_loudly_when_the_epoch_rotation_cannot_resolve
+   _storage` (no `FLEET_DATABASE_URL`, no override -- entering the
+   lifespan raises `RuntimeError`) and `tests/test_fleet.py::
+   test_lifespan_fails_loudly_when_rotate_epoch_itself_raises` (storage
+   resolves fine, but a fake `Storage`'s own `rotate_epoch` raises --
+   still propagates, not swallowed); `tests/test_fleet.py::
+   test_lifespan_rotates_the_epoch_on_every_service_start` (two separate
+   `TestClient(app)` lifespans against the same migrated database produce
+   two different epochs) and `tests/test_fleet.py::
+   test_lifespan_restart_an_old_bookmark_resumes_from_0_without_losing_a
+   _pending_command` (a bookmark persisted against the pre-restart epoch,
+   handed to a freshly started app via `Last-Event-ID`, resumes from `0`
+   and still delivers the still-pending command, not skips it). The
+   pre-existing real-server stop/restart acceptance test
+   (`test_receive_commands_falls_back_to_polling_on_a_dropped_stream_and
+   _resumes`) needed updating: since the restarted server now also
+   rotates the epoch, the resumed stream correctly **redelivers** the
+   still-pending first command before the genuinely new second one --
+   updated to assert that redelivery explicitly, proving the harmless-
+   redelivery claim directly rather than only asserting the end state.
+   Both pre-existing `fleet.app.lifespan` tests
+   (`test_lifespan_starts_and_cancels_the_alarm_background_task`,
+   `test_lifespan_fails_loudly_on_a_misconfigured_alert_channel`) needed
+   `upgrade(url)` added to their own setup -- they never migrated their
+   database before (nothing they exercised touched storage synchronously
+   before this package), and the automatic rotation now needs the
+   `fleet_epoch` table to exist for its own `FLEET_DATABASE_URL`-based
+   path to succeed.
+
+**Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`): `ruff check .` and `mypy .` / `mypy protocol fleet
+agent tools` all clean; `python -m pytest -W ignore::ResourceWarning -rA`
+**2x**: **1286 passed, 1 skipped** (the pre-existing `age` CLI skip)
+identical both runs, coverage **99%** (4897 statements, 25 missed)
+identical both runs (statement count up from the original P5.1c
+verification's 4889 by the new `_server_bootstrap_*`/`_override_storage
+_for_server_startup` fixtures and the two new `test_lifespan_fails_loudly
+_*` tests added by this round; missed-line count unchanged at 25, still
+the same pre-existing, untouched gaps documented elsewhere in this file).
 
 ## P5.5a cross-review fixes: duplicate recipients, a memory DoS on the upload endpoint, an insufficient age-file check, and an unhandled handler exception
 

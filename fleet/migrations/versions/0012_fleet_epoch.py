@@ -35,16 +35,24 @@ and simply sees its still-pending commands again (`Storage
 .pending_commands`'s own redelivery-is-always-safe reasoning, P5.1's
 original design) instead of silently skipping the ones that got reused.
 
-**Operator note:** rotating the epoch is a manual, deliberate step, not
-automatic -- a database *migrated* fresh (this migration's own data
-insert) already gets a new epoch for free, but a database *restored* from
-an existing backup file also restores whatever epoch was in that file
-verbatim (it is an ordinary table, backed up and restored like any other).
-After restoring a backup, run `python -m fleet.admin rotate-epoch` once,
-by hand, so every agent's already-persisted `Last-Event-ID` stops matching
-and instead resumes from `0` -- safe, since redelivery is always harmless
+**Operator note (updated, cross-review):** `fleet.app.lifespan` rotates
+the epoch **automatically on every fleet service start**, before any
+request is served (`fleet.storage.Storage.rotate_epoch`) -- a database
+*migrated* fresh already gets a new epoch for free (this migration's own
+data insert), and restoring an existing backup file (which also restores
+whatever epoch was already in that file verbatim -- it is an ordinary
+table, backed up and restored like any other) is always followed by
+restarting the fleet service around the swap, since there is no way to
+replace the database file under a running process; that restart alone
+already rotates the epoch again. The one case the automatic path does not
+cover is restoring a backup file into a database whose fleet service
+process is deliberately kept running throughout (e.g. a warm standby) --
+for that case only, run `python -m fleet.admin rotate-epoch` once, by
+hand. Either way, every agent's already-persisted `Last-Event-ID` stops
+matching and resumes from `0` -- safe, since redelivery is always harmless
 (`Storage.pending_commands`'s own docstring), unlike the silent skip this
-whole package exists to prevent.
+whole package exists to prevent. See `fleet.app.lifespan`'s own docstring
+for the full reasoning, including the multi-process note.
 
 `down_revision` **"0011"** (`0011_backups.py`, P5.5a) -- the current head
 at the time this package started; another package may also branch from

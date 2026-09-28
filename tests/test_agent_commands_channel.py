@@ -45,6 +45,7 @@ from agent.commands_channel import (
     _append_to_outbox,
     _classify,
     _flush_outbox_if_any,
+    _is_bounded_last_event_id,
     _load_outbox,
     _parse_command_obj,
     _parse_event_data,
@@ -319,7 +320,18 @@ def test_receive_commands_falls_back_to_polling_on_a_dropped_stream_and_resumes(
     server, confirm the fallback poll is attempted (also fails while the
     server is down), then -- driven entirely by the injected `sleep`
     callable, never a real wait -- the server comes back and the stream
-    resumes, delivering a command that was created while it was down."""
+    resumes, delivering a command that was created while it was down.
+
+    **P5.1c, cross-review:** the restarted server's `fleet.app.lifespan`
+    now rotates the fleet epoch on every start -- the `Last-Event-ID`
+    persisted from before the restart therefore no longer matches, and the
+    resumed stream first redelivers `first` (still pending, never
+    resulted) before delivering the genuinely new `second` command. This
+    is the expected, documented cost of rotating unconditionally on every
+    restart (not only a restore): harmless, since a still-pending command
+    is always safe to redeliver (`Storage.pending_commands`'s own
+    idempotent-redelivery reasoning) -- proven directly here rather than
+    only asserted."""
 
     token = _issue_token(app_storage)
     first = app_storage.create_command(
@@ -388,10 +400,15 @@ def test_receive_commands_falls_back_to_polling_on_a_dropped_stream_and_resumes(
 
                 running_threads.pop().stop()
 
+                # P5.1c: the restart rotates the epoch, so the resumed
+                # stream's own `Last-Event-ID` check falls back to 0 and
+                # redelivers `first` (still pending) before `second`.
+                redelivered = next(gen)
                 item = next(gen)
             finally:
                 gen.close()
 
+            assert redelivered == first
             assert sleep_calls, "the fallback poll's retry sleep was never called"
             assert second_command_holder
             assert item == second_command_holder[0]
@@ -1020,6 +1037,22 @@ def test_read_last_event_id_refuses_an_out_of_bounds_or_injection_value(
     path.write_text(raw, encoding="utf-8")
 
     assert _read_last_event_id(path) is None
+
+
+def test_is_bounded_last_event_id_rejects_a_trailing_newline() -> None:
+    """Cross-review: `_LAST_EVENT_ID_PATTERN` used to be matched with
+    `.match()` against a `$`-anchored pattern -- `re`'s `$` matches "end of
+    string, or just before a trailing newline", so a value with a trailing
+    `\\n` would have incorrectly passed. Exercised directly against
+    `_is_bounded_last_event_id` (not via `_read_last_event_id`, which
+    already strips whitespace off whatever it reads from disk before this
+    check ever sees it -- this proves the regex fix itself, independent of
+    that stripping)."""
+
+    valid = "0123456789abcdef0123456789abcdef.42"
+
+    assert _is_bounded_last_event_id(valid) is True
+    assert _is_bounded_last_event_id(valid + "\n") is False
 
 
 def test_read_last_event_id_accepts_a_value_at_exactly_the_length_ceiling(

@@ -151,6 +151,7 @@ def test_lifespan_starts_and_cancels_the_alarm_background_task(
     otherwise need either a real wait or an artificial construction that
     tests the wrapper rather than anything real)."""
 
+    upgrade(f"sqlite:///{db_path}")  # P5.1c: lifespan now rotates the epoch, needs the table
     monkeypatch.setenv("FLEET_DATABASE_URL", f"sqlite:///{db_path}")
     # Large on purpose -- the loop's single `asyncio.sleep` call must not
     # actually fire while this test's `with` block is open.
@@ -179,6 +180,7 @@ def test_lifespan_fails_loudly_on_a_misconfigured_alert_channel(
     must raise `NotifierConfigError` here -- application *startup* fails
     loudly, not a background task nobody is watching."""
 
+    upgrade(f"sqlite:///{db_path}")  # P5.1c: lifespan now rotates the epoch, needs the table
     monkeypatch.setenv("FLEET_DATABASE_URL", f"sqlite:///{db_path}")
     monkeypatch.setenv("FLEET_ALERT_SMTP_HOST", "smtp.example.invalid")
     monkeypatch.delenv("FLEET_ALERT_SMTP_FROM", raising=False)
@@ -189,6 +191,134 @@ def test_lifespan_fails_loudly_on_a_misconfigured_alert_channel(
             pass
     finally:
         storage_module._storage_singleton = None
+
+
+def test_lifespan_fails_loudly_when_the_epoch_rotation_cannot_resolve_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P5.1c, cross-review round 2 (main-session decision): a failed
+    epoch rotation at startup must abort startup loudly, exactly like a
+    misconfigured alert channel just above -- not be caught and merely
+    logged (an earlier draft did catch every exception here and only log
+    it, which was rejected: a silently failed rotation in production would
+    mean the restore protection this whole package exists to provide is
+    gone, without anyone noticing -- the wrong trade to make for what
+    turned out to be a test-fixture ordering problem, fixed on the test
+    side instead, see `tests/test_agent_fetch_logs.py`).
+
+    No `FLEET_DATABASE_URL` and no `app.dependency_overrides[get_storage]`
+    registered -- storage cannot be resolved at all, so entering the
+    lifespan (`with TestClient(app)`) must raise `RuntimeError` straight
+    out of `Storage`'s own `get_storage()`, not swallow it."""
+
+    monkeypatch.delenv("FLEET_DATABASE_URL", raising=False)
+    storage_module._storage_singleton = None
+    try:
+        with pytest.raises(RuntimeError), TestClient(app):
+            pass
+    finally:
+        storage_module._storage_singleton = None
+
+
+def test_lifespan_fails_loudly_when_rotate_epoch_itself_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the same guarantee: even when storage resolves
+    successfully, a failure *inside* `Storage.rotate_epoch` itself (e.g. a
+    database error) must still abort startup loudly, not be swallowed."""
+
+    class _BrokenStorage:
+        def rotate_epoch(self, now: datetime) -> str:
+            raise RuntimeError("simulated database failure during epoch rotation")
+
+    app.dependency_overrides[get_storage] = lambda: _BrokenStorage()
+    storage_module._storage_singleton = None
+    try:
+        with (
+            pytest.raises(RuntimeError, match="simulated database failure"),
+            TestClient(app),
+        ):
+            pass
+    finally:
+        app.dependency_overrides.pop(get_storage, None)
+        storage_module._storage_singleton = None
+
+
+def test_lifespan_rotates_the_epoch_on_every_service_start(
+    monkeypatch: pytest.MonkeyPatch, db_path: str
+) -> None:
+    """P5.1c, cross-review: `fleet.app.lifespan` rotates the fleet
+    database epoch on every service start, not only via the manual
+    `rotate-epoch` CLI -- entering the lifespan twice (two separate
+    "service starts" against the same database) must produce two
+    different epochs."""
+
+    url = f"sqlite:///{db_path}"
+    upgrade(url)
+    monkeypatch.setenv("FLEET_DATABASE_URL", url)
+    monkeypatch.setenv("FLEET_ALARM_CHECK_INTERVAL_S", "3600")
+
+    storage_module._storage_singleton = None
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        storage_module._storage_singleton = None
+    first_epoch = create_storage(url).get_epoch()
+
+    storage_module._storage_singleton = None
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        storage_module._storage_singleton = None
+    second_epoch = create_storage(url).get_epoch()
+
+    assert first_epoch != second_epoch
+
+
+def test_lifespan_restart_an_old_bookmark_resumes_from_0_without_losing_a_pending_command(
+    monkeypatch: pytest.MonkeyPatch, db_path: str
+) -> None:
+    """P5.1c, cross-review: the automatic epoch rotation on every service
+    start must not lose a still-pending command -- an agent's
+    `Last-Event-ID`, persisted before the "restart" (this test's own
+    `upgrade`/`create_command` setup, done against the *pre-rotation*
+    epoch), fails the epoch check on the *post-restart* service (a fresh
+    `TestClient(app)` lifespan, which just rotated it) and falls back to
+    `0`, delivering the still-pending command rather than skipping it."""
+
+    url = f"sqlite:///{db_path}"
+    upgrade(url)
+    setup_storage = create_storage(url)
+    token = f"agent_{APARTMENT}_{secrets.token_urlsafe(32)}"
+    setup_storage.set_apartment_token(APARTMENT, token)
+    old_epoch = setup_storage.get_epoch()
+    command = setup_storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    pending = setup_storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
+    persisted_last_event_id = f"{old_epoch}.{pending[0].sequence}"
+
+    monkeypatch.setenv("FLEET_DATABASE_URL", url)
+    monkeypatch.setenv("FLEET_ALARM_CHECK_INTERVAL_S", "3600")
+    storage_module._storage_singleton = None
+    try:
+        with TestClient(app) as restarted_client:
+            response = restarted_client.get(
+                "/v1/commands?wait=0",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Last-Event-ID": persisted_last_event_id,
+                },
+            )
+    finally:
+        storage_module._storage_singleton = None
+
+    assert create_storage(url).get_epoch() != old_epoch
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [command.id]
 
 
 # -----------------------------------------------------------------------------
@@ -1161,6 +1291,7 @@ def test_commands_stream_wait_0_old_style_plain_integer_last_event_id_is_treated
         "deadbeefdeadbeefdeadbeefdeadbeef.-1",  # negative sequence
         "deadbeefdeadbeefdeadbeefdeadbeef.1\r\nX-Injected: yes",  # header injection attempt
         "deadbeefdeadbeefdeadbeefdeadbeef.",  # missing sequence
+        "deadbeefdeadbeefdeadbeefdeadbeef.1\n",  # trailing newline
     ],
 )
 def test_commands_stream_wait_0_garbage_last_event_id_is_treated_as_0(
@@ -1204,6 +1335,33 @@ def test_commands_stream_wait_0_a_different_epoch_is_treated_as_0(
     response = client.get(
         "/v1/commands?wait=0",
         headers={**_bearer(token), "Last-Event-ID": f"{wrong_epoch}.{sequence}"},
+    )
+
+    assert response.status_code == 200
+    assert [entry["id"] for entry in response.json()] == [own_command.id]
+
+
+def test_commands_stream_wait_0_current_epoch_with_a_trailing_newline_is_treated_as_0(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    """Cross-review: `_EVENT_ID_PATTERN` used to be matched with `.match()`
+    against a `$`-anchored pattern -- `re`'s `$` matches "end of string, or
+    just before a trailing newline", so `"<current epoch>.<own sequence>\\n"`
+    would have incorrectly matched and been honoured despite not being the
+    exact header value. Uses the real, current epoch (not a wrong one) so
+    only the trailing `\\n` is under test -- `.fullmatch()` must reject it."""
+
+    own_command = storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    pending = storage.pending_commands(APARTMENT, 0, datetime.now(UTC))
+    sequence = pending[0].sequence
+    epoch = storage.get_epoch()
+
+    response = client.get(
+        "/v1/commands?wait=0",
+        headers={**_bearer(token), "Last-Event-ID": f"{epoch}.{sequence}\n"},
     )
 
     assert response.status_code == 200
