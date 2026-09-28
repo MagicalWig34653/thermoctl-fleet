@@ -660,6 +660,12 @@ they must also stay conceptually separate, not just separately scheduled.
   record P5.4 as "done but inactive" with both conditions.
 - **Depends on:** P5.1 (the desired state arrives over the same channel as
   commands, see section 13).
+- [x] done, **agent side only** -- see `docs/STATUS.md`'s own P5.4 section
+  for the full design (`agent/sources.py`'s exact-match source check, the
+  Docker Engine API pull/verify/swap/rollback path, the restart-safe
+  pending-swap record) and verification output. **Stays inactive**, per
+  the owner decision above: fetching the desired state from the fleet over
+  SSE, and any fleet-side storage/UI for it, are **P5.4b**, not started.
 - **Read back by:** main session (the digest check is the central
   safeguard from security principle 2).
 
