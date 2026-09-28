@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -89,7 +90,7 @@ def _export_armored(gnupghome: Path, uid: str) -> str:
 
 
 @pytest.fixture
-def gnupghome() -> Path:
+def gnupghome() -> Iterator[Path]:
     # A short path under /tmp, not the pytest tmp_path fixture's (much
     # longer, per-test) directory: gpg-agent's Unix domain socket path has
     # a hard length limit (~108 bytes on Linux/macOS), and pytest's default
