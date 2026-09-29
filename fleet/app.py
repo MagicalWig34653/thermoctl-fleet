@@ -66,6 +66,9 @@ from protocol import (
     BackupKind,
     BackupUploadAccepted,
     CommandResult,
+    DesiredState,
+    DesiredStateEvent,
+    DesiredStateOutcomeReport,
     DiagnosticBundleUploadAccepted,
     Event,
     Heartbeat,
@@ -710,12 +713,61 @@ async def _stream_command_events(
     the epoch check already happened once, in `_last_event_id`, before this
     generator was ever created; `Storage.pending_commands`'s own membership
     check is unchanged.
+
+    **P5.4b: also emits `event: desired_state`, a separate event type over
+    this same connection** -- **not** a `Command`, **not** a `CommandType`
+    value (section 13, CLAUDE.md security principle 1) -- whenever
+    `Storage.get_desired_state(apartment)`'s own current revision differs
+    from `last_desired_revision` (which starts at `None`, so the very
+    first poll of a fresh connection already sends the current revision if
+    one exists -- "delivered on connect", P5.4b scope item 3). Its `id:`
+    reuses the same `epoch.sequence` value the *last delivered command*
+    already carries (never its own, independently advancing counter): a
+    desired state is a "what is the latest value" delivery, not a queued
+    item a `Last-Event-ID` needs to resume *past* -- an agent that
+    reconnects always gets the then-current revision resent unconditionally
+    on the first poll of the new connection, regardless of what
+    `Last-Event-ID` it presented, exactly the same as a first-ever
+    connection. This keeps command catch-up semantics (the actual thing
+    `Last-Event-ID` protects) completely unaffected by desired-state
+    delivery. `pilot_mode` is read fresh from `ApartmentRecord` on every
+    send (never cached across polls), since the landlord can flip it at
+    any time and the agent's own fail-closed check
+    (`agent.loop.reconcile_desired_state`) must see the current value, not
+    a stale one from connection setup.
     """
 
     sequence = after_sequence
+    last_desired_revision: int | None = None
     while True:
         if await is_disconnected():
             return
+
+        # **Desired state is checked and yielded before this iteration's
+        # pending commands** (deliberately, not the other order) -- an
+        # `agent_restart`/any other command already pending at connect
+        # time can make `agent.loop.run` exit its whole SSE session right
+        # after handling it (`ExecutionOutcome.exit_after_report`); if
+        # commands were yielded first, a desired-state delivery due on
+        # this very connection could be starved by that exit before it
+        # was ever sent. Desired state itself never closes the loop, so
+        # yielding it first never starves a command the same way.
+        desired_record = await asyncio.to_thread(storage.get_desired_state, apartment)
+        if desired_record is not None and desired_record.revision != last_desired_revision:
+            last_desired_revision = desired_record.revision
+            apartment_record = await asyncio.to_thread(storage.get_apartment, apartment)
+            pilot_mode = apartment_record.pilot_mode if apartment_record is not None else False
+            desired_event = DesiredStateEvent(
+                desired_state=DesiredState.model_validate_json(desired_record.state_json),
+                pilot_mode=pilot_mode,
+            )
+            yield {
+                "event": "desired_state",
+                "id": f"{epoch}.{sequence}",
+                "data": desired_event.model_dump_json(),
+                "retry": retry_ms,
+            }
+
         pending = await asyncio.to_thread(
             storage.pending_commands, apartment, sequence, datetime.now(UTC)
         )
@@ -727,6 +779,7 @@ async def _stream_command_events(
                 "data": item.command.model_dump_json(),
                 "retry": retry_ms,
             }
+
         await asyncio.sleep(poll_interval_s)
 
 
@@ -757,7 +810,15 @@ async def commands_stream(
     path (a polling client may still resume past what it already saw), and
     every command returned here is marked delivered exactly like an SSE
     delivery (`Storage.pending_commands`'s own `delivered_at` bookkeeping,
-    shared by both paths). The response also carries `Retry-After: 60`
+    shared by both paths). **Deliberately does not carry desired-state
+    delivery** (P5.4b, open point recorded in `docs/STATUS.md` as P5.4c-
+    adjacent, low severity): the `desired_state` SSE event only exists on
+    the open-connection path below; an agent stuck on the fallback poll
+    (no open connection at all) simply does not receive a desired-state
+    update until it can hold the stream open again. Acceptable for now
+    since P5.4/P5.4b stays inactive in production either way (section 13's
+    "Decided afterward" gate); revisit if `wait=0` fallback ever needs to
+    carry more than commands. The response also carries `Retry-After: 60`
     (section 3's own poll cadence), the same convention `request_token_
     challenge` already uses for its own 60 s poll interval.
 
@@ -886,6 +947,48 @@ def receive_command_result(
     # `_COMMAND_RESULT_STATUS`'s own docstring for why a plain retry is not
     # an error.
     response.status_code = _COMMAND_RESULT_STATUS[outcome]
+
+
+@app.post("/v1/desired-state/result", status_code=204)
+def receive_desired_state_result(
+    report: DesiredStateOutcomeReport,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> None:
+    """P5.4b, agent scope item 4: the agent's report of what
+    `agent.loop.reconcile_desired_state` did with a delivered revision.
+
+    **Deliberately its own endpoint, not a reuse of `POST
+    /v1/commands/{id}/result`** -- a desired-state reconciliation pass is
+    not a `Command` (see `protocol.desired_state.DesiredStateOutcomeReport`'s
+    own docstring; `DesiredState` is delivered as a separate SSE event
+    type, never a `CommandType` value, CLAUDE.md security principle 1),
+    so there is no command id to key a result against; `report.revision`
+    is the key instead.
+
+    Token check (P1.1) as everywhere else on this agent-facing surface --
+    `authenticated_apartment` is the apartment the presented token's hash
+    resolved to, and every report is stored scoped to it
+    (`Storage.record_desired_state_outcome`), so one apartment can never
+    write another's outcome history. **No existence check against a known
+    revision** -- unlike `receive_command_result`'s "unknown id -> 404",
+    a desired-state outcome report is accepted unconditionally once the
+    token authenticates the apartment: an agent that reconciles toward a
+    revision it once saw, even one the landlord has since superseded (a
+    reconcile pass started before a newer revision was delivered, or a
+    retried report after a lost response), is not an error case worth
+    rejecting -- `Storage.record_desired_state_outcome` simply appends
+    another row, and `fleet/ui_apartment.py` only ever shows the most
+    recent one by receipt time.
+
+    No tenant data, no room temperature, no setpoint -- `report` carries
+    only a revision number, a success flag, a free-text reason (the same
+    kind of operational text `CommandResult.error_text` already carries
+    unfiltered, since it originates in the agent's own reconcile logic,
+    not from thermoctl), and an optional service name.
+    """
+
+    storage.record_desired_state_outcome(authenticated_apartment, report, now=datetime.now(UTC))
 
 
 _CONTENT_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")

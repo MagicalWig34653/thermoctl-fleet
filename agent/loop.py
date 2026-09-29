@@ -91,6 +91,7 @@ from agent import sources as agent_sources
 from agent.commands_channel import (
     CommandResultError,
     CommandStreamAuthError,
+    DesiredStateReceived,
     RejectedCommand,
 )
 from agent.commands_channel import flush_outbox as _flush_outbox
@@ -103,10 +104,11 @@ from agent.restore import (
     RestoreTargets,
     run_restore_poll_loop,
 )
-from agent.safe_io import append_bytes_safe, read_text_safe
+from agent.safe_io import UnsafeStateFileError, append_bytes_safe, read_text_safe
 from protocol import Command, CommandResult, DesiredState, Heartbeat, LogExcerpt
 from protocol.backups import BackupKind, BackupUploadAccepted
 from protocol.commands import CommandType
+from protocol.desired_state import DesiredStateOutcomeReport
 from protocol.diagnostics import DiagnosticBundleUploadAccepted
 
 logger = logging.getLogger(__name__)
@@ -127,6 +129,19 @@ DEFAULT_EXECUTED_IDS_FILE = Path("executed_command_ids")
 DEFAULT_LAST_EVENT_ID_FILE = Path("commands_last_event_id")
 DEFAULT_COMMAND_OUTBOX_FILE = Path("commands_outbox.json")
 DEFAULT_LOCAL_LOG_FILE = Path("agent.log")
+# P5.4's own persisted in-flight-swap record (`PendingSwap`, see that
+# class's own docstring) -- moved up here from further down in this file
+# (defined right next to `reconcile_desired_state` until P5.4b) so `run`'s
+# own signature can default `pending_swap_path` to it directly; Python
+# evaluates a function's default argument values at `def` time, which
+# requires this name to already exist above `run`, not merely somewhere
+# else in the same module.
+DEFAULT_PENDING_SWAP_FILE = Path("pending_swap.json")
+# P5.4b: the last desired-state `revision` this agent has already started
+# reconciling toward (`_load_last_desired_state_revision`/
+# `_save_last_desired_state_revision`) -- see `run`'s own docstring for the
+# stale-revision-ignoring rule this guards.
+DEFAULT_DESIRED_STATE_LAST_REVISION_FILE = Path("desired_state_last_revision")
 
 # The watchdog's own state file (`watchdog/state.go`) -- the agent only ever
 # *reads* this for the `agent_restart` precondition below, never writes it
@@ -1025,7 +1040,7 @@ def receive_commands(
     fallback_poll_interval_s: float = 60.0,
     sleep: Callable[[float], None] = time.sleep,
     on_contact: Callable[[bool], None] = lambda ok: None,
-) -> Generator[Command | RejectedCommand]:
+) -> Generator[Command | RejectedCommand | DesiredStateReceived]:
     """Reads the SSE stream `GET /v1/commands`, or the 60 s fallback (section 3).
 
     **A thin call into `agent.commands_channel.receive_commands`** (P5.1),
@@ -1685,6 +1700,148 @@ def report_led_status(
     temp.replace(path)
 
 
+def _load_last_desired_state_revision(path: Path) -> int:
+    """The last desired-state `revision` this agent has already started
+    reconciling toward (P5.4b scope item 4: "ignore a revision <= the last
+    applied one, persist last seen revision via safe_io").
+
+    **Fails safe, not closed** -- the same reasoning `agent.commands_channel
+    ._read_last_event_id` already applies to its own bookmark file: this is
+    not a security boundary (`reconcile_desired_state`'s own digest/source
+    checks, and `pilot_mode`, are), only a dedup optimization against
+    reapplying an already-current revision. An unreadable, missing, or
+    tampered file (`agent.safe_io.UnsafeStateFileError`, a symlink or a
+    non-regular file) is therefore treated exactly like "nothing applied
+    yet" (`0`) -- the worst case is one redundant `reconcile_desired_state`
+    pass, which is itself idempotent (it only ever changes anything if the
+    running digest still differs from the desired one)."""
+
+    try:
+        raw = read_text_safe(path)
+    except (OSError, UnsafeStateFileError):
+        return 0
+    if raw is None:
+        return 0
+    raw = raw.strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _save_last_desired_state_revision(path: Path, revision: int) -> None:
+    """Atomic temp-file-plus-replace write, the same pattern every other
+    small state file in this package uses (`_write_last_event_id`,
+    `report_watchdog_state`, ...)."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(str(revision), encoding="utf-8")
+    temp.replace(path)
+
+
+def _report_desired_state_outcome(
+    client: httpx.Client, revision: int, outcome: ReconcileOutcome
+) -> None:
+    """`POST /v1/desired-state/result` (P5.4b scope item 4) -- **best
+    effort, deliberately not buffered** on a transport failure, unlike
+    `agent.commands_channel.report_result`'s own outbox for `CommandResult`.
+
+    This report is supplementary status for the landlord's UI
+    (`fleet/ui_apartment.py`'s "last reported outcome"), not part of
+    section 7's closed, at-most-once command execution contract that
+    outbox exists to make reliable -- the agent's own local log
+    (`local_log_path`, already written by `reconcile_desired_state` itself
+    before this is ever called) stays the authoritative on-device record
+    of what happened regardless of whether this call ever reaches the
+    cloud. A failure here is logged and otherwise ignored."""
+
+    report = DesiredStateOutcomeReport(
+        revision=revision,
+        successful=outcome.successful,
+        reason=outcome.reason,
+        service=outcome.service,
+    )
+    try:
+        response = client.post(
+            "/v1/desired-state/result", json=report.model_dump(mode="json")
+        )
+    except httpx.TransportError as error:
+        logger.warning("Reporting desired-state outcome failed (%s); not retried.", error)
+        return
+    if response.status_code != 204:
+        logger.warning(
+            "Desired-state outcome report was refused: %s", response.status_code
+        )
+
+
+def _handle_desired_state_received(
+    item: DesiredStateReceived,
+    ctx: ExecutionContext,
+    *,
+    desired_state_last_revision_path: Path,
+    pending_swap_path: Path,
+) -> None:
+    """P5.4b scope item 4, the agent-side glue `docs/STATUS.md`'s P5.4
+    section flagged as still missing: validate (already done by
+    `agent.commands_channel._parse_desired_state_event` before this is
+    ever called -- a malformed event never reaches here at all), ignore a
+    stale revision, persist the new one, call `reconcile_desired_state`
+    with the delivered `pilot_mode`, then report the outcome.
+
+    **Stays fail-closed/inactive exactly like `reconcile_desired_state`
+    itself** (section 13's "Decided afterward", 2026-09-28) -- this
+    function does not loosen that in any way, it only ever supplies the
+    `pilot_mode` value the cloud attached to this delivery; a cloud that
+    never sets `pilot_mode` (the default) still gets rejected by
+    `reconcile_desired_state`'s own pre-check, unchanged.
+
+    **No `backup_config` configured** (`ctx.backup_config is None`, e.g.
+    `--apartment-id` was never given to `python -m agent run`) means
+    `reconcile_desired_state` cannot run at all (it requires a
+    `BackupConfig` to take the mandatory pre-swap backup) -- this is
+    reported as an honest failed outcome, not a crash of the whole
+    command loop, mirroring `_handle_fetch_logs`'s own "a missing client
+    is an honest failure" reasoning for the same class of "this agent was
+    started without a feature configured" case.
+    """
+
+    desired = item.event.desired_state
+    last_applied = _load_last_desired_state_revision(desired_state_last_revision_path)
+    if desired.revision <= last_applied:
+        logger.info(
+            "Ignoring desired-state revision %d (already at or past %d).",
+            desired.revision,
+            last_applied,
+        )
+        return
+
+    _save_last_desired_state_revision(desired_state_last_revision_path, desired.revision)
+
+    if ctx.backup_config is None:
+        outcome = ReconcileOutcome(
+            successful=False,
+            reason=(
+                "backup_config is not configured on this agent (no --apartment-id "
+                "at startup) -- desired-state reconciliation is disabled."
+            ),
+        )
+    else:
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=item.event.pilot_mode,
+            backup_config=ctx.backup_config,
+            watchdog_state_path=ctx.watchdog_state_path,
+            pending_swap_path=pending_swap_path,
+            local_log_path=ctx.local_log_path,
+        )
+
+    if ctx.client is not None:
+        _report_desired_state_outcome(ctx.client, desired.revision, outcome)
+
+
 def run(
     client: httpx.Client,
     *,
@@ -1697,12 +1854,23 @@ def run(
     backup_config: BackupConfig | None = None,
     restore_targets: RestoreTargets | None = None,
     restore_poll_interval_s: float = DEFAULT_RESTORE_POLL_INTERVAL_S,
+    pending_swap_path: Path = DEFAULT_PENDING_SWAP_FILE,
+    desired_state_last_revision_path: Path = DEFAULT_DESIRED_STATE_LAST_REVISION_FILE,
     exit_fn: Callable[[int], None] = lambda code: sys.exit(code),
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """The main loop (`python -m agent run`): `receive_commands` ->
     `execute_command`/`_handle_rejected_command` -> `report_result`,
     forever, plus the P5.7 LED bookkeeping this package adds.
+
+    **P5.4b: a `DesiredStateReceived` item is handled separately, not via
+    `execute_command`** (`_handle_desired_state_received`) -- it is not a
+    `Command` at all (see that dataclass's own docstring), so there is no
+    `CommandResult` to report via `report_result`/`outbox_path`; its own
+    outcome is instead reported via `POST /v1/desired-state/result`
+    (`_report_desired_state_outcome`, best-effort, not buffered). Every
+    other item type flows through the loop exactly as before this
+    package.
 
     **`CommandStreamAuthError` stops this loop** (propagated to the
     caller, `agent.__main__` turns it into a clear exit-1 message) -- the
@@ -1805,6 +1973,14 @@ def run(
     )
     try:
         for item in commands:
+            if isinstance(item, DesiredStateReceived):
+                _handle_desired_state_received(
+                    item,
+                    ctx,
+                    desired_state_last_revision_path=desired_state_last_revision_path,
+                    pending_swap_path=pending_swap_path,
+                )
+                continue
             if isinstance(item, RejectedCommand):
                 outcome = _handle_rejected_command(item, state, ctx, executed_ids_path)
             else:
@@ -1877,7 +2053,8 @@ RECONCILE_HEALTH_POLL_INTERVAL_S = 5.0
 # Section 13 step 1: "is there free space (> 20%)?"
 RECONCILE_MIN_FREE_DISK_PERCENT = 20.0
 
-DEFAULT_PENDING_SWAP_FILE = Path("pending_swap.json")
+# `DEFAULT_PENDING_SWAP_FILE` itself now lives near the top of this module
+# (P5.4b) -- see that definition's own comment for why.
 
 HealthReader = Callable[[], str | None]
 OutdoorTempReader = Callable[[], float | None]
