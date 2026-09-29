@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block title %}Sollzustand bearbeiten – thermoctl-fleet{% endblock %}
+
+{% block content %}
+{# P5.4b, section 13: version + digest per service, and the update window,
+   for exactly one apartment -- "the fleet service knows no 'for all'".
+   The image field per service is always the fixed, fleet-side display
+   constant (fleet.desired_state_sources.DISPLAY_SOURCES), never something
+   this form lets the landlord type: the agent ignores anything but an
+   exact match with its own hard-coded source list anyway (CLAUDE.md
+   security principle 2). This is step one of two -- it only validates and
+   hands off to the confirmation page below, it never writes a revision
+   itself. #}
+<p><a href="/ui/apartments/{{ apartment_id | urlpath }}">&larr; Zurück zur Wohnung</a></p>
+<h1>Sollzustand bearbeiten</h1>
+
+<p>
+    Wohnung <strong>{{ apartment_id }}</strong>{% if apartment_label and apartment_label != apartment_id %} ({{ apartment_label }}){% endif %}
+</p>
+
+<p class="error" role="alert">
+    Update-Ausführung ist derzeit inaktiv: Der Agent lehnt jede Aktualisierung ab,
+    solange thermoctl-Status/Außentemperatur nicht lesbar sind (fail-closed) oder
+    "Pilotbetrieb" für diese Wohnung nicht gesetzt ist. Das Setzen eines Sollzustands
+    hier löst also aktuell keine Aktualisierung am Gerät aus.
+</p>
+
+{% if retired %}
+<p class="error" role="alert">Diese Wohnung ist außer Betrieb, ein Sollzustand kann nicht gesetzt werden.</p>
+{% else %}
+
+{% if error %}
+<p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    {% for service in services %}
+    <fieldset>
+        <legend>{{ service.label }}</legend>
+        <p>Quelle (Information, nicht änderbar): <code>{{ service.image }}</code></p>
+        <label for="version_{{ service.name }}">Version
+            <input type="text" id="version_{{ service.name }}" name="version_{{ service.name }}" value="{{ service.version }}" maxlength="{{ max_version_length }}" required>
+        </label>
+        <label for="digest_{{ service.name }}">Digest (sha256:…)
+            <input type="text" id="digest_{{ service.name }}" name="digest_{{ service.name }}" value="{{ service.digest }}" pattern="sha256:[0-9a-f]{64}" required>
+        </label>
+    </fieldset>
+    {% endfor %}
+
+    <fieldset>
+        <legend>Aktualisierungsfenster</legend>
+        <label for="window_from">Von (HH:MM)
+            <input type="text" id="window_from" name="window_from" value="{{ window_from }}" pattern="[0-2][0-9]:[0-5][0-9]" required>
+        </label>
+        <label for="window_until">Bis (HH:MM)
+            <input type="text" id="window_until" name="window_until" value="{{ window_until }}" pattern="[0-2][0-9]:[0-5][0-9]" required>
+        </label>
+        <label for="window_temp">Nicht unter Außentemperatur (°C)
+            <input type="text" id="window_temp" name="window_temp" value="{{ window_temp }}" inputmode="decimal" required>
+        </label>
+    </fieldset>
+
+    <button type="submit">Weiter</button>
+</form>
+{% endif %}
+{% endblock %}

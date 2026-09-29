@@ -1,6 +1,333 @@
 # Status
 
-Last updated: 2026-09-28.
+Last updated: 2026-09-29.
+
+## P5.4b -- desired-state delivery, fleet side + agent wiring (section 13)
+
+Completes what P5.4's own scope note flagged as still missing: fleet-side
+storage of the desired state, a per-apartment UI to edit it, delivery to
+the agent over the SSE command channel, and the agent-side glue that
+receives it and calls `agent.loop.reconcile_desired_state`. **Still
+inactive in production**, unchanged from P5.4's own gate (section 13,
+"Decided afterward", 2026-09-28): the fail-closed pre-check
+(thermoctl health/outdoor temperature unreadable -> reject) and
+`pilot_mode` required at the target. This package changes nothing about
+that gate -- it only supplies the value `pilot_mode` the agent's own
+already-built check reads.
+
+**Design:**
+
+- **Protocol** (`protocol/desired_state.py`): `DesiredStateEvent`
+  (`desired_state` + `pilot_mode`, the SSE `desired_state` event's payload)
+  and `DesiredStateOutcomeReport` (`revision`/`successful`/`reason`/
+  `service`, the body of `POST /v1/desired-state/result`) -- both
+  deliberately **not** `Command`/`CommandType` values (CLAUDE.md security
+  principle 1: the closed command list stays closed; `protocol/commands.py`
+  is untouched, pinned by an exact-set test). `PROTOCOL_VERSION` bumped to
+  8 (main was 7) -- two wholly new models, the same "counts as a change to
+  the models" reading every prior bump already established.
+- **Fleet storage** (`fleet/storage.py`, `0015_desired_state.py`): two
+  new, deliberately **append-only** tables. `DesiredStateRecord` is both
+  the current value (highest `revision` per apartment) and its own full
+  history at once -- editing always inserts a new row
+  (`Storage.create_desired_state_revision`, which always recomputes
+  `revision` server-side as one more than the current latest, ignoring
+  whatever the caller passed), never updates one in place; `reason` is
+  `NOT NULL` (CLAUDE.md security principle 5, the same mandatory-reason
+  rule `update_apartment`'s own `pilot_mode` change already has), and an
+  `InventoryAuditLogRecord` row is written in the same transaction,
+  consistent with every other landlord-initiated change this codebase
+  already audits there. `DesiredStateOutcomeRecord` stores every reported
+  reconciliation attempt, keyed by `revision`, not by a command id (a
+  desired-state pass is not a `Command`); `Storage
+  .latest_desired_state_outcome` is what the UI shows. Refuses an unknown
+  or retired apartment, mirroring `create_command`'s own checks.
+- **Fleet UI** (`fleet/ui_routes.py`, `fleet/ui_apartment.py`,
+  `fleet/desired_state_sources.py`, `fleet/templates/ui/desired_state_edit
+  .html`/`desired_state_confirm.html`): per apartment only ("the fleet
+  service knows no 'for all'", section 13) -- a two-step
+  edit-then-confirm flow, the same shape P5.1b's command buttons already
+  established, adapted for the extra data-entry step a desired state
+  needs (version + digest per service, the update window) that a plain
+  command confirmation does not. **The image field is never a form
+  input** -- `fleet.desired_state_sources.DISPLAY_SOURCES` is a fixed,
+  fleet-side **display-only** constant (kept in sync with `agent.sources
+  .ALLOWED_SOURCES` by hand, pinned equal by a test, deliberately not
+  imported from it -- see that module's own docstring for why importing
+  it would blur CLAUDE.md security principle 2's line between "the agent
+  trusts this" and "the cloud only shows this"); `Storage
+  .create_desired_state_revision` always stores exactly that constant's
+  value, never anything derived from the landlord's own input, and there
+  is structurally no `image_*` form field to submit one through in the
+  first place (tested: a hand-added `image_thermoctl` field in the POST
+  body is silently ignored). Digests are validated server-side,
+  `fullmatch` against `^sha256:[0-9a-f]{64}$`, on **both** the edit step
+  and the confirm step (the confirm step's hidden fields are never
+  trusted blindly just because they were shown once already -- the same
+  "re-check everything on the write itself" rule this codebase applies
+  throughout). Both the edit form and the apartment page show, in plain
+  text, that update execution is currently inactive (the fail-closed
+  pre-check plus `pilot_mode`), "so nobody expects something to happen".
+  **One service per pass is not enforced in the fleet** (the agent does
+  one per reconcile pass, `RECONCILE_SERVICE_ORDER`) -- the confirmation
+  page warns instead, exactly when both `zigbee2mqtt` and `thermoctl`
+  digests differ from the apartment's current stored revision at once
+  (section 13: "Zigbee2MQTT is the bigger risk ... its own release, never
+  together with a thermoctl update").
+- **Delivery** (`fleet/app.py::_stream_command_events`): a **separate SSE
+  event type** on the existing `GET /v1/commands` connection --
+  `event: desired_state`, never `event: message` (which stays exactly
+  `Command` JSON, unchanged) and never a `CommandType` value. Delivered on
+  every connect (the current revision, if any exists, unconditionally,
+  regardless of `Last-Event-ID`) and again whenever the stored revision
+  changes during a still-open connection -- checked, and yielded,
+  **before** this iteration's pending commands (deliberately, not the
+  more "natural" reverse order): a command already pending at connect
+  time can make `agent.loop.run` exit its whole SSE session right after
+  handling it, which would otherwise starve a desired-state delivery due
+  on that same connection. `pilot_mode` is read fresh from
+  `ApartmentRecord` on every send, never cached, since the landlord can
+  flip it at any time and the agent's own fail-closed check must see the
+  current value. **Resume semantics stay consistent with the epoch-
+  prefixed ids** (P5.1c): the event's own `id:` reuses the current
+  `<epoch>.<sequence>` value from the last command delivery on this
+  connection -- a desired state is a "what is the latest value" delivery,
+  not a queued item `Last-Event-ID` needs to resume *past*, so it never
+  advances its own counter and never interferes with command catch-up.
+  **The `wait=0` fallback poll does not carry desired-state delivery**
+  (documented open point, low severity, acceptable while P5.4/P5.4b stays
+  inactive either way) -- only the open-connection path delivers it.
+- **Agent** (`agent/commands_channel.py`, `agent/loop.py`): `_stream_once`
+  dispatches on the SSE event's own name -- `desired_state` is parsed as a
+  `DesiredStateEvent` and surfaced as a new `DesiredStateReceived` item
+  (never a `Command`/`RejectedCommand`); a malformed `desired_state` event
+  is only logged and dropped, not surfaced at all (there is no command id
+  to report a rejection result against for a state delivery). `agent.loop
+  .run`'s own main loop (`_handle_desired_state_received`) then: loads the
+  last-applied revision (`_load_last_desired_state_revision`, `agent
+  .safe_io`-backed, **fails safe, not closed** -- the same reasoning
+  `agent.commands_channel._read_last_event_id` already applies to its own
+  bookmark, since this is a dedup optimization, not a security boundary;
+  `reconcile_desired_state`'s own digest/source checks and `pilot_mode`
+  are the actual boundary); ignores a revision `<=` that value; persists
+  the new revision (atomic temp-file-plus-replace, same pattern as every
+  other small state file in this package) **before** calling
+  `reconcile_desired_state` with the delivered `pilot_mode`; calls it,
+  or -- if this agent was started with no `backup_config` (no
+  `--apartment-id`) -- reports an honest failed outcome instead of
+  crashing the loop; and reports the outcome via
+  `POST /v1/desired-state/result` (`_report_desired_state_outcome`,
+  **best-effort, deliberately not buffered** on a transport failure,
+  unlike `CommandResult`'s own outbox -- this is supplementary UI status,
+  not part of section 7's closed, at-most-once command contract; the
+  agent's own local log, already written by `reconcile_desired_state`
+  itself, stays the authoritative on-device record either way).
+  `agent.__main__` wires `pending_swap_path`/`desired_state_last_revision_path`
+  under the agent's own data directory, same convention as every other
+  state file there.
+
+**Verification.** `ruff check .` clean; `mypy .` (134 files) and
+`mypy protocol fleet agent tools` (67 files) clean; pytest: **1583
+passed, 1 skipped**, TOTAL **6346 stmts / 42 missed / 99%**; Go:
+`go vet ./...`/`go test ./...` clean, `watchdog/check_contract.sh`
+passing (this package never touches `watchdog/`).
+
+**Tests** (new files): `tests/test_protocol_desired_state.py`
+(`CommandType`'s exact set pinned, `PROTOCOL_VERSION == 8`,
+`DesiredStateEvent`/`DesiredStateOutcomeReport` round-trips and digest
+validation, including a `fullmatch`-not-prefix check);
+`tests/test_fleet_desired_state.py` (`DISPLAY_SOURCES ==
+agent.sources.ALLOWED_SOURCES`; revision increment/history/mandatory
+reason/unknown-or-retired-apartment refusal at the storage layer;
+`_stream_command_events` delivers on connect, only resends on change,
+never sends anything when unset; `POST /v1/desired-state/result` requires
+a token, stores the report, and scopes strictly to the authenticated
+apartment); `tests/test_ui_desired_state.py` (login/CSRF required on both
+steps; an invalid or trailing-garbage digest is refused server-side; an
+invalid window time is refused; a retired apartment is refused; the
+"both thermoctl and zigbee2mqtt changed" warning; the confirm step writes
+exactly one revision and one audit row; a hand-added `image_*` field is
+silently ignored; revision increments across repeated submissions; the
+apartment page shows the current state and the "inactive" notice);
+`tests/test_agent_desired_state_channel.py` (pure parsing incl. malformed/
+missing-field payloads dropped, not raised; delivered on connect over the
+real SSE channel/real TLS harness; never misclassified as a
+`RejectedCommand`); `tests/test_agent_loop_desired_state.py` (the
+headline acceptance case -- `pilot_mode=False` rejected end to end over
+the real SSE channel with the real TLS harness, and the rejection
+reported back to the fleet; a stale revision is ignored, no outcome
+reported, bookmark unchanged; a newer revision after a stale one is still
+picked up; a missing `backup_config` is reported as an honest failure,
+not a crash).
+
+**Open points:**
+
+- **P5.4c, rollout queue -- out of scope, not built.** Section 13's
+  "Rules for the rollout" (pilot apartment first, then the rest no
+  earlier than 48 hours later, one apartment at a time, stop at the first
+  apartment that does not come back healthy) needs its own sequencing
+  package once `apply_update` is promoted out of stage 2 -- P5.4b only
+  ever delivers *one* apartment's desired state at a time by construction
+  ("the fleet service knows no 'for all'"), it does not sequence *across*
+  apartments or track a rollout's own progress.
+- **Still inactive**, unchanged from P5.4: needs a real thermoctl health
+  endpoint (closing the `_default_health_reader`/`_default_outdoor_temp
+  _reader` honesty gap) and `pilot_mode` set per apartment before any
+  reconciliation this package delivers can ever actually apply.
+- **`wait=0` fallback does not carry desired-state delivery** (see
+  "Delivery" above) -- low severity while P5.4/P5.4b stays inactive
+  either way; revisit if the fallback path ever needs to carry more than
+  commands.
+
+**Files:** `protocol/desired_state.py`, `protocol/version.py`,
+`protocol/__init__.py`, `fleet/storage.py`, `fleet/migrations/versions
+/0015_desired_state.py`, `fleet/app.py`, `fleet/desired_state_sources.py`
+(new), `fleet/ui_routes.py`, `fleet/ui_apartment.py`, `fleet/templates/ui
+/desired_state_edit.html` (new), `fleet/templates/ui/desired_state_confirm
+.html` (new), `fleet/templates/ui/apartment.html`,
+`agent/commands_channel.py`, `agent/loop.py`, `agent/__main__.py`,
+`tests/test_protocol_desired_state.py` (new), `tests/test_fleet_desired_state.py`
+(new), `tests/test_ui_desired_state.py` (new), `tests/test_agent_desired_state_channel.py`
+(new), `tests/test_agent_loop_desired_state.py` (new).
+
+### P5.4b cross-review fixes (same worktree, follow-up commit)
+
+Cross-review of the initial commit returned **CHANGES REQUIRED**, four
+points -- no security-boundary defect found (`CommandType` closure, source
+pinning, CSRF/auth, digest validation, and the SSE event dispatch all held
+under mutation), all four addressed here:
+
+1. **Reconcile semantics, spec section 13 ("it ... reconciles toward a
+   desired state"), not a one-shot attempt.** The initial commit persisted
+   a revision as "applied" *before* calling `reconcile_desired_state`, so
+   a transient pre-check rejection (the time window not reached yet, a
+   momentarily full disk, a health reading that is temporarily
+   unavailable) was never retried again until a *new* revision arrived or
+   the SSE connection happened to drop and reconnect -- not "reconciles
+   toward", only "attempts once per revision". **Fixed structurally, not
+   with a bigger interval:** the agent now keeps a *held* `DesiredStateEvent`
+   on disk (`agent.loop._load_held_desired_state`/`_save_held_desired_state`,
+   `DEFAULT_DESIRED_STATE_HELD_STATE_FILE`, replacing the old bare-revision
+   bookmark file) and a new `_DesiredStateReconciler` that owns every
+   `reconcile_desired_state` call from `run` -- triggered immediately when
+   `_handle_desired_state_received` accepts a fresh revision, and again,
+   repeatedly, by a new background daemon thread
+   (`run_desired_state_reconcile_loop`, started unconditionally alongside
+   the existing backup/restore threads, default interval 10 minutes,
+   `run`'s own new `desired_state_reconcile_interval_s` parameter) until
+   `reconcile_desired_state` itself reports "already at the desired
+   revision" (`ReconcileOutcome.successful and .service is None`) --
+   tracked as `last_converged_revision`, after which further attempts for
+   that same revision are skipped entirely (no Docker call at all) until a
+   newer revision replaces it. Both call sites (the immediate one and the
+   periodic one) go through the same `_DesiredStateReconciler` instance
+   and its one `threading.Lock`, so they can never race each other or the
+   held-state file. **Revision comparison moved from "last applied" to
+   "currently held"**: only a revision strictly *lower* than the held one
+   is ignored; an *equal* revision is a no-op (same state, nothing to
+   replace); a *higher* one always replaces the held state and triggers an
+   immediate attempt, even past an earlier one the agent never actually
+   applied. **"Report on change, not every tick"**:
+   `_DesiredStateReconciler` remembers the last
+   `(revision, successful, reason, service)` tuple it actually reported
+   and only calls `POST /v1/desired-state/result`
+   (`_report_desired_state_outcome`) again when that tuple changes --
+   an unconverged-but-unchanged rejection (e.g. `pilot_mode` still unset)
+   is retried every tick but reported to the fleet only once, until either
+   it changes or converges. **`_load_held_desired_state` fails closed, not
+   safe** (deliberately the opposite of this file's own dedup-only
+   bookmarks, e.g. `agent.commands_channel._read_last_event_id`): an
+   unreadable, missing, empty, or structurally invalid held-state file
+   (a symlink, corrupt JSON, a `pydantic.ValidationError`) is treated as
+   *holding nothing at all*, never as "hold whatever was last known good"
+   -- every `_DesiredStateReconciler.attempt()` for "nothing held" is a
+   pure no-op, no Docker call reached, tested directly
+   (`tests/test_agent_desired_state_reconciler.py`). This is
+   defence-in-depth, not the actual boundary: `reconcile_desired_state`
+   itself still separately re-validates the digest/source of whatever
+   `DesiredState` it is ever handed regardless of where that value came
+   from (CLAUDE.md security principle 5) -- see "Trust model" below.
+2. **Coverage** -- every branch cross-review flagged is now covered:
+   `fleet/ui_routes.py`'s desired-state confirm step re-validates
+   independently of step one (a hand-crafted `POST` straight to
+   `/confirm`, skipping `/edit` entirely, for an unknown apartment -> 404,
+   a retired one -> 400, an over-length reason -> 400, a malformed digest
+   or window time -> 400, and a `Storage.create_desired_state_revision`
+   `ValueError` mapped to a clean `400` via a monkeypatched storage call);
+   `fleet/ui_routes.py`'s step-one submit gets its own unknown-apartment
+   404, over-length-version, and non-numeric-window-temperature cases;
+   `agent/loop.py`'s new code is now 100% covered (an empty held-state
+   file, a `POST /v1/desired-state/result` transport error, and a non-204
+   reply are all exercised directly against `_load_held_desired_state`/
+   `_report_desired_state_outcome`); `agent/commands_channel.py`'s
+   "empty SSE data" branch (an `id`/`event`-only frame with no `data:`
+   field, still dispatched by `httpx_sse`'s own decoder since `id`/`event`
+   are non-empty) is exercised with a raw SSE body over
+   `httpx.MockTransport`; `fleet/ui_apartment.py`'s
+   `build_desired_state_outcome_display` gets a direct unit test for both
+   branches of its service-label ternary (`service=None` -> no label,
+   a known service -> its label). One pre-existing route this package
+   never touches (`apartment_restore_create`'s own unknown-apartment 404)
+   was also still uncovered and got a test in the same pass
+   (`tests/test_ui_restore.py`).
+3. **The revision race** (`Storage.create_desired_state_revision`):
+   "`SELECT max(revision)` then `INSERT`" was not atomic on its own -- two
+   concurrent submissions for the same apartment could both read the same
+   current-max revision and both try to insert the same
+   `(apartment_id, revision)` pair, the loser hitting `IntegrityError` at
+   the unique constraint. **Fixed the same way
+   `create_command_unless_duplicate` already fixes the identical race for
+   commands**, not with a catch-and-retry: the apartment row is locked for
+   the whole transaction (`BEGIN IMMEDIATE` on SQLite, `with_for_update()`
+   elsewhere) before the `max()` read runs, so a second concurrent caller
+   simply waits (SQLite's own 30 s busy timeout, unchanged,
+   `create_engine_from_url`) rather than racing it -- no `IntegrityError`
+   can reach this method's caller. Verified with a real two-thread test
+   against a file-backed SQLite database, each thread opening its own
+   `Storage` bound to the same URL (`tests/test_fleet_desired_state.py
+   ::test_create_desired_state_revision_serializes_concurrent_callers`):
+   8 concurrent callers, zero errors, revisions 1-8 with no duplicate and
+   no gap.
+4. **Trust model, written down explicitly (this point requested by
+   cross-review, not a code change):** the agent's held-desired-state file
+   (`DEFAULT_DESIRED_STATE_HELD_STATE_FILE`) and the fleet's own
+   `wait=0` fallback gap are both **local/operational trust boundaries,
+   not the security boundary**. A landlord or attacker with local
+   filesystem write access to the agent's own state directory who
+   tampers with the held-state file is already inside the security
+   perimeter this codebase defends (the same boundary
+   `agent.safe_io`/`load_agent_state`'s own "fails closed on a symlinked
+   state file" reasoning already draws elsewhere) -- out of scope for this
+   package, exactly as it is for every other on-device state file. What
+   actually stays authoritative regardless of what the held-state file
+   says is unchanged from P5.4: `reconcile_desired_state`'s own digest
+   check against `agent.sources.ALLOWED_SOURCES` (never trusts the held
+   file's `image` field beyond an exact match), `pilot_mode` (delivered
+   fresh with every SSE event, read straight from `ApartmentRecord`, never
+   cached past one delivery), and the fail-closed pre-check (an unknown
+   thermoctl health/outdoor temperature reading still rejects
+   unconditionally). The **`wait=0` fallback not carrying desired-state
+   delivery** (already an open point above) means an agent stuck on that
+   path simply never receives an update until it can hold the SSE stream
+   open again -- a delivery gap, not a trust gap: nothing is ever acted on
+   without first passing through the same validated `DesiredStateEvent`
+   parsing and the same fail-closed pre-check either way.
+
+**Verification after the fix-up commit:** `ruff check .` clean; `mypy .`
+(135 files) and `mypy protocol fleet agent tools` (67 files) clean;
+pytest: **1655 passed, 1 skipped**, TOTAL **6385 stmts / 19 missed / 99%**
+(back at the pre-package floor -- every line this package itself added is
+now 100% covered; the 19 remaining repo-wide misses all predate it:
+`agent/loop.py`'s own 4 -- `collect_heartbeat`/`send_heartbeat`'s two
+`NotImplementedError` placeholders and one pre-existing P5.3a `fetch_logs`
+upload-transport-error branch -- `agent/commands_channel.py`'s own 1
+inside `_read_last_event_id`, `agent/log_filter.py`'s own 1,
+`fleet/admin.py`'s own 1, and `tools/check_image_config.py`'s own 12,
+none of them touched by this package); Go: `go vet ./...`/`go test ./...`
+clean, `watchdog/check_contract.sh` passing (this package
+still never touches `watchdog/`); both migration directions re-verified
+(`upgrade` from `0014`, `downgrade` to `0014`, `downgrade` to `base`,
+`upgrade` again).
 
 ## Merge: P5.5b onto main (main session, 2026-09-29)
 

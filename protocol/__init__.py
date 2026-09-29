@@ -20,7 +20,14 @@ from protocol.backups import (
     BackupUploadAccepted,
 )
 from protocol.commands import Command, CommandResult, CommandType, LogExcerpt
-from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
+from protocol.desired_state import (
+    DesiredState,
+    DesiredStateEvent,
+    DesiredStateOutcomeReport,
+    Services,
+    ServiceState,
+    UpdateWindow,
+)
 from protocol.diagnostics import (
     MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES,
     DiagnosticBundleUploadAccepted,
@@ -78,6 +85,8 @@ __all__ = [
     "CommandType",
     "ControlState",
     "DesiredState",
+    "DesiredStateEvent",
+    "DesiredStateOutcomeReport",
     "Device",
     "DeviceLifecycle",
     "DeviceState",

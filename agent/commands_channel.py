@@ -1,5 +1,5 @@
 """The agent side of the SSE command channel (P5.1, docs/specification.md
-sections 3, 7).
+sections 3, 7; P5.4b adds the `desired_state` event, section 13).
 
 `receive_commands(client, last_event_id_path, ...)`:
 
@@ -80,6 +80,7 @@ from pydantic import TypeAdapter
 from agent.registration import _parse_and_clamp_retry_after
 from agent.safe_io import UnsafeStateFileError, read_text_safe
 from protocol.commands import Command, CommandResult
+from protocol.desired_state import DesiredStateEvent
 from protocol.version import PROTOCOL_VERSION
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,28 @@ class RejectedCommand:
     reason: str
 
 
-CommandChannelItem = Command | RejectedCommand
+@dataclass(frozen=True)
+class DesiredStateReceived:
+    """One successfully validated `event: desired_state` SSE event (P5.4b,
+    section 13) -- carries the full `protocol.desired_state
+    .DesiredStateEvent` (the `DesiredState` plus the apartment's current
+    `pilot_mode`), for `agent.loop.run` to hand to `reconcile_desired_state`
+    after its own stale-revision check.
+
+    **Deliberately not a `Command`, not a `CommandType` value** -- see
+    `protocol.desired_state.DesiredStateEvent`'s own docstring
+    (CLAUDE.md security principle 1). A malformed `desired_state` event is
+    never surfaced as an item at all (unlike a malformed `Command`, which
+    becomes a `RejectedCommand` so P5.2's executor has something to report
+    a result *for*) -- there is no command id to report a result against
+    for a state delivery in the first place, so this module only logs a
+    warning and drops it (`_parse_desired_state_event`).
+    """
+
+    event: DesiredStateEvent
+
+
+CommandChannelItem = Command | RejectedCommand | DesiredStateReceived
 
 
 class CommandStreamError(Exception):
@@ -236,6 +258,23 @@ def _parse_event_data(raw_data: str) -> CommandChannelItem:
             reason=f"malformed command or unknown command type: {error}",
         )
     return _classify(command)
+
+
+def _parse_desired_state_event(raw_data: str) -> DesiredStateReceived | None:
+    """Parses one SSE `event: desired_state`'s `data:` field (P5.4b). `None`
+    on any validation failure -- logged (`logger.warning`), never raised
+    and never surfaced as an item: there is no command id a malformed
+    desired-state delivery could be reported against (see
+    `DesiredStateReceived`'s own docstring), so the caller
+    (`_stream_once`) simply skips yielding anything for this event and
+    waits for the next one."""
+
+    try:
+        event = DesiredStateEvent.model_validate_json(raw_data)
+    except pydantic.ValidationError as error:
+        logger.warning("Malformed desired_state event, ignoring it (%s).", error)
+        return None
+    return DesiredStateReceived(event=event)
 
 
 def _parse_command_obj(raw: object) -> CommandChannelItem:
@@ -362,8 +401,18 @@ def _stream_once(
             # command it never actually saw processed.
             if sse.id:
                 _write_last_event_id(last_event_id_path, sse.id)
-            if sse.data:
-                yield _parse_event_data(sse.data)
+            if not sse.data:
+                continue
+            # P5.4b: `event: desired_state` carries a `DesiredStateEvent`,
+            # never a `Command` -- dispatched by the SSE event name
+            # (`fleet.app._stream_command_events` is the only place that
+            # ever sets it to something other than the default `"message"`).
+            if sse.event == "desired_state":
+                item = _parse_desired_state_event(sse.data)
+                if item is not None:
+                    yield item
+                continue
+            yield _parse_event_data(sse.data)
 
 
 def _poll_once(
@@ -422,7 +471,7 @@ def receive_commands(
     closed the connection, section 3's fallback applies just the same), do
     exactly one `wait=0` poll, yield what it returned, then sleep for the
     (clamped) fallback interval before trying the stream again. Never
-    executes anything -- only yields `Command`/`RejectedCommand` items to
+    executes anything -- only yields `Command`/`RejectedCommand`/`DesiredStateReceived` items to
     the caller (P5.2's job).
 
     `on_contact` (cross-review of P5.2, main-session decision): an

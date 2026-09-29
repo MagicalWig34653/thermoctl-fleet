@@ -42,4 +42,10 @@ between the two packages of this repository and future compatibility checks.
 # on an existing model counts as "a change to the models" too, per this
 # file's own opening paragraph's literal reading -- see
 # `protocol/registration.py` and `protocol/restore.py`.
-PROTOCOL_VERSION = 7
+# 8: adds `protocol.desired_state.DesiredStateEvent` and
+# `DesiredStateOutcomeReport` (P5.4b, section 13) -- the SSE `desired_state`
+# event payload and the `POST /v1/desired-state/result` report body. Both
+# wholly new models, same "counts as a change to the models" reading as
+# every prior bump above; see `protocol/desired_state.py` and
+# `docs/STATUS.md`'s P5.4b section.
+PROTOCOL_VERSION = 8

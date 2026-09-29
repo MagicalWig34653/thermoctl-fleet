@@ -14,11 +14,14 @@ import base64
 import binascii
 import logging
 import os
+import re
 import secrets
 from datetime import UTC, date, datetime
+from datetime import time as time_of_day
 from pathlib import Path
 from urllib.parse import quote
 
+import pydantic
 from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -28,13 +31,17 @@ from fleet.age_key_block import AgeKeyBlockError, validate_single_x25519_stanza
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
+from fleet.desired_state_sources import DISPLAY_SOURCES
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
 from fleet.storage import Storage, get_storage
 from fleet.ui_apartment import (
     COMMAND_TYPE_LABELS,
     DEFAULT_FETCH_LOGS_LINES,
+    DESIRED_STATE_SERVICE_LABELS,
+    DESIRED_STATE_SERVICE_ORDER,
     MAX_FETCH_LOGS_LINES,
     MIN_FETCH_LOGS_LINES,
+    DesiredStateServiceDisplay,
     build_apartment_detail,
 )
 from fleet.ui_auth import (
@@ -72,6 +79,7 @@ from fleet.ui_inventory import (
 )
 from fleet.ui_tasks import build_task_overview
 from protocol.commands import CommandType
+from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 from protocol.inventory import ApartmentState
 from protocol.registration import AgentRegistrationFile
 
@@ -1344,6 +1352,374 @@ def command_confirm_submit(
         reason=reason.strip(),
         now=datetime.now(UTC),
     )
+
+    return RedirectResponse(
+        url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+    )
+
+
+# -----------------------------------------------------------------------------
+# Desired state (P5.4b, section 13). Per-apartment only ("the fleet service
+# knows no 'for all'") -- two steps, the same "GET renders, POST confirmed
+# by the second POST writes" shape as the command-confirmation routes above,
+# adapted for the extra data-entry step a desired state needs that a plain
+# command confirmation does not (a command carries at most a reason and an
+# optional line count, never per-service version/digest/window values).
+#
+# Both routes are registered here, above `apartment_detail`'s own
+# `{apartment_id:path}` route below -- same route-ordering rule as the
+# command-confirmation routes' own comment already states.
+# -----------------------------------------------------------------------------
+
+_WINDOW_TIME_PATTERN = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+
+
+def _parse_window_time(value: str, field_label: str) -> time_of_day:
+    if not _WINDOW_TIME_PATTERN.fullmatch(value):
+        raise ValueError(f"{field_label} muss im Format HH:MM (00:00–23:59) sein.")
+    hours, minutes = value.split(":")
+    return time_of_day(hour=int(hours), minute=int(minutes))
+
+
+def _parse_window_temp(value: str) -> float:
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError("Außentemperatur muss eine Zahl sein.") from exc
+
+
+def _desired_state_service_display_from_form(
+    name: str, version: str, digest: str
+) -> DesiredStateServiceDisplay:
+    return DesiredStateServiceDisplay(
+        name=name,
+        label=DESIRED_STATE_SERVICE_LABELS[name],
+        image=DISPLAY_SOURCES[name],
+        version=version,
+        digest=digest,
+    )
+
+
+def _build_desired_state_from_form(
+    service_versions: dict[str, str], service_digests: dict[str, str],
+    window_from: str, window_until: str, window_temp: str,
+) -> DesiredState:
+    """Validates and assembles a `DesiredState` from raw form fields --
+    used both by the edit step (first validation) and the confirm step
+    (re-validation of the same, now hidden, fields -- **never trusted
+    blindly just because they were already shown once**, the same
+    "re-check everything server-side on the write itself" rule this
+    codebase applies throughout, e.g. `apartment_edit_submit`).
+
+    `revision=0` is a placeholder only -- `Storage.create_desired_state_revision`
+    always recomputes the real revision number server-side and ignores
+    this one (see that method's own docstring); a `DesiredState` value
+    cannot be constructed without *some* `revision`, so this is the
+    least meaningful value satisfying `Field(ge=0)`, not a hint.
+
+    Raises `ValueError`/`pydantic.ValidationError` on any invalid field --
+    both are treated identically by both call sites (a 400 with a message).
+    """
+
+    services = Services(
+        **{
+            name: ServiceState(
+                image=DISPLAY_SOURCES[name],
+                version=service_versions[name].strip(),
+                digest=service_digests[name].strip(),
+            )
+            for name in DESIRED_STATE_SERVICE_ORDER
+        }
+    )
+    window = UpdateWindow(
+        from_=_parse_window_time(window_from, "Von"),
+        until=_parse_window_time(window_until, "Bis"),
+        not_below_outdoor_temp_c=_parse_window_temp(window_temp),
+    )
+    return DesiredState(revision=0, services=services, window=window)
+
+
+def _desired_state_edit_response(
+    request: Request,
+    authenticated: AuthenticatedUiSession,
+    *,
+    apartment_id: str,
+    apartment_label: str,
+    retired: bool,
+    services: list[DesiredStateServiceDisplay],
+    window_from: str,
+    window_until: str,
+    window_temp: str,
+    error: str | None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "desired_state_edit.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "apartment_id": apartment_id,
+            "apartment_label": apartment_label,
+            "retired": retired,
+            "services": services,
+            "window_from": window_from,
+            "window_until": window_until,
+            "window_temp": window_temp,
+            "max_version_length": MAX_VERSION_LENGTH,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/apartments/{apartment_id}/desired-state/edit", response_class=HTMLResponse)
+def desired_state_edit_form(
+    request: Request,
+    apartment_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    current = storage.get_desired_state(apartment_id)
+    if current is not None:
+        desired = DesiredState.model_validate_json(current.state_json)
+        services = [
+            DesiredStateServiceDisplay(
+                name=name,
+                label=DESIRED_STATE_SERVICE_LABELS[name],
+                image=DISPLAY_SOURCES[name],
+                version=getattr(desired.services, name).version,
+                digest=getattr(desired.services, name).digest,
+            )
+            for name in DESIRED_STATE_SERVICE_ORDER
+        ]
+        window_from = desired.window.from_.strftime("%H:%M")
+        window_until = desired.window.until.strftime("%H:%M")
+        window_temp = str(desired.window.not_below_outdoor_temp_c)
+    else:
+        services = [
+            _desired_state_service_display_from_form(name, "", "")
+            for name in DESIRED_STATE_SERVICE_ORDER
+        ]
+        window_from = "09:00"
+        window_until = "16:00"
+        window_temp = "-2"
+
+    return _desired_state_edit_response(
+        request,
+        authenticated,
+        apartment_id=apartment_id,
+        apartment_label=apartment.label,
+        retired=apartment.state == "retired",
+        services=services,
+        window_from=window_from,
+        window_until=window_until,
+        window_temp=window_temp,
+        error=None,
+    )
+
+
+@router.post("/apartments/{apartment_id}/desired-state/edit", response_class=HTMLResponse)
+def desired_state_edit_submit(
+    request: Request,
+    apartment_id: str,
+    csrf_token: str = Form(...),
+    version_thermoctl: str = Form(""),
+    digest_thermoctl: str = Form(""),
+    version_zigbee2mqtt: str = Form(""),
+    digest_zigbee2mqtt: str = Form(""),
+    version_mosquitto: str = Form(""),
+    digest_mosquitto: str = Form(""),
+    version_agent: str = Form(""),
+    digest_agent: str = Form(""),
+    window_from: str = Form(""),
+    window_until: str = Form(""),
+    window_temp: str = Form(""),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Step one's own submit: validates every field server-side and, on
+    success, renders the confirmation page (step two) -- never writes a
+    revision itself (`desired_state_confirm_submit` below is the only
+    place `Storage.create_desired_state_revision` is ever called)."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    service_versions = {
+        "thermoctl": version_thermoctl,
+        "zigbee2mqtt": version_zigbee2mqtt,
+        "mosquitto": version_mosquitto,
+        "agent": version_agent,
+    }
+    service_digests = {
+        "thermoctl": digest_thermoctl,
+        "zigbee2mqtt": digest_zigbee2mqtt,
+        "mosquitto": digest_mosquitto,
+        "agent": digest_agent,
+    }
+    services_display = [
+        _desired_state_service_display_from_form(
+            name, service_versions[name], service_digests[name]
+        )
+        for name in DESIRED_STATE_SERVICE_ORDER
+    ]
+
+    def _error(message: str) -> HTMLResponse:
+        return _desired_state_edit_response(
+            request,
+            authenticated,
+            apartment_id=apartment_id,
+            apartment_label=apartment.label,
+            retired=apartment.state == "retired",
+            services=services_display,
+            window_from=window_from,
+            window_until=window_until,
+            window_temp=window_temp,
+            error=message,
+            status_code=400,
+        )
+
+    if apartment.state == "retired":
+        return _error("Diese Wohnung ist außer Betrieb, ein Sollzustand kann nicht gesetzt werden.")
+
+    for name in DESIRED_STATE_SERVICE_ORDER:
+        length_error = _first_length_error(
+            (
+                DESIRED_STATE_SERVICE_LABELS[name] + " Version",
+                service_versions[name].strip(),
+                MAX_VERSION_LENGTH,
+            )
+        )
+        if length_error is not None:
+            return _error(length_error)
+
+    try:
+        desired = _build_desired_state_from_form(
+            service_versions, service_digests, window_from, window_until, window_temp
+        )
+    except (ValueError, pydantic.ValidationError) as error:
+        return _error(f"Ungültige Eingabe: {error}")
+
+    current = storage.get_desired_state(apartment_id)
+    both_changed = False
+    if current is not None:
+        previous = DesiredState.model_validate_json(current.state_json)
+        both_changed = (
+            previous.services.thermoctl.digest != desired.services.thermoctl.digest
+            and previous.services.zigbee2mqtt.digest != desired.services.zigbee2mqtt.digest
+        )
+
+    response = templates.TemplateResponse(
+        request,
+        "desired_state_confirm.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "apartment_id": apartment_id,
+            "apartment_label": apartment.label,
+            "services": [
+                DesiredStateServiceDisplay(
+                    name=name,
+                    label=DESIRED_STATE_SERVICE_LABELS[name],
+                    image=DISPLAY_SOURCES[name],
+                    version=getattr(desired.services, name).version,
+                    digest=getattr(desired.services, name).digest,
+                )
+                for name in DESIRED_STATE_SERVICE_ORDER
+            ],
+            "window_from": desired.window.from_.strftime("%H:%M"),
+            "window_until": desired.window.until.strftime("%H:%M"),
+            "window_temp": str(desired.window.not_below_outdoor_temp_c),
+            "both_thermoctl_and_zigbee_changed": both_changed,
+            "error": None,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/apartments/{apartment_id}/desired-state/confirm")
+def desired_state_confirm_submit(
+    apartment_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(...),
+    version_thermoctl: str = Form(""),
+    digest_thermoctl: str = Form(""),
+    version_zigbee2mqtt: str = Form(""),
+    digest_zigbee2mqtt: str = Form(""),
+    version_mosquitto: str = Form(""),
+    digest_mosquitto: str = Form(""),
+    version_agent: str = Form(""),
+    digest_agent: str = Form(""),
+    window_from: str = Form(""),
+    window_until: str = Form(""),
+    window_temp: str = Form(""),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """The actual write -- `Storage.create_desired_state_revision` is only
+    ever called from here. Re-validates every field again (see
+    `_build_desired_state_from_form`'s own docstring for why the hidden
+    fields carried over from step one are never trusted blindly)."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+    if apartment.state == "retired":
+        raise HTTPException(
+            status_code=400,
+            detail="Diese Wohnung ist außer Betrieb, ein Sollzustand kann nicht gesetzt werden.",
+        )
+
+    if not reason.strip():
+        raise HTTPException(status_code=400, detail="Ein Grund ist erforderlich.")
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        raise HTTPException(status_code=400, detail=length_error)
+
+    service_versions = {
+        "thermoctl": version_thermoctl,
+        "zigbee2mqtt": version_zigbee2mqtt,
+        "mosquitto": version_mosquitto,
+        "agent": version_agent,
+    }
+    service_digests = {
+        "thermoctl": digest_thermoctl,
+        "zigbee2mqtt": digest_zigbee2mqtt,
+        "mosquitto": digest_mosquitto,
+        "agent": digest_agent,
+    }
+    try:
+        desired = _build_desired_state_from_form(
+            service_versions, service_digests, window_from, window_until, window_temp
+        )
+    except (ValueError, pydantic.ValidationError) as error:
+        raise HTTPException(status_code=400, detail=f"Ungültige Eingabe: {error}") from error
+
+    try:
+        storage.create_desired_state_revision(
+            apartment_id,
+            desired,
+            ui_username=authenticated.user.username,
+            reason=reason.strip(),
+            now=datetime.now(UTC),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
     return RedirectResponse(
         url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303

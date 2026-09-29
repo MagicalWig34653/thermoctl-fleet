@@ -669,6 +669,47 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Read back by:** main session (the digest check is the central
   safeguard from security principle 2).
 
+### P5.4b -- Desired-state delivery, fleet side + agent wiring **SR**
+- [x] done -- see `docs/STATUS.md`'s own P5.4b section for the full design
+  and verification output.
+- **Goal:** fleet-side per-apartment desired-state storage with full
+  history/audit; a per-apartment UI form (version + digest per service,
+  the update window), with a confirmation step and server-side digest
+  validation; delivery over the existing SSE channel as a separate
+  `desired_state` event (not a `Command`, not a `CommandType` value);
+  agent-side wiring that validates the event, ignores a stale revision,
+  calls `agent.loop.reconcile_desired_state` with the delivered
+  `pilot_mode`, and reports the outcome back to the fleet.
+- **Files:** `protocol/desired_state.py` (`DesiredStateEvent`,
+  `DesiredStateOutcomeReport`), `protocol/version.py` (8),
+  `fleet/storage.py` (`DesiredStateRecord`, `DesiredStateOutcomeRecord`),
+  `fleet/migrations/versions/0015_desired_state.py`, `fleet/app.py` (SSE
+  emission, `POST /v1/desired-state/result`), `fleet/desired_state_sources.py`
+  (new, display-only), `fleet/ui_apartment.py`/`fleet/ui_routes.py`
+  (the two-step form), `fleet/templates/ui/desired_state_edit.html`/
+  `desired_state_confirm.html`/`apartment.html`, `agent/commands_channel.py`
+  (`DesiredStateReceived`), `agent/loop.py` (`run`'s own wiring),
+  `agent/__main__.py`.
+- **Section:** 13.
+- **Acceptance:** `CommandType` unchanged (exact-set test); no
+  source/registry field the fleet can set that the agent trusts (the form
+  has no such field, and a test pins `fleet.desired_state_sources
+  .DISPLAY_SOURCES` against `agent.sources.ALLOWED_SOURCES`); a stale
+  revision is ignored; `pilot_mode=False` rejects, tested end to end over
+  the real SSE channel with the real TLS harness; CSRF/login required;
+  an invalid digest is refused server-side; history/audit is written.
+- **Depends on:** P5.4 (agent-side `reconcile_desired_state`), P5.1c (the
+  SSE channel and its epoch-prefixed ids).
+- **Open point carried forward -- P5.4c, rollout queue:** the pilot-first,
+  48-hour-staggered rollout queue that stops at the first apartment that
+  does not come back healthy (section 13, "Rules for the rollout") is
+  **out of scope for P5.4b** and not built -- this package only delivers
+  *one* apartment's desired state at a time by construction ("the fleet
+  service knows no 'for all'"), it does not sequence *across* apartments.
+  Needs its own package once `apply_update` is promoted out of stage 2.
+- **Read back by:** main session (desired-state delivery and the closed
+  command list interact directly, security principles 1 and 5).
+
 ### P5.5a -- Backup creation and upload **SR**
 - [x] done -- see `docs/STATUS.md`'s P5.5a section.
 - **Goal:** implement `agent/loop.py::create_backup` for both kinds of

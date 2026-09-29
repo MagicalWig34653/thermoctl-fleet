@@ -199,6 +199,49 @@
     {% endif %}
 </section>
 
+<section aria-labelledby="desired-state-heading">
+    <h2 id="desired-state-heading">Sollzustand (Container-Updates)</h2>
+    <p class="error" role="alert">
+        Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten,
+        Pilotbetrieb erforderlich, section 13).
+    </p>
+    {% if not detail.retired %}
+    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">Sollzustand bearbeiten</a></p>
+    {% endif %}
+
+    {% if detail.desired_state %}
+    <p>Aktuelle Revision: {{ detail.desired_state.revision }}, gesetzt von {{ detail.desired_state.created_by }} am {{ detail.desired_state.created_text }}</p>
+    <p>Grund: {{ detail.desired_state.reason }}</p>
+    <ul>
+        {% for service in detail.desired_state.services %}
+        <li><strong>{{ service.label }}</strong>: {{ service.version }} ({{ service.digest }})</li>
+        {% endfor %}
+    </ul>
+    <p>Fenster: {{ detail.desired_state.window_from }}–{{ detail.desired_state.window_until }} Uhr, nicht unter {{ detail.desired_state.window_not_below_outdoor_temp_c }} °C</p>
+    {% else %}
+    <p>Kein Sollzustand gesetzt.</p>
+    {% endif %}
+
+    {% if detail.desired_state_outcome %}
+    <h3>Letztes gemeldetes Ergebnis</h3>
+    <p>
+        Revision {{ detail.desired_state_outcome.revision }}:
+        <span class="apartment-tile__tag">{{ "erfolgreich" if detail.desired_state_outcome.successful else "fehlgeschlagen" }}</span>
+        {% if detail.desired_state_outcome.service_label %}({{ detail.desired_state_outcome.service_label }}){% endif %}
+        -- {{ detail.desired_state_outcome.reason }} (gemeldet {{ detail.desired_state_outcome.reported_text }})
+    </p>
+    {% endif %}
+
+    {% if detail.desired_state_history %}
+    <h3>Verlauf</h3>
+    <ul>
+        {% for revision in detail.desired_state_history %}
+        <li>Revision {{ revision.revision }} von {{ revision.created_by }} am {{ revision.created_text }}: {{ revision.reason }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+</section>
+
 <section aria-labelledby="backups-heading">
     <h2 id="backups-heading">Sicherungen</h2>
     {% if detail.backups %}

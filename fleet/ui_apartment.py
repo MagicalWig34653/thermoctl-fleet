@@ -82,11 +82,20 @@ from datetime import UTC, datetime, timedelta
 
 from fleet.alarms import ABSENCE_THRESHOLD, AlarmKind
 from fleet.restore_vendor import AGE_VENDOR_JS_SHA256
-from fleet.storage import AlarmRecord, BackupSummary, CommandRecord, HeartbeatHistoryEntry, Storage
+from fleet.storage import (
+    AlarmRecord,
+    BackupSummary,
+    CommandRecord,
+    DesiredStateOutcomeRecord,
+    DesiredStateRecord,
+    HeartbeatHistoryEntry,
+    Storage,
+)
 from fleet.ui_house import FAULT_KIND_LABELS
 from protocol import FaultKind
 from protocol.backups import BackupKind
 from protocol.commands import CommandType
+from protocol.desired_state import DesiredState
 
 # P5.5a, section 15.1/15.2 -- German label per `protocol.backups.BackupKind`
 # value, the same "covers exactly the enum" reasoning
@@ -165,6 +174,108 @@ def available_commands() -> list[tuple[str, str]]:
     structurally never omit or invent a command (CLAUDE.md principle 1)."""
 
     return [(command.value, COMMAND_TYPE_LABELS[command]) for command in CommandType]
+
+
+# P5.4b, section 13 -- the four fixed service names, in the fixed order the
+# form/confirmation page always shows them in (matches
+# `agent.loop.RECONCILE_SERVICE_ORDER`, not re-derived here since
+# `protocol.desired_state.Services` itself is a closed set of four named
+# fields, never an open list this module iterates).
+DESIRED_STATE_SERVICE_ORDER: tuple[str, ...] = ("thermoctl", "zigbee2mqtt", "mosquitto", "agent")
+
+DESIRED_STATE_SERVICE_LABELS: dict[str, str] = {
+    "thermoctl": "thermoctl",
+    "zigbee2mqtt": "Zigbee2MQTT",
+    "mosquitto": "Mosquitto",
+    "agent": "Agent",
+}
+
+
+@dataclass(frozen=True)
+class DesiredStateServiceDisplay:
+    """One service's row in the desired-state form/confirmation/history
+    (P5.4b). `image` is always `fleet.desired_state_sources
+    .DISPLAY_SOURCES[name]` -- **never** a value read from the landlord's
+    own form input (CLAUDE.md security principle 2, see that module's own
+    docstring)."""
+
+    name: str
+    label: str
+    image: str
+    version: str
+    digest: str
+
+
+@dataclass(frozen=True)
+class DesiredStateDisplay:
+    """One stored `DesiredStateRecord` revision, rendered (P5.4b scope
+    item 1/2) -- used both for "the current desired state" on the
+    apartment page and for each entry of its full history."""
+
+    revision: int
+    services: list[DesiredStateServiceDisplay]
+    window_from: str
+    window_until: str
+    window_not_below_outdoor_temp_c: float
+    created_text: str
+    created_by: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class DesiredStateOutcomeDisplay:
+    """The most recently reported `DesiredStateOutcomeRecord` (P5.4b scope
+    item 4: "show last reported outcome in the apartment view")."""
+
+    revision: int
+    successful: bool
+    reason: str
+    service_label: str | None
+    reported_text: str
+
+
+def _desired_state_services_from_json(state_json: str) -> list[DesiredStateServiceDisplay]:
+    desired = DesiredState.model_validate_json(state_json)
+    return [
+        DesiredStateServiceDisplay(
+            name=name,
+            label=DESIRED_STATE_SERVICE_LABELS[name],
+            image=getattr(desired.services, name).image,
+            version=getattr(desired.services, name).version,
+            digest=getattr(desired.services, name).digest,
+        )
+        for name in DESIRED_STATE_SERVICE_ORDER
+    ]
+
+
+def build_desired_state_display(record: DesiredStateRecord) -> DesiredStateDisplay:
+    desired = DesiredState.model_validate_json(record.state_json)
+    return DesiredStateDisplay(
+        revision=record.revision,
+        services=_desired_state_services_from_json(record.state_json),
+        window_from=desired.window.from_.strftime("%H:%M"),
+        window_until=desired.window.until.strftime("%H:%M"),
+        window_not_below_outdoor_temp_c=desired.window.not_below_outdoor_temp_c,
+        created_text=_format_timestamp(record.created_at),
+        created_by=record.created_by,
+        reason=record.reason,
+    )
+
+
+def build_desired_state_outcome_display(
+    record: DesiredStateOutcomeRecord,
+) -> DesiredStateOutcomeDisplay:
+    return DesiredStateOutcomeDisplay(
+        revision=record.revision,
+        successful=record.successful,
+        reason=record.reason,
+        service_label=(
+            DESIRED_STATE_SERVICE_LABELS.get(record.service, record.service)
+            if record.service is not None
+            else None
+        ),
+        reported_text=_format_timestamp(record.reported_at),
+    )
 
 
 def _truncate_error_text(error_text: str) -> str:
@@ -603,6 +714,21 @@ class ApartmentDetail:
     restore_pending: bool
     restore_pending_expires_text: str | None
     restore_vendor_js_sha256: str
+    # Desired state (P5.4b, section 13). `desired_state` is the current
+    # (highest-revision) row, if any was ever set; `desired_state_outcome`
+    # is the most recently reported reconciliation attempt, independent of
+    # which revision it was for (an outcome for a now-superseded revision
+    # is still worth showing -- it is the last thing the agent actually
+    # did). `desired_state_history` is every revision ever set, newest
+    # first (scope item 1: "full history"). `desired_state_active` is
+    # always `False` in this scaffold -- section 13's "Decided afterward"
+    # gate (fail-closed pre-check, `pilot_mode`) is enforced entirely in
+    # the agent, but the UI still says so plainly, "so nobody expects
+    # something to happen" (P5.4b work order).
+    desired_state: DesiredStateDisplay | None
+    desired_state_history: list[DesiredStateDisplay]
+    desired_state_outcome: DesiredStateOutcomeDisplay | None
+    desired_state_active: bool
 
 
 def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> TimelineEntry:
@@ -765,6 +891,23 @@ def build_apartment_detail(
         else None
     )
 
+    desired_state_record = storage.get_desired_state(apartment_id)
+    desired_state_display = (
+        build_desired_state_display(desired_state_record)
+        if desired_state_record is not None
+        else None
+    )
+    desired_state_history_displays = [
+        build_desired_state_display(record)
+        for record in storage.desired_state_history(apartment_id)
+    ]
+    desired_state_outcome_record = storage.latest_desired_state_outcome(apartment_id)
+    desired_state_outcome_display = (
+        build_desired_state_outcome_display(desired_state_outcome_record)
+        if desired_state_outcome_record is not None
+        else None
+    )
+
     history_days = clamp_history_days(days)
     since = now - timedelta(days=history_days)
 
@@ -837,6 +980,10 @@ def build_apartment_detail(
             restore_pending=restore_pending,
             restore_pending_expires_text=restore_pending_expires_text,
             restore_vendor_js_sha256=AGE_VENDOR_JS_SHA256,
+            desired_state=desired_state_display,
+            desired_state_history=desired_state_history_displays,
+            desired_state_outcome=desired_state_outcome_display,
+            desired_state_active=False,
         )
 
     heartbeat = latest.heartbeat
@@ -876,6 +1023,10 @@ def build_apartment_detail(
         restore_pending=restore_pending,
         restore_pending_expires_text=restore_pending_expires_text,
         restore_vendor_js_sha256=AGE_VENDOR_JS_SHA256,
+        desired_state=desired_state_display,
+        desired_state_history=desired_state_history_displays,
+        desired_state_outcome=desired_state_outcome_display,
+        desired_state_active=False,
     )
 
 
@@ -885,6 +1036,8 @@ __all__ = [
     "COMMAND_TYPE_LABELS",
     "DEFAULT_FETCH_LOGS_LINES",
     "DEFAULT_HISTORY_DAYS",
+    "DESIRED_STATE_SERVICE_LABELS",
+    "DESIRED_STATE_SERVICE_ORDER",
     "MAX_FETCH_LOGS_LINES",
     "MAX_HISTORY_DAYS",
     "MIN_FETCH_LOGS_LINES",
@@ -892,6 +1045,9 @@ __all__ = [
     "ApartmentDetail",
     "BackupDisplay",
     "CommandDisplay",
+    "DesiredStateDisplay",
+    "DesiredStateOutcomeDisplay",
+    "DesiredStateServiceDisplay",
     "DiagnosticBundleDisplay",
     "LogExcerptDisplay",
     "OpenFaultDisplay",
@@ -901,5 +1057,7 @@ __all__ = [
     "build_apartment_detail",
     "build_backup_history",
     "build_command_history",
+    "build_desired_state_display",
+    "build_desired_state_outcome_display",
     "clamp_history_days",
 ]

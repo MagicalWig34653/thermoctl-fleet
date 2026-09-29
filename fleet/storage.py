@@ -80,6 +80,7 @@ from sqlalchemy import (
     LargeBinary,
     String,
     Text,
+    UniqueConstraint,
     and_,
     case,
     create_engine,
@@ -107,6 +108,7 @@ from fleet.device_lifecycle import (
 from protocol import Event, Heartbeat, LogExcerpt, fault_kind_from_key
 from protocol.backups import BackupKind
 from protocol.commands import Command, CommandResult, CommandType
+from protocol.desired_state import DesiredState, DesiredStateOutcomeReport
 from protocol.version import PROTOCOL_VERSION
 
 
@@ -602,6 +604,91 @@ class CommandRecord(Base):
     duration_s: Mapped[float | None] = mapped_column(Float(), nullable=True)
     error_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
     result_received_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
+
+class DesiredStateRecord(Base):
+    """P5.4b (section 13): one revision of one apartment's desired state, as
+    the landlord set it in the UI.
+
+    **Append-only, never updated** -- editing the desired state always
+    inserts a new row with `revision = previous revision + 1`
+    (`Storage.create_desired_state_revision`), never mutates an existing
+    one. This is deliberately both the *current* value (the row with the
+    highest `revision` for an apartment) and its own full history at the
+    same time -- "who/when/what" (CLAUDE.md working method: "every endpoint
+    and every function gets a test", section 20.3's "every change ... is
+    logged: who, when, why", applied here to desired state exactly as it
+    already is to apartment/device state) needs no separate audit table to
+    reconstruct, since nothing here is ever overwritten. A row is also
+    still written to `inventory_audit_log` (`_write_inventory_audit_log`),
+    consistent with every other landlord-initiated change this codebase
+    already logs there -- belt and braces, not a second source of truth:
+    the audit log is for the cross-entity "what happened when" view
+    (`fleet/ui_house.py`'s "Aufgaben"/inventory views), this table is the
+    authoritative, replayable state itself.
+
+    `state_json` is the full `protocol.desired_state.DesiredState` (with
+    its own `revision` field, kept in sync with this row's own `revision`
+    column, never a second independent counter) serialized verbatim --
+    mirrors `HeartbeatRecord.payload_json`'s own "store the validated wire
+    model, not a hand-picked subset of columns" pattern, and the same
+    reasoning applies to why this is safe: `protocol.desired_state
+    .DesiredState` carries no room temperature, setpoint, schedule, or
+    tenant data (section 6) to begin with -- only image/version/digest per
+    service and a maintenance time window.
+
+    `image` is **never** taken from the landlord's own free-text input**
+    -- see `fleet.ui_routes.desired_state_confirm_submit`'s own docstring
+    for how the image field stored here is always filled from
+    `fleet.desired_state_sources.DISPLAY_SOURCES`, a fixed, fleet-side
+    *display* constant, never a value the UI form lets the landlord type
+    (CLAUDE.md security principle 2: "the cloud only names version and
+    digest, never the source" -- the agent's own hard-coded
+    `agent.sources.ALLOWED_SOURCES` is the only place a source is ever
+    authoritative; what is stored here is informational only, and the
+    agent ignores this field's exact string unless it happens to match its
+    own hard-coded source exactly, i.e. this fleet-side constant is kept
+    in sync with the agent's table by hand, not trusted structurally).
+    """
+
+    __tablename__ = "desired_states"
+    __table_args__ = (
+        UniqueConstraint("apartment_id", "revision", name="uq_desired_states_apartment_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    state_json: Mapped[str] = mapped_column(Text(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+
+
+class DesiredStateOutcomeRecord(Base):
+    """P5.4b: one `protocol.desired_state.DesiredStateOutcomeReport` the
+    agent reported via `POST /v1/desired-state/result` -- append-only, the
+    same "history, not just current value" reasoning as
+    `DesiredStateRecord` above, keyed by `revision` (not by a command id --
+    a desired-state reconciliation pass is not a `Command`, see
+    `protocol.desired_state.DesiredStateOutcomeReport`'s own docstring).
+    `fleet/ui_apartment.py` only ever shows the row with the latest
+    `reported_at` per apartment (`Storage.latest_desired_state_outcome`),
+    but every report is kept -- an apartment can be rejected on one
+    revision and later succeed on the next, and both are worth keeping for
+    the same "who/when/what" reasoning as every other audited change in
+    this codebase.
+    """
+
+    __tablename__ = "desired_state_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    successful: Mapped[bool] = mapped_column(Boolean(), nullable=False)
+    reason: Mapped[str] = mapped_column(Text(), nullable=False)
+    service: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reported_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
 
 class BackupRecord(Base):
@@ -2386,6 +2473,200 @@ class Storage:
                 record.epoch = new_epoch
                 record.created_at = _naive_utc(now)
         return new_epoch
+
+    # -- desired state (P5.4b, section 13) ----------------------------------------
+
+    def create_desired_state_revision(
+        self,
+        apartment_id: str,
+        desired_state: DesiredState,
+        *,
+        ui_username: str,
+        reason: str,
+        now: datetime,
+    ) -> DesiredStateRecord:
+        """Inserts a new, immutable desired-state revision for
+        `apartment_id` (section 13, the landlord's per-apartment update
+        form, P5.4b) -- `desired_state.revision` is **ignored on input and
+        always recomputed here** as one more than the apartment's current
+        latest revision (or `1` if none exists yet), so a caller can never
+        race itself into a duplicate or out-of-order revision number by
+        passing a stale value; the `DesiredState` returned via the
+        `revision` property on the created row is the authoritative one.
+
+        **Mandatory, non-empty `reason`** -- same rule, same reasoning, as
+        `update_apartment`'s own (CLAUDE.md security principle 5, section
+        20.3's "who, when, why" applied to a per-apartment maintenance
+        instruction). Refuses (`ValueError`) an unknown or retired
+        apartment, mirroring `create_command`'s own checks -- a retired
+        apartment has no agent left to reconcile toward this state.
+
+        Writes exactly one audit row in the same transaction (`entity_type
+        ="desired_state"`, `action="revision_created"`, `after` carrying the
+        new revision number and the per-service digests -- never a
+        temperature, setpoint, or any other section-6 value, since none of
+        those exist on `DesiredState` to begin with).
+
+        **Race (cross-review, main-session): "SELECT max() then INSERT" is
+        not atomic on its own** -- two concurrent submissions for the same
+        apartment (a genuine double-click, or two landlords) can both read
+        the same current-max revision and both try to insert the same
+        `(apartment_id, revision)` pair, which `uq_desired_states_apartment
+        _revision` then refuses for the loser as an `IntegrityError`. Fixed
+        the same way `create_command_unless_duplicate` already fixes the
+        identical shape of race for commands: the apartment row is locked
+        for the duration of this transaction before the `max()` read even
+        runs (`BEGIN IMMEDIATE` on SQLite -- this repository's only tested
+        dialect, `with_for_update()` elsewhere), so a second concurrent
+        caller simply waits for the first transaction to commit or roll
+        back (SQLite's own 30s busy timeout, `create_engine_from_url`) and
+        then computes its revision against the now-committed result,
+        rather than racing it. No `IntegrityError` can reach this method's
+        caller under this lock; belt-and-braces, not a substitute for the
+        lock -- see `tests/test_fleet_desired_state.py
+        ::test_create_desired_state_revision_serializes_concurrent_callers`
+        for a real two-thread test against a file-backed SQLite database.
+        """
+
+        if not reason.strip():
+            raise ValueError("A reason is required for every desired-state change.")
+
+        with self.session() as session:
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            apartment = session.scalar(
+                select(ApartmentRecord).where(ApartmentRecord.id == apartment_id).with_for_update()
+            )
+            if apartment is None:
+                raise ValueError(f"Unknown apartment {apartment_id!r}.")
+            if apartment.state == "retired":
+                raise ValueError(f"Apartment {apartment_id!r} is retired.")
+
+            current_latest = session.scalar(
+                select(func.max(DesiredStateRecord.revision)).where(
+                    DesiredStateRecord.apartment_id == apartment_id
+                )
+            )
+            next_revision = (current_latest or 0) + 1
+
+            stamped = desired_state.model_copy(update={"revision": next_revision})
+            created_at = _naive_utc(now)
+            record = DesiredStateRecord(
+                apartment_id=apartment_id,
+                revision=next_revision,
+                state_json=stamped.model_dump_json(),
+                created_at=created_at,
+                created_by=ui_username,
+                reason=reason.strip(),
+            )
+            session.add(record)
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="desired_state",
+                entity_id=apartment_id,
+                action="revision_created",
+                reason=reason.strip(),
+                before=None,
+                after={
+                    "revision": next_revision,
+                    "digests": {
+                        name: getattr(stamped.services, name).digest
+                        for name in ("thermoctl", "zigbee2mqtt", "mosquitto", "agent")
+                    },
+                    "window": stamped.window.model_dump(mode="json"),
+                },
+            )
+            session.flush()
+            session.refresh(record)
+            session.expunge(record)
+            return record
+
+    def get_desired_state(self, apartment_id: str) -> DesiredStateRecord | None:
+        """The current (highest-`revision`) desired-state row for
+        `apartment_id`, or `None` if none was ever set -- used by both the
+        UI (`fleet/ui_apartment.py`) and the SSE stream
+        (`fleet.app._stream_command_events`) to decide what "the latest
+        revision" currently is."""
+
+        with self.session() as session:
+            record = session.scalar(
+                select(DesiredStateRecord)
+                .where(DesiredStateRecord.apartment_id == apartment_id)
+                .order_by(DesiredStateRecord.revision.desc())
+                .limit(1)
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def desired_state_history(self, apartment_id: str) -> list[DesiredStateRecord]:
+        """Every revision ever set for `apartment_id`, newest first --
+        `fleet/ui_apartment.py`'s "history" list (P5.4b scope item 1: "full
+        history")."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(DesiredStateRecord)
+                    .where(DesiredStateRecord.apartment_id == apartment_id)
+                    .order_by(DesiredStateRecord.revision.desc())
+                ).all()
+            )
+            session.expunge_all()
+            return rows
+
+    def record_desired_state_outcome(
+        self,
+        apartment_id: str,
+        report: DesiredStateOutcomeReport,
+        *,
+        now: datetime,
+    ) -> None:
+        """Stores one `POST /v1/desired-state/result` report from the agent
+        (P5.4b scope item 4) -- append-only, see
+        `DesiredStateOutcomeRecord`'s own docstring for why this never
+        updates a prior row in place. Not scoped against a known command
+        id (there is none, a desired-state reconciliation pass is not a
+        `Command`) -- **any** `revision`/`service` value the agent reports
+        is stored as given, since it can only ever name one of the fixed
+        four service names or `None` (`protocol.desired_state
+        .DesiredStateOutcomeReport.service` is a plain string, not further
+        constrained at the model level, but `fleet.app
+        .receive_desired_state_result` is only ever reachable by an agent
+        already authenticated as `apartment_id` -- the same trust boundary
+        every other agent-facing write in this module already relies on).
+        """
+
+        with self.session() as session:
+            session.add(
+                DesiredStateOutcomeRecord(
+                    apartment_id=apartment_id,
+                    revision=report.revision,
+                    successful=report.successful,
+                    reason=report.reason,
+                    service=report.service,
+                    reported_at=_naive_utc(now),
+                )
+            )
+
+    def latest_desired_state_outcome(
+        self, apartment_id: str
+    ) -> DesiredStateOutcomeRecord | None:
+        """The most recently reported outcome for `apartment_id`, or `None`
+        if the agent has never reported one -- `fleet/ui_apartment.py`'s
+        "last reported outcome" display (P5.4b scope item 4)."""
+
+        with self.session() as session:
+            record = session.scalar(
+                select(DesiredStateOutcomeRecord)
+                .where(DesiredStateOutcomeRecord.apartment_id == apartment_id)
+                .order_by(DesiredStateOutcomeRecord.id.desc())
+                .limit(1)
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
 
     # -- fetch_logs uploads (P5.3a, sections 6, 7, 21.5) --------------------------
 

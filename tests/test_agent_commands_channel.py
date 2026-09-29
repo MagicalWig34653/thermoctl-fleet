@@ -558,6 +558,36 @@ def _mock_status_client(status_code: int) -> httpx.Client:
     return httpx.Client(base_url="https://example.invalid", transport=httpx.MockTransport(handler))
 
 
+def _sse_body_client(body: str) -> httpx.Client:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=body.encode("utf-8"), headers={"content-type": "text/event-stream"}
+        )
+
+    return httpx.Client(base_url="https://example.invalid", transport=httpx.MockTransport(handler))
+
+
+def test_stream_once_skips_an_sse_event_with_no_data_field(tmp_path: Path) -> None:
+    """P5.4b: `if not sse.data: continue` -- an SSE frame that carries an
+    `id`/`event` but no `data:` field at all (e.g. a keep-alive-shaped
+    frame) still dispatches as a `ServerSentEvent` with `data == ""`
+    (`httpx_sse`'s own decoder: an event is only suppressed entirely when
+    `event`/`data`/`id`/`retry` are *all* empty) -- this must be silently
+    skipped, never turned into a malformed-`RejectedCommand` or crash. A
+    second, well-formed event right after it still comes through."""
+
+    body = (
+        "event: message\nid: abc\n\n"
+        'event: message\nid: def\ndata: {"id": "cmd-1", "command": "report_now", '
+        '"expires_at": "2026-01-01T00:00:00Z", "protocol_version": 1}\n\n'
+    )
+    items = list(_stream_once(_sse_body_client(body), tmp_path / "last-event-id"))
+
+    assert len(items) == 1
+    assert isinstance(items[0], Command)
+    assert items[0].id == "cmd-1"
+
+
 def test_stream_once_non_200_non_auth_response_raises_command_stream_error(
     tmp_path: Path,
 ) -> None:

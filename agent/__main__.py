@@ -135,6 +135,10 @@ def _run_agent(args: argparse.Namespace) -> int:
                 backup_config=backup_config,
                 restore_targets=restore_targets,
                 restore_poll_interval_s=args.restore_poll_interval_s,
+                pending_swap_path=data_dir / loop.DEFAULT_PENDING_SWAP_FILE,
+                desired_state_held_state_path=(
+                    data_dir / loop.DEFAULT_DESIRED_STATE_HELD_STATE_FILE
+                ),
             )
     except CommandStreamAuthError:
         print(
