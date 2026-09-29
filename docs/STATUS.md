@@ -730,16 +730,76 @@ each refused with `DETAIL_UNSAFE_STAGING`, and the live directory's own
 planted marker file confirmed byte-identical, and its directory listing
 unchanged, afterward.
 
-**Verification (this package's own run, after both rounds of
-cross-review fixes above):** `ruff check .` clean; `mypy .` and `mypy
-protocol fleet agent tools` clean; `pytest` -- REPLACE_PYTEST_LINE; `go
+**Cross-review round 3 finding and fix (a reproduced false positive in
+round 2's own fix):** `_assert_no_symlink_ancestor` walked every
+already-existing ancestor of `staging_dir` up to the filesystem root and
+refused if *any* of them was a symlink -- including ancestors that have
+nothing to do with this module's own components at all. On macOS, `/var`
+is itself a symlink to `/private/var`; some container layouts have their
+own equivalent redirect somewhere above a perfectly legitimate
+`staging_dir`. Round 2's own tests never caught this because pytest's own
+`tmp_path` fixture hands back an already-`resolve()`d path, silently
+hiding exactly the ancestor the bug depended on. The effect: **every
+restore on such a system refused**, unconditionally -- a self-inflicted
+denial of service, not a security improvement.
+
+**Fix: compare resolved locations against resolved locations, drop the
+ancestor walk entirely.** `_resolve_prospective` computes the real,
+symlink-resolved location a path will have once created (resolving the
+longest already-existing prefix, appending the remaining not-yet-existing
+suffix literally) -- applied to `staging_dir`'s own prospective location
+*and* to the two live boundaries (`thermoctl_db_path.parent.resolve()`,
+`zigbee2mqtt_dir.resolve()`) alike, so an unrelated ancestor symlink
+resolves the same way on both sides of the overlap comparison and never
+trips it. `_assert_component_is_safe` replaces the ancestor walk with a
+narrower check: only `staging_dir` itself (and separately,
+`staging_dir/"zigbee2mqtt"`) must not *itself* already exist as a symlink
+or non-directory (`lstat`, never follows) -- nothing above it is inspected
+or restricted anymore. **The "ancestor symlinked into a live dir" attack
+is still caught**, without walking anything: resolving `staging_dir`
+*through* such an ancestor produces the live directory's own real
+location, which the overlap check still refuses on exactly the same
+grounds as before (proven by keeping that round-2 test passing unchanged,
+`test_apply_pending_restore_refuses_when_an_ancestor_of_staging_dir_is_a_
+symlink`). Two new tests prove the fix the other way: a `staging_dir`
+reached through an *unrelated* symlinked ancestor (`tmp_path/"link" ->
+tmp_path/"real"`, live directories elsewhere) now succeeds and genuinely
+stages; and, the round 3 finding's own reproduction case, a real
+`tempfile.mkdtemp()` base (not pytest's pre-resolved `tmp_path`) succeeds
+too, on any platform where the system temp directory itself sits behind a
+symlink (confirmed reproducing on this run's own platform, not skipped).
+
+The module's own top-level docstring now states the TOCTOU window
+precisely: `_assert_staging_layout_is_safe`'s own checks are the cheap,
+first line of defense, not the last -- the window from that check through
+the *final* `write_bytes_safe` call is not something this single,
+no-privilege-boundary agent process can fully close against a
+sufficiently well-timed local attacker on its own; closing it
+authoritatively (a real re-check immediately before anything is moved
+into the live directories) is **P5.5c's** own job, unchanged from round
+2's own reasoning -- this module's check only has to catch the mistake or
+attack *early enough to refuse loudly and stage nothing*, not to be the
+final word on the live directories' own safety.
+
+**Verification (this package's own run, after all three rounds of
+cross-review fixes above):** `ruff check .` clean; `mypy .` (127 files)
+and `mypy protocol fleet agent tools` (65 files) clean; `pytest -W
+ignore::ResourceWarning -rA` -- **1589 passed, 1 skipped** (the skip is
+pre-existing/unrelated: "no 'age' CLI binary available in this
+environment") in 118.15s, coverage **TOTAL 6043 stmts / 20 missed / 99%**
+-- every file this package touches or created is at 100% (`agent/restore
+.py` included); the 20 missed lines are all pre-existing, unrelated code
+(`agent/commands_channel.py`, `agent/log_filter.py`, `agent/loop.py`'s own
+pre-existing `NotImplementedError` stubs, `fleet/admin.py`,
+`fleet/ui_routes.py`, `tools/check_image_config.py`); `go
 vet`/`go test`/`check_contract.sh` unaffected and passing (Python-only
 package). New/updated test files: `tests/test_age_key_block.py`,
 `tests/test_age_identity.py`, `tests/test_restore_vendor.py` (includes a
 real `node` + the real vendored bundle interop test, decrypted with
 `pyrage`), `tests/test_fleet_restore.py` (incl. the concurrency fix
 above), `tests/test_agent_restore.py` (rewritten for staging, plus the
-six staging-safety tests above), `tests/test_ui_restore.py` (incl. the
+six round-2 staging-safety tests and the two round-3 false-positive
+fix tests above), `tests/test_ui_restore.py` (incl. the
 sha256 display), `tests/test_restore_e2e.py` (rewritten for staging; full
 end-to-end over the real fleet app and real TLS: browser step simulated
 with `pyrage`, device fetch and staging for real, staged files and

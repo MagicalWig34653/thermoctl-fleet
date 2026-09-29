@@ -38,6 +38,30 @@ it re-checks the live directories itself, immediately before moving
 anything, from a process this module has no way to influence beyond what
 it writes into the staging directory and its manifest.
 
+**`staging_dir` (and its `zigbee2mqtt/` subdirectory) are verified safe --
+not a symlink, not overlapping the live directories -- before anything
+else runs at all** (`_assert_staging_layout_is_safe`, cross-review rounds
+2 and 3): a symlink planted there, pointing into the live, read-only
+mounts, would otherwise make `mkdir` follow it silently and
+`agent.safe_io.write_bytes_safe` (which only ever checks the *final* path
+component it writes) write decrypted tenant data straight through it.
+**The TOCTOU window this leaves is not this process's to fully close on
+its own** -- from the moment `_assert_staging_layout_is_safe` finishes
+proving `staging_dir` safe to the moment the *last* `write_bytes_safe`
+call in `apply_pending_restore` actually writes a file, nothing in this
+module re-checks that nothing changed underneath it (a local attacker
+capable of replacing `staging_dir` with a symlink in that exact window is
+a threat model this single-process, no-privilege-boundary agent cannot
+defend against by itself). This is deliberately the same trade-off
+`docs/STATUS.md`'s P5.5c section already documents for the mover's own
+role: **P5.5c's separate Go mover re-checks everything itself,
+authoritatively, immediately before it moves anything** -- validating the
+manifest's hashes, refusing symlinks and non-regular files in staging
+again, from a process a compromised agent cannot influence beyond what it
+already wrote to disk. This module's own check is the first, cheap line
+of defense (catches the mistake/attack early, refuses loudly, stages
+nothing); it is not, and is not meant to be, the last one.
+
 **Nothing in this module ever writes the landlord's decrypted identity, or
 the decrypted operational-data bytes, to a log line or an exception
 message -- only to the staging directory itself, exactly once, atomically.**
@@ -63,7 +87,6 @@ import hashlib
 import io
 import json
 import logging
-import os
 import stat
 import tarfile
 import threading
@@ -232,93 +255,97 @@ def _staged_restore_already_pending(targets: RestoreTargets) -> bool:
     return (targets.staging_dir / MANIFEST_FILENAME).is_file()
 
 
-def _normalized_absolute(path: Path) -> Path:
-    """`path`, made absolute and syntactically normalized (`..`/`.`
-    segments collapsed) -- **never** resolves a symlink (unlike
-    `Path.resolve`, which this module compares against exactly to detect
-    one, see `_assert_staging_layout_is_safe`'s own docstring)."""
+def _resolve_prospective(path: Path) -> Path:
+    """The real, symlink-resolved location `path` will have once every
+    currently-missing component of it has been created.
 
-    return Path(os.path.normpath(str(path.absolute())))
+    If `path` already exists, this is simply `path.resolve(strict=True)`.
+    If it does not, this resolves the longest already-existing *prefix* of
+    `path` (following any symlinks in *that* prefix) and appends the
+    remaining, not-yet-existing suffix components literally, since there
+    is nothing to resolve there yet -- recursing on `path.parent` until an
+    existing ancestor is found (the filesystem root always exists, so this
+    always terminates).
+
+    **Deliberately does not treat an unrelated, already-resolved ancestor
+    symlink as a problem** (cross-review round 3 fix for a false positive
+    an earlier version of this module's own ancestor-walk produced: macOS
+    resolves `/var` to `/private/var`, some container layouts have their
+    own such redirects -- neither has anything to do with this module's
+    own `staging_dir`/`zigbee2mqtt` components, and refusing every restore
+    because of it would be a self-inflicted denial of service, not a
+    security improvement). This function's only job is to compute where
+    `path` *really* is, symlinks and all -- `_create_and_verify_safe_dir`
+    is what decides whether that real location is a problem, by comparing
+    it against the live directories' own equally-resolved locations, never
+    by objecting to a symlink's mere existence somewhere upstream."""
+
+    if path.exists():
+        return path.resolve(strict=True)
+    return _resolve_prospective(path.parent) / path.name
 
 
-def _assert_no_symlink_ancestor(path: Path) -> None:
+def _assert_component_is_safe(path: Path) -> None:
     """Refuses (raises `RestoreError(DETAIL_UNSAFE_STAGING)`) if `path`
-    itself, or any of its **already-existing** ancestors, is a symlink --
-    checked with `lstat` (never follows one) before this module ever calls
-    `mkdir` on `path`, so a symlink planted anywhere in the chain is caught
-    before `mkdir(..., exist_ok=True)` could silently follow it into a
-    different location. An ancestor that does not exist yet is safe to
-    skip: `mkdir(parents=True, ...)` creates it fresh, and it cannot be a
-    symlink to somewhere else if it does not exist at all -- every
-    ancestor *above* it has already been proven, by this same walk, not to
-    be one either, so the fresh directory is created in exactly the real
-    location this path names, not through a redirect."""
+    **itself** already exists but is not a real directory (`lstat`, never
+    follows) -- in particular, if it is a symlink. Says nothing about any
+    ancestor of `path` (cross-review round 3: that used to be checked too,
+    and produced false positives for unrelated, legitimate ancestor
+    symlinks -- see `_resolve_prospective`'s own docstring). A `path` that
+    does not exist yet is safe: `mkdir` creates it fresh below."""
 
-    for ancestor in (*reversed(path.parents), path):
-        if str(ancestor) == ancestor.anchor:
-            continue  # the filesystem root itself -- never a symlink to check
-        try:
-            found = ancestor.lstat()
-        except FileNotFoundError:
-            continue  # does not exist yet -- created fresh, see docstring above
-        if stat.S_ISLNK(found.st_mode):
-            raise RestoreError(DETAIL_UNSAFE_STAGING)
+    try:
+        found = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(found.st_mode):
+        raise RestoreError(DETAIL_UNSAFE_STAGING)
 
 
 def _create_and_verify_safe_dir(path: Path, *, forbidden_overlaps: list[Path]) -> Path:
     """Creates `path` (mode `0700`) and returns its resolved, real
     location -- **only** after proving, in order, that:
 
-    1. no already-existing ancestor of `path` is a symlink
-       (`_assert_no_symlink_ancestor`, checked *before* `mkdir` is ever
-       called, so `mkdir(..., exist_ok=True)` cannot silently follow one).
-    2. `path`'s own syntactically normalized absolute location (never
-       symlink-resolved -- there is nothing left to resolve, check 1
-       already proved no symlink exists anywhere in its chain) does not
-       overlap, in **either** direction, any path in `forbidden_overlaps`
-       (`Path.is_relative_to`, both ways, plus an exact-equality check) --
-       "overlap" here means one is nested inside the other, or they are
-       the same path. **Checked before `mkdir` runs at all** -- a path
-       that turns out to be nested inside (or to contain) a live,
-       read-only directory must never have so much as an empty directory
-       created under it by this function; `mkdir` only ever runs once
-       this check has already passed.
-    3. once created, `path` still resolves to exactly that same
-       normalized location (`Path.resolve(strict=True) ==
-       _normalized_absolute(path)`) -- the standard idiom for "no symlink
-       anywhere in this path", belt and braces on top of check 1 (a TOCTOU
-       window between the two checks is not modeled as a realistic threat
-       here -- this is a local, single-process agent, not a multi-tenant
-       service; the *ancestor* check already closes the window that
-       matters, "was a symlink planted before this call ran at all").
-    4. the created directory is genuinely a directory, not something else
-       `lstat` would otherwise have to be fooled about.
+    1. `path` itself, if it already exists, is a real directory, not a
+       symlink or anything else (`_assert_component_is_safe`) -- checked
+       *before* `mkdir` is ever called.
+    2. `path`'s own **resolved** prospective location
+       (`_resolve_prospective` -- symlinks in any ancestor *outside* this
+       module's own components are followed, not flagged; see that
+       function's own docstring for why) does not overlap, in **either**
+       direction, any path in `forbidden_overlaps` (`Path.is_relative_to`,
+       both ways, plus an exact-equality check) -- "overlap" here means
+       one is nested inside the other, or they are the same real
+       location. **Checked before `mkdir` runs at all** -- a path that
+       turns out to resolve inside (or to contain) a live, read-only
+       directory must never have so much as an empty directory created
+       under it by this function.
+    3. once created, `path` still resolves to exactly that same location
+       (`Path.resolve(strict=True)` compared against the prospective
+       value computed in step 2) and is genuinely a directory -- belt and
+       braces against a symlink planted in the narrow window between
+       steps 1/2 and this `mkdir` call (see this module's own top-level
+       docstring for why that whole window, through the final
+       `write_bytes_safe` calls, is P5.5c's own authoritative re-check to
+       close, not something this process alone can fully close against a
+       sufficiently well-timed local attacker).
 
     Raises `RestoreError(DETAIL_UNSAFE_STAGING)` on any violation -- this
     function creates nothing beyond the one directory `path` names, and
     only calls `mkdir` after checks 1 and 2 have already passed.
     """
 
-    _assert_no_symlink_ancestor(path)
+    _assert_component_is_safe(path)
 
-    normalized = _normalized_absolute(path)
+    expected = _resolve_prospective(path)
     for boundary in forbidden_overlaps:
-        if normalized == boundary:
+        if expected == boundary:
             raise RestoreError(DETAIL_UNSAFE_STAGING)
-        if normalized.is_relative_to(boundary) or boundary.is_relative_to(normalized):
+        if expected.is_relative_to(boundary) or boundary.is_relative_to(expected):
             raise RestoreError(DETAIL_UNSAFE_STAGING)
 
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    resolved = path.resolve(strict=True)
-    if resolved != normalized:  # pragma: no cover -- see the docstring's own TOCTOU note
-        # Only reachable if a symlink is planted in `path`'s chain in the
-        # narrow window between the ancestor check above and this
-        # `mkdir` -- deliberately not artificially constructed here (see
-        # the docstring's own reasoning for why that window is not
-        # modeled as a realistic threat for this local, single-process
-        # agent); kept as defense in depth regardless.
-        raise RestoreError(DETAIL_UNSAFE_STAGING)
     if not stat.S_ISDIR(path.lstat().st_mode):  # pragma: no cover -- see reasoning below
         # Structurally unreachable via any real path through this
         # function: `Path.mkdir(exist_ok=True)` itself already re-raises
@@ -330,22 +357,49 @@ def _create_and_verify_safe_dir(path: Path, *, forbidden_overlaps: list[Path]) -
         # this codebase's other `# pragma: no cover` branches already take
         # (e.g. `fleet.app.report_device_age_recipient`'s own).
         raise RestoreError(DETAIL_UNSAFE_STAGING)
+    resolved = path.resolve(strict=True)
+    if resolved != expected:  # pragma: no cover -- see the docstring's own TOCTOU note
+        # Only reachable if a symlink is planted at `path` itself in the
+        # narrow window between checks 1/2 and this `mkdir` -- deliberately
+        # not artificially constructed here (see this function's own
+        # docstring for why that window is not something this process
+        # alone can fully close); kept as defense in depth regardless.
+        raise RestoreError(DETAIL_UNSAFE_STAGING)
 
     return resolved
 
 
 def _assert_staging_layout_is_safe(targets: RestoreTargets) -> None:
-    """Owner decision safeguard, cross-review round 2, 2026-09-28: without
-    this check, a symlink planted at `targets.staging_dir` (or any
-    ancestor of it, or the fixed `zigbee2mqtt/` subdirectory this module
-    creates inside it) that points into the live, read-only
-    `thermoctl_db_path`/`zigbee2mqtt_dir` mounts would make `mkdir(...,
-    exist_ok=True)` a silent no-op *through* the symlink and
-    `agent.safe_io.write_bytes_safe` (which, by design, only ever `lstat`-
-    checks the *final* path component it is asked to write -- see that
-    function's own docstring) write straight into live tenant data,
-    defeating the whole "never writes the live tenant data" guarantee this
-    module's own docstring promises.
+    """Owner decision safeguard, cross-review rounds 2 and 3, 2026-09-28:
+    without this check, a symlink at `targets.staging_dir` itself, or at
+    the fixed `zigbee2mqtt/` subdirectory this module creates inside it,
+    pointing into the live, read-only `thermoctl_db_path`/`zigbee2mqtt_dir`
+    mounts, would make `mkdir(..., exist_ok=True)` a silent no-op
+    *through* the symlink and `agent.safe_io.write_bytes_safe` (which, by
+    design, only ever `lstat`-checks the *final* path component it is
+    asked to write -- see that function's own docstring) write straight
+    into live tenant data, defeating the whole "never writes the live
+    tenant data" guarantee this module's own docstring promises.
+
+    **Compares resolved locations against resolved locations, never
+    against a merely syntactic/normalized path** (round 3 fix for a
+    reproduced false positive: an earlier version walked every ancestor of
+    `staging_dir` up to the filesystem root and refused if *any* of them
+    -- including ones with nothing to do with this module, such as
+    macOS's own `/var` -> `/private/var` redirect, or a container's
+    overlay layout -- was a symlink. That refused every legitimate
+    restore on such a system. `_resolve_prospective`/
+    `_create_and_verify_safe_dir` fix this by resolving *through* any such
+    unrelated ancestor symlink on both sides of the comparison -- the live
+    boundaries below and `staging_dir`'s own prospective location alike --
+    and only refusing if the two **resolved, real locations** actually
+    overlap. An ancestor symlink that happens to point *into* a live
+    directory is still caught this way too: resolving `staging_dir`
+    through it produces the live directory's own real location, which the
+    overlap check below still catches -- nothing about dropping the
+    ancestor *walk* weakens that case, see
+    `tests/test_agent_restore.py
+    ::test_apply_pending_restore_refuses_when_an_ancestor_of_staging_dir_is_a_symlink`.)
 
     Called **before any decryption or staging** -- `apply_pending_restore`
     calls this first, before `_operational_store_is_empty`, before
@@ -356,10 +410,10 @@ def _assert_staging_layout_is_safe(targets: RestoreTargets) -> None:
 
     Checks, via `_create_and_verify_safe_dir`:
 
-    - `targets.staging_dir` itself -- no symlink in its chain, resolves to
-      itself, is a real directory, and does not overlap (nested either
-      way, or identical to) `targets.thermoctl_db_path`'s own parent
-      directory or `targets.zigbee2mqtt_dir`.
+    - `targets.staging_dir` itself -- not a symlink, resolves to a real
+      location that does not overlap (nested either way, or identical to)
+      `targets.thermoctl_db_path`'s own parent directory or
+      `targets.zigbee2mqtt_dir`.
     - `targets.staging_dir / "zigbee2mqtt"` -- the one fixed subdirectory
       this module ever creates inside staging (`agent.loop.create_backup`'s
       own tar layout, mirrored here) -- checked **unconditionally**, before

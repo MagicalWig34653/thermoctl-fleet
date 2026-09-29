@@ -19,13 +19,16 @@ import base64
 import hashlib
 import io
 import json
+import shutil
 import tarfile
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pyrage
+import pytest
 from pyrage import x25519
 
 from agent.age_identity import load_or_create_identity, recipient_for
@@ -468,6 +471,81 @@ def test_apply_pending_restore_refuses_when_staging_dir_exactly_equals_a_live_di
     assert result.detail == DETAIL_UNSAFE_STAGING
     assert marker.read_bytes() == _LIVE_MARKER_CONTENT
     assert list(live_zigbee_dir.iterdir()) == [marker]
+
+
+def test_apply_pending_restore_succeeds_through_an_unrelated_symlinked_ancestor(
+    tmp_path: Path,
+) -> None:
+    """Cross-review round 3 fix: an ancestor of `staging_dir` being a
+    symlink is not, by itself, a problem -- only if it (or `staging_dir`
+    itself) resolves somewhere that overlaps a live directory. Here
+    `tmp_path/"link"` is a symlink to `tmp_path/"real"`, `staging_dir` is
+    `link/staging`, and the live directories live entirely elsewhere --
+    the restore must succeed and actually stage, exactly as if `staging_dir`
+    had been given directly, unresolved ancestor and all."""
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real_dir, target_is_directory=True)
+
+    targets = RestoreTargets(
+        data_dir=data_dir,
+        thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
+        zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+        staging_dir=link / "staging",
+    )
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is True
+    assert result.detail == DETAIL_STAGED
+    assert (real_dir / "staging" / "thermoctl.db").read_bytes() == THERMOCTL_DB_CONTENT
+    assert (
+        real_dir / "staging" / "zigbee2mqtt" / "database.db"
+    ).read_bytes() == Z2M_DATABASE_CONTENT
+
+
+def test_apply_pending_restore_succeeds_with_an_unresolved_tempdir_base(tmp_path: Path) -> None:
+    """Cross-review round 3's own reproduction case: pytest's `tmp_path`
+    fixture hands back an already-`resolve()`d path, which is exactly why
+    the round-2 bug's tests never caught the false positive -- a raw
+    `tempfile.mkdtemp()` call does not resolve its result, and on a
+    platform where the system temp directory itself sits behind a symlink
+    (macOS: `/var` -> `/private/var`) that difference is real. Skipped,
+    with a reason, on a platform/environment where `mkdtemp()` happens to
+    already return a resolved path (nothing to reproduce there)."""
+
+    unresolved_base = Path(tempfile.mkdtemp())
+    try:
+        if unresolved_base.resolve(strict=True) == unresolved_base:
+            pytest.skip(
+                f"{tempfile.gettempdir()!r} is not behind a symlink on this platform -- "
+                "nothing to reproduce here."
+            )
+
+        data_dir = unresolved_base / "data"
+        data_dir.mkdir()
+        staging_dir = unresolved_base / "staging"
+
+        targets = RestoreTargets(
+            data_dir=data_dir,
+            thermoctl_db_path=unresolved_base / "thermoctl" / "thermoctl.db",
+            zigbee2mqtt_dir=unresolved_base / "zigbee2mqtt",
+            staging_dir=staging_dir,
+        )
+        pending = _build_pending_restore(targets.data_dir)
+
+        result = apply_pending_restore(pending, targets)
+
+        assert result.success is True
+        assert result.detail == DETAIL_STAGED
+        assert (staging_dir / "thermoctl.db").read_bytes() == THERMOCTL_DB_CONTENT
+    finally:
+        shutil.rmtree(unresolved_base, ignore_errors=True)
 
 
 def test_apply_pending_restore_wrong_key_fails_cleanly_nothing_staged(tmp_path: Path) -> None:
