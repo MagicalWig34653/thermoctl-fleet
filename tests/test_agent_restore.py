@@ -35,6 +35,7 @@ from agent.restore import (
     DETAIL_MALFORMED_ARCHIVE,
     DETAIL_STAGED,
     DETAIL_STORE_NOT_EMPTY,
+    DETAIL_UNSAFE_STAGING,
     MANIFEST_FILENAME,
     RestoreTargets,
     apply_pending_restore,
@@ -120,6 +121,25 @@ def _manifest(targets: RestoreTargets) -> dict[str, Any]:
         (targets.staging_dir / MANIFEST_FILENAME).read_text(encoding="utf-8")
     )
     return manifest
+
+
+def _staging_has_no_staged_content(targets: RestoreTargets) -> bool:
+    """`True` if `staging_dir` holds no tenant data and no manifest --
+    **not** "does not exist at all": `_assert_staging_layout_is_safe`
+    (cross-review round 2) now always creates and verifies `staging_dir`
+    itself, and its `zigbee2mqtt/` subdirectory, as its own very first
+    step, before any of the checks/decryption below it ever run -- so an
+    empty, freshly-created (and proven-safe) directory existing is not
+    itself evidence that anything was actually staged. What every
+    "refuses, nothing staged" test in this file actually has to prove is
+    that no manifest and no data file ever landed inside it."""
+
+    if (targets.staging_dir / MANIFEST_FILENAME).exists():
+        return False
+    for path in targets.staging_dir.rglob("*"):
+        if path.is_file():
+            return False
+    return True
 
 
 def test_apply_pending_restore_stages_the_decrypted_files(tmp_path: Path) -> None:
@@ -228,7 +248,7 @@ def test_apply_pending_restore_refuses_when_thermoctl_db_already_has_content(
     # Nothing was touched -- the pre-existing (read-only, in real
     # deployment) file is untouched, and nothing was staged.
     assert targets.thermoctl_db_path.read_bytes() == b"existing tenant data"
-    assert not targets.staging_dir.exists()
+    assert _staging_has_no_staged_content(targets)
 
 
 def test_apply_pending_restore_refuses_when_zigbee2mqtt_already_has_content(
@@ -243,7 +263,7 @@ def test_apply_pending_restore_refuses_when_zigbee2mqtt_already_has_content(
 
     assert result.success is False
     assert result.detail == DETAIL_STORE_NOT_EMPTY
-    assert not targets.staging_dir.exists()
+    assert _staging_has_no_staged_content(targets)
 
 
 def test_apply_pending_restore_empty_thermoctl_file_still_counts_as_empty(
@@ -283,6 +303,173 @@ def test_apply_pending_restore_refuses_when_a_staged_restore_already_exists(
     assert (targets.staging_dir / MANIFEST_FILENAME).read_text() == '{"already": "here"}'
 
 
+# -- cross-review round 2: staging_dir symlink/overlap safety ---------------
+#
+# Without `_assert_staging_layout_is_safe`, a symlink planted at
+# `staging_dir` (or an ancestor, or its `zigbee2mqtt/` subdirectory)
+# pointing into the live, read-only mounts would make `mkdir(...,
+# exist_ok=True)` a no-op through the symlink and `write_bytes_safe`
+# (which only ever `lstat`-checks the *final* path component) write
+# straight into live tenant data -- defeating the "never writes the live
+# tenant data" guarantee. Every scenario below plants exactly that,
+# confirms the restore is refused with `DETAIL_UNSAFE_STAGING`, and proves
+# the live directory's own content is untouched afterward.
+
+_LIVE_MARKER_CONTENT = b"live tenant data -- must never be touched by this module"
+
+
+def test_apply_pending_restore_refuses_when_staging_dir_is_a_symlink_into_a_live_dir(
+    tmp_path: Path,
+) -> None:
+    targets = _targets(tmp_path)
+    targets.zigbee2mqtt_dir.mkdir(parents=True)
+    marker = targets.zigbee2mqtt_dir / "existing.txt"
+    marker.write_bytes(_LIVE_MARKER_CONTENT)
+    targets.staging_dir.symlink_to(targets.zigbee2mqtt_dir, target_is_directory=True)
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is False
+    assert result.detail == DETAIL_UNSAFE_STAGING
+    assert marker.read_bytes() == _LIVE_MARKER_CONTENT
+    assert list(targets.zigbee2mqtt_dir.iterdir()) == [marker]
+
+
+def test_apply_pending_restore_refuses_when_an_ancestor_of_staging_dir_is_a_symlink(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    live_zigbee_dir = tmp_path / "zigbee2mqtt"
+    live_zigbee_dir.mkdir()
+    marker = live_zigbee_dir / "existing.txt"
+    marker.write_bytes(_LIVE_MARKER_CONTENT)
+
+    # `ancestor_link` is a symlink; `staging_dir` names a path *beneath*
+    # it -- an ancestor of `staging_dir` is a symlink, `staging_dir`
+    # itself is not.
+    ancestor_link = tmp_path / "ancestor-link"
+    ancestor_link.symlink_to(live_zigbee_dir, target_is_directory=True)
+    targets = RestoreTargets(
+        data_dir=data_dir,
+        thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
+        zigbee2mqtt_dir=live_zigbee_dir,
+        staging_dir=ancestor_link / "staging",
+    )
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is False
+    assert result.detail == DETAIL_UNSAFE_STAGING
+    assert marker.read_bytes() == _LIVE_MARKER_CONTENT
+    assert list(live_zigbee_dir.iterdir()) == [marker]
+
+
+def test_apply_pending_restore_refuses_when_the_zigbee2mqtt_subdir_is_pre_created_as_a_symlink(
+    tmp_path: Path,
+) -> None:
+    targets = _targets(tmp_path)
+    targets.staging_dir.mkdir(parents=True, mode=0o700)
+    live_elsewhere = tmp_path / "elsewhere"
+    live_elsewhere.mkdir()
+    marker = live_elsewhere / "planted.txt"
+    marker.write_bytes(_LIVE_MARKER_CONTENT)
+    (targets.staging_dir / "zigbee2mqtt").symlink_to(live_elsewhere, target_is_directory=True)
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is False
+    assert result.detail == DETAIL_UNSAFE_STAGING
+    assert marker.read_bytes() == _LIVE_MARKER_CONTENT
+    assert list(live_elsewhere.iterdir()) == [marker]
+
+
+def test_apply_pending_restore_refuses_when_staging_dir_is_nested_inside_a_live_dir(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    live_zigbee_dir = tmp_path / "zigbee2mqtt"
+    live_zigbee_dir.mkdir()
+    marker = live_zigbee_dir / "existing.txt"
+    marker.write_bytes(_LIVE_MARKER_CONTENT)
+
+    targets = RestoreTargets(
+        data_dir=data_dir,
+        thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
+        zigbee2mqtt_dir=live_zigbee_dir,
+        staging_dir=live_zigbee_dir / "staging",  # nested inside the live dir
+    )
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is False
+    assert result.detail == DETAIL_UNSAFE_STAGING
+    assert marker.read_bytes() == _LIVE_MARKER_CONTENT
+    # Nothing -- not even an empty "staging" directory -- was created
+    # inside the live directory: the overlap is checked before `mkdir`
+    # ever runs, see `_create_and_verify_safe_dir`'s own docstring.
+    assert list(live_zigbee_dir.iterdir()) == [marker]
+
+
+def test_apply_pending_restore_refuses_when_a_live_dir_is_nested_inside_staging(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir(mode=0o700)
+    live_zigbee_dir = staging_dir / "zigbee2mqtt-live"  # nested inside staging
+    live_zigbee_dir.mkdir()
+    marker = live_zigbee_dir / "existing.txt"
+    marker.write_bytes(_LIVE_MARKER_CONTENT)
+
+    targets = RestoreTargets(
+        data_dir=data_dir,
+        thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
+        zigbee2mqtt_dir=live_zigbee_dir,
+        staging_dir=staging_dir,
+    )
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is False
+    assert result.detail == DETAIL_UNSAFE_STAGING
+    assert marker.read_bytes() == _LIVE_MARKER_CONTENT
+    assert list(live_zigbee_dir.iterdir()) == [marker]
+
+
+def test_apply_pending_restore_refuses_when_staging_dir_exactly_equals_a_live_dir(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    live_zigbee_dir = tmp_path / "zigbee2mqtt"
+    live_zigbee_dir.mkdir()
+    marker = live_zigbee_dir / "existing.txt"
+    marker.write_bytes(_LIVE_MARKER_CONTENT)
+
+    targets = RestoreTargets(
+        data_dir=data_dir,
+        thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
+        zigbee2mqtt_dir=live_zigbee_dir,
+        staging_dir=live_zigbee_dir,  # exactly the same path, not merely nested
+    )
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is False
+    assert result.detail == DETAIL_UNSAFE_STAGING
+    assert marker.read_bytes() == _LIVE_MARKER_CONTENT
+    assert list(live_zigbee_dir.iterdir()) == [marker]
+
+
 def test_apply_pending_restore_wrong_key_fails_cleanly_nothing_staged(tmp_path: Path) -> None:
     """A key block encrypted to a *different* device identity than the one
     actually stored on disk -- the device cannot unwrap it at all."""
@@ -297,7 +484,7 @@ def test_apply_pending_restore_wrong_key_fails_cleanly_nothing_staged(tmp_path: 
 
     assert result.success is False
     assert result.detail == DETAIL_DECRYPT_FAILED
-    assert not targets.staging_dir.exists()
+    assert _staging_has_no_staged_content(targets)
 
 
 def test_apply_pending_restore_malformed_archive_fails_cleanly(tmp_path: Path) -> None:
@@ -310,7 +497,7 @@ def test_apply_pending_restore_malformed_archive_fails_cleanly(tmp_path: Path) -
 
     assert result.success is False
     assert result.detail == DETAIL_MALFORMED_ARCHIVE
-    assert not targets.staging_dir.exists()
+    assert _staging_has_no_staged_content(targets)
 
 
 def test_apply_pending_restore_thermoctl_member_as_a_directory_fails_cleanly(
@@ -348,7 +535,7 @@ def test_apply_pending_restore_missing_thermoctl_member_fails_cleanly(tmp_path: 
 
     assert result.success is False
     assert result.detail == DETAIL_MALFORMED_ARCHIVE
-    assert not targets.staging_dir.exists()
+    assert _staging_has_no_staged_content(targets)
 
 
 def test_apply_pending_restore_never_writes_the_landlord_identity_string_anywhere(

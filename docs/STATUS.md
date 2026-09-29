@@ -683,22 +683,69 @@ tenant data itself (both owner decisions, below).
    `restore_targets`/`restore_poll_interval_s`, default 60s, its own
    background thread, same shape as the daily backup scheduler).
 
-**Verification (this package's own run, after the cross-review fixes
-above):** `ruff check .` clean; `mypy .` and `mypy protocol fleet agent
-tools` clean; `pytest` -- REPLACE_PYTEST_LINE; `go vet`/`go test`/
-`check_contract.sh` unaffected and passing (Python-only package). New/
-updated test files: `tests/test_age_key_block.py`,
+**Cross-review round 2 finding and fix (staging-directory symlink/overlap
+safety):** `apply_pending_restore` created and wrote into `staging_dir`
+(and its `zigbee2mqtt/` subdirectory) via plain `mkdir(...,
+exist_ok=True)` and `write_bytes_safe`, neither of which checks anything
+*above* the final path component. If `staging_dir` (or any ancestor of
+it, or the `zigbee2mqtt/` subdirectory specifically) were a symlink
+pointing into the live, read-only `thermoctl_db_path`/`zigbee2mqtt_dir`
+mounts, `mkdir(exist_ok=True)` would silently follow it and
+`write_bytes_safe` would write the decrypted tenant data straight through
+it into the live directories -- exactly the write access the owner
+decision says this module must never have. Fixed with
+`_assert_staging_layout_is_safe` (`agent/restore.py`), called **first**,
+before `_operational_store_is_empty`, before `_staged_restore_already_
+pending`, and long before either `pyrage.decrypt` call:
+
+- `_assert_no_symlink_ancestor` walks every already-existing ancestor of a
+  path with `lstat` (never following one) and refuses if any of them, or
+  the path itself, is a symlink -- checked **before** `mkdir` is ever
+  called, so a planted symlink is caught, not silently followed.
+- The path's own syntactically normalized location is checked against
+  `thermoctl_db_path`'s parent directory and `zigbee2mqtt_dir` for overlap
+  in **either** direction (`Path.is_relative_to`, both ways, plus exact
+  equality) -- **before** `mkdir` runs, so a `staging_dir` nested inside a
+  live directory (or vice versa) never gets so much as an empty directory
+  created under it.
+- Once created, `Path.resolve(strict=True)` is compared against that same
+  normalized location (the standard "no symlink anywhere in this path"
+  idiom) and `lstat` confirms it is genuinely a directory -- belt and
+  braces on top of the ancestor check.
+- Applied to **both** `staging_dir` itself and `staging_dir / "zigbee2mqtt"`
+  -- the latter checked unconditionally, before the archive has even been
+  decrypted, so a symlink pre-planted there is caught regardless of
+  whether the eventual archive turns out to contain a Zigbee2MQTT member
+  at all.
+
+A violation refuses with the closed detail string `DETAIL_UNSAFE_STAGING`
+("staging directory is unsafe (symlink or overlaps live data)") -- nothing
+is decrypted, nothing is written, and the failure is reported like any
+other. Six new tests in `tests/test_agent_restore.py` reproduce every
+scenario named in cross-review (staging_dir itself a symlink into a live
+dir; an ancestor of staging_dir a symlink; the `zigbee2mqtt/` subdir
+pre-created as a symlink; staging_dir nested inside a live dir; a live dir
+nested inside staging_dir; staging_dir exactly equal to a live dir) --
+each refused with `DETAIL_UNSAFE_STAGING`, and the live directory's own
+planted marker file confirmed byte-identical, and its directory listing
+unchanged, afterward.
+
+**Verification (this package's own run, after both rounds of
+cross-review fixes above):** `ruff check .` clean; `mypy .` and `mypy
+protocol fleet agent tools` clean; `pytest` -- REPLACE_PYTEST_LINE; `go
+vet`/`go test`/`check_contract.sh` unaffected and passing (Python-only
+package). New/updated test files: `tests/test_age_key_block.py`,
 `tests/test_age_identity.py`, `tests/test_restore_vendor.py` (includes a
 real `node` + the real vendored bundle interop test, decrypted with
 `pyrage`), `tests/test_fleet_restore.py` (incl. the concurrency fix
-above), `tests/test_agent_restore.py` (rewritten for staging),
-`tests/test_ui_restore.py` (incl. the sha256 display),
-`tests/test_restore_e2e.py` (rewritten for staging; full end-to-end over
-the real fleet app and real TLS: browser step simulated with `pyrage`,
-device fetch and staging for real, staged files and manifest compared
-byte-for-byte/hash-for-hash, and the landlord's key string confirmed
-absent from the fleet's sqlite file, every blob-storage file, and every
-file under the agent's own tmp tree afterward), `tests
+above), `tests/test_agent_restore.py` (rewritten for staging, plus the
+six staging-safety tests above), `tests/test_ui_restore.py` (incl. the
+sha256 display), `tests/test_restore_e2e.py` (rewritten for staging; full
+end-to-end over the real fleet app and real TLS: browser step simulated
+with `pyrage`, device fetch and staging for real, staged files and
+manifest compared byte-for-byte/hash-for-hash, and the landlord's key
+string confirmed absent from the fleet's sqlite file, every blob-storage
+file, and every file under the agent's own tmp tree afterward), `tests
 /test_device_registration_v1.py` (the `age_recipient` conflict fix) --
 plus fixes to five pre-existing tests whose own assertions pinned the
 *previous* CSP value/"no script anywhere" invariant (now: `script-src

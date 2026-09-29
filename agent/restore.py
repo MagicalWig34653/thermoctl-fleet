@@ -63,6 +63,8 @@ import hashlib
 import io
 import json
 import logging
+import os
+import stat
 import tarfile
 import threading
 import time
@@ -108,6 +110,7 @@ DETAIL_STORE_NOT_EMPTY = "operational data store is not empty"
 DETAIL_ALREADY_STAGED = "a staged restore already exists, awaiting the mover"
 DETAIL_DECRYPT_FAILED = "key block or operational data could not be decrypted"
 DETAIL_MALFORMED_ARCHIVE = "decrypted archive is missing expected files"
+DETAIL_UNSAFE_STAGING = "staging directory is unsafe (symlink or overlaps live data)"
 
 
 class RestoreError(Exception):
@@ -229,6 +232,153 @@ def _staged_restore_already_pending(targets: RestoreTargets) -> bool:
     return (targets.staging_dir / MANIFEST_FILENAME).is_file()
 
 
+def _normalized_absolute(path: Path) -> Path:
+    """`path`, made absolute and syntactically normalized (`..`/`.`
+    segments collapsed) -- **never** resolves a symlink (unlike
+    `Path.resolve`, which this module compares against exactly to detect
+    one, see `_assert_staging_layout_is_safe`'s own docstring)."""
+
+    return Path(os.path.normpath(str(path.absolute())))
+
+
+def _assert_no_symlink_ancestor(path: Path) -> None:
+    """Refuses (raises `RestoreError(DETAIL_UNSAFE_STAGING)`) if `path`
+    itself, or any of its **already-existing** ancestors, is a symlink --
+    checked with `lstat` (never follows one) before this module ever calls
+    `mkdir` on `path`, so a symlink planted anywhere in the chain is caught
+    before `mkdir(..., exist_ok=True)` could silently follow it into a
+    different location. An ancestor that does not exist yet is safe to
+    skip: `mkdir(parents=True, ...)` creates it fresh, and it cannot be a
+    symlink to somewhere else if it does not exist at all -- every
+    ancestor *above* it has already been proven, by this same walk, not to
+    be one either, so the fresh directory is created in exactly the real
+    location this path names, not through a redirect."""
+
+    for ancestor in (*reversed(path.parents), path):
+        if str(ancestor) == ancestor.anchor:
+            continue  # the filesystem root itself -- never a symlink to check
+        try:
+            found = ancestor.lstat()
+        except FileNotFoundError:
+            continue  # does not exist yet -- created fresh, see docstring above
+        if stat.S_ISLNK(found.st_mode):
+            raise RestoreError(DETAIL_UNSAFE_STAGING)
+
+
+def _create_and_verify_safe_dir(path: Path, *, forbidden_overlaps: list[Path]) -> Path:
+    """Creates `path` (mode `0700`) and returns its resolved, real
+    location -- **only** after proving, in order, that:
+
+    1. no already-existing ancestor of `path` is a symlink
+       (`_assert_no_symlink_ancestor`, checked *before* `mkdir` is ever
+       called, so `mkdir(..., exist_ok=True)` cannot silently follow one).
+    2. `path`'s own syntactically normalized absolute location (never
+       symlink-resolved -- there is nothing left to resolve, check 1
+       already proved no symlink exists anywhere in its chain) does not
+       overlap, in **either** direction, any path in `forbidden_overlaps`
+       (`Path.is_relative_to`, both ways, plus an exact-equality check) --
+       "overlap" here means one is nested inside the other, or they are
+       the same path. **Checked before `mkdir` runs at all** -- a path
+       that turns out to be nested inside (or to contain) a live,
+       read-only directory must never have so much as an empty directory
+       created under it by this function; `mkdir` only ever runs once
+       this check has already passed.
+    3. once created, `path` still resolves to exactly that same
+       normalized location (`Path.resolve(strict=True) ==
+       _normalized_absolute(path)`) -- the standard idiom for "no symlink
+       anywhere in this path", belt and braces on top of check 1 (a TOCTOU
+       window between the two checks is not modeled as a realistic threat
+       here -- this is a local, single-process agent, not a multi-tenant
+       service; the *ancestor* check already closes the window that
+       matters, "was a symlink planted before this call ran at all").
+    4. the created directory is genuinely a directory, not something else
+       `lstat` would otherwise have to be fooled about.
+
+    Raises `RestoreError(DETAIL_UNSAFE_STAGING)` on any violation -- this
+    function creates nothing beyond the one directory `path` names, and
+    only calls `mkdir` after checks 1 and 2 have already passed.
+    """
+
+    _assert_no_symlink_ancestor(path)
+
+    normalized = _normalized_absolute(path)
+    for boundary in forbidden_overlaps:
+        if normalized == boundary:
+            raise RestoreError(DETAIL_UNSAFE_STAGING)
+        if normalized.is_relative_to(boundary) or boundary.is_relative_to(normalized):
+            raise RestoreError(DETAIL_UNSAFE_STAGING)
+
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    resolved = path.resolve(strict=True)
+    if resolved != normalized:  # pragma: no cover -- see the docstring's own TOCTOU note
+        # Only reachable if a symlink is planted in `path`'s chain in the
+        # narrow window between the ancestor check above and this
+        # `mkdir` -- deliberately not artificially constructed here (see
+        # the docstring's own reasoning for why that window is not
+        # modeled as a realistic threat for this local, single-process
+        # agent); kept as defense in depth regardless.
+        raise RestoreError(DETAIL_UNSAFE_STAGING)
+    if not stat.S_ISDIR(path.lstat().st_mode):  # pragma: no cover -- see reasoning below
+        # Structurally unreachable via any real path through this
+        # function: `Path.mkdir(exist_ok=True)` itself already re-raises
+        # `FileExistsError` (uncaught by this module, propagated to the
+        # caller as a plain `OSError`) the moment the target exists but is
+        # not a directory -- this check only remains as defense in depth
+        # against a filesystem/`mkdir` behaviour this reasoning turns out
+        # not to hold for, the same "no real path here is known" stance
+        # this codebase's other `# pragma: no cover` branches already take
+        # (e.g. `fleet.app.report_device_age_recipient`'s own).
+        raise RestoreError(DETAIL_UNSAFE_STAGING)
+
+    return resolved
+
+
+def _assert_staging_layout_is_safe(targets: RestoreTargets) -> None:
+    """Owner decision safeguard, cross-review round 2, 2026-09-28: without
+    this check, a symlink planted at `targets.staging_dir` (or any
+    ancestor of it, or the fixed `zigbee2mqtt/` subdirectory this module
+    creates inside it) that points into the live, read-only
+    `thermoctl_db_path`/`zigbee2mqtt_dir` mounts would make `mkdir(...,
+    exist_ok=True)` a silent no-op *through* the symlink and
+    `agent.safe_io.write_bytes_safe` (which, by design, only ever `lstat`-
+    checks the *final* path component it is asked to write -- see that
+    function's own docstring) write straight into live tenant data,
+    defeating the whole "never writes the live tenant data" guarantee this
+    module's own docstring promises.
+
+    Called **before any decryption or staging** -- `apply_pending_restore`
+    calls this first, before `_operational_store_is_empty`, before
+    `_staged_restore_already_pending`, and long before either `pyrage
+    .decrypt` call: a violation here means nothing is ever decrypted and
+    nothing beyond the two empty, verified-safe directories below is ever
+    created.
+
+    Checks, via `_create_and_verify_safe_dir`:
+
+    - `targets.staging_dir` itself -- no symlink in its chain, resolves to
+      itself, is a real directory, and does not overlap (nested either
+      way, or identical to) `targets.thermoctl_db_path`'s own parent
+      directory or `targets.zigbee2mqtt_dir`.
+    - `targets.staging_dir / "zigbee2mqtt"` -- the one fixed subdirectory
+      this module ever creates inside staging (`agent.loop.create_backup`'s
+      own tar layout, mirrored here) -- checked **unconditionally**, before
+      the archive has even been decrypted (so this module cannot yet know
+      whether the archive actually contains a Zigbee2MQTT member): a
+      symlink planted there ahead of time must be caught regardless of
+      what the eventual archive turns out to hold.
+    """
+
+    live_boundaries = [
+        targets.thermoctl_db_path.parent.resolve(strict=False),
+        targets.zigbee2mqtt_dir.resolve(strict=False),
+    ]
+    _create_and_verify_safe_dir(targets.staging_dir, forbidden_overlaps=live_boundaries)
+    _create_and_verify_safe_dir(
+        targets.staging_dir / "zigbee2mqtt", forbidden_overlaps=live_boundaries
+    )
+
+
 @dataclass(frozen=True)
 class _StagedFile:
     relative_path: str
@@ -274,25 +424,31 @@ def apply_pending_restore(pending: PendingRestore, targets: RestoreTargets) -> R
     module docstring for the full security reasoning; this docstring only
     lists the order the checks below run in and why:
 
-    1. **Empty-store check first, before any decryption at all** -- the
-       cheapest check, advisory only (see `_operational_store_is_empty`'s
-       own docstring), and the one whose refusal must never depend on
-       whether the supplied key even happens to be correct.
-    2. **Already-staged check** -- refuses if a previous restore is still
+    1. **Staging-layout safety check first, before anything else at all**
+       (`_assert_staging_layout_is_safe`, cross-review round 2) -- refuses
+       if `staging_dir` (or an ancestor, or its `zigbee2mqtt/` subdirectory)
+       is a symlink, or overlaps the live, read-only mounts. Nothing past
+       this point ever runs if it fails.
+    2. **Empty-store check, before any decryption at all** -- the
+       cheapest remaining check, advisory only (see
+       `_operational_store_is_empty`'s own docstring), and one whose
+       refusal must never depend on whether the supplied key even happens
+       to be correct.
+    3. **Already-staged check** -- refuses if a previous restore is still
        staged, unconsumed (`_staged_restore_already_pending`), before any
        decryption either: there is nowhere safe to put a second one yet.
-    3. Decrypt `key_block_b64` with this device's own age identity -> the
+    4. Decrypt `key_block_b64` with this device's own age identity -> the
        landlord's identity, **in memory only**.
-    4. Decrypt `operational_data_b64` with the landlord's identity -> the
+    5. Decrypt `operational_data_b64` with the landlord's identity -> the
        plaintext tar bytes, **in memory only**.
-    5. Extract the expected members from the tar **into memory** (never
+    6. Extract the expected members from the tar **into memory** (never
        partially extracting to disk before every member has been read
        successfully) -- a malformed archive therefore still fails clean,
        nothing written.
-    6. Only once every previous step has fully succeeded: write every
+    7. Only once every previous step has fully succeeded: write every
        staged file under `targets.staging_dir`, atomically
        (`agent.safe_io.write_bytes_safe`), then the manifest **last**.
-    7. If a device-configuration backup was bundled, write it directly to
+    8. If a device-configuration backup was bundled, write it directly to
        `targets.data_dir` (not staged, not gated by the empty-store check
        -- device configuration carries no tenant data, section 15.1's own
        table, so there is nothing the staging/mover split exists to
@@ -300,6 +456,15 @@ def apply_pending_restore(pending: PendingRestore, targets: RestoreTargets) -> R
        kind is handled differently from operational data throughout this
        codebase).
     """
+
+    try:
+        _assert_staging_layout_is_safe(targets)
+    except RestoreError:
+        logger.warning(
+            "Restore staging directory is unsafe (symlink or overlaps live data) -- "
+            "nothing decrypted, nothing staged."
+        )
+        return RestoreResult(success=False, detail=DETAIL_UNSAFE_STAGING)
 
     if not _operational_store_is_empty(targets):
         return RestoreResult(success=False, detail=DETAIL_STORE_NOT_EMPTY)
@@ -353,10 +518,13 @@ def apply_pending_restore(pending: PendingRestore, targets: RestoreTargets) -> R
         logger.warning("Decrypted operational-data archive is malformed -- nothing staged.")
         return RestoreResult(success=False, detail=DETAIL_MALFORMED_ARCHIVE)
 
-    targets.staging_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Both possible parent directories (`staging_dir` itself, for
+    # `thermoctl.db`; `staging_dir / "zigbee2mqtt"`, for the two
+    # Zigbee2MQTT members) were already created and verified safe by
+    # `_assert_staging_layout_is_safe` above -- nothing left to `mkdir`
+    # here, only to write into.
     for staged in staged_files:
         destination = targets.staging_dir / staged.relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         write_bytes_safe(destination, staged.content, mode=0o600)
     _write_manifest(targets, pending.operational_backup_id, staged_files, datetime.now(UTC))
 
