@@ -81,6 +81,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fleet.alarms import ABSENCE_THRESHOLD, AlarmKind
+from fleet.restore_vendor import AGE_VENDOR_JS_SHA256
 from fleet.storage import AlarmRecord, BackupSummary, CommandRecord, HeartbeatHistoryEntry, Storage
 from fleet.ui_house import FAULT_KIND_LABELS
 from protocol import FaultKind
@@ -581,6 +582,27 @@ class ApartmentDetail:
     # still needs them), unlike the command buttons, which a retired
     # apartment genuinely cannot receive any more.
     backups: list[BackupDisplay]
+    # Restore (P5.5b, section 15.2/15.3's "Decided afterward" paragraphs) --
+    # the "Wiederherstellen" form is only ever offered when there is a
+    # currently assigned device *and* that device has already reported an
+    # age recipient (`restore_device_recipient`); `restore_operational_
+    # backups` is `backups` filtered to `operational_data` -- the only kind
+    # a restore can target. `restore_pending`/`restore_pending_expires_
+    # text` reflect an already-created restore still waiting on the
+    # device to fetch it (`Storage.get_pending_restore_status`).
+    # `restore_vendor_js_sha256` is the vendored browser age script's own
+    # sha256 (owner decision, 2026-09-28, cross-review, "limit of the
+    # browser-side encryption" paragraph, section 15.3): shown next to the
+    # form so the landlord can compare it against the value named in the
+    # operating manual -- this protects against a leaked database, logs,
+    # server backups, or passive reading of the fleet, but **not** against
+    # an actively taken-over fleet server that serves a modified script at
+    # the next restore (accepted deliberately, see that paragraph).
+    restore_device_recipient: str | None
+    restore_operational_backups: list[BackupDisplay]
+    restore_pending: bool
+    restore_pending_expires_text: str | None
+    restore_vendor_js_sha256: str
 
 
 def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> TimelineEntry:
@@ -725,6 +747,24 @@ def build_apartment_detail(
     commands = build_command_history(storage, apartment_id, now)
     backups = build_backup_history(storage, apartment_id)
 
+    # P5.5b -- see `ApartmentDetail`'s own docstring for what each field
+    # gates in the template.
+    current_device = storage.get_current_device_for_apartment(apartment_id)
+    restore_device_recipient = (
+        current_device.age_recipient if current_device is not None else None
+    )
+    restore_operational_backups = [
+        _build_backup_display(summary)
+        for summary in storage.get_operational_data_backups_for_apartment(apartment_id)
+    ]
+    pending_restore = storage.get_pending_restore_status(apartment_id)
+    restore_pending = pending_restore is not None
+    restore_pending_expires_text = (
+        f"gültig bis {_format_timestamp(pending_restore.expires_at)}"
+        if pending_restore is not None
+        else None
+    )
+
     history_days = clamp_history_days(days)
     since = now - timedelta(days=history_days)
 
@@ -792,6 +832,11 @@ def build_apartment_detail(
             available_commands=available_commands(),
             commands=commands,
             backups=backups,
+            restore_device_recipient=restore_device_recipient,
+            restore_operational_backups=restore_operational_backups,
+            restore_pending=restore_pending,
+            restore_pending_expires_text=restore_pending_expires_text,
+            restore_vendor_js_sha256=AGE_VENDOR_JS_SHA256,
         )
 
     heartbeat = latest.heartbeat
@@ -826,6 +871,11 @@ def build_apartment_detail(
         available_commands=available_commands(),
         commands=commands,
         backups=backups,
+        restore_device_recipient=restore_device_recipient,
+        restore_operational_backups=restore_operational_backups,
+        restore_pending=restore_pending,
+        restore_pending_expires_text=restore_pending_expires_text,
+        restore_vendor_js_sha256=AGE_VENDOR_JS_SHA256,
     )
 
 

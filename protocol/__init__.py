@@ -58,6 +58,7 @@ from protocol.registration import (
     TokenRequest,
     verification_code_for,
 )
+from protocol.restore import AgeRecipientReport, PendingRestore, RestoreResult
 from protocol.version import PROTOCOL_VERSION
 
 __all__ = [
@@ -65,6 +66,7 @@ __all__ = [
     "MAX_BACKUP_UPLOAD_BYTES",
     "MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES",
     "PROTOCOL_VERSION",
+    "AgeRecipientReport",
     "AgentRegistrationFile",
     "Apartment",
     "ApartmentState",
@@ -86,10 +88,12 @@ __all__ = [
     "Heartbeat",
     "LogExcerpt",
     "OpenFault",
+    "PendingRestore",
     "Property",
     "RegistrationAccepted",
     "RegistrationConfirmation",
     "RegistrationRequest",
+    "RestoreResult",
     "ServiceState",
     "Services",
     "SystemState",

@@ -8,10 +8,14 @@
     An external, same-origin stylesheet, not an inline style block
     (cross-review round 2: `default-src 'self'` without `'unsafe-inline'`
     blocks inline CSS too, not only inline scripts -- see
-    fleet/static/ui/fleet-ui.css's own header comment). Still no script of
-    any kind (P3.0 requirement: "no JS needed") -- the CSP sent by
-    fleet/ui_routes.py's security-headers middleware would block an inline
-    one regardless, and no script is mounted under /ui/static either.
+    fleet/static/ui/fleet-ui.css's own header comment). No page loads a
+    script unless it explicitly opts in via {% block scripts %} below
+    (P5.5b's restore form is the first, and so far only, page that does --
+    see fleet/templates/ui/apartment.html); every other page stays exactly
+    as script-free as P3.0's original "no JS needed" requirement, and the
+    CSP sent by fleet/ui_routes.py's security-headers middleware
+    (`script-src 'self'`, same-origin only, no CDN at runtime -- P5.5b)
+    would refuse anything not served from /ui/static regardless.
     #}
     <link rel="stylesheet" href="/ui/static/fleet-ui.css">
 </head>
@@ -35,5 +39,6 @@
 <main id="main">
 {% block content %}{% endblock %}
 </main>
+{% block scripts %}{% endblock %}
 </body>
 </html>

@@ -547,6 +547,303 @@ clean, `go test ./...` -- all three packages `ok`, `bash check_contract.sh`
 every prior package since P5.5a -- the watchdog's own `go.mod` has and needs
 no new dependency, untouched by this package).
 
+## P5.5b -- Restore (sections 15.2, 15.3 step 4, and its two "Decided
+afterward" paragraphs, 2026-09-28)
+
+**What:** the counterpart to P5.5a: a swapped/freshly-commissioned device
+fetches the device-configuration backup and, on a swap, the encrypted
+operational-data backup -- with the landlord's decryption key never
+reaching the fleet in plain text, and the agent never writing the live
+tenant data itself (both owner decisions, below).
+
+**Design, end to end:**
+
+1. **Device generates its own age X25519 key pair**, next to its Ed25519
+   device key (`agent/age_identity.py`, stored via `agent/safe_io.py
+   ::write_bytes_safe`, mode `0600`, never logged). Only the **public**
+   recipient is ever reported to the fleet:
+   - as part of registration (`protocol.registration.RegistrationRequest
+     .age_recipient`, new, optional field -- `PROTOCOL_VERSION` bumped to
+     **7**, chained after P5.3b's `6` -- both packages branched from `5`
+     in parallel, re-numbered at merge, same convention this file's own
+     "Merge integration" section above already documents for the
+     migration chain);
+   - for a device that registered before this package existed:
+     `POST /v1/device/age-recipient` (`protocol.restore
+     .AgeRecipientReport`, token-authenticated, set-once/idempotent,
+     `Storage.set_device_age_recipient` -- `409` on a genuine conflict,
+     never a silent overwrite).
+   The fleet validates every reported recipient via the real
+   `pyrage.x25519.Recipient.from_str` (`fleet.age_key_block
+   .validate_age_recipient`), plus an explicit, independently tested
+   refusal of anything containing `AGE-SECRET-KEY-` (belt and braces on
+   top of `pyrage` already rejecting it by its own bech32 prefix).
+   **Cross-review fix:** `report_device_registration` (`POST
+   /v1/registration`) used to ignore `set_device_age_recipient`'s `False`
+   entirely -- a device already carrying a *different* recipient on file
+   kept the stale one, silently, while the rest of registration proceeded
+   as if nothing had happened. Now: `409`, the same conflict shape the
+   dedicated endpoint already gives (`tests/test_device_registration_v1.py
+   ::test_registration_with_a_conflicting_age_recipient_is_refused_with_409`).
+2. **Fleet UI, login required:** "Wiederherstellen" form on "Eine Wohnung"
+   (`fleet/templates/ui/apartment.html`, `fleet/ui_routes.py
+   ::apartment_restore_create`), offered only when the apartment has a
+   currently assigned, confirmed device with a reported age recipient and
+   at least one `operational_data` backup. The key input field has **no
+   `name` attribute** (never submitted, not even with JS disabled -- no
+   plaintext fallback exists server-side either). A vendored, pinned
+   (`age-encryption@0.3.1`) browser build of `typage`
+   (`fleet/static/ui/vendor/age-encryption.vendor.js`, built with
+   `esbuild`, self-contained, no remaining `import`/external URL, sha256
+   recorded in `fleet.restore_vendor.AGE_VENDOR_JS_SHA256` and checked by
+   a test) encrypts the typed key, in the browser, to the device's own
+   recipient; `fleet/static/ui/restore_form.js` wires the form to it and
+   writes only the ciphertext into a *named* hidden field before
+   submitting. The server (`fleet.age_key_block
+   .validate_single_x25519_stanza`) checks the submission structurally --
+   real age header, **exactly one `X25519`-typed stanza** (a real
+   `pyrage.encrypt` call reliably adds a second, "grease", stanza of some
+   other type; only `X25519`-typed stanzas count toward "exactly one",
+   confirmed directly by a test) -- and the explicit `AGE-SECRET-KEY-`
+   substring refusal again, independent of the recipient-side check.
+   `Storage.create_pending_restore` stores the opaque ciphertext bound to
+   `(apartment, device, backup)`, with a 15-minute (configurable,
+   `FLEET_RESTORE_KEY_BLOCK_TTL_S`) expiry, and an audit-log entry (who,
+   when, which backup id -- never the payload).
+
+   **Owner decision (a), cross-review, precise guarantee:** the page shows
+   the vendored script's own sha256 (`ApartmentDetail
+   .restore_vendor_js_sha256`) next to a German hint to compare it with
+   the value named in the operating manual
+   (`tests/test_ui_restore.py::test_restore_form_shows_the_vendored_js_sha256`,
+   `tests/test_restore_e2e.py`'s own end-to-end check). Stated precisely,
+   not just claimed: this protects against a **leaked database, logs,
+   server backups, or passive reading** of the fleet -- it does **not**
+   protect against an **actively taken-over fleet server that serves a
+   modified script** at the next restore and captures the key then. That
+   gap is accepted deliberately by the project owner (restores are rare
+   and consciously triggered) -- the sha256 display is the mitigation the
+   spec itself names for it, not a claim that the gap is closed.
+3. **Device fetch, single endpoint:** `GET /v1/restore`
+   (`fleet.app.fetch_pending_restore`, token-authenticated) -- `204` when
+   nothing is pending, otherwise the key block, the chosen operational
+   backup's own bytes, and the apartment's latest device-configuration
+   backup (if any), all base64-in-JSON (`protocol.restore.PendingRestore`)
+   so the fetch is atomic from the agent's point of view. Deleted in the
+   same transaction it is read in (`Storage
+   .fetch_and_delete_pending_restore`) -- single-fetch, and **only the
+   device currently assigned to the apartment** (re-checked against the
+   stored restore's own `device_id`, on top of the apartment bearer token
+   already having been revoked by any device swap in between -- tested
+   directly with a second device). A backstop purge loop
+   (`fleet.app._restore_purge_loop`) deletes anything expired that nobody
+   ever fetched. Not a command -- `protocol.commands.CommandType` is
+   untouched.
+
+   **Cross-review finding and fix (concurrency bug):** `fetch_and_delete
+   _pending_restore` used to `SELECT` the row, decide in Python, and only
+   then `DELETE` it -- a classic check-then-act race. Two concurrent
+   fetches for the same apartment (a retry racing the original, or a
+   genuine second device) could both read the row before either `DELETE`
+   ran, and **both** received the same key block -- reproduced directly
+   (ten real threads, one real sqlite **file** database, separate
+   sessions, `results.count(successes) == 2` before the fix). Fixed with a
+   single, atomic, guarded `DELETE ... WHERE apartment_id = ? AND
+   device_id = ? AND expires_at > ? RETURNING ...` statement -- exactly
+   one concurrent caller's `DELETE` can ever match and remove the row;
+   every other caller's statement matches zero rows in the same instant.
+   Proven fixed by `tests/test_fleet_restore.py
+   ::test_fetch_and_delete_pending_restore_is_race_safe_under_concurrency`
+   (ten threads, exactly one winner, every run -- checked six times in a
+   row during this fix with no flake).
+4. **Agent stages, never writes the live tenant data** (`agent/restore.py
+   ::apply_pending_restore`, the security boundary, principle 5; owner
+   decision, 2026-09-28, second "Decided afterward" paragraph: "the agent
+   container never gets write access to the live tenant data ... the
+   agent writes the decrypted operational data only into its own staging
+   directory"): refuses early (advisory only -- reading the read-only
+   mounts is fine) if the live operational-data store already has content
+   (`_operational_store_is_empty`), and refuses if a previous restore is
+   still staged and unconsumed (`_staged_restore_already_pending`, the
+   manifest's own presence is the check) -- both **before** any
+   decryption. Decrypts the key block with its own identity (landlord
+   identity, in memory only, never written or logged), then the
+   operational backup with that identity, extracts the tar **fully into
+   memory** before writing anything, then writes every staged file
+   atomically (`agent.safe_io.write_bytes_safe`, mode `0600`, staging
+   directory mode `0700`) under `RestoreTargets.staging_dir` -- never
+   under `thermoctl_db_path`/`zigbee2mqtt_dir`, which this module only
+   ever *reads*. Writes `manifest.json` **last**, atomically, once every
+   staged file has already been written successfully -- backup id, staged-
+   at timestamp, and each file's relative path/size/sha256, for **P5.5c**
+   (below) to verify before it moves anything. Reports **"staged, awaiting
+   apply"** -- never "restored" -- via `POST /v1/restore/result` (a
+   closed, non-sensitive set of `detail` strings, never content). Polled
+   for at startup and periodically (`agent.loop.run`'s own
+   `restore_targets`/`restore_poll_interval_s`, default 60s, its own
+   background thread, same shape as the daily backup scheduler).
+
+**Cross-review round 2 finding and fix (staging-directory symlink/overlap
+safety):** `apply_pending_restore` created and wrote into `staging_dir`
+(and its `zigbee2mqtt/` subdirectory) via plain `mkdir(...,
+exist_ok=True)` and `write_bytes_safe`, neither of which checks anything
+*above* the final path component. If `staging_dir` (or any ancestor of
+it, or the `zigbee2mqtt/` subdirectory specifically) were a symlink
+pointing into the live, read-only `thermoctl_db_path`/`zigbee2mqtt_dir`
+mounts, `mkdir(exist_ok=True)` would silently follow it and
+`write_bytes_safe` would write the decrypted tenant data straight through
+it into the live directories -- exactly the write access the owner
+decision says this module must never have. Fixed with
+`_assert_staging_layout_is_safe` (`agent/restore.py`), called **first**,
+before `_operational_store_is_empty`, before `_staged_restore_already_
+pending`, and long before either `pyrage.decrypt` call:
+
+- `_assert_no_symlink_ancestor` walks every already-existing ancestor of a
+  path with `lstat` (never following one) and refuses if any of them, or
+  the path itself, is a symlink -- checked **before** `mkdir` is ever
+  called, so a planted symlink is caught, not silently followed.
+- The path's own syntactically normalized location is checked against
+  `thermoctl_db_path`'s parent directory and `zigbee2mqtt_dir` for overlap
+  in **either** direction (`Path.is_relative_to`, both ways, plus exact
+  equality) -- **before** `mkdir` runs, so a `staging_dir` nested inside a
+  live directory (or vice versa) never gets so much as an empty directory
+  created under it.
+- Once created, `Path.resolve(strict=True)` is compared against that same
+  normalized location (the standard "no symlink anywhere in this path"
+  idiom) and `lstat` confirms it is genuinely a directory -- belt and
+  braces on top of the ancestor check.
+- Applied to **both** `staging_dir` itself and `staging_dir / "zigbee2mqtt"`
+  -- the latter checked unconditionally, before the archive has even been
+  decrypted, so a symlink pre-planted there is caught regardless of
+  whether the eventual archive turns out to contain a Zigbee2MQTT member
+  at all.
+
+A violation refuses with the closed detail string `DETAIL_UNSAFE_STAGING`
+("staging directory is unsafe (symlink or overlaps live data)") -- nothing
+is decrypted, nothing is written, and the failure is reported like any
+other. Six new tests in `tests/test_agent_restore.py` reproduce every
+scenario named in cross-review (staging_dir itself a symlink into a live
+dir; an ancestor of staging_dir a symlink; the `zigbee2mqtt/` subdir
+pre-created as a symlink; staging_dir nested inside a live dir; a live dir
+nested inside staging_dir; staging_dir exactly equal to a live dir) --
+each refused with `DETAIL_UNSAFE_STAGING`, and the live directory's own
+planted marker file confirmed byte-identical, and its directory listing
+unchanged, afterward.
+
+**Cross-review round 3 finding and fix (a reproduced false positive in
+round 2's own fix):** `_assert_no_symlink_ancestor` walked every
+already-existing ancestor of `staging_dir` up to the filesystem root and
+refused if *any* of them was a symlink -- including ancestors that have
+nothing to do with this module's own components at all. On macOS, `/var`
+is itself a symlink to `/private/var`; some container layouts have their
+own equivalent redirect somewhere above a perfectly legitimate
+`staging_dir`. Round 2's own tests never caught this because pytest's own
+`tmp_path` fixture hands back an already-`resolve()`d path, silently
+hiding exactly the ancestor the bug depended on. The effect: **every
+restore on such a system refused**, unconditionally -- a self-inflicted
+denial of service, not a security improvement.
+
+**Fix: compare resolved locations against resolved locations, drop the
+ancestor walk entirely.** `_resolve_prospective` computes the real,
+symlink-resolved location a path will have once created (resolving the
+longest already-existing prefix, appending the remaining not-yet-existing
+suffix literally) -- applied to `staging_dir`'s own prospective location
+*and* to the two live boundaries (`thermoctl_db_path.parent.resolve()`,
+`zigbee2mqtt_dir.resolve()`) alike, so an unrelated ancestor symlink
+resolves the same way on both sides of the overlap comparison and never
+trips it. `_assert_component_is_safe` replaces the ancestor walk with a
+narrower check: only `staging_dir` itself (and separately,
+`staging_dir/"zigbee2mqtt"`) must not *itself* already exist as a symlink
+or non-directory (`lstat`, never follows) -- nothing above it is inspected
+or restricted anymore. **The "ancestor symlinked into a live dir" attack
+is still caught**, without walking anything: resolving `staging_dir`
+*through* such an ancestor produces the live directory's own real
+location, which the overlap check still refuses on exactly the same
+grounds as before (proven by keeping that round-2 test passing unchanged,
+`test_apply_pending_restore_refuses_when_an_ancestor_of_staging_dir_is_a_
+symlink`). Two new tests prove the fix the other way: a `staging_dir`
+reached through an *unrelated* symlinked ancestor (`tmp_path/"link" ->
+tmp_path/"real"`, live directories elsewhere) now succeeds and genuinely
+stages; and, the round 3 finding's own reproduction case, a real
+`tempfile.mkdtemp()` base (not pytest's pre-resolved `tmp_path`) succeeds
+too, on any platform where the system temp directory itself sits behind a
+symlink (confirmed reproducing on this run's own platform, not skipped).
+
+The module's own top-level docstring now states the TOCTOU window
+precisely: `_assert_staging_layout_is_safe`'s own checks are the cheap,
+first line of defense, not the last -- the window from that check through
+the *final* `write_bytes_safe` call is not something this single,
+no-privilege-boundary agent process can fully close against a
+sufficiently well-timed local attacker on its own; closing it
+authoritatively (a real re-check immediately before anything is moved
+into the live directories) is **P5.5c's** own job, unchanged from round
+2's own reasoning -- this module's check only has to catch the mistake or
+attack *early enough to refuse loudly and stage nothing*, not to be the
+final word on the live directories' own safety.
+
+**Verification (this package's own run, after all three rounds of
+cross-review fixes above):** `ruff check .` clean; `mypy .` (127 files)
+and `mypy protocol fleet agent tools` (65 files) clean; `pytest -W
+ignore::ResourceWarning -rA` -- **1589 passed, 1 skipped** (the skip is
+pre-existing/unrelated: "no 'age' CLI binary available in this
+environment") in 118.15s, coverage **TOTAL 6043 stmts / 20 missed / 99%**
+-- every file this package touches or created is at 100% (`agent/restore
+.py` included); the 20 missed lines are all pre-existing, unrelated code
+(`agent/commands_channel.py`, `agent/log_filter.py`, `agent/loop.py`'s own
+pre-existing `NotImplementedError` stubs, `fleet/admin.py`,
+`fleet/ui_routes.py`, `tools/check_image_config.py`); `go
+vet`/`go test`/`check_contract.sh` unaffected and passing (Python-only
+package). New/updated test files: `tests/test_age_key_block.py`,
+`tests/test_age_identity.py`, `tests/test_restore_vendor.py` (includes a
+real `node` + the real vendored bundle interop test, decrypted with
+`pyrage`), `tests/test_fleet_restore.py` (incl. the concurrency fix
+above), `tests/test_agent_restore.py` (rewritten for staging, plus the
+six round-2 staging-safety tests and the two round-3 false-positive
+fix tests above), `tests/test_ui_restore.py` (incl. the
+sha256 display), `tests/test_restore_e2e.py` (rewritten for staging; full
+end-to-end over the real fleet app and real TLS: browser step simulated
+with `pyrage`, device fetch and staging for real, staged files and
+manifest compared byte-for-byte/hash-for-hash, and the landlord's key
+string confirmed absent from the fleet's sqlite file, every blob-storage
+file, and every file under the agent's own tmp tree afterward), `tests
+/test_device_registration_v1.py` (the `age_recipient` conflict fix) --
+plus fixes to five pre-existing tests whose own assertions pinned the
+*previous* CSP value/"no script anywhere" invariant (now: `script-src
+'self'`, external same-origin `<script>` permitted only for this
+feature's own vendored files).
+
+**Migration re-chaining (merge with main, 2026-09-28):** originally
+branched from `0012_fleet_epoch` (P5.1c) as `0013_restore`, in parallel
+with P5.3b's own `0013_diagnostic_bundles` (also branched from `0012`) --
+re-chained at merge onto `0014_restore`, `down_revision = "0013"`, the
+same "re-number, never reuse" convention this file's own "Merge
+integration" section above already established for the identical
+situation one revision earlier. Verified: `upgrade` from empty,
+`downgrade` to `0013`, `downgrade` to `base`, `upgrade` again.
+
+**Open points:**
+
+- **P5.5c (new, open, not started -- see `docs/implementation_plan.md`):**
+  a small, separate Go program next to the watchdog moves a staged
+  restore (`agent/restore.py`'s own staging directory and manifest) into
+  the live thermoctl/Zigbee2MQTT directories -- the authoritative
+  "is the live store actually empty" re-check (this package's own check is
+  advisory only, since the agent process has no write access to those
+  directories in the first place), manifest hash verification, refusing
+  symlinks/non-regular files in staging, and a status file the agent reads
+  back to report the final result. Same constraints as the watchdog
+  (CLAUDE.md security principle 6): Go, no dependency, no network, no
+  registry. Nothing in this package builds it -- P5.5b's own scope stops
+  at "decrypt and stage".
+- Device-configuration restore is currently "write the fetched JSON to
+  `device_config.json` in the agent's data dir" -- there is no code yet
+  that *applies* any of its fields (broker settings, WireGuard peer,
+  timezone), matching `agent.loop.create_backup`'s own "nothing invented"
+  reasoning for the same fields on the create side; applying it is future
+  work once those features themselves exist. Unaffected by the staging
+  change above -- device configuration carries no tenant data (section
+  15.1's own table), so it is still written directly, not staged.
+
 ## P5.1c -- SSE resume survives a fleet database restore (sections 3, 7)
 
 **The problem** (found during the P5.E end-to-end run, 2026-09-28): the SSE

@@ -536,7 +536,7 @@ def test_house_view_carries_the_security_headers(
     response = client.get("/ui/")
 
     assert response.status_code == 200
-    assert response.headers["Content-Security-Policy"] == "default-src 'self'"
+    assert response.headers["Content-Security-Policy"] == "default-src 'self'; script-src 'self'"
     assert response.headers["X-Frame-Options"] == "DENY"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert response.headers["Cache-Control"] == "no-store"

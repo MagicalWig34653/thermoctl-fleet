@@ -16,6 +16,7 @@ have been implemented.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hmac
 import json
@@ -34,6 +35,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
+from fleet.age_key_block import AgeRecipientError, validate_age_recipient
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
 from fleet.auth import require_apartment_token, require_apartment_token_by_hash
 from fleet.backup_retention import run_backup_retention
@@ -60,6 +62,7 @@ from protocol import (
     AGE_HEADER_MAGIC,
     MAX_BACKUP_UPLOAD_BYTES,
     MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES,
+    AgeRecipientReport,
     BackupKind,
     BackupUploadAccepted,
     CommandResult,
@@ -67,8 +70,10 @@ from protocol import (
     Event,
     Heartbeat,
     LogExcerpt,
+    PendingRestore,
     RegistrationAccepted,
     RegistrationRequest,
+    RestoreResult,
     TokenChallenge,
     TokenIssued,
     TokenRequest,
@@ -243,6 +248,35 @@ async def _log_retention_loop(interval_s: float, retention_days: int) -> None:  
         await asyncio.sleep(interval_s)
 
 
+_RESTORE_PURGE_INTERVAL_ENV = "FLEET_RESTORE_PURGE_INTERVAL_S"  # noqa: S105
+_DEFAULT_RESTORE_PURGE_INTERVAL_S = 60.0
+
+
+async def _restore_purge_loop(interval_s: float) -> None:  # pragma: no cover
+    """Periodically deletes expired pending restores (P5.5b) -- the same
+    thin scheduling wrapper as `_backup_retention_loop`/`_alarm_check_loop`
+    above, deliberately untested here for the identical reason (an
+    infinite loop around a real `asyncio.sleep`); the logic it calls,
+    `Storage.purge_expired_pending_restores`, is fully covered with an
+    injected clock in `tests/test_storage.py`. This is a backstop, not the
+    primary way an expired row disappears -- `Storage
+    .fetch_and_delete_pending_restore` already opportunistically deletes
+    an expired row it happens to encounter; this loop only catches one
+    nobody ever tried to fetch at all (e.g. a device that never came back
+    up after a swap)."""
+
+    while True:
+        try:
+            deleted = await asyncio.to_thread(
+                get_storage().purge_expired_pending_restores, datetime.now(UTC)
+            )
+            if deleted:
+                logger.info("Purged %d expired pending restore(s).", deleted)
+        except Exception:
+            logger.exception("Pending-restore purge failed")
+        await asyncio.sleep(interval_s)
+
+
 async def _diagnostic_bundle_retention_loop(
     interval_s: float, retention_days: int
 ) -> None:  # pragma: no cover
@@ -397,6 +431,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _log_retention_loop(log_retention_interval_s, log_retention_days)
     )
 
+    restore_purge_interval_s = float(
+        os.environ.get(_RESTORE_PURGE_INTERVAL_ENV, _DEFAULT_RESTORE_PURGE_INTERVAL_S)
+    )
+    restore_purge_task = asyncio.create_task(_restore_purge_loop(restore_purge_interval_s))
+
     diagnostic_bundle_retention_interval_s = float(
         os.environ.get(
             _DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_ENV,
@@ -419,6 +458,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         task.cancel()
         backup_retention_task.cancel()
         log_retention_task.cancel()
+        restore_purge_task.cancel()
         diagnostic_bundle_retention_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -426,6 +466,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await backup_retention_task
         with contextlib.suppress(asyncio.CancelledError):
             await log_retention_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await restore_purge_task
         with contextlib.suppress(asyncio.CancelledError):
             await diagnostic_bundle_retention_task
 
@@ -1022,6 +1064,174 @@ async def upload_backup(
     )
 
 
+@app.post("/v1/device/age-recipient", status_code=200)
+def report_device_age_recipient(
+    payload: AgeRecipientReport,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """P5.5b, owner decision 2026-09-28: how a device that registered
+    *before* this package existed reports its age recipient once, after
+    the fact -- a device registering for the first time reports it as part
+    of `POST /v1/registration` instead (`report_device_registration`
+    below).
+
+    Auth is the apartment's own bearer token
+    (`require_apartment_token_by_hash`), the same as every other
+    post-registration endpoint -- **not** the registration flow's own
+    uniform-refusal convention: this is an ordinary authenticated device
+    endpoint, not a pre-authentication registration step, so a validation
+    failure here is an ordinary `4xx`, distinguishable, like every other
+    already-authenticated endpoint in this file.
+
+    `validate_age_recipient` (`fleet.age_key_block`) is what actually
+    parses/validates the string -- `400` if it is not a well-formed age
+    X25519 recipient (includes the explicit "never `AGE-SECRET-KEY-`"
+    refusal). `Storage.set_device_age_recipient` is set-once/idempotent:
+    `200` for a first report or a repeated identical one, `409` if this
+    device already has a *different* recipient on file (see that method's
+    own docstring for why this is not silently overwritten). `404` if the
+    apartment's currently assigned device cannot be determined at all (no
+    open assignment) -- an apartment token always corresponds to *some*
+    currently assigned device in this codebase's own model (`Storage
+    .confirm_device` is the only place a token is ever issued), so this
+    branch is defense in depth, not an expected path.
+    """
+
+    try:
+        validate_age_recipient(payload.recipient)
+    except AgeRecipientError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    device = storage.get_current_device_for_apartment(authenticated_apartment)
+    if device is None:  # pragma: no cover -- see this function's own docstring
+        raise HTTPException(
+            status_code=404, detail="No device is currently assigned to this apartment."
+        )
+
+    stored = storage.set_device_age_recipient(device.id, payload.recipient)
+    if not stored:
+        raise HTTPException(
+            status_code=409,
+            detail="This device already has a different age recipient on file.",
+        )
+    return Response(status_code=200)
+
+
+@app.get("/v1/restore", response_model=None)
+def fetch_pending_restore(
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    backup_storage: BackupBlobStorage = Depends(get_backup_storage),  # noqa: B008
+) -> Response:
+    """The device's own fetch (P5.5b, section 15.3 step 4) -- `204 No
+    Content` if nothing is pending, a `PendingRestore` (`200`) otherwise.
+
+    **Only the device currently assigned to this apartment may fetch**
+    (section 15.5) -- enforced two ways, stacked: the bearer token itself
+    already scopes this call to one apartment
+    (`require_apartment_token_by_hash`), and `Storage
+    .fetch_and_delete_pending_restore` additionally checks the *stored*
+    restore's own `device_id` against the apartment's currently assigned
+    device (`Storage.get_current_device_for_apartment`) -- a device swap
+    between the restore's creation and this fetch already revokes the old
+    apartment token (`Storage.confirm_device`), but this second check
+    means even a *new* device newly assigned to the same apartment cannot
+    pick up a restore that was encrypted to the *previous* device's
+    recipient (see `PendingRestoreRecord`'s own docstring).
+
+    **Deletes the row on a successful fetch** (single-fetch, owner
+    decision) -- a second fetch, retry, or replay always gets `204`, never
+    the same block twice.
+
+    This endpoint bundles three things into one response purely so the
+    fetch is atomic from the agent's own point of view (`protocol.restore
+    .PendingRestore`'s own docstring explains the base64-in-JSON choice):
+    the key block, the chosen operational-data backup's own bytes, and (if
+    one exists) the apartment's latest device-configuration backup.
+    """
+
+    device = storage.get_current_device_for_apartment(authenticated_apartment)
+    if device is None:  # pragma: no cover -- see this function's own docstring
+        # A valid apartment token with no currently assigned device is
+        # structurally unreachable via any path this codebase's own
+        # `Storage` exposes (`confirm_device` is the only place a token is
+        # ever issued, and `remove_device` revokes it in the same
+        # transaction that ends the assignment) -- kept as defense in
+        # depth, the same "no real path here is known" reasoning
+        # `fleet.app.report_device_registration`'s own analogous branch
+        # already documents.
+        return Response(status_code=204)
+
+    fetched = storage.fetch_and_delete_pending_restore(
+        authenticated_apartment, device.id, datetime.now(UTC)
+    )
+    if fetched is None:
+        return Response(status_code=204)
+    summary, key_block = fetched
+
+    operational_path = storage.get_backup_storage_path(
+        authenticated_apartment, summary.backup_id
+    )
+    if operational_path is None:  # pragma: no cover -- would mean the backup row vanished
+        return Response(status_code=204)
+    operational_bytes = backup_storage.read(operational_path)
+
+    device_config_b64: str | None = None
+    device_config_backup_id: str | None = None
+    device_config_summary = storage.get_latest_device_config_backup(authenticated_apartment)
+    if device_config_summary is not None:
+        device_config_path = storage.get_backup_storage_path(
+            authenticated_apartment, device_config_summary.backup_id
+        )
+        if device_config_path is not None:
+            device_config_backup_id = device_config_summary.backup_id
+            device_config_b64 = base64.b64encode(
+                backup_storage.read(device_config_path)
+            ).decode("ascii")
+
+    pending = PendingRestore(
+        key_block_b64=base64.b64encode(key_block).decode("ascii"),
+        operational_backup_id=summary.backup_id,
+        operational_data_b64=base64.b64encode(operational_bytes).decode("ascii"),
+        device_config_backup_id=device_config_backup_id,
+        device_config_b64=device_config_b64,
+    )
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder(pending),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/v1/restore/result", status_code=204)
+def report_restore_result(
+    result: RestoreResult,
+    authenticated_apartment: str = Depends(require_apartment_token_by_hash),
+) -> None:
+    """"Report result to the fleet (success/failure, no content)" (owner
+    decision) -- logged, not stored: there is no per-restore row left to
+    attach this to by the time it arrives (`fetch_and_delete_pending_restore`
+    already deleted it), and the work order is explicit that this is a
+    report, not a second audit trail. `authenticated_apartment` is
+    required (this must still be the assigned device, not an arbitrary
+    caller), and is used in the log line below -- never in an exception
+    message or anything that could echo `result.detail`'s content
+    unfiltered into a log an operator did not expect it in (it does not,
+    but the bound is worth stating: `detail` is always one of `agent
+    .restore`'s own closed set of values, never attacker-influenced free
+    text)."""
+
+    if result.success:
+        logger.info("Restore reported successful for apartment %r.", authenticated_apartment)
+    else:
+        logger.warning(
+            "Restore reported failed for apartment %r: %s",
+            authenticated_apartment,
+            result.detail,
+        )
+
+
 # P5.3b: `Storage.store_diagnostic_bundle`'s own outcome -> HTTP status,
 # mirroring `_LOG_EXCERPT_STATUS`'s established pattern just below.
 _DIAGNOSTIC_BUNDLE_STATUS: dict[StoreDiagnosticBundleOutcome, int] = {
@@ -1492,6 +1702,23 @@ def report_device_registration(
     device that succeeds on a retry after one transient failure is not
     penalised for it (mirrors the UI login throttle's own "give the
     reservation back" reasoning).
+
+    **`payload.age_recipient` (P5.5b), one exception to "every failure is
+    the same response" -- cross-review fix:** an invalid recipient shape
+    still fails uniformly (checked before the registration code is ever
+    consumed, alongside the public key). But once the code *has* been
+    consumed and this device's own row already carries a **different**
+    age recipient, `Storage.set_device_age_recipient`'s `False` is no
+    longer folded into the uniform failure -- an earlier version of this
+    function ignored that return value entirely, silently keeping the
+    stale recipient on file while registration otherwise proceeded as if
+    nothing had happened. Now: `409`, the same conflict shape `POST /v1
+    /device/age-recipient` (`report_device_age_recipient` above) already
+    gives an already-registered device for the identical situation --
+    there is no "an attacker could learn something from a distinguishable
+    response" concern left to protect at this point, since the one-time
+    code has already been spent and this device's identity already
+    confirmed by the signature/key checks above.
     """
 
     response.headers.update(_NO_STORE_HEADERS)
@@ -1503,7 +1730,14 @@ def report_device_registration(
         raw_public_key = decode_bytes(payload.public_key)
         Ed25519PublicKey.from_public_bytes(raw_public_key)
         reject_low_order_public_key(raw_public_key)
-    except ValueError as error:
+        # P5.5b: validated alongside the public key, before any storage
+        # write -- an invalid `age_recipient` fails the whole registration
+        # attempt uniformly, exactly like an invalid public key, rather
+        # than accepting the device's Ed25519 identity but silently
+        # dropping its age recipient.
+        if payload.age_recipient is not None:
+            validate_age_recipient(payload.age_recipient)
+    except (ValueError, AgeRecipientError) as error:
         raise _uniform_registration_failure() from error
 
     verification_code = verification_code_for(payload.public_key)
@@ -1520,6 +1754,28 @@ def report_device_registration(
         # exist -- kept as defense in depth, not because a real path here
         # is known.
         raise _uniform_registration_failure()  # pragma: no cover
+
+    if payload.age_recipient is not None and not storage.set_device_age_recipient(
+        device_id, payload.age_recipient
+    ):
+        # Cross-review fix: this used to ignore `set_device_age_recipient`'s
+        # `False` entirely -- a device already carrying a *different*
+        # recipient (its identity file was reset without the fleet being
+        # told, or something more suspicious) would silently keep the
+        # stale one on file while the rest of registration proceeded as if
+        # nothing had happened. Treated exactly like `POST /v1/device
+        # /age-recipient`'s own identical conflict (`report_device_age_
+        # recipient` above): `409`, not the uniform registration failure
+        # -- the registration code has already been consumed by this
+        # point (`record_device_report` above), so there is no "probe an
+        # unconfirmed code" concern left to protect via a uniform response;
+        # this is now an ordinary, already-authenticated-by-possession-of-
+        # the-one-time-code conflict, the same shape `report_device_age_
+        # recipient` already gives an already-registered device.
+        raise HTTPException(
+            status_code=409,
+            detail="This device already has a different age recipient on file.",
+        )
     external_id = storage.assign_registration_external_id(device_id, now)
     if external_id is None:
         raise _uniform_registration_failure()  # pragma: no cover -- see above

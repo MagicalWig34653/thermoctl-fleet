@@ -696,23 +696,105 @@ they must also stay conceptually separate, not just separately scheduled.
   P5.1-P5.4.
 - **Read back by:** main session (encryption, security principle 4).
 
-### P5.5b -- Restore -- **open, not started**
+### P5.5b -- Restore **SR**
+- [x] done -- see `docs/STATUS.md`'s P5.5b section for the full design.
 - **Goal:** section 15.2/15.3 step 4's counterpart to P5.5a: "The agent
   fetches the device configuration and, on a swap, the encrypted
   operational data. The landlord enters the decryption key once in the
   fleet UI; it is only passed through, never stored." No stub exists yet
   for either the fleet-side "hand the device its backups on
   (re-)assignment" flow or the agent-side "receive and unpack" flow.
-- **Files:** likely `fleet/ui_routes.py`/`fleet/app.py` (a new endpoint
-  the newly assigned device fetches from) and `agent/loop.py` (unpacking,
-  never storing the passed-through key).
-- **Section:** 15.2, 15.3 step 4 (and its "Decided afterward" paragraph,
-  2026-09-28: the browser encrypts the entered key to a device-generated age
-  recipient; the fleet only forwards the opaque block, never the plain key).
+- **Files:** `protocol/version.py`, `protocol/registration.py` (new
+  `age_recipient` field), `protocol/restore.py` (new), `fleet/app.py`
+  (three new endpoints), `fleet/age_key_block.py` (new), `fleet/storage.py`
+  (`devices.age_recipient`, new `pending_restores` table),
+  `fleet/migrations/versions/0014_restore.py` (new), `fleet/ui_routes.py`/
+  `fleet/ui_apartment.py` (the "Wiederherstellen" form, incl. the vendored
+  script's own sha256 shown next to it), `fleet/templates/ui/apartment.html`,
+  `fleet/static/ui/vendor/age-encryption.vendor.js` (new, vendored),
+  `fleet/static/ui/restore_form.js` (new), `fleet/restore_vendor.py` (new),
+  `agent/age_identity.py` (new), `agent/restore.py` (new -- **stages** into
+  the agent's own directory, never writes the live thermoctl/Zigbee2MQTT
+  data, see P5.5c below), `agent/registration.py`, `agent/loop.py`,
+  `agent/__main__.py`, `agent/safe_io.py` (new `write_bytes_safe`).
+- **Section:** 15.2, 15.3 step 4 and its two "Decided afterward" paragraphs
+  (2026-09-28): (1) the browser encrypts the entered key to a
+  device-generated age recipient, the fleet only forwards the opaque
+  block, never the plain key; (2) the browser-side encryption script's
+  limit (protects against a leaked database/logs/backups/passive reading,
+  not against an actively taken-over fleet server -- the UI shows the
+  script's sha256 so the landlord can compare it against the operating
+  manual); (3) the agent never writes the live tenant data at all --
+  thermoctl/Zigbee2MQTT stay mounted read-only, the agent only stages, a
+  separate Go program (**P5.5c**, below) moves staged data into place.
+- **Acceptance:** real end-to-end test over the real fleet app and real
+  TLS (browser step simulated with `pyrage`, plus a real `node` + the real
+  vendored JS interop test); plaintext key rejected; wrong/second device
+  cannot fetch; expired block gone; block deleted after one fetch (proven
+  race-safe under real concurrent access, not just sequentially); the
+  landlord's key string never appears in the fleet's sqlite file, the
+  blob-storage directory, or the agent's own tmp tree; agent refuses to
+  stage over an already non-empty live store, and refuses a second staging
+  while a previous one is still unconsumed; wrong key fails clean, nothing
+  staged; a conflicting `age_recipient` at registration time is refused
+  (`409`), not silently accepted.
 - **Depends on:** P5.5a (this package) -- reuses `protocol.backups`,
   `fleet.backup_storage`, and the same age recipients/identity concept.
 - **Read back by:** main session (security principle 3: the landlord's
   decryption key must only ever be passed through, never stored).
+
+### P5.5c -- Restore mover (Go, next to the watchdog) -- **open, not started**
+- **Goal:** the other half of section 15.3's second "Decided afterward"
+  paragraph (2026-09-28): "Moving it into the real data directories is
+  done by a small, separate Go program on the bare system next to the
+  watchdog (same module, no dependency, no network, section 18.4's
+  language rule), and only if no operational data exists there yet." P5.5b
+  (agent-side) only ever stages a decrypted restore into its own directory
+  plus a manifest (`agent/restore.py`, `MANIFEST_FILENAME`,
+  `docs/STATUS.md`'s P5.5b section) -- nothing in this scaffold yet reads
+  that staging directory back out and moves it into
+  `thermoctl_db_path`/`zigbee2mqtt_dir`.
+- **What it has to do**, per the manifest P5.5b already writes
+  (`{staging_dir}/manifest.json`: `backup_id`, `staged_at`, and a `files`
+  list of `{path, size_bytes, sha256}` relative to `staging_dir`):
+  1. Notice a staged restore is waiting (the manifest's presence, same
+     check `agent/restore.py::_staged_restore_already_pending` already
+     uses on the agent side) -- likely watched via the same kind of
+     periodic poll the watchdog's own main loop already uses, not a new
+     mechanism.
+  2. **Re-check the live directories are empty itself, authoritatively**
+     (CLAUDE.md security principle 5, and this package's own "the agent's
+     own check is advisory only" reasoning) -- never trusts that the
+     agent already checked this; a compromised or buggy agent process
+     must not be able to route around this by staging anyway.
+  3. Validate every file named in the manifest actually exists in
+     `staging_dir`, is a **regular file** (refuses symlinks, FIFOs,
+     device nodes, directories masquerading as a listed path -- the same
+     `lstat`-before-`open` discipline `agent/safe_io.py` already applies,
+     ported to Go, no dependency), and its size/sha256 match the manifest
+     exactly.
+  4. Move (not copy-then-delete, to stay atomic per file -- `os.Rename`
+     within the same filesystem) each validated file into its real
+     destination (`thermoctl_db_path`/`zigbee2mqtt_dir`), then remove the
+     staging directory (manifest included) so a later restore can stage
+     again.
+  5. Write a status file the agent itself reads back to report the final
+     result to the fleet (mirrors `agent.loop`'s own LED/health status
+     file convention, section 22.3/17) -- the mover has no fleet
+     connection of its own (no network, per the module's own constraint)
+     and cannot call `POST /v1/restore/result` itself.
+- **Constraints, same as the watchdog's own (CLAUDE.md security principle
+  6, adopted for this program too):** Go, statically built, `go.mod`
+  without a single third-party dependency, **no network access, no
+  registry** -- this program only ever touches the local filesystem and
+  (for step 5) a local status file the agent polls.
+- **Section:** 15.3's second "Decided afterward" paragraph, 17, 18.3/18.4.
+- **Depends on:** P5.5b (this package) -- consumes exactly the staging
+  layout and manifest format `agent/restore.py` already produces; a change
+  to that format is a contract change between the two, not a private
+  detail of either.
+- **Read back by:** main session (CLAUDE.md security principle 5/6: the
+  authoritative empty-check and the no-network/no-dependency constraint).
 
 ### P5.6 -- Watchdog main loop (`watchdog/watch.go`)
 - **Goal:** actually implement `AgentStopped`, `StartDigest`,

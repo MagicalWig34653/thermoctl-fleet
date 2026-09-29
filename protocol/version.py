@@ -34,4 +34,12 @@ between the two packages of this repository and future compatibility checks.
 # `POST /v1/commands/{id}/bundle` (P5.3b, sections 15.1, 21.5) -- a wholly
 # new module, same "counts as a change to the models" reading as every
 # prior bump above.
-PROTOCOL_VERSION = 6
+# 7: adds `protocol.registration.RegistrationRequest.age_recipient` and the
+# wholly new `protocol.restore` module (`AgeRecipientReport`,
+# `PendingRestore`, `RestoreResult`) for P5.5b (section 15.2/15.3's
+# "Decided afterward" paragraph, 2026-09-28: the device generates its own
+# age key pair and registers only the public recipient). An additive field
+# on an existing model counts as "a change to the models" too, per this
+# file's own opening paragraph's literal reading -- see
+# `protocol/registration.py` and `protocol/restore.py`.
+PROTOCOL_VERSION = 7

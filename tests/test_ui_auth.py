@@ -819,6 +819,12 @@ def test_unknown_user_and_locked_user_both_run_exactly_one_argon2_verify(
 
 
 def test_templates_contain_no_inline_style_or_script() -> None:
+    """No inline `<style>`/`style=` anywhere (CSP has no `'unsafe-inline'`).
+    A `<script>` tag is permitted **only** as an external, same-origin
+    reference (P5.5b's restore form, `fleet/templates/ui/apartment.html`,
+    loads the vendored age JS this way) -- checked line by line, so an
+    inline script slipped in anywhere still fails this test."""
+
     templates_dir = Path(__file__).resolve().parent.parent / "fleet" / "templates" / "ui"
     html_files = sorted(templates_dir.glob("*.html"))
     assert html_files, "no templates found -- did the directory move?"
@@ -827,8 +833,10 @@ def test_templates_contain_no_inline_style_or_script() -> None:
     for path in html_files:
         text = path.read_text(encoding="utf-8")
         assert "<style" not in text, f"{path}: inline <style> block ({reason})"
-        assert "<script" not in text, f"{path}: inline <script> ({reason})"
         assert " style=" not in text, f"{path}: inline style= attribute ({reason})"
+        for line in text.splitlines():
+            if "<script" in line:
+                assert 'src="/ui/static/' in line, f"{path}: inline <script> ({reason})"
 
 
 # -- HTTP: login flow -----------------------------------------------------------
@@ -1027,13 +1035,19 @@ def test_security_headers_present_on_login_and_protected_pages(
     client: TestClient, password: str, totp_secret: str, user_id: int
 ) -> None:
     login_response = client.get("/ui/login")
-    assert login_response.headers["content-security-policy"] == "default-src 'self'"
+    assert (
+        login_response.headers["content-security-policy"]
+        == "default-src 'self'; script-src 'self'"
+    )
     assert login_response.headers["x-frame-options"] == "DENY"
     assert login_response.headers["referrer-policy"] == "no-referrer"
 
     _login(client, password, totp_secret)
     protected_response = client.get("/ui/")
-    assert protected_response.headers["content-security-policy"] == "default-src 'self'"
+    assert (
+        protected_response.headers["content-security-policy"]
+        == "default-src 'self'; script-src 'self'"
+    )
     assert protected_response.headers["x-frame-options"] == "DENY"
     assert protected_response.headers["referrer-policy"] == "no-referrer"
     assert protected_response.headers["cache-control"] == "no-store"

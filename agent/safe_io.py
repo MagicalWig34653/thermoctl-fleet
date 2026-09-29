@@ -123,3 +123,47 @@ def append_bytes_safe(path: Path, data: bytes) -> bool:
     finally:
         os.close(fd)
     return True
+
+
+def write_bytes_safe(path: Path, data: bytes, mode: int = 0o600) -> None:
+    """Atomically writes `data` to `path` (mode `mode`, default `0600`) --
+    a fresh temp file in the same directory (`O_CREAT | O_EXCL`, so two
+    concurrent writers never collide on it), fsynced, then renamed into
+    place via `os.replace` (a reader of `path` therefore never observes a
+    half-written file, the same guarantee `agent.registration
+    ._atomic_write_text`'s own temp-then-replace already gives the private
+    key file, extended here to this module's own hardened-open primitives).
+
+    Refuses (raises `UnsafeStateFileError`, via `_assert_safe_lstat`) if
+    `path` itself already exists as a symlink or a non-regular file,
+    checked *before* the temp file is ever created -- the same pre-check
+    every read in this module already applies, now applied to a write too.
+
+    **Unlike `append_bytes_safe`, this function raises instead of
+    returning `False` on failure.** It exists for state a caller has no
+    safe way to degrade past -- a freshly generated cryptographic identity
+    (`agent.age_identity.load_or_create_identity`) that failed to persist
+    must not be silently treated as "fine, we will just regenerate it next
+    time", since that would mean a *different* identity (and therefore a
+    different recipient) every time this process restarts, silently
+    breaking every restore encrypted to the previous one.
+    """
+
+    _assert_safe_lstat(path)
+    temp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        # A write or fsync failure must not leave a half-written temp file
+        # lying around next to `path` -- "no partial state left behind"
+        # applies here the same way it does everywhere else this codebase
+        # writes a file atomically (e.g. `agent.encryption.encrypt_stream`'s
+        # own callers).
+        temp_path.unlink(missing_ok=True)
+        raise
+    os.replace(temp_path, path)

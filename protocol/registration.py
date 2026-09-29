@@ -82,7 +82,7 @@ import binascii
 import hashlib
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Section 14 applied analogously to registration (P4.2b, project owner
 # decision 2026-09-26): a raw Ed25519 public key is exactly 32 bytes, a raw
@@ -203,10 +203,49 @@ class RegistrationRequest(BaseModel):
     docstring (`encode_bytes`) -- the private half never leaves the base
     station and never appears in this or any other model (CLAUDE.md
     security principle 3).
+
+    `age_recipient` (P5.5b, PROTOCOL_VERSION 7, owner decision
+    2026-09-28): the device's own age X25519 **public** recipient
+    (`age1...`), generated next to the Ed25519 key above and reported the
+    same way -- optional here (`None` for an older agent that predates
+    this field, section 18.2's own compatibility rule: "a field may only
+    ever be added"), in which case `fleet.app.report_device_age_recipient`
+    (`POST /v1/device/age-recipient`) is how such a device reports it
+    later instead, once it has a token. Deliberately only a loose,
+    advisory shape check here (`_advisory_age_recipient_shape` -- an
+    `age1...` prefix check, not a bech32/curve parse) -- `protocol/` stays
+    pydantic+stdlib only (this
+    module's own docstring), so the actual cryptographic validation
+    (`pyrage.x25519.Recipient.from_str`, and the explicit "never
+    `AGE-SECRET-KEY-`" refusal) happens in `fleet.age_key_block
+    .validate_age_recipient`, which `fleet.app.report_device_registration`
+    calls before this field's value is ever stored.
     """
 
     registration_code: str = Field(min_length=1)
     public_key: str = Field(min_length=1)
+    age_recipient: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @field_validator("age_recipient")
+    @classmethod
+    def _advisory_age_recipient_shape(cls, value: str | None) -> str | None:
+        """Loose, advisory-only shape check (`age1` prefix, bech32
+        charset) -- see this field's own docstring for why the real
+        cryptographic validation deliberately lives in `fleet/`, not here.
+        Rejects the one shape this layer *can* and must refuse on sight
+        regardless: anything containing the private-key prefix
+        `AGE-SECRET-KEY-` never even reaches a model instance (CLAUDE.md
+        security principle 3) -- belt and braces on top of `fleet
+        .age_key_block.validate_age_recipient`'s own identical check.
+        """
+
+        if value is None:
+            return None
+        if "AGE-SECRET-KEY-" in value:
+            raise ValueError("age_recipient must not look like an age private key.")
+        if not value.startswith("age1"):
+            raise ValueError("age_recipient must be an age1... X25519 recipient.")
+        return value
 
 
 class RegistrationConfirmation(BaseModel):
