@@ -52,6 +52,40 @@ PrivateNetwork=true
 # hash/size checks, the closed file-name allowlist, the authoritative
 # empty-store re-check) -- CLAUDE.md security principle 5 applied to a
 # program that runs as root, not despite it.
+#
+# **Sandboxing (cross-review hardening, P5.5c):** running as root without
+# any further confinement would mean a bug in this program (or a flaw
+# this review missed) has the run of the entire filesystem. The
+# directives below narrow that down to exactly the paths this program's
+# own design ever touches -- nothing here substitutes for the
+# application-level checks above, it bounds what a mistake in them could
+# still reach.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict makes the entire filesystem read-only for this
+# unit except the API virtual filesystems and whatever is explicitly
+# listed below -- the opposite of the default "everything writable",
+# applied on top of running as root specifically because root is not
+# otherwise bound by filesystem permissions at all.
+ProtectSystem=strict
+# Exactly the four directories this program's own Config (main.go) ever
+# names, nothing more:
+#   - /var/lib/thermoctl-agent: agent/__main__.py's own
+#     --restore-staging-dir default lives here (pending-restore/) -- this
+#     program creates nothing else in this directory, but removing the
+#     staging directory itself (os.RemoveAll, on full success) requires
+#     write access to *its* parent too, not only to the staging directory
+#     itself (rmdir(2)'s own requirement), which is why the parent is
+#     listed rather than only the pending-restore/ subdirectory.
+#   - /var/lib/thermoctl: thermoctl's live data directory
+#     (--thermoctl-db-file's own parent).
+#   - /var/lib/zigbee2mqtt: Zigbee2MQTT's live data directory
+#     (--zigbee2mqtt-dir).
+#   - /run/thermoctl-restore-mover: this program's own status file
+#     directory (--status-file's own parent,
+#     image/common/tmpfiles.d/thermoctl-restore-mover.conf).
+ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl /var/lib/zigbee2mqtt /run/thermoctl-restore-mover
 
 [Install]
 WantedBy=multi-user.target

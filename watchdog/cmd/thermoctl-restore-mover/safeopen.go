@@ -7,6 +7,7 @@ import (
 )
 
 var errNotRegular = errors.New("not a regular file")
+var errHardLinked = errors.New("more than one hard link")
 
 // openRegularNoFollow is the Go port of agent/safe_io.py's own
 // lstat-then-O_NOFOLLOW-then-fstat discipline: lstat path first (never
@@ -43,11 +44,47 @@ func openRegularNoFollow(path string) (*os.File, int64, error) {
 	return file, info.Size(), nil
 }
 
+// openStagedFileNoFollow additionally refuses a file with more than one
+// hard link (cross-review finding, P5.5c): without this check, a manifest
+// entry could name a file the agent (or a local attacker with write
+// access to the staging directory, CLAUDE.md security principle 5's own
+// "never trust the agent process" reasoning applied one step further)
+// had hard-linked to some other, unrelated path -- this program would
+// then read/verify one name for that inode while a second name for the
+// very same inode could be mutated concurrently, or (in the previous,
+// rename-based design this function's caller replaced) moved and
+// chowned/chmoded *by path*, silently mutating whatever else that inode
+// was linked from. `st_nlink == 1` is the only thing that proves this
+// process is looking at the *only* path to this inode, checked via the
+// already-open descriptor's own fstat (never the path a second time).
+func openStagedFileNoFollow(path string) (*os.File, int64, error) {
+	file, size, err := openRegularNoFollow(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, 0, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		file.Close()
+		return nil, 0, errors.New("could not determine link count on this platform")
+	}
+	if stat.Nlink != 1 {
+		file.Close()
+		return nil, 0, errHardLinked
+	}
+	return file, size, nil
+}
+
 // lstatIsDirNoSymlink reports whether path exists, is a directory, and is
 // not itself a symlink (lstat only, never follows) -- used for the
-// staging directory itself and its fixed "zigbee2mqtt" subdirectory,
-// mirroring agent/restore.py::_assert_component_is_safe's own check on
-// the writer side.
+// staging directory itself, its fixed "zigbee2mqtt" subdirectory, and
+// every destination directory a validated file is copied into, mirroring
+// agent/restore.py::_assert_component_is_safe's own check on the writer
+// side.
 func lstatIsDirNoSymlink(path string) (bool, error) {
 	info, err := os.Lstat(path)
 	if err != nil {

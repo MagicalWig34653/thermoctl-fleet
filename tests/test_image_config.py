@@ -130,11 +130,22 @@ def test_restore_mover_path_unit_without_the_watched_path_is_rejected(tmp_path: 
         check_restore_mover_units(service, path_unit)
 
 
+_HARDENED_RESTORE_MOVER_SERVICE_BODY = (
+    "[Service]\n"
+    "ExecStart=/usr/local/bin/thermoctl-restore-mover\n"
+    "PrivateNetwork=true\n"
+    "NoNewPrivileges=yes\n"
+    "ProtectHome=yes\n"
+    "PrivateTmp=yes\n"
+    "ProtectSystem=strict\n"
+    "ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl "
+    "/var/lib/zigbee2mqtt /run/thermoctl-restore-mover\n"
+)
+
+
 def test_restore_mover_units_present_and_wired_passes(tmp_path: Path) -> None:
     service = tmp_path / "thermoctl-restore-mover.service"
-    service.write_text(
-        "[Service]\nExecStart=/usr/local/bin/thermoctl-restore-mover\n", encoding="utf-8"
-    )
+    service.write_text(_HARDENED_RESTORE_MOVER_SERVICE_BODY, encoding="utf-8")
     path_unit = tmp_path / "thermoctl-restore-mover.path"
     path_unit.write_text(
         "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n"
@@ -142,6 +153,49 @@ def test_restore_mover_units_present_and_wired_passes(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     check_restore_mover_units(service, path_unit)
+
+
+def test_restore_mover_service_without_sandboxing_is_rejected(tmp_path: Path) -> None:
+    # Cross-review hardening finding: this program runs as root, so its
+    # unit must sandbox it -- every other required line present (wiring,
+    # PrivateNetwork) but none of the newer hardening directives.
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(
+        "[Service]\nExecStart=/usr/local/bin/thermoctl-restore-mover\nPrivateNetwork=true\n",
+        encoding="utf-8",
+    )
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n"
+        "Unit=thermoctl-restore-mover.service\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(service, path_unit)
+
+
+def test_restore_mover_service_without_all_readwrite_paths_is_rejected(tmp_path: Path) -> None:
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(
+        "[Service]\n"
+        "ExecStart=/usr/local/bin/thermoctl-restore-mover\n"
+        "PrivateNetwork=true\n"
+        "NoNewPrivileges=yes\n"
+        "ProtectHome=yes\n"
+        "PrivateTmp=yes\n"
+        "ProtectSystem=strict\n"
+        # Missing /run/thermoctl-restore-mover.
+        "ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl /var/lib/zigbee2mqtt\n",
+        encoding="utf-8",
+    )
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n"
+        "Unit=thermoctl-restore-mover.service\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(service, path_unit)
 
 
 def test_restore_mover_tmpfiles_entry_missing_is_rejected(tmp_path: Path) -> None:

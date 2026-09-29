@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	pathpkg "path"
 )
@@ -47,27 +49,56 @@ var allowedManifestPaths = map[string]struct{}{
 	"zigbee2mqtt/coordinator_backup.json": {},
 }
 
+// MaxManifestBytes bounds how much of manifest.json this program will
+// ever read (cross-review finding, P5.5c) -- the manifest is itself
+// agent-controlled (staged by the same process this program never
+// trusts, CLAUDE.md security principle 5), and without a cap a
+// maliciously or accidentally huge manifest.json would be read fully into
+// memory before any other check ever runs. 64 KiB is generous headroom
+// over the largest manifest this contract ever actually produces (three
+// fixed file entries, a handful of bytes each) -- see
+// agent/restore.py::_write_manifest's own docstring for the fixed,
+// closed shape it writes.
+const MaxManifestBytes = 64 * 1024
+
 // parseManifest reads and decodes path -- returns (nil, false, nil) if
 // path does not exist at all (nothing pending, not an error), (nil, true,
-// err) if it exists but cannot be parsed, or (manifest, true, nil) on
-// success. json.Unmarshal alone is used (no third-party dependency,
+// err) if it exists but cannot be parsed or opened safely, (nil, true,
+// errManifestTooLarge) if it exceeds MaxManifestBytes, or (manifest, true,
+// nil) on success. Opened via openRegularNoFollow (lstat before open,
+// O_NOFOLLOW, regular files only -- the manifest gets exactly the same
+// discipline every staged data file already gets, since it is written by
+// the same untrusted process) rather than a plain os.ReadFile.
+// json.Unmarshal alone is used to decode (no third-party dependency,
 // stdlib only, section 18.3) -- structural validation of the *values* it
 // decodes to (safe paths, non-empty backup_id) is a separate step
 // (validateManifestShape below), not this function's job.
 func parseManifest(path string) (*Manifest, bool, error) {
-	data, err := os.ReadFile(path)
+	file, _, err := openRegularNoFollow(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, nil
 		}
 		return nil, true, err
 	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, MaxManifestBytes+1))
+	if err != nil {
+		return nil, true, err
+	}
+	if len(data) > MaxManifestBytes {
+		return nil, true, errManifestTooLarge
+	}
+
 	var manifest Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, true, err
 	}
 	return &manifest, true, nil
 }
+
+var errManifestTooLarge = errors.New("manifest exceeds the maximum allowed size")
 
 // validateManifestShape checks the manifest's own structural well-
 // formedness -- independent of what is actually present in staging

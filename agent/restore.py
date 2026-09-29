@@ -532,6 +532,22 @@ def apply_pending_restore(pending: PendingRestore, targets: RestoreTargets) -> R
        protect there; see P5.5a's own identical reasoning for why this
        kind is handled differently from operational data throughout this
        codebase).
+
+    **Size cap, shared contract with P5.5c's mover (cross-review
+    finding):** this function itself enforces no explicit cap on the
+    decrypted archive's members -- `operational_data_b64` already comes
+    from a real, size-limited upload (`protocol.backups`'s own ceiling)
+    and is decrypted entirely in memory regardless. The *authoritative*
+    ceiling on any single staged file actually reaching the live
+    directories is `watchdog/cmd/thermoctl-restore-mover`'s own
+    `MaxStagedFileBytes` (256 MiB, generous headroom above "a few
+    megabytes", `protocol/restore.py`'s own module docstring) -- a file
+    this module stages larger than that is still written here (nothing
+    in this function's own contract changes), but the mover refuses to
+    move it (`DetailFileTooLarge`), the same "this program is the one
+    that actually decides, not the agent" reasoning CLAUDE.md security
+    principle 5 already applies to every other check split between the
+    two programs.
     """
 
     try:

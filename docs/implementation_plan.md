@@ -769,16 +769,34 @@ they must also stay conceptually separate, not just separately scheduled.
      agent already checked this; a compromised or buggy agent process
      must not be able to route around this by staging anyway.
   3. Validate every file named in the manifest actually exists in
-     `staging_dir`, is a **regular file** (refuses symlinks, FIFOs,
-     device nodes, directories masquerading as a listed path -- the same
+     `staging_dir`, is a **regular file with exactly one hard link**
+     (refuses symlinks, FIFOs, device nodes, directories masquerading as
+     a listed path, and -- cross-review finding, `docs/STATUS.md` -- a
+     multiply-linked file, which would let this program's own chown/chmod
+     mutate an inode reachable from somewhere else entirely; the same
      `lstat`-before-`open` discipline `agent/safe_io.py` already applies,
      ported to Go, no dependency), and its size/sha256 match the manifest
-     exactly.
-  4. Move (not copy-then-delete, to stay atomic per file -- `os.Rename`
-     within the same filesystem) each validated file into its real
-     destination (`thermoctl_db_path`/`zigbee2mqtt_dir`), then remove the
-     staging directory (manifest included) so a later restore can stage
-     again.
+     exactly. `manifest.json` itself gets the identical discipline plus a
+     size cap (cross-review finding) before it is ever parsed.
+  4. Move each validated file into its real destination
+     (`thermoctl_db_path`/`zigbee2mqtt_dir`), then remove the staging
+     directory (manifest included) so a later restore can stage again.
+     **Revised after cross-review (see `docs/STATUS.md`'s "P5.5c
+     cross-review fixes" entry):** not a direct `os.Rename` of the staged
+     path -- that path stays writable by the untrusted agent process for
+     as long as this program runs, so a "validate, then later rename the
+     path" split lets it be swapped for a symlink (or a hard link
+     elsewhere) in between. Instead: read, hash, *and* copy each
+     validated entry's bytes, in one continuous pass from the single
+     descriptor it was opened and checked on, into a fresh file this
+     program itself creates inside the real destination directory
+     (`O_CREAT|O_EXCL|O_NOFOLLOW`), fsynced and fchown/fchmod'd via that
+     descriptor (never by path) -- only *then* renamed into its final
+     name, always within that same destination directory (so it can
+     never fail with `EXDEV`, which also means "staging and destination
+     must be on the same filesystem" no longer applies at all). Every
+     file is validated and copied before a single one is renamed into
+     place.
   5. Write a status file the agent itself reads back to report the final
      result to the fleet (mirrors `agent.loop`'s own LED/health status
      file convention, section 22.3/17) -- the mover has no fleet

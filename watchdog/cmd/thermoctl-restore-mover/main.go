@@ -29,7 +29,11 @@ func run(cfg Config, warn func(format string, args ...any), now func() time.Time
 		return 0
 	}
 	if err != nil {
-		writeOutcome(cfg, warn, now, "", ResultFailure, DetailManifestMalformed)
+		detail := DetailManifestMalformed
+		if err == errManifestTooLarge {
+			detail = DetailManifestTooLarge
+		}
+		writeOutcome(cfg, warn, now, "", ResultFailure, detail)
 		return 1
 	}
 
@@ -45,16 +49,16 @@ func run(cfg Config, warn func(format string, args ...any), now func() time.Time
 		return 1
 	}
 
-	files, err := validateAll(cfg.StagingDir, manifest, targets)
+	prepared, err := validateAll(cfg.StagingDir, manifest, targets)
 	if err != nil {
 		warn("thermoctl-restore-mover: validation failed: %v", err)
 		writeOutcome(cfg, warn, now, manifest.BackupID, ResultFailure, detailOf(err, DetailUnsafeStaging))
 		return 1
 	}
 
-	result := moveFiles(files, warn)
+	result := finalizeAll(prepared, warn)
 	if !result.complete() {
-		warn("thermoctl-restore-mover: moved %d/%d files before failing; leaving the rest staged", result.Moved, result.Total)
+		warn("thermoctl-restore-mover: renamed %d/%d files before failing; leaving the rest staged", result.Renamed, result.Total)
 		writeOutcome(cfg, warn, now, manifest.BackupID, ResultFailure, DetailPartialMove)
 		return 1
 	}

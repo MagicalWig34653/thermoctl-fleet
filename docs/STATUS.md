@@ -899,20 +899,23 @@ access to the live tenant data").
      future change to this definition on either side without the other is
      a contract break.
    - **Every manifest entry is re-validated from scratch**
-     (`validate.go`): lstat before open (`safeopen.go::openRegularNoFollow`,
-     the Go port of `agent/safe_io.py`'s own `O_NOFOLLOW`/`fstat`-on-the-
-     descriptor discipline), regular files only (refuses symlinks, FIFOs,
-     device nodes), a **closed allowlist** of exactly the three relative
-     names `apply_pending_restore` can ever stage (`thermoctl.db`,
+     (`validate.go`): lstat before open
+     (`safeopen.go::openStagedFileNoFollow`, the Go port of
+     `agent/safe_io.py`'s own `O_NOFOLLOW`/`fstat`-on-the-descriptor
+     discipline, **extended to also refuse a file with more than one
+     hard link** -- cross-review finding, see the "cross-review fixes"
+     entry below), regular files only (refuses symlinks, FIFOs, device
+     nodes), a **closed allowlist** of exactly the three relative names
+     `apply_pending_restore` can ever stage (`thermoctl.db`,
      `zigbee2mqtt/database.db`, `zigbee2mqtt/coordinator_backup.json`),
      manifest paths checked relative/clean/no-`..`/no-absolute via the
      `path` package's forward-slash semantics (the manifest is always
      `/`-separated, written on the Python side, regardless of this
-     program's own OS), and size/sha256 checked against the manifest,
-     both computed from the already-open file descriptor -- never a
-     second, separate stat/open of the path, which would reopen the exact
-     TOCTOU window `agent/restore.py`'s own module docstring says is "not
-     this process's to fully close on its own".
+     program's own OS), and size/sha256 checked against the manifest.
+     `manifest.json` itself gets the identical lstat/`O_NOFOLLOW`
+     discipline (it is written by the same untrusted agent process as
+     everything else under staging) plus a `MaxManifestBytes` (64 KiB)
+     cap enforced via `io.LimitReader` before it is ever parsed.
    - **Staging directory contents checked in both directions**
      (`validate.go::validateStagingContentsMatchManifest`): every manifest
      entry must exist and validate, *and* every entry actually present
@@ -921,13 +924,23 @@ access to the live tenant data").
      outright, not silently ignored.
    - The staging directory itself (and its `zigbee2mqtt/` subdirectory)
      is lstat-checked to be a real directory, not a symlink, before
-     anything else runs.
-3. **Same-filesystem move, never copy-then-delete:** `sameDevice`
-   (`*syscall.Stat_t.Dev` comparison, stdlib only) refuses upfront if
-   staging and a file's destination directory are not on the same
-   filesystem; `os.Rename` is additionally checked for `EXDEV` at move
-   time as defense in depth (never falls back to a copy either way --
-   `move.go::moveFiles`/`isExdev`).
+     anything else runs; so is every destination directory a validated
+     file is about to be copied into.
+3. **Copy from the validated descriptor into a new, root-created file;
+   rename only within the destination directory (redesigned after
+   cross-review, see below).** Every manifest entry is opened once
+   (`openStagedFileNoFollow`) and its bytes are read, hashed, *and*
+   copied -- in one continuous pass from that single held-open
+   descriptor, capped at `MaxStagedFileBytes` (256 MiB) -- into a fresh
+   file this program itself creates inside the real destination
+   directory (`validate.go::createTempInDir`,
+   `O_CREAT|O_EXCL|O_NOFOLLOW`, random name, mode `0600`), fsynced,
+   fchown/fchmod'd via the descriptor (never by path), and only *then*
+   renamed into its final name -- always a same-directory rename, so it
+   can never fail with `EXDEV`; the earlier "staging and destination
+   must be on the same filesystem, refuse on EXDEV" requirement no
+   longer applies at all, since nothing is ever renamed *out of*
+   staging any more (`move.go::finalizeAll`).
 4. **Ownership/mode of the moved files -- an explicit open point, not a
    guess:** `image/common/agent-compose.yml`/`tools/check_image_config.py`
    do not yet define a compose file or a fixed uid/gid for the
@@ -935,32 +948,40 @@ access to the live tenant data").
    P5.4/P5.6 sections -- those containers are reconciled by the agent, not
    shipped by this image, and their own uid/gid is not fixed anywhere in
    this repository yet). Hard-coding a numeric uid in the mover would
-   therefore be an unverifiable guess. Decision: chown each moved file to
-   match its **destination directory's own existing owner/group**
-   (`move.go::applyDestinationOwnership`) and set mode `0644` -- whichever
-   process created that live directory already set it up for the uid that
-   actually needs to read it, the same reasoning
+   therefore be an unverifiable guess. Decision: chown each copied file's
+   *open descriptor* (`fchown`/`fchmod`, never by path) to match its
+   **destination directory's own existing owner/group**
+   (`validate.go::applyDestinationOwnership`) and set mode `0644` --
+   whichever process created that live directory already set it up for
+   the uid that actually needs to read it, the same reasoning
    `image/common/tmpfiles.d/thermoctl-agent.conf` already applies to
-   `/run/thermoctl-agent`'s own pinned numeric uid/gid. Best-effort, not
-   fatal to the move itself: a chown/chmod failure is logged, never rolls
-   back an already-successful rename.
-5. **Order: validate everything first, then move; honest partial
-   failure.** `main.go::run` never moves a single file until every file
-   named in the manifest has validated. A move failure partway through
-   (e.g. a destination directory made read-only mid-run) is reported as
-   `DetailPartialMove`, and whatever is still in staging (manifest
-   included) is left exactly where it was -- **never deleted on
-   failure**, so a later run (after the underlying problem is fixed) can
-   finish the job without asking the landlord to restore a second time.
-   Staging (including the manifest) is removed only once every file has
-   moved successfully (`move.go::removeStagingDir`) -- this is also what
-   lets a later restore stage again
+   `/run/thermoctl-agent`'s own pinned numeric uid/gid.
+5. **Order: validate and copy everything first, then rename; honest
+   partial failure.** `validate.go::validateAll` copies every manifest
+   entry into a temporary file under its real destination directory
+   before `move.go::finalizeAll` renames a single one of them into its
+   final name -- a failure at any point during validation/copying
+   removes every temp file already created by an earlier entry in the
+   same run (`cleanupPrepared`) and leaves `stagingDir` completely
+   untouched. A rename failure partway through `finalizeAll` (e.g. a
+   destination directory's permissions changing between the copy and the
+   rename) is reported as `DetailPartialMove`; whatever was already
+   renamed stays renamed, any still-pending temp files are removed, and
+   whatever is still in `stagingDir` (manifest included) is left exactly
+   where it was -- **never deleted on failure**, so a later run (after
+   the underlying problem is fixed) can finish the job without asking
+   the landlord to restore a second time. Staging (including the
+   manifest) is removed only once every file has been renamed into place
+   successfully (`move.go::removeStagingDir`) -- this is also what lets a
+   later restore stage again
    (`agent.restore._staged_restore_already_pending` checks exactly this
    directory's manifest).
 6. **Status file, closed set of detail strings**
    (`watchdog/cmd/thermoctl-restore-mover/status.go`/`details.go`): a
    fixed, small JSON document (`backup_id`, `result` [`success`/
-   `failure`], `detail` [one of 15 closed `DETAIL_*` strings, `details.go`
+   `failure`], `detail` [one of 18 closed `DETAIL_*` strings (see the
+   cross-review fixes entry below for the four added/one removed since
+   this package first merged), `details.go`
    -- never anything decrypted, never a raw Go error string], `timestamp`)
    written atomically (temp file in the same directory, fsync, chmod
    `0644`, rename) to `/run/thermoctl-restore-mover/status.json` -- a
@@ -1024,39 +1045,11 @@ staging on success, and produce the exact `{"success": true, "detail":
 `thermoctl-leds`; its `push`/`pull_request` path filters extended to
 `agent/restore.py`/`agent/safe_io.py` (imported by the contract test).
 
-**Verification numbers:**
-- Go: 31 tests in `cmd/thermoctl-restore-mover` (every branch the task
-  asked for: tampered hash, tampered size, missing file, extra file in
-  staging and in the `zigbee2mqtt/` subdirectory, a manifest entry with no
-  file present, symlink in staging, symlinked staging dir, symlinked
-  `zigbee2mqtt/` subdirectory, `..`/absolute path in the manifest, unknown
-  file name, malformed manifest, empty `backup_id`, non-empty live
-  directory on both sides, empty-file-still-counts-as-empty, destination
-  directory missing, partial move failure leaving staging intact, a
-  second no-op run after success, plus direct unit tests for
-  `isSafeManifestPath`/`sameDevice`/`isExdev`/`applyDestinationOwnership`/
-  `errUnsafe`/`detailOf`/`writeStatusFile`/`parseManifest`/
-  `lstatIsDirNoSymlink`), 80.0% statement coverage (uncovered: `main()`
-  itself, an entry point, and a handful of I/O-error branches that would
-  need an artificially broken filesystem to reach honestly -- the same
-  "no real path here is known" stance this codebase's other untested
-  entry points already take, e.g. `tools/check_image_config.py::main`).
-  `go vet ./...`/`gofmt -l .` clean across the whole module;
-  `watchdog/go.mod` still has no `require`; the watchdog's own root
-  package (not `cmd/`) is untouched, so its previously-measured 299
-  statement lines are unaffected -- this new program is not counted
-  toward that budget, the same rule `cmd/thermoctl-leds` already
-  established.
-- Python: `agent/restore.py` 100% line coverage (`_check_and_report_mover_status`
-  covered by 12 new tests in `tests/test_agent_restore.py` -- every
-  malformed-input branch, the dedupe marker, a new `backup_id` re-firing
-  it, and the symlinked-status-file refusal); `tools/check_image_config.py`
-  extended with `check_restore_mover_units`/
-  `check_restore_mover_tmpfiles_entry`, 14 new tests in
-  `tests/test_image_config.py`. Full suite: 1611 passed, 1 skipped
-  (pre-existing, unrelated to this package), 99% coverage (repository
-  floor unchanged). `ruff check .`/`mypy .`/`mypy protocol fleet agent
-  tools` clean.
+**Verification numbers (as first merged, before the cross-review fixes
+below):** Go: 31 tests, 80.0% statement coverage. Python: `agent/restore.py`
+100% line coverage, full suite 1611 passed/1 skipped, 99% coverage.
+`ruff`/`mypy`/`go vet`/`gofmt` all clean. See the cross-review fixes entry
+immediately below for the current numbers, which supersede these.
 
 **Open points:**
 
@@ -1086,6 +1079,133 @@ staging on success, and produce the exact `{"success": true, "detail":
   point, `image/README.md`) -- this package's own
   `DetailDestinationMissing` refusal is what a real device would report
   if that step were skipped, not a new gap this package introduces.
+
+## P5.5c cross-review fixes: a rename-based TOCTOU, hard links, an unbounded manifest read, and unsandboxed root
+
+Cross-review of the original P5.5c commit found two HIGH-severity
+findings, both demonstrated by a reviewer-written reproduction against the
+original, `os.Rename`-based design, plus three further hardening gaps.
+All five are fixed in this package; nothing about the checks documented
+above (manifest/live-emptiness validation, the status file, the
+cross-language contract, the build/CI machinery) changed in a way that
+required a different design -- only the *last* step, "how a validated
+file actually reaches its destination", was redesigned.
+
+**A. TOCTOU: a staged file could be swapped for a symlink between
+validation and the move.** The original design validated every manifest
+entry (open, hash, close) and only *afterward*, in a second pass, called
+`os.Rename(srcPath, dstPath)` on the *path* again. Staging stays writable
+by the untrusted agent process for as long as this program runs
+(CLAUDE.md security principle 5 -- the agent is explicitly not trusted),
+so that process could replace the staged path with a symlink into the
+live, read-only mounts in the window between the two passes; a path-based
+rename then follows the symlink. **Fix:** redesigned per design points 3
+and 5 above -- every manifest entry is now opened exactly once
+(`openStagedFileNoFollow`), and its bytes are read, hashed, *and* copied
+into a brand-new file this program itself creates inside the real
+destination directory, all in one continuous pass from that single
+held-open descriptor. Nothing about the *path* after that point can
+affect what was already read from the already-open file descriptor --
+`TestOpenStagedFileImmuneToPathSwapAfterOpen`
+(`watchdog/cmd/thermoctl-restore-mover/mover_test.go`) reproduces the
+reviewer's own scenario directly against the fixed primitive (open, then
+swap the path for a symlink to different, attacker-controlled content,
+then read from the already-open descriptor -- the original bytes come
+back, not the symlink target's). The only remaining rename
+(`move.go::finalizeAll`) is always a same-directory rename of a file this
+program itself created and fully verified -- there is no staged path left
+to swap by the time it runs.
+
+**B. Hard links: a staged file's inode could be mutated by path via a
+second, unrelated name.** The original design never checked `st_nlink`;
+a staged file the agent (or a local attacker with write access to
+staging) had additionally hard-linked to some other path would be
+`os.Rename`d and then `chown`/`chmod`d *by path* -- mutating the shared
+inode, reachable from wherever else it was linked, as root.
+**Fix:** `openStagedFileNoFollow` (`safeopen.go`) additionally fstats the
+opened descriptor and refuses (`DetailHardLinkedFile`) anything with
+`Nlink != 1`; ownership/mode changes now go through `file.Chown`/
+`file.Chmod` (`fchown(2)`/`fchmod(2)` on the descriptor, never by path) on
+a file this program itself created and holds the only reference to.
+`TestRunHardLinkedFileInStagingRefused` reproduces the reviewer's own
+scenario (`os.Link` a staged file to a path outside staging, run the
+mover, assert refusal and nothing at the destination).
+
+**C. Unbounded manifest read.** `manifest.json` is agent-controlled, the
+same as every staged data file, but was read via a plain `os.ReadFile`
+with no size cap and no symlink discipline. **Fix:**
+`parseManifest` (`manifest.go`) now opens it with the same
+lstat/`O_NOFOLLOW` discipline as every other staged file
+(`openRegularNoFollow`) and caps the read at `MaxManifestBytes` (64 KiB,
+generous headroom over the fixed three-entry shape
+`agent/restore.py::_write_manifest` actually writes) via `io.LimitReader`
+-- a manifest larger than that is refused (`DetailManifestTooLarge`)
+before it is ever fully read into memory, let alone parsed.
+`MaxStagedFileBytes` (256 MiB, documented next to
+`agent/restore.py::apply_pending_restore`'s own docstring, which already
+states operational-data backups stay "well within section 15.1's own 'a
+few megabytes' ceiling") caps each individual staged file the same way.
+
+**D. Destination directory symlink.** `prepareFile`'s destination-
+directory check used `os.Stat` (follows symlinks), so a symlinked live
+destination directory pointing somewhere unexpected would have been
+silently followed rather than refused. **Fix:** switched to `os.Lstat`
+plus an explicit symlink-bit check (`DetailUnsafeDestination`, new
+closed-set value); `TestRunSymlinkedDestinationDirRefused` reproduces it.
+
+**E. Unsandboxed root.** The mover already had to run as root (it needs
+to `chown` to an arbitrary destination uid, which only root can do -- see
+design point 4 above), but its systemd unit did not otherwise narrow what
+it could reach. **Fix:**
+`watchdog/cmd/thermoctl-restore-mover/thermoctl-restore-mover.service`
+gained `NoNewPrivileges=yes`, `ProtectHome=yes`, `PrivateTmp=yes`,
+`ProtectSystem=strict` plus a `ReadWritePaths=` naming exactly the four
+directories this program's own `Config` (`main.go`) ever touches
+(`/var/lib/thermoctl-agent`, `/var/lib/thermoctl`, `/var/lib/zigbee2mqtt`,
+`/run/thermoctl-restore-mover`) -- nothing more. `/var/lib/thermoctl-agent`
+(the staging directory's *parent*, not only the staging directory itself)
+is required rather than optional: `os.RemoveAll` on the staging directory
+needs write access to its parent too (`rmdir(2)`'s own requirement), not
+only to the staging directory's own contents.
+`tools/check_image_config.py::check_restore_mover_units` extended to
+assert every one of these directives is present, plus that
+`ReadWritePaths=` names all four required paths --
+`test_restore_mover_service_without_sandboxing_is_rejected`/
+`test_restore_mover_service_without_all_readwrite_paths_is_rejected`
+(`tests/test_image_config.py`).
+
+**Not changed:** the manifest/live-emptiness validation logic, the status
+file format and its closed detail set (extended with four new values --
+`DetailManifestTooLarge`, `DetailUnsafeDestination`, `DetailHardLinkedFile`,
+`DetailFileTooLarge` -- `DetailCrossFilesystem` removed, since the
+redesign makes an `EXDEV` failure structurally impossible: the only
+rename left is always within the same destination directory), the
+trigger (systemd path unit), the cross-language contract test's own
+sequence (still passes unchanged end to end, since it exercises this
+program's public behavior, not its internal `os.Rename` vs. copy
+mechanics), and the "no `PROTOCOL_VERSION` bump" conclusion.
+
+**Verification numbers (current, supersedes the entry above):**
+- Go: 40 tests in `cmd/thermoctl-restore-mover` (9 new: the TOCTOU
+  immunity regression, the hard-link refusal, the oversized-manifest
+  refusal, the symlinked-destination-directory refusal, a direct
+  `finalizeAll` partial-failure test plus a `run()`-level integration
+  test for the same, `createTempInDir`'s own uniqueness/mode/O_NOFOLLOW
+  properties, `openStagedFileNoFollow`'s single-link/hard-link/symlink
+  branches, and `cleanupPrepared`), 78.1% statement coverage (the drop
+  from 80.0% is `main()` and a few more now-added, still-defensive I/O
+  branches, not a regression in what is actually exercised -- every
+  branch the coordinator's fix list named has a dedicated test).
+  `go vet ./...`/`gofmt -l .` clean; `watchdog/go.mod` still has no
+  `require`; the watchdog's own root package is untouched.
+- Python: unaffected by this fix (no Python code changed) --
+  `agent/restore.py` still 100% line coverage, full suite still 1611
+  passed/1 skipped, 99% coverage. `tests/test_image_config.py` gained 2
+  more tests (16 total for the restore-mover checks) for finding E.
+  `ruff check .`/`mypy .`/`mypy protocol fleet agent tools` clean.
+- `watchdog/check_contract.sh` passes unchanged end to end (re-verified
+  after the fix, including the `{"success": true, "detail": "applied"}`
+  round trip).
 
 ## P5.1c -- SSE resume survives a fleet database restore (sections 3, 7)
 

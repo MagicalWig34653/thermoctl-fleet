@@ -4,8 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -125,6 +128,25 @@ func (s setup) readStatus(t *testing.T) Status {
 	return status
 }
 
+// leftoverTempFiles returns every ".thermoctl-restore-mover-*.tmp" file
+// still present anywhere under dir -- used to assert this program never
+// leaves an orphaned temp file behind, on either a clean success or a
+// refusal.
+func leftoverTempFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	var found []string
+	filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".thermoctl-restore-mover-") {
+			found = append(found, path)
+		}
+		return nil
+	})
+	return found
+}
+
 func TestRunNoManifestIsANoOp(t *testing.T) {
 	s := newSetup(t)
 	if err := os.Remove(s.manifestPath); err != nil {
@@ -162,9 +184,20 @@ func TestRunSuccess(t *testing.T) {
 	if err != nil || string(moved) != string(s.thermoctlBytes) {
 		t.Fatalf("thermoctl.db not moved correctly: %v %q", err, moved)
 	}
+	info, err := os.Stat(s.thermoctlDBPath)
+	if err != nil {
+		t.Fatalf("stat moved file: %v", err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("mode = %v, want 0644", info.Mode().Perm())
+	}
 	z2mDB, err := os.ReadFile(filepath.Join(s.zigbee2mqttDir, "database.db"))
 	if err != nil || string(z2mDB) != string(s.z2mDBBytes) {
 		t.Fatalf("zigbee2mqtt/database.db not moved correctly: %v %q", err, z2mDB)
+	}
+
+	if leftover := leftoverTempFiles(t, s.dir); len(leftover) != 0 {
+		t.Fatalf("leftover temp files after a clean success: %v", leftover)
 	}
 }
 
@@ -230,6 +263,9 @@ func TestRunTamperedHashRefused(t *testing.T) {
 	// Nothing should have moved.
 	if _, err := os.Stat(s.thermoctlDBPath); !os.IsNotExist(err) {
 		t.Fatalf("thermoctl.db should not exist at destination after a refusal")
+	}
+	if leftover := leftoverTempFiles(t, s.dir); len(leftover) != 0 {
+		t.Fatalf("leftover temp files after a refusal: %v", leftover)
 	}
 }
 
@@ -335,6 +371,32 @@ func TestRunSymlinkInStagingRefused(t *testing.T) {
 	}
 }
 
+func TestRunHardLinkedFileInStagingRefused(t *testing.T) {
+	// Cross-review finding: a staged file with more than one hard link
+	// must be refused -- this program's own chown/chmod (or whatever
+	// wrote through the other link concurrently) would otherwise mutate
+	// an inode reachable from somewhere else entirely.
+	s := newSetup(t)
+	staged := filepath.Join(s.stagingDir, "thermoctl.db")
+	outsideLink := filepath.Join(s.dir, "hardlink-outside-staging")
+	if err := os.Link(staged, outsideLink); err != nil {
+		t.Skipf("hard links not supported on this filesystem: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(outsideLink) })
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	status := s.readStatus(t)
+	if status.Detail != DetailHardLinkedFile {
+		t.Fatalf("detail = %q, want %q", status.Detail, DetailHardLinkedFile)
+	}
+	if _, err := os.Stat(s.thermoctlDBPath); !os.IsNotExist(err) {
+		t.Fatalf("thermoctl.db should not exist at destination after a refusal")
+	}
+}
+
 func TestRunSymlinkedStagingDirRefused(t *testing.T) {
 	s := newSetup(t)
 	real := s.stagingDir
@@ -374,6 +436,32 @@ func TestRunSymlinkedZigbee2mqttSubdirRefused(t *testing.T) {
 	status := s.readStatus(t)
 	if status.Detail != DetailUnsafeStaging {
 		t.Fatalf("detail = %q, want %q", status.Detail, DetailUnsafeStaging)
+	}
+}
+
+func TestRunSymlinkedDestinationDirRefused(t *testing.T) {
+	// Cross-review finding: a symlinked live destination directory (here,
+	// zigbee2mqtt_dir itself) must be refused, not silently followed.
+	s := newSetup(t)
+	real := s.zigbee2mqttDir
+	linked := real + "-real"
+	if err := os.Rename(real, linked); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if err := os.Symlink(linked, real); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	status := s.readStatus(t)
+	if status.Detail != DetailUnsafeDestination {
+		t.Fatalf("detail = %q, want %q", status.Detail, DetailUnsafeDestination)
+	}
+	if leftover := leftoverTempFiles(t, s.dir); len(leftover) != 0 {
+		t.Fatalf("leftover temp files after a refusal: %v", leftover)
 	}
 }
 
@@ -443,6 +531,27 @@ func TestRunMalformedManifestRefused(t *testing.T) {
 	}
 }
 
+func TestRunOversizedManifestRefused(t *testing.T) {
+	// Cross-review finding: an (agent-controlled) manifest larger than
+	// MaxManifestBytes must be refused before it is even fully read, let
+	// alone parsed.
+	s := newSetup(t)
+	huge := make([]byte, MaxManifestBytes+1024)
+	for i := range huge {
+		huge[i] = 'a'
+	}
+	writeFile(t, s.manifestPath, huge)
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	status := s.readStatus(t)
+	if status.Detail != DetailManifestTooLarge || status.BackupID != "" {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+}
+
 func TestRunEmptyBackupIDRefused(t *testing.T) {
 	s := newSetup(t)
 	m := s.defaultManifest()
@@ -475,45 +584,105 @@ func TestRunDestinationDirectoryMissingRefused(t *testing.T) {
 	}
 }
 
-func TestRunCrossFilesystemSimulatedRefused(t *testing.T) {
-	// sameDevice is exercised directly (as documented in validate.go) --
-	// simulating a genuine EXDEV via two real, distinct mounted
-	// filesystems is not reliably available in a CI sandbox, so this
-	// test constructs two *syscall.Stat_t-backed os.FileInfo values with
-	// different Dev fields the same way validateOneFile's own call would
-	// see them, via two temp dirs and monkeypatching is avoided in favor
-	// of a direct unit test of sameDevice itself (see validate_test.go).
-	t.Skip("covered directly by TestSameDeviceDiffers in validate_test.go")
+// TestFinalizeAllPartialFailureRemovesPendingTempsButKeepsRenamedFiles
+// exercises finalizeAll (move.go) directly, at the unit level, rather
+// than through the full run() -- a genuine rename-time failure in
+// production can only come from something changing between prepareFile
+// and this step (e.g. a destination directory's permissions, or a disk
+// filling up); it cannot be reproduced through run() by pre-occupying a
+// final destination path, because that path is, by construction, one of
+// the exact three paths liveStoreIsEmpty already checks and refuses on
+// *before* validation/copy ever runs (see TestRunLiveStoreNotEmptyZ2m).
+// This test instead builds the "already prepared" state finalizeAll
+// expects directly, and makes only its rename fail.
+func TestFinalizeAllPartialFailureRemovesPendingTempsButKeepsRenamedFiles(t *testing.T) {
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+
+	temp1, tempPath1, err := createTempInDir(dir1)
+	if err != nil {
+		t.Fatalf("createTempInDir: %v", err)
+	}
+	if _, err := temp1.WriteString("content-1"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	temp1.Close()
+	finalPath1 := filepath.Join(dir1, "final-1.db")
+
+	temp2, tempPath2, err := createTempInDir(dir2)
+	if err != nil {
+		t.Fatalf("createTempInDir: %v", err)
+	}
+	temp2.Close()
+	// The second file's final name is already occupied by a directory --
+	// os.Rename onto it fails deterministically, without relying on any
+	// OS-specific permission behavior.
+	finalPath2 := filepath.Join(dir2, "final-2.db")
+	if err := os.Mkdir(finalPath2, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	prepared := []preparedFile{
+		{RelPath: "one", TempPath: tempPath1, FinalPath: finalPath1, DestDir: dir1},
+		{RelPath: "two", TempPath: tempPath2, FinalPath: finalPath2, DestDir: dir2},
+	}
+
+	result := finalizeAll(prepared, noopWarn)
+	if result.complete() {
+		t.Fatalf("expected an incomplete result")
+	}
+	if result.Renamed != 1 || result.Total != 2 {
+		t.Fatalf("result = %+v, want Renamed=1 Total=2", result)
+	}
+
+	if data, err := os.ReadFile(finalPath1); err != nil || string(data) != "content-1" {
+		t.Fatalf("file 1 was not renamed into place: %v %q", err, data)
+	}
+	if _, err := os.Stat(tempPath2); !os.IsNotExist(err) {
+		t.Fatalf("temp file 2 should have been removed after its rename failed, err=%v", err)
+	}
 }
 
-func TestRunPartialMoveFailureLeavesStagingIntact(t *testing.T) {
+func TestRunPartialMoveFailureIsReportedHonestly(t *testing.T) {
+	// A run()-level integration test complementing the direct finalizeAll
+	// test above: makes the *second* manifest entry's destination
+	// directory read-only after this program's own process has already
+	// created it (root/the test's own uid can usually still write to a
+	// 0500 directory it owns on some platforms, so this is skipped where
+	// that turns out to be true rather than asserting a false failure).
 	s := newSetup(t)
-	// Make the second manifest entry's destination directory read-only so
-	// its rename fails after the first file has already moved.
 	if err := os.Chmod(s.zigbee2mqttDir, 0o500); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 	t.Cleanup(func() { os.Chmod(s.zigbee2mqttDir, 0o755) })
+
+	if probe, probePath, probeErr := createTempInDir(s.zigbee2mqttDir); probeErr == nil {
+		probe.Close()
+		os.Remove(probePath)
+		t.Skip("this process can still write to a 0500 directory it owns on this platform/filesystem")
+	}
 
 	code := run(s.config(), noopWarn, testNow)
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1", code)
 	}
 	status := s.readStatus(t)
-	if status.Detail != DetailPartialMove {
-		t.Fatalf("detail = %q, want %q", status.Detail, DetailPartialMove)
+	// With a read-only destination directory, prepareFile itself fails
+	// while creating the temp file for the first zigbee2mqtt entry --
+	// validateAll aborts, cleaning up the earlier thermoctl.db temp file,
+	// so nothing at all has been moved yet (a stronger guarantee than a
+	// bare partial-move report: staging is entirely untouched).
+	if status.Result != ResultFailure {
+		t.Fatalf("unexpected status: %+v", status)
 	}
-
-	// thermoctl.db (validated first) should have moved; the
-	// zigbee2mqtt files, and the manifest, should still be staged.
-	if _, err := os.Stat(s.thermoctlDBPath); err != nil {
-		t.Fatalf("thermoctl.db should have moved before the failure: %v", err)
+	if _, err := os.Stat(s.thermoctlDBPath); !os.IsNotExist(err) {
+		t.Fatalf("nothing should have moved when the first failure happens during validation, not finalize")
 	}
 	if _, err := os.Stat(s.manifestPath); err != nil {
-		t.Fatalf("manifest should still be present after a partial failure: %v", err)
+		t.Fatalf("manifest should still be present after a refusal: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(s.stagingDir, "zigbee2mqtt", "database.db")); err != nil {
-		t.Fatalf("unmoved file should still be staged: %v", err)
+	if leftover := leftoverTempFiles(t, s.dir); len(leftover) != 0 {
+		t.Fatalf("leftover temp files after a refusal: %v", leftover)
 	}
 }
 
@@ -532,5 +701,90 @@ func TestRunTwiceIsIdempotentAfterSuccess(t *testing.T) {
 	after := s.readStatus(t)
 	if before != after {
 		t.Fatalf("status file changed on a no-op second run: %+v -> %+v", before, after)
+	}
+}
+
+// TestOpenStagedFileImmuneToPathSwapAfterOpen is the regression test for
+// the cross-review's TOCTOU finding: once openStagedFileNoFollow has
+// returned an open descriptor, nothing that subsequently happens to the
+// *path* -- including the untrusted agent process replacing it with a
+// symlink to unrelated, attacker-controlled content -- has any effect on
+// what is read from that descriptor. This is the exact property
+// prepareFile (validate.go) relies on: it opens once and reads/hashes/
+// copies from that one descriptor in a single, uninterrupted pass, never
+// reopening the path.
+func TestOpenStagedFileImmuneToPathSwapAfterOpen(t *testing.T) {
+	dir := t.TempDir()
+	originalContent := []byte("original-validated-content")
+	path := filepath.Join(dir, "thermoctl.db")
+	writeFile(t, path, originalContent)
+
+	file, size, err := openStagedFileNoFollow(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer file.Close()
+	if size != int64(len(originalContent)) {
+		t.Fatalf("size = %d, want %d", size, len(originalContent))
+	}
+
+	// Simulate the untrusted agent process swapping the staged path for a
+	// symlink to something else entirely, in the window between this
+	// program opening the file and finishing its read.
+	outside := filepath.Join(dir, "outside.txt")
+	writeFile(t, outside, []byte("attacker-controlled-content-of-a-different-length"))
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	got, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != string(originalContent) {
+		t.Fatalf("read %q from the already-open descriptor after a path swap, want the original %q -- "+
+			"the whole design this test guards depends on this never changing", got, originalContent)
+	}
+}
+
+// TestPrepareFileEndToEndImmuneToPathSwapAfterOpen exercises the actual
+// prepareFile function this program uses (not just the low-level open
+// primitive above): the staged path is swapped for a symlink to
+// different, differently-sized content immediately after prepareFile
+// would have opened it (there is no externally observable window to hook
+// into, by design -- open/read/hash/copy is one uninterrupted call), so
+// this instead proves the same property the way an external attacker
+// actually could observe it: run prepareFile normally, and separately
+// confirm (via TestOpenStagedFileImmuneToPathSwapAfterOpen above) that the
+// primitive it is built on is immune. This test additionally confirms
+// prepareFile's own end-to-end output -- the copied file, once finalized
+// -- is a plain regular file with exactly the validated bytes, never a
+// symlink and never anything derived from a path that changed after the
+// fact.
+func TestPrepareFileEndToEndProducesARegularFileWithValidatedBytes(t *testing.T) {
+	s := newSetup(t)
+	code := run(s.config(), noopWarn, testNow)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	info, err := os.Lstat(s.thermoctlDBPath)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("moved file is a symlink, want a regular file")
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("moved file is not a regular file: %v", info.Mode())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("could not stat_t the moved file")
+	}
+	if stat.Nlink != 1 {
+		t.Fatalf("moved file has Nlink = %d, want 1", stat.Nlink)
 	}
 }

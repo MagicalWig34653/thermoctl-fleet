@@ -296,6 +296,17 @@ def check_restore_mover_units(service_path: Path, path_unit_path: Path) -> None:
     `agent.restore.MANIFEST_FILENAME` -- a plausibility check, not a real
     systemd config validation, the same bound this whole module's own
     docstring already states.
+
+    **Cross-review hardening finding:** also asserts the `.service` unit
+    sandboxes this program even though it runs as root (unlike the
+    watchdog/thermoctl-leds units, both already unprivileged) --
+    `NoNewPrivileges=yes`, `ProtectHome=yes`, `PrivateTmp=yes`,
+    `ProtectSystem=strict` plus a `ReadWritePaths=` naming exactly the
+    four directories this program's own `Config` (main.go) ever touches,
+    nothing more. `PrivateNetwork=true` was already required before this
+    finding (mirrors the watchdog/thermoctl-leds units) and is checked
+    again here alongside the newer directives so a regression removing
+    any one of them is caught in one place.
     """
 
     if not service_path.is_file():
@@ -314,6 +325,39 @@ def check_restore_mover_units(service_path: Path, path_unit_path: Path) -> None:
             f"{path_unit_path}: does not watch "
             f"/var/lib/thermoctl-agent/pending-restore/manifest.json (agent/__main__.py's "
             f"own --restore-staging-dir default plus agent.restore.MANIFEST_FILENAME)."
+        )
+
+    service_content = service_path.read_text(encoding="utf-8")
+    required_hardening = [
+        "PrivateNetwork=true",
+        "NoNewPrivileges=yes",
+        "ProtectHome=yes",
+        "PrivateTmp=yes",
+        "ProtectSystem=strict",
+        "ReadWritePaths=",
+    ]
+    missing_hardening = [line for line in required_hardening if line not in service_content]
+    if missing_hardening:
+        raise ImageError(
+            f"{service_path}: missing sandboxing directive(s) {missing_hardening!r} -- this "
+            f"program runs as root, so its systemd unit has to narrow what it can reach "
+            f"itself."
+        )
+
+    required_paths = [
+        "/var/lib/thermoctl-agent",
+        "/var/lib/thermoctl",
+        "/var/lib/zigbee2mqtt",
+        "/run/thermoctl-restore-mover",
+    ]
+    read_write_line = next(
+        (line for line in service_content.splitlines() if line.startswith("ReadWritePaths=")),
+        "",
+    )
+    missing_paths = [path for path in required_paths if path not in read_write_line]
+    if missing_paths:
+        raise ImageError(
+            f"{service_path}: ReadWritePaths= is missing required path(s) {missing_paths!r}."
         )
 
 
