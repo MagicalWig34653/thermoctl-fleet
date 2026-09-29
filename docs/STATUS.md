@@ -2,6 +2,28 @@
 
 Last updated: 2026-09-29.
 
+## Merge: P5.4b onto main (main session, 2026-09-29) -- open points before activation
+
+Cross-review PASS (round 2). P5.4/P5.4b stay inactive; before either is
+ever activated, these must be closed (all unreachable today, since the
+pre-check rejects at `pilot_mode` before any Docker or backup call):
+
+- **Reconciler thread vs. command execution:** `run_desired_state_reconcile_loop`
+  runs on its own thread with no lock shared with command execution --
+  a periodic swap could overlap a fleet-issued `backup_now` or
+  `agent_restart`. Needs one agent-wide lock for container/backup
+  operations.
+- **Main command loop blocked:** the immediate trigger in
+  `_handle_desired_state_received` runs `reconcile_desired_state` on the
+  command thread and can block it for up to 15 minutes (health deadline),
+  long enough for other pending commands to hit their 15-minute expiry.
+  Move the immediate trigger onto the reconciler's own thread/queue.
+- **No drift re-check after convergence:** once a revision converged, the
+  agent does not re-verify running containers until a higher revision
+  arrives. Consistent with spec 13's single update pass, but an explicit
+  assumption (nothing outside the agent changes the containers).
+- No test exercises two concurrent `attempt()` calls on the reconciler lock.
+
 ## P5.4b -- desired-state delivery, fleet side + agent wiring (section 13)
 
 Completes what P5.4's own scope note flagged as still missing: fleet-side
