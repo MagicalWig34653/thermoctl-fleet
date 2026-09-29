@@ -42,6 +42,7 @@ from fleet.backup_retention import run_backup_retention
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
 from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
+from fleet.rollout import advance_all_rollouts
 from fleet.storage import (
     RecordCommandResultOutcome,
     Storage,
@@ -319,6 +320,30 @@ async def _diagnostic_bundle_retention_loop(
         await asyncio.sleep(interval_s)
 
 
+_ROLLOUT_WORKER_INTERVAL_ENV = "FLEET_ROLLOUT_WORKER_INTERVAL_S"  # noqa: S105
+_DEFAULT_ROLLOUT_WORKER_INTERVAL_S = 60.0
+
+
+async def _rollout_worker_loop(interval_s: float) -> None:  # pragma: no cover
+    """Periodically advances every currently-running rollout queue (P5.4c,
+    section 13) -- the same thin scheduling wrapper as
+    `_alarm_check_loop`/`_backup_retention_loop` above, deliberately
+    untested here for the identical reason (an infinite loop around a
+    real `asyncio.sleep`); the logic it calls, `fleet.rollout
+    .advance_all_rollouts`, is fully covered with an injected clock in
+    `tests/test_rollout.py`. Runs via `asyncio.to_thread` for the same
+    "do not freeze every other request" reason `_alarm_check_loop`
+    already documents for itself -- `advance_all_rollouts` does blocking
+    database I/O, none of it `async`."""
+
+    while True:
+        try:
+            await asyncio.to_thread(advance_all_rollouts, get_storage(), datetime.now(UTC))
+        except Exception:
+            logger.exception("Rollout worker tick failed")
+        await asyncio.sleep(interval_s)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Starts the absence-alarm background task (P2.2) for the lifetime of
@@ -455,6 +480,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             diagnostic_bundle_retention_interval_s, diagnostic_bundle_retention_days
         )
     )
+
+    rollout_worker_interval_s = float(
+        os.environ.get(_ROLLOUT_WORKER_INTERVAL_ENV, _DEFAULT_ROLLOUT_WORKER_INTERVAL_S)
+    )
+    rollout_worker_task = asyncio.create_task(_rollout_worker_loop(rollout_worker_interval_s))
     try:
         yield
     finally:
@@ -463,6 +493,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log_retention_task.cancel()
         restore_purge_task.cancel()
         diagnostic_bundle_retention_task.cancel()
+        rollout_worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
         with contextlib.suppress(asyncio.CancelledError):
@@ -473,6 +504,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await restore_purge_task
         with contextlib.suppress(asyncio.CancelledError):
             await diagnostic_bundle_retention_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await rollout_worker_task
 
 
 app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION), lifespan=lifespan)

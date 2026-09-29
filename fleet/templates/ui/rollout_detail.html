@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+
+{% block title %}Rollout {{ detail.rollout_id }} – thermoctl-fleet{% endblock %}
+
+{% block content %}
+<p><a href="/ui/rollouts">&larr; Zurück zur Übersicht</a></p>
+<h1>Rollout: {{ detail.service_label }} &rarr; {{ detail.version }}</h1>
+
+<p class="error" role="alert">
+    Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten, Pilotbetrieb
+    erforderlich) -- dieser Rollout stoppt bei der Pilot-Wohnung, bis thermoctl eine
+    Gesundheits-/Außentemperatur-API liefert.
+</p>
+
+<p>Status: <strong>{{ detail.state_label }}</strong>
+    {% if detail.stopped_reason %}-- {{ detail.stopped_reason }}{% endif %}</p>
+<p>Digest: {{ detail.digest }}</p>
+<p>Wartezeit nach Pilot: {{ detail.stagger_hours }} h. Zeitüberschreitung je Wohnung: {{ detail.timeout_hours }} h.</p>
+{% if detail.pilot_converged_text %}
+<p>Pilot erfolgreich seit: {{ detail.pilot_converged_text }}</p>
+{% endif %}
+<p>Erstellt: {{ detail.created_text }} von {{ detail.created_by }}</p>
+<p>Grund: {{ detail.reason }}</p>
+
+{% if detail.can_resume %}
+<form method="post" action="/ui/rollouts/{{ detail.rollout_id | urlpath }}/resume">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="resume_reason">Grund für Fortsetzen (Pflichtfeld)
+        <input type="text" id="resume_reason" name="reason" required>
+    </label>
+    <button type="submit">Fortsetzen</button>
+</form>
+{% endif %}
+{% if detail.can_cancel %}
+<form method="post" action="/ui/rollouts/{{ detail.rollout_id | urlpath }}/cancel">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="cancel_reason">Grund für Abbruch (Pflichtfeld)
+        <input type="text" id="cancel_reason" name="reason" required>
+    </label>
+    <button type="submit">Abbrechen</button>
+</form>
+{% endif %}
+
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Wohnung</th>
+            <th>Pilot</th>
+            <th>Status</th>
+            <th>Revision</th>
+            <th>Gestartet</th>
+            <th>Erfolgreich seit</th>
+            <th>Letzte Rückmeldung</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for apartment in detail.apartments %}
+        <tr>
+            <td>{{ apartment.position }}</td>
+            <td><a href="/ui/apartments/{{ apartment.apartment_id | urlpath }}">{{ apartment.apartment_id }}</a></td>
+            <td>{% if apartment.is_pilot %}ja{% else %}nein{% endif %}</td>
+            <td>{{ apartment.status_label }}</td>
+            <td>{{ apartment.revision if apartment.revision is not none else "-" }}</td>
+            <td>{{ apartment.started_text or "-" }}</td>
+            <td>{{ apartment.converged_text or "-" }}</td>
+            <td>{{ apartment.last_outcome_reason or "-" }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

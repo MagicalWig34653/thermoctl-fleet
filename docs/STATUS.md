@@ -2,6 +2,186 @@
 
 Last updated: 2026-09-29.
 
+## P5.4c -- rollout queue, fleet side (section 13, "Rules for the rollout")
+
+Sequences a single target release **across** apartments, something P5.4b
+deliberately does not do ("the fleet service knows no 'for all'", P5.4b's
+own scope note): the pilot apartment(s) first, the rest no earlier than
+48 hours after the pilot converged healthy, one apartment in progress at a
+time, a stop at the first apartment that does not come back healthy.
+**Still inactive, for exactly the same reason as P5.4/P5.4b** (section
+13's own "Decided afterward", 2026-09-28): every desired-state revision
+this package creates goes through the unchanged
+`Storage.create_desired_state_revision` path, delivered to the agent the
+unchanged P5.4b way, and rejected by the agent's own fail-closed pre-check
+(health/outdoor temperature unreadable) plus the `pilot_mode` gate -- a
+rollout against today's scaffold stops at the pilot apartment with a
+rejected outcome, by design, until thermoctl ships a real health API.
+
+**Design:**
+
+- **Storage** (`fleet/storage.py`, `0016_rollouts.py`): two new,
+  **append-only-in-spirit** tables. `RolloutRecord` is one row per
+  rollout -- a single `service`/`version`/`digest` (structurally one
+  service family per rollout: `service` is a plain string column, never a
+  set, so "refuse mixing thermoctl and zigbee2mqtt in one rollout" is not
+  a check that can be forgotten, it is simply not representable) plus
+  sequencing state (`state`: `running`/`stopped`/`completed`/`cancelled`,
+  `stopped_reason`, `pilot_converged_at`, per-rollout
+  `stagger_hours`/`timeout_hours`, CLAUDE.md "nothing hard-coded" applied
+  to both timing thresholds, defaulting to 48h/2h). `RolloutApartmentRecord`
+  is one row per apartment in a rollout's ordered queue (`position`,
+  `is_pilot` stored redundantly rather than re-derived so a later flip of
+  the inventory flag cannot change an already-created rollout's own
+  pilot after the fact, `status`: `queued`/`in_progress`/`converged`/
+  `failed`/`timed_out`/`skipped`, the `revision` it created, timestamps,
+  last outcome reason). `Storage.create_rollout` validates, in order: a
+  known service name; a valid digest (`^sha256:[0-9a-f]{64}$`); a
+  non-empty version/reason; every named apartment known, non-retired, and
+  **already carrying a current desired state** (this package only ever
+  *changes* the target service on top of an apartment's existing desired
+  state, it never invents the other three services' version/digest); at
+  least one named apartment with `pilot_mode=True`; and that no named
+  apartment is already queued in another rollout whose own state is
+  `running` or `stopped` ("never two rollouts touching the same apartment
+  concurrently"). Pilot apartments are moved to the front automatically.
+  Writes exactly one audit row (`entity_type="rollout"`), same as every
+  other landlord-initiated change in this codebase; `mark_rollout_apartment
+  _failed`/`_timed_out` also audit the resulting stop (`created_by="system"`,
+  the worker itself), `resume_rollout`/`cancel_rollout` each audit their
+  own explicit UI action.
+- **Worker** (`fleet/rollout.py`, new): `advance_rollout` is the pure-ish,
+  injected-clock function driving one rollout by one step -- same testing
+  method `fleet.alarms.check_absence_alarms`/`fleet.backup_retention
+  .run_backup_retention` already establish. For the apartment currently
+  `in_progress`, it checks `Storage.latest_desired_state_outcome` for the
+  exact revision it created; an unsuccessful outcome or an unmet timeout
+  stops the whole rollout (`Storage.mark_rollout_apartment_failed`/
+  `_timed_out`, which also flips `RolloutRecord.state` to `stopped` in the
+  same transaction). Otherwise it looks for the next apartment to start:
+  pilots first, then non-pilots gated on **every** pilot having converged
+  and `now >= pilot_converged_at + stagger_hours`. Starting an apartment
+  reads its current desired state, replaces only the rollout's target
+  service, and calls the unchanged `Storage.create_desired_state_revision`
+  (reason references the rollout id). `advance_all_rollouts` iterates
+  every currently-`running` rollout id and calls `advance_rollout` for
+  each, one failure logged and isolated from the rest (same "do not let
+  one apartment's problem take down the whole background task" reasoning
+  `fleet.app._alarm_check_loop` already applies to notifier failures).
+  **Idempotent across worker restarts by construction**: every mutation
+  goes through a `Storage` method that re-reads the current row inside its
+  own transaction (`start_rollout_apartment` refuses unless still
+  `queued`), so a freshly started process with no memory of the previous
+  tick reproduces exactly the same next step, never a duplicate revision
+  or a double stop.
+- **"Comes back healthy" -- decision to confirm.** The specification's own
+  wording is not spelled out further. Chosen, the strictest reasonable
+  reading: the agent's `DesiredStateOutcomeReport` for the exact revision
+  must report `successful=True`, **and** a heartbeat must arrive
+  afterwards (`received_at` strictly after the outcome's own
+  `reported_at`) with `thermoctl.reachable=True`. Neither alone counts.
+  `ControlState.last_decision` is deliberately **not** part of this check
+  -- it is a required field on `Heartbeat`, never absent, so testing it
+  for presence would check nothing; a genuinely *stale* `last_decision`
+  is exactly what section 8's own "control stalled" alarm already
+  covers, duplicating its threshold here was judged out of scope.
+- **A rollout must include at least one `pilot_mode` apartment -- decision
+  to confirm.** Without one, "the pilot apartment first, then the rest no
+  earlier than 48 hours later" has nothing to gate on; refused fail-closed
+  (`ValueError`) rather than silently skipping the pilot phase.
+- **An apartment must already carry a current desired state to join a
+  rollout -- decision to confirm.** This package only ever changes the
+  rollout's own target service on top of an apartment's existing desired
+  state; an apartment with none yet cannot safely be sequenced without
+  inventing values for the other three services.
+- **"Resumed" retries the blocking apartment -- decision to confirm.** The
+  specification does not say what "resumed" means operationally; the
+  strictest reasonable reading chosen here is that `Storage.resume_rollout`
+  resets the `failed`/`timed_out` apartment back to `queued` (a fresh
+  desired-state revision is created for it on the next worker tick) --
+  never skips ahead past the apartment that failed.
+- **UI** (`fleet/ui_rollout.py`, new; `fleet/ui_routes.py`; `fleet
+  /templates/ui/rollout_list.html`/`rollout_new.html`/`rollout_confirm.html`
+  /`rollout_detail.html`, new; `fleet/templates/ui/base.html`): a list view,
+  a two-step new-then-confirm form (service select, version, digest, per-
+  rollout stagger/timeout, an apartment checklist -- pilot apartments and
+  the "no current desired state" case both called out in the list, exactly
+  the same "the UI never lets the landlord type a source" and "re-validate
+  everything server-side on the write itself, never trust hidden fields
+  blindly" rules P5.4b's own desired-state form already established), and
+  a detail page with per-apartment position/status/revision/times/last
+  outcome plus resume/cancel actions (CSRF, mandatory reason, audited).
+  Every rollout page repeats the same "update execution is currently
+  inactive" notice the desired-state pages already carry.
+- **Lifespan** (`fleet/app.py`): a new background task,
+  `_rollout_worker_loop`, the same thin scheduling wrapper as
+  `_alarm_check_loop`/`_backup_retention_loop` (default interval 60s,
+  `FLEET_ROLLOUT_WORKER_INTERVAL_S`), calling `fleet.rollout
+  .advance_all_rollouts` via `asyncio.to_thread` for the same "do not
+  freeze every other request" reason those loops already document.
+
+**No protocol change.** `protocol/desired_state.py`'s own `DesiredState`
+is reused unchanged; `PROTOCOL_VERSION` stays 8.
+
+**Verification.** `ruff check .` clean; `mypy .` (141 files) and
+`mypy protocol fleet agent tools` (70 files) clean; pytest: **1751
+passed, 1 skipped**, TOTAL **6941 stmts / 56 missed / 99%**; Go:
+`go vet ./...`/`go test ./...` clean (this package never touches
+`watchdog/`), `watchdog/check_contract.sh` passing; migration
+`0016_rollouts` upgrade/downgrade/re-upgrade against a real SQLite file
+verified directly.
+
+**Tests** (new files): `tests/test_storage_rollouts.py` (`create_rollout`'s
+own validations -- pilot ordering, unknown/mixed service, invalid digest,
+empty/unknown/retired apartment, missing desired state, missing pilot,
+double-touch refusal, cancel-then-recreate; `start_rollout_apartment`'s
+"must be queued" guard; `mark_rollout_apartment_failed`/`_timed_out` stop
+the rollout; `resume_rollout`/`cancel_rollout` state guards, audit rows,
+mandatory reason; `complete_rollout` only from `running`);
+`tests/test_rollout_worker.py` (pilot started first; full pilot
+convergence then the 48h gate, both sides of it; stop on a reported
+failure; stop on timeout with no outcome and with a successful-but-
+unhealthy outcome; a heartbeat older than the outcome does not count; an
+unreachable heartbeat does not converge; completion when the only
+apartment converges; never more than one apartment `in_progress`; a
+cancelled/unknown rollout is a no-op; idempotency across a simulated
+worker restart; `advance_all_rollouts` advances every running rollout and
+isolates one failure from the rest); `tests/test_ui_rollout.py`
+(login/CSRF required on every mutating route incl. resume/cancel; the
+full new-then-confirm-then-create flow with its audit row; refusal
+without any pilot apartment; refusal of an invalid digest; refusal of an
+unknown/combined service value (the structural "no mixing" test); the
+confirm step's own re-validation of an empty reason; detail view 404 for
+an unknown rollout; resume/cancel CSRF and mandatory-reason guards; cancel
+writes an audit row and flips state; resuming an already-cancelled
+rollout is refused; the list view renders).
+
+**Open points:**
+
+- **Still inactive**, same reason and same closing condition as P5.4/P5.4b:
+  needs a real thermoctl health endpoint and `pilot_mode` set per
+  apartment before any rollout this package sequences can actually apply
+  anything.
+- **The three "decision to confirm" points above** (pilot required,
+  desired state required, resume retries the blocking apartment) are the
+  strictest reasonable reading of an open point the specification does
+  not spell out -- worth a project-owner confirmation before this package
+  is ever used against a live pilot, none of them security-relevant
+  (CLAUDE.md principle 7) on their own.
+- **`RolloutRecord`/`RolloutApartmentRecord` rows are never deleted** --
+  no retention job exists yet for this package, consistent with
+  `fleet/storage.py`'s own module docstring ("retention is deliberately
+  not implemented here" for heartbeats/events either).
+
+**Files:** `fleet/storage.py`, `fleet/migrations/versions/0016_rollouts.py`
+(new), `fleet/rollout.py` (new), `fleet/ui_rollout.py` (new),
+`fleet/ui_routes.py`, `fleet/app.py`, `fleet/templates/ui/rollout_list.html`
+(new), `fleet/templates/ui/rollout_new.html` (new), `fleet/templates/ui
+/rollout_confirm.html` (new), `fleet/templates/ui/rollout_detail.html`
+(new), `fleet/templates/ui/base.html`, `tests/test_storage_rollouts.py`
+(new), `tests/test_rollout_worker.py` (new), `tests/test_ui_rollout.py`
+(new).
+
 ## Merge: P5.5c onto main (main session, 2026-09-29)
 
 Cross-review PASS (round 2). Main-session read-back of
@@ -206,14 +386,14 @@ not a crash).
 
 **Open points:**
 
-- **P5.4c, rollout queue -- out of scope, not built.** Section 13's
-  "Rules for the rollout" (pilot apartment first, then the rest no
-  earlier than 48 hours later, one apartment at a time, stop at the first
-  apartment that does not come back healthy) needs its own sequencing
-  package once `apply_update` is promoted out of stage 2 -- P5.4b only
-  ever delivers *one* apartment's desired state at a time by construction
-  ("the fleet service knows no 'for all'"), it does not sequence *across*
-  apartments or track a rollout's own progress.
+- **P5.4c, rollout queue -- built, see its own section above/below.**
+  Section 13's "Rules for the rollout" (pilot apartment first, then the
+  rest no earlier than 48 hours later, one apartment at a time, stop at
+  the first apartment that does not come back healthy) is P5.4c, layered
+  entirely on top of this package's own `create_desired_state_revision`
+  path -- see that section for the full design. **Still inactive** for
+  the same reason as this package (below): nothing sequences until the
+  fail-closed pre-check and `pilot_mode` stop rejecting.
 - **Still inactive**, unchanged from P5.4: needs a real thermoctl health
   endpoint (closing the `_default_health_reader`/`_default_outdoor_temp
   _reader` honesty gap) and `pilot_mode` set per apartment before any

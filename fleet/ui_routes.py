@@ -33,6 +33,7 @@ from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
 from fleet.desired_state_sources import DISPLAY_SOURCES
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
+from fleet.rollout import DEFAULT_STAGGER_HOURS, DEFAULT_TIMEOUT_HOURS
 from fleet.storage import Storage, get_storage
 from fleet.ui_apartment import (
     COMMAND_TYPE_LABELS,
@@ -76,6 +77,11 @@ from fleet.ui_inventory import (
     build_confirm_view,
     build_inventory_view,
     build_replace_device_view,
+)
+from fleet.ui_rollout import (
+    ROLLOUT_SERVICE_LABELS,
+    build_rollout_detail,
+    build_rollout_list,
 )
 from fleet.ui_tasks import build_task_overview
 from protocol.commands import CommandType
@@ -1723,6 +1729,327 @@ def desired_state_confirm_submit(
 
     return RedirectResponse(
         url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+    )
+
+
+# -- rollouts (P5.4c, section 13, "Rules for the rollout") ----------------------
+
+
+@router.get("/rollouts", response_class=HTMLResponse)
+def rollout_list(
+    request: Request,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "rollout_list.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "entries": build_rollout_list(storage),
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _rollout_new_response(
+    request: Request,
+    authenticated: AuthenticatedUiSession,
+    storage: Storage,
+    *,
+    service: str,
+    version: str,
+    digest: str,
+    stagger_hours: str,
+    timeout_hours: str,
+    selected_apartment_ids: set[str],
+    error: str | None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    apartments = []
+    for apartment in storage.list_apartments():
+        if apartment.state == "retired":
+            continue
+        apartments.append(
+            {
+                "apartment_id": apartment.id,
+                "label": apartment.label,
+                "pilot_mode": apartment.pilot_mode,
+                "has_desired_state": storage.get_desired_state(apartment.id) is not None,
+            }
+        )
+    response = templates.TemplateResponse(
+        request,
+        "rollout_new.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "service_options": list(ROLLOUT_SERVICE_LABELS.items()),
+            "service": service,
+            "version": version,
+            "digest": digest,
+            "stagger_hours": stagger_hours,
+            "timeout_hours": timeout_hours,
+            "max_version_length": MAX_VERSION_LENGTH,
+            "apartments": apartments,
+            "selected_apartment_ids": selected_apartment_ids,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/rollouts/new", response_class=HTMLResponse)
+def rollout_new_form(
+    request: Request,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    return _rollout_new_response(
+        request,
+        authenticated,
+        storage,
+        service="thermoctl",
+        version="",
+        digest="",
+        stagger_hours=str(DEFAULT_STAGGER_HOURS),
+        timeout_hours=str(DEFAULT_TIMEOUT_HOURS),
+        selected_apartment_ids=set(),
+        error=None,
+    )
+
+
+@router.post("/rollouts/new", response_class=HTMLResponse)
+def rollout_new_submit(
+    request: Request,
+    csrf_token: str = Form(...),
+    service: str = Form(""),
+    version: str = Form(""),
+    digest: str = Form(""),
+    stagger_hours: str = Form(str(DEFAULT_STAGGER_HOURS)),
+    timeout_hours: str = Form(str(DEFAULT_TIMEOUT_HOURS)),
+    apartment_ids: list[str] = Form(default_factory=list),  # noqa: B008
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Step one's own submit -- validates and, on success, renders the
+    confirmation page (step two). Never calls `Storage.create_rollout`
+    itself, same "the confirm step is the only writer" convention as
+    `desired_state_edit_submit`/`desired_state_confirm_submit` above.
+
+    **The apartment order sent to `Storage.create_rollout` is this
+    route's own displayed apartment order (`storage.list_apartments()`,
+    filtered to the checked ids), not the order the checkboxes happened to
+    be clicked in** -- an HTML form does not preserve click order, and
+    `Storage.create_rollout` moves pilot apartments to the front
+    regardless, so any deterministic order is sufficient here."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    selected = set(apartment_ids)
+
+    def _error(message: str) -> HTMLResponse:
+        return _rollout_new_response(
+            request,
+            authenticated,
+            storage,
+            service=service,
+            version=version,
+            digest=digest,
+            stagger_hours=stagger_hours,
+            timeout_hours=timeout_hours,
+            selected_apartment_ids=selected,
+            error=message,
+            status_code=400,
+        )
+
+    if service not in ROLLOUT_SERVICE_LABELS:
+        return _error("Unbekannter Dienst.")
+    length_error = _first_length_error(("Version", version.strip(), MAX_VERSION_LENGTH))
+    if length_error is not None:
+        return _error(length_error)
+    if not version.strip():
+        return _error("Eine Version ist erforderlich.")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest.strip()):
+        return _error("Ungültiger Digest (sha256:<64 Hex-Zeichen> erwartet).")
+    try:
+        stagger_hours_value = float(stagger_hours)
+        timeout_hours_value = float(timeout_hours)
+    except ValueError:
+        return _error("Wartezeit und Zeitüberschreitung müssen Zahlen sein.")
+    if stagger_hours_value < 0:
+        return _error("Wartezeit darf nicht negativ sein.")
+    if timeout_hours_value <= 0:
+        return _error("Zeitüberschreitung muss positiv sein.")
+    if not selected:
+        return _error("Mindestens eine Wohnung ist erforderlich.")
+
+    ordered_ids = [a.id for a in storage.list_apartments() if a.id in selected]
+    pilot_ids = {a.id for a in storage.list_apartments() if a.pilot_mode}
+    if not (selected & pilot_ids):
+        return _error("Mindestens eine ausgewählte Wohnung muss im Pilotbetrieb sein.")
+    ordered_ids = sorted(ordered_ids, key=lambda a: (a not in pilot_ids,))
+
+    response = templates.TemplateResponse(
+        request,
+        "rollout_confirm.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "service": service,
+            "service_label": ROLLOUT_SERVICE_LABELS[service],
+            "version": version.strip(),
+            "digest": digest.strip(),
+            "stagger_hours": stagger_hours_value,
+            "timeout_hours": timeout_hours_value,
+            "ordered_apartment_ids": ordered_ids,
+            "pilot_apartment_ids": pilot_ids & selected,
+            "error": None,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/rollouts/confirm")
+def rollout_confirm_submit(
+    csrf_token: str = Form(...),
+    reason: str = Form(...),
+    service: str = Form(""),
+    version: str = Form(""),
+    digest: str = Form(""),
+    stagger_hours: str = Form(str(DEFAULT_STAGGER_HOURS)),
+    timeout_hours: str = Form(str(DEFAULT_TIMEOUT_HOURS)),
+    apartment_ids: list[str] = Form(default_factory=list),  # noqa: B008
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """The actual write -- `Storage.create_rollout` is only ever called
+    from here, and re-validates every field again (the hidden fields
+    carried over from step one are never trusted blindly, same rule
+    `desired_state_confirm_submit` already applies)."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    if not reason.strip():
+        raise HTTPException(status_code=400, detail="Ein Grund ist erforderlich.")
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        raise HTTPException(status_code=400, detail=length_error)
+
+    try:
+        stagger_hours_value = float(stagger_hours)
+        timeout_hours_value = float(timeout_hours)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400, detail="Wartezeit und Zeitüberschreitung müssen Zahlen sein."
+        ) from error
+
+    try:
+        rollout = storage.create_rollout(
+            service=service,
+            version=version.strip(),
+            digest=digest.strip(),
+            apartment_ids=list(apartment_ids),
+            stagger_hours=stagger_hours_value,
+            timeout_hours=timeout_hours_value,
+            ui_username=authenticated.user.username,
+            reason=reason.strip(),
+            now=datetime.now(UTC),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    return RedirectResponse(
+        url=f"/ui/rollouts/{quote(rollout.id, safe='')}", status_code=303
+    )
+
+
+@router.get("/rollouts/{rollout_id}", response_class=HTMLResponse)
+def rollout_detail_view(
+    request: Request,
+    rollout_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    detail = build_rollout_detail(storage, rollout_id)
+    response = templates.TemplateResponse(
+        request,
+        "rollout_detail.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "detail": detail,
+        },
+        status_code=200 if detail is not None else 404,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/rollouts/{rollout_id}/resume")
+def rollout_resume_submit(
+    rollout_id: str,
+    csrf_token: str = Form(...),
+    reason: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """P5.4c scope item 2: "resumed ... only by explicit UI action"."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+    if not reason.strip():
+        raise HTTPException(status_code=400, detail="Ein Grund ist erforderlich.")
+
+    try:
+        storage.resume_rollout(
+            rollout_id,
+            ui_username=authenticated.user.username,
+            reason=reason.strip(),
+            now=datetime.now(UTC),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    return RedirectResponse(
+        url=f"/ui/rollouts/{quote(rollout_id, safe='')}", status_code=303
+    )
+
+
+@router.post("/rollouts/{rollout_id}/cancel")
+def rollout_cancel_submit(
+    rollout_id: str,
+    csrf_token: str = Form(...),
+    reason: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """P5.4c scope item 2: "cancelled ... only by explicit UI action"."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+    if not reason.strip():
+        raise HTTPException(status_code=400, detail="Ein Grund ist erforderlich.")
+
+    try:
+        storage.cancel_rollout(
+            rollout_id,
+            ui_username=authenticated.user.username,
+            reason=reason.strip(),
+            now=datetime.now(UTC),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    return RedirectResponse(
+        url=f"/ui/rollouts/{quote(rollout_id, safe='')}", status_code=303
     )
 
 
