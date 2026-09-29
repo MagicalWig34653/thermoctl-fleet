@@ -81,11 +81,13 @@ import time
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from datetime import time as time_of_day
 from pathlib import Path
 from typing import Literal
 
 import httpx
 
+from agent import sources as agent_sources
 from agent.commands_channel import (
     CommandResultError,
     CommandStreamAuthError,
@@ -562,6 +564,250 @@ def read_container_state(
         "health": health.get("Status"),
         "image": data.get("Image"),
     }
+
+
+# ---------------------------------------------------------------------------
+# P5.4 (section 13): the Docker Engine API operations `reconcile_desired_state`
+# needs beyond `read_container_log_lines`/`read_container_log_window`/
+# `read_container_state` above -- pulling an image strictly by digest,
+# verifying it actually landed under that digest, and swapping one
+# container's image while keeping its existing run configuration otherwise
+# unchanged. Same reasoning as those three functions: the local Docker
+# Engine API over the Unix socket only, never a registry-reaching Docker
+# SDK, and -- unlike `watchdog/runtime.go`'s own `os/exec` calls, which are
+# fine there because the watchdog never *chooses* an image, only ever
+# swaps between two digests the agent already checked (security principle
+# 6) -- never a shell/`docker` CLI call here either: the agent is the one
+# place that does choose, so every operation below goes through the Engine
+# API directly, the same footing `read_container_log_lines` already
+# established for a read-only call.
+# ---------------------------------------------------------------------------
+
+
+def pull_image_by_digest(
+    repo: str, digest: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET, timeout: float = 600.0
+) -> None:
+    """`POST /images/create?fromImage={repo}&tag={digest}` -- the Docker
+    Engine API's own way to pull strictly by digest (the `tag` query
+    parameter accepts a `sha256:...` value exactly like a tag, and the
+    daemon then pulls that manifest, never "latest" or a mutable tag).
+    Section 13's "no digest, no start" is enforced by this function's own
+    caller (`reconcile_desired_state`), before this is ever called --
+    `agent.sources.digest_is_well_formed`/`image_repo_matches_source` are
+    checked first, so `repo`/`digest` here are never cloud-controlled
+    strings that reached this point unchecked.
+
+    The response is a stream of newline-delimited JSON status objects;
+    this function only watches for an `"error"` key in any of them (the
+    daemon can report a failed pull as `200 OK` with an in-stream error
+    object, not necessarily as an HTTP error status) and raises
+    `RuntimeError` if one appears. Raises `httpx.HTTPError` for a
+    transport-level failure (socket missing, daemon down, unknown
+    repository, ...), exactly like the read-only Docker functions above.
+    """
+
+    transport = httpx.HTTPTransport(uds=str(socket_path))
+    with httpx.Client(transport=transport, base_url="http://docker", timeout=timeout) as client:
+        with client.stream(
+            "POST", "/images/create", params={"fromImage": repo, "tag": digest}
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("error"):
+                    raise RuntimeError(f"pulling {repo}@{digest} failed: {event['error']}")
+
+
+def image_repo_digests(
+    image_ref: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> list[str]:
+    """`GET /images/{image_ref}/json`'s own `RepoDigests` -- `image_ref` is
+    normally `"{repo}@{digest}"`, the exact string just pulled by
+    `pull_image_by_digest`. Raises `httpx.HTTPError` if that image is not
+    present locally (a pull that produced nothing, which should not
+    happen, but this function does not assume it cannot)."""
+
+    transport = httpx.HTTPTransport(uds=str(socket_path))
+    with httpx.Client(transport=transport, base_url="http://docker") as client:
+        response = client.get(f"/images/{image_ref}/json", timeout=30.0)
+        response.raise_for_status()
+        data = response.json()
+    digests = data.get("RepoDigests")
+    return list(digests) if isinstance(digests, list) else []
+
+
+def verify_pulled_digest(
+    repo: str, digest: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> bool:
+    """`True` iff `f"{repo}@{digest}"` is actually among the just-pulled
+    image's own `RepoDigests` (section 13 step 3: "check the digest. If it
+    does not match: abort, the old state stays.") -- the same check
+    `watchdog/runtime.go`'s own `cliRuntime.repoDigest` performs for the
+    *running* container's image, applied here right after the pull,
+    before anything is ever swapped. `False` (never raises) on any lookup
+    failure -- indistinguishable from "does not match" for this
+    function's only caller, which aborts either way."""
+
+    wanted = f"{repo}@{digest}"
+    try:
+        return wanted in image_repo_digests(wanted, socket_path=socket_path)
+    except httpx.HTTPError:
+        return False
+
+
+def inspect_container_full(
+    container: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> dict[str, object]:
+    """The full `GET /containers/{name}/json` body -- unlike
+    `read_container_state`'s own small, diagnostic-bundle-shaped subset,
+    `_recreate_container_with_image` below needs the whole `Config`/
+    `HostConfig` to recreate a container with the same run configuration,
+    only the image swapped. Raises `httpx.HTTPError` if `container` does
+    not exist."""
+
+    transport = httpx.HTTPTransport(uds=str(socket_path))
+    with httpx.Client(transport=transport, base_url="http://docker") as client:
+        response = client.get(f"/containers/{container}/json", timeout=30.0)
+        response.raise_for_status()
+        result: dict[str, object] = response.json()
+        return result
+
+
+def current_repo_digest(
+    container: str, repo: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> str | None:
+    """The registry manifest digest `container` is *currently* running,
+    resolved through its own local image's `RepoDigests` for `repo` --
+    exactly `watchdog/runtime.go`'s own `cliRuntime.repoDigest`, ported to
+    the Engine API instead of the CLI (this module never shells out, see
+    this section's own comment above). `None` if the container does not
+    exist yet, or its image carries no `RepoDigests` entry for `repo` (an
+    image never pulled by digest, or from a different source) -- treated
+    by every caller as "definitely not already at the desired digest",
+    never as a false match, mirroring the Go function's own documented
+    behaviour."""
+
+    try:
+        state = inspect_container_full(container, socket_path=socket_path)
+    except httpx.HTTPError:
+        return None
+    image_id = state.get("Image")
+    if not isinstance(image_id, str) or not image_id:
+        return None
+    try:
+        digests = image_repo_digests(image_id, socket_path=socket_path)
+    except httpx.HTTPError:
+        return None
+    prefix = f"{repo}@"
+    for entry in digests:
+        if entry.startswith(prefix):
+            return entry[len(prefix) :]
+    return None
+
+
+def container_is_healthy(
+    container: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> bool | None:
+    """Whether `container` currently counts as healthy, for
+    `reconcile_desired_state`'s own post-swap wait (section 13 step 4:
+    "wait for health"). Honestly limited to what the Docker Engine API
+    itself already reports (`State.Health.Status`, if the image defines a
+    `HEALTHCHECK`) or, absent one, plain "is it running at all" -- this
+    scaffold has no thermoctl `/api/v1/health` reader yet (`docs/STATUS.md`'s
+    P5.4 open point, the same limitation `_default_health_reader` below
+    documents for the pre-check), so this function does not invent a
+    richer, service-specific probe; once thermoctl ships that endpoint,
+    this is the function to extend. Returns `None` for "cannot tell right
+    now" (container not found, socket error) -- treated by the caller's
+    poll loop exactly like "not yet healthy", never like a hard failure,
+    since a container can legitimately be briefly uninspectable right
+    after a recreate."""
+
+    try:
+        state = inspect_container_full(container, socket_path=socket_path)
+    except httpx.HTTPError:
+        return None
+    container_state = state.get("State")
+    if not isinstance(container_state, dict):
+        return None
+    health = container_state.get("Health")
+    if isinstance(health, dict):
+        return health.get("Status") == "healthy"
+    return bool(container_state.get("Running"))
+
+
+def _recreate_container_with_image(
+    container: str, image_ref: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> None:
+    """Stops, removes, and re-creates `container` with `image_ref`
+    (`"{repo}@{digest}"`), keeping its existing `Config`/`HostConfig`
+    otherwise unchanged -- section 13's own "swap, start the service"
+    (step 4), against the Docker Engine API directly.
+
+    **No compose file for thermoctl/zigbee2mqtt/mosquitto exists in this
+    repository yet** (`image/common/README.md`'s own P5.4/P5.6 open
+    point: "no compose file for thermoctl/Zigbee2MQTT themselves exists
+    yet in this repository") -- this function is the documented stand-in
+    the implementation plan explicitly allows for that case ("if nothing
+    exists yet, implement against the Engine API recreate path and
+    document"). Once such compose files are added, the swap step can move
+    to the same `docker compose -f <fixed, locally shipped file> up -d
+    --pull never --force-recreate <service>` pattern `watchdog/runtime.go`
+    already uses for the agent's own self-swap (section 13's own "no
+    arbitrary compose files" is about what the cloud may hand the agent,
+    never about a fixed file shipped with the image) -- **not** done here
+    now, so as not to invent a compose file this repository does not
+    actually ship for these three services yet.
+
+    Raises `httpx.HTTPError` on any step's failure. **Not itself a
+    rollback**: `reconcile_desired_state`/`_rollback_to_previous` call
+    this same function again with the previous digest to roll back, they
+    do not special-case failure here beyond that.
+    """
+
+    inspect = inspect_container_full(container, socket_path=socket_path)
+    raw_config = inspect.get("Config")
+    config: dict[str, object] = dict(raw_config) if isinstance(raw_config, dict) else {}
+    host_config = inspect.get("HostConfig") or {}
+    config["Image"] = image_ref
+    create_body: dict[str, object] = {**config, "HostConfig": host_config}
+
+    transport = httpx.HTTPTransport(uds=str(socket_path))
+    with httpx.Client(transport=transport, base_url="http://docker", timeout=120.0) as client:
+        stop = client.post(f"/containers/{container}/stop", params={"t": "30"})
+        if stop.status_code not in (204, 304):
+            stop.raise_for_status()
+        remove = client.delete(f"/containers/{container}", params={"force": "true"})
+        if remove.status_code not in (204, 404):
+            remove.raise_for_status()
+        create = client.post("/containers/create", params={"name": container}, json=create_body)
+        create.raise_for_status()
+        start = client.post(f"/containers/{container}/start")
+        if start.status_code not in (204, 304):
+            start.raise_for_status()
+
+
+def _rollback_to_previous(
+    container: str, repo: str, previous_digest: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> bool:
+    """Best-effort rollback to `previous_digest`, via
+    `_recreate_container_with_image` again -- swallows `httpx.HTTPError`
+    and reports `False` rather than raising, since every caller already
+    has a failure to report regardless of whether this second recreate
+    itself also succeeds."""
+
+    try:
+        _recreate_container_with_image(
+            container, f"{repo}@{previous_digest}", socket_path=socket_path
+        )
+    except httpx.HTTPError:
+        return False
+    return True
 
 
 def _read_memory_usage() -> dict[str, int] | None:
@@ -1587,28 +1833,594 @@ def run(
         restore_stop_event.set()
 
 
-def reconcile_desired_state(desired: DesiredState) -> None:
-    """Reconciles the four containers against the held desired state (section 13).
+# `protocol.desired_state.Services`' own field order, fixed here as the
+# priority `_select_service_to_update` walks -- "one service per reconcile
+# pass; never zigbee2mqtt together with thermoctl" (implementation plan,
+# P5.4) follows structurally from that function only ever returning one
+# name, never a list; this order only decides *which* one, when more than
+# one differs at once. `agent` is deliberately last: the other three are
+# genuinely swapped by this pass, the agent's own case only ever pulls,
+# verifies, and hands off to the watchdog (step 6 below).
+RECONCILE_SERVICE_ORDER: tuple[str, ...] = ("thermoctl", "mosquitto", "zigbee2mqtt", "agent")
 
-    Intended flow, none of the steps implemented:
+# The agent's own fixed service-name -> container-name table (cross-review
+# finding, main session: this used to be computed ad hoc at each call site
+# -- `"thermoctl-agent" if service == "agent" else service` -- and, for a
+# resumed swap, taken from the *persisted* pending-swap file itself. Both
+# are replaced by this one constant: a container/repo to touch is **never**
+# read back from a file `reconcile_desired_state` itself wrote earlier (see
+# `PendingSwap`'s own docstring for why that distinction matters), only
+# ever looked up here, keyed by a `service` value that has itself already
+# been validated against this same table (`_load_pending_swap`).
+SERVICE_CONTAINER_NAMES: dict[str, str] = {
+    "thermoctl": "thermoctl",
+    "zigbee2mqtt": "zigbee2mqtt",
+    "mosquitto": "mosquitto",
+    "agent": "thermoctl-agent",
+}
 
-    1. Pre-check without the cloud (disk space, time window, outdoor temperature,
-       control running normally).
-    2. Backup of database and configuration.
-    3. Fetch the image from the hard-coded source list, verify the digest against
-       `desired.services[...].digest` -- no digest, no start.
-    4. Swap the service, wait for health.
-    5. Wait 15 minutes for a heartbeat or health, otherwise automatically roll back
-       to the previous digest.
+# The subset of `SERVICE_CONTAINER_NAMES` a `PendingSwap` may ever
+# legitimately name: `agent` is deliberately excluded -- section 13 step 6
+# (security principle 6), the agent never recreates its own container, so
+# `reconcile_desired_state` never persists a pending swap for it; a
+# `PendingSwap` record claiming `service="agent"` is therefore never one
+# this code itself produced, only ever a tampered or corrupted file, and
+# `_load_pending_swap` rejects it on exactly that basis.
+PENDING_SWAP_SERVICES: tuple[str, ...] = ("thermoctl", "zigbee2mqtt", "mosquitto")
 
-    The agent only knows the four service names from `protocol.desired_state.Services`
-    and the hard-coded source prefix list -- **not** taken over from the cloud, see
-    section 13.
+# Section 13 step 5: "if the heartbeat fails to arrive for 15 minutes ...
+# the agent falls back to the previous digest on its own". Configurable so
+# tests can exercise the timeout path without a real 15-minute wait.
+RECONCILE_HEALTH_DEADLINE_S = 900.0
+RECONCILE_HEALTH_POLL_INTERVAL_S = 5.0
+
+# Section 13 step 1: "is there free space (> 20%)?"
+RECONCILE_MIN_FREE_DISK_PERCENT = 20.0
+
+DEFAULT_PENDING_SWAP_FILE = Path("pending_swap.json")
+
+HealthReader = Callable[[], str | None]
+OutdoorTempReader = Callable[[], float | None]
+DiskUsageReader = Callable[[], "dict[str, int] | None"]
+
+
+def _default_health_reader() -> str | None:
+    """No thermoctl health endpoint exists in this scaffold yet (section
+    13 pre-check: "is the system currently controlling normally?",
+    section 10's own list of what thermoctl still needs to expose) --
+    honestly reports "unavailable" (`None`) rather than inventing a
+    reading. `_reconcile_precheck`'s own fail-closed rule then rejects on
+    exactly that, per the project owner's 2026-09-28 decision (section 13,
+    "Decided afterward": "unknown never counts as fine"). Real callers
+    (once such an endpoint exists) pass their own reader instead --
+    `reconcile_desired_state` never hard-codes this one, it is only the
+    default."""
+
+    return None
+
+
+def _default_outdoor_temp_reader() -> float | None:
+    """Same honesty as `_default_health_reader` -- no outdoor-temperature
+    source exists in this scaffold yet, so `None` ("unavailable"), never a
+    guessed value."""
+
+    return None
+
+
+@dataclass(frozen=True)
+class PendingSwap:
+    """One in-flight container swap, persisted so an agent restart resumes
+    waiting for health (or rolling back) instead of forgetting the swap
+    ever happened -- section 13 step 5's own "no one has to intervene at
+    night", applied to the agent process itself, not only to the
+    apartment's heating.
+
+    **Deliberately carries no `container`/`repo` field** (cross-review,
+    main session, security-relevant): this record round-trips through a
+    local JSON file between two calls, so it must be treated the same way
+    every other on-disk value this module reads back is treated --
+    untrusted until checked, never as a trusted source for *which Docker
+    resource to touch*. `_await_or_rollback_pending_swap` (this record's
+    only consumer) always resolves the container name and the source
+    repository itself, from `SERVICE_CONTAINER_NAMES`/
+    `agent.sources.ALLOWED_SOURCES`, keyed by this record's own `service`
+    -- which `_load_pending_swap` has itself already checked against
+    `PENDING_SWAP_SERVICES` before a `PendingSwap` is ever constructed. A
+    tampered file naming a foreign container or a foreign repository
+    therefore has nothing to change: there is no field left in this type
+    for such a value to occupy.
     """
 
-    raise NotImplementedError(
-        "Reconciling the desired state (pre-check, backup, digest check, rollback) "
-        "is missing -- see docs/specification.md section 13."
+    service: str
+    previous_digest: str
+    new_digest: str
+    since: float
+
+
+def _load_pending_swap(path: Path) -> PendingSwap | None:
+    """Reads a persisted in-flight swap via `agent.safe_io.read_text_safe`
+    -- the same "reject a symlink/non-regular file outright" defense
+    `load_agent_state` already applies to the executed-ids file, and for
+    the same reason: **fails closed**. Silently treating an unsafe path as
+    "nothing pending" would let a local attacker (or a corrupted disk)
+    erase the one record that a swap is still awaiting its health
+    deadline, after which a failing new revision would never be rolled
+    back at all.
+
+    **Validates every field before constructing a `PendingSwap` at all**
+    (cross-review, main session, security-relevant) -- `service` must be
+    one of `PENDING_SWAP_SERVICES` (never `"agent"`, see `PendingSwap`'s
+    own docstring; never anything this module itself would not have
+    written), `previous_digest`/`new_digest` must each satisfy
+    `agent.sources.digest_is_well_formed`, and `since` must be a real
+    number. Any extra key an old-format file might still carry (a
+    previous version of this function persisted `repo`/`container`
+    directly) is simply ignored, never read back.
+
+    Raises `UnsafeStateFileError`/`OSError` (an unsafe path) or `ValueError`
+    (missing key, wrong type, or a value that fails one of the checks
+    above -- including `json.JSONDecodeError`, itself a `ValueError`) on
+    an unsafe, corrupt, or tampered file -- **in every one of these
+    cases, this function itself has made no Docker call and returned no
+    `PendingSwap`**, so `reconcile_desired_state`'s caller
+    (`agent.__main__`, like `load_agent_state`'s own caller) sees a clear,
+    non-zero exit instead of a reconciliation pass that silently trusted
+    an invalid record.
+    """
+
+    raw = read_text_safe(path)
+    if raw is None:
+        return None
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("pending swap record is not a JSON object.")
+    try:
+        service = data["service"]
+        previous_digest = data["previous_digest"]
+        new_digest = data["new_digest"]
+        since = data["since"]
+    except KeyError as error:
+        raise ValueError(f"pending swap record is missing required field {error}.") from error
+
+    if service not in PENDING_SWAP_SERVICES:
+        raise ValueError(
+            f"pending swap record names an unknown or disallowed service {service!r}."
+        )
+    if not isinstance(since, int | float) or isinstance(since, bool):
+        raise ValueError("pending swap record's 'since' is not a number.")
+    if not isinstance(previous_digest, str) or not agent_sources.digest_is_well_formed(
+        previous_digest
+    ):
+        raise ValueError("pending swap record's previous_digest is not a well-formed digest.")
+    if not isinstance(new_digest, str) or not agent_sources.digest_is_well_formed(new_digest):
+        raise ValueError("pending swap record's new_digest is not a well-formed digest.")
+
+    return PendingSwap(
+        service=service,
+        previous_digest=previous_digest,
+        new_digest=new_digest,
+        since=float(since),
+    )
+
+
+def _save_pending_swap(path: Path, swap: PendingSwap | None) -> None:
+    """Persists (or, `swap=None`, clears) the in-flight swap record --
+    written atomically (temporary file plus `Path.replace`), the same
+    pattern `save_agent_state`/`report_watchdog_state` already use for
+    every other state file in this module. Only the four fields
+    `PendingSwap` actually carries are ever written -- see that type's own
+    docstring for why `container`/`repo` are deliberately not among
+    them."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if swap is None:
+        path.unlink(missing_ok=True)
+        return
+    payload = {
+        "service": swap.service,
+        "previous_digest": swap.previous_digest,
+        "new_digest": swap.new_digest,
+        "since": swap.since,
+    }
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload), encoding="utf-8")
+    temp.replace(path)
+
+
+@dataclass(frozen=True)
+class ReconcileOutcome:
+    """What `reconcile_desired_state` returns -- `service` is `None` only
+    when nothing needed reconciling at all (already at the desired
+    revision) or the pre-check rejected before a service was even
+    selected."""
+
+    successful: bool
+    reason: str
+    service: str | None = None
+
+
+def _time_within_update_window(
+    current_time: time_of_day, window_from: time_of_day, window_until: time_of_day
+) -> bool:
+    """`True` iff `current_time` falls within `[window_from, window_until]`
+    -- **supports a window that crosses midnight** (cross-review, main
+    session: `window_from > window_until`, e.g. `22:00`-`06:00`, a
+    plausible "overnight" maintenance window section 13's own JSON example
+    does not rule out): in that case the window is really two pieces of
+    the same day, "from `window_from` to midnight" plus "from midnight to
+    `window_until`", so membership is `current_time >= window_from OR
+    current_time <= window_until` instead of the ordinary single-range
+    `AND`. An ordinary, non-wrapping window (`window_from <= window_until`,
+    including the degenerate case `window_from == window_until`, a single
+    instant) keeps the simple `AND` check."""
+
+    if window_from <= window_until:
+        return window_from <= current_time <= window_until
+    return current_time >= window_from or current_time <= window_until
+
+
+def _reconcile_precheck(
+    desired: DesiredState,
+    *,
+    pilot_mode: bool,
+    now: datetime,
+    health_reader: HealthReader,
+    outdoor_temp_reader: OutdoorTempReader,
+    disk_usage_reader: DiskUsageReader,
+) -> str | None:
+    """The local-only pre-check (section 13 step 1, plus its own "Decided
+    afterward" paragraph) -- returns `None` if every check passes, or the
+    first failing reason otherwise. **Order matters**:
+    `reconcile_desired_state` calls this before touching the backup or the
+    network at all ("Order so that nothing is pulled before the pre-check
+    passes" -- the implementation plan's own P5.4 requirement), so every
+    `return` below is reached before a single byte is backed up or pulled.
+
+    The two owner-mandated, fail-closed conditions (2026-09-28) come
+    first, deliberately, ahead of the disk/window/temperature checks below
+    the specification's own section 13 already listed: `pilot_mode` (the
+    existing inventory flag, section 21.4 -- currently only known from the
+    cloud, see `docs/STATUS.md`'s own P5.4 open point on what this does
+    and does not protect against) and the health reader's own "unknown
+    never counts as fine" rule.
+    """
+
+    if not pilot_mode:
+        return (
+            "pilot_mode is not set for this apartment -- desired-state "
+            "reconciliation stays inactive until it is (owner decision "
+            "2026-09-28, docs/specification.md section 13)."
+        )
+
+    control_health = health_reader()
+    if control_health != "ok":
+        return (
+            f"thermoctl control health could not be confirmed (read: "
+            f"{control_health!r}) -- fail-closed rejection, 'unknown' never "
+            "counts as fine (owner decision 2026-09-28)."
+        )
+
+    outdoor_temp = outdoor_temp_reader()
+    if outdoor_temp is None:
+        return (
+            "outdoor temperature could not be read -- fail-closed "
+            "rejection, 'unknown' never counts as fine (owner decision "
+            "2026-09-28)."
+        )
+    if outdoor_temp < desired.window.not_below_outdoor_temp_c:
+        return (
+            f"outdoor temperature {outdoor_temp}C is below the update "
+            f"threshold {desired.window.not_below_outdoor_temp_c}C."
+        )
+
+    current_time = now.time()
+    if not _time_within_update_window(current_time, desired.window.from_, desired.window.until):
+        return (
+            f"current local time {current_time.isoformat()} is outside the "
+            f"update window {desired.window.from_.isoformat()}-"
+            f"{desired.window.until.isoformat()}."
+        )
+
+    disk = disk_usage_reader()
+    total = disk.get("total_bytes", 0) if disk else 0
+    free = disk.get("free_bytes", 0) if disk else 0
+    if disk is None or total <= 0:
+        return "free disk space could not be read."
+    free_percent = free / total * 100
+    if free_percent <= RECONCILE_MIN_FREE_DISK_PERCENT:
+        return (
+            f"free disk space {free_percent:.1f}% is at or below the "
+            f"required {RECONCILE_MIN_FREE_DISK_PERCENT:.0f}%."
+        )
+
+    return None
+
+
+def _select_service_to_update(
+    desired: DesiredState, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> str | None:
+    """The first service, in `RECONCILE_SERVICE_ORDER`, whose desired
+    digest differs from what is currently running -- `None` if all four
+    already match (nothing to do)."""
+
+    for service in RECONCILE_SERVICE_ORDER:
+        service_state = getattr(desired.services, service)
+        repo = agent_sources.ALLOWED_SOURCES[service]
+        container = SERVICE_CONTAINER_NAMES[service]
+        running_digest = current_repo_digest(container, repo, socket_path=socket_path)
+        if running_digest != service_state.digest:
+            return service
+    return None
+
+
+def _await_or_rollback_pending_swap(
+    swap: PendingSwap,
+    *,
+    pending_swap_path: Path,
+    local_log_path: Path,
+    socket_path: Path,
+    health_deadline_s: float,
+    poll_interval_s: float,
+    sleep: Callable[[float], None],
+    now: Callable[[], datetime],
+) -> ReconcileOutcome:
+    """Waits, polling `container_is_healthy` every `poll_interval_s`, for
+    the container the record's own `service` names to report healthy --
+    bounded by `health_deadline_s` **anchored to `swap.since`**, the
+    moment the swap was made, not to whenever this call happens to run
+    (the same "resumed, not restarted from zero" reasoning
+    `watchdog/runtime.go`'s own `AwaitHealthReport` applies to its state
+    file's `since`, cross-review R2 on P5.6) -- this is what makes an
+    agent-restart mid-wait resume correctly instead of granting a freshly
+    restarted agent a brand new 15 minutes.
+
+    **The container name and the source repository are resolved here,
+    from `SERVICE_CONTAINER_NAMES`/`agent.sources.ALLOWED_SOURCES`, never
+    read from `swap` itself** -- `PendingSwap` carries no such fields (see
+    its own docstring); `swap.service` has already been checked against
+    `PENDING_SWAP_SERVICES` by `_load_pending_swap` before this function
+    is ever called with it.
+
+    On success: clears the pending-swap record, reports success. On
+    timeout: **rolls back to `swap.previous_digest` on its own** (section
+    13 step 5, "no one has to intervene at night"), then clears the
+    pending-swap record regardless of whether the rollback itself
+    succeeded -- a failed rollback must not leave the agent stuck retrying
+    an ever-stale swap forever; it is reported as failed either way, and
+    the next `reconcile_desired_state` call's own digest comparison starts
+    fresh rather than trusting this stale record any further.
+    """
+
+    container = SERVICE_CONTAINER_NAMES[swap.service]
+    repo = agent_sources.ALLOWED_SOURCES[swap.service]
+
+    deadline = swap.since + health_deadline_s
+    while True:
+        healthy = container_is_healthy(container, socket_path=socket_path)
+        if healthy:
+            _save_pending_swap(pending_swap_path, None)
+            _append_local_log(
+                local_log_path, f"{swap.service}: {swap.new_digest} confirmed healthy."
+            )
+            return ReconcileOutcome(
+                successful=True, reason="swap confirmed healthy.", service=swap.service
+            )
+        if now().timestamp() >= deadline:
+            break
+        sleep(poll_interval_s)
+
+    reason = (
+        f"{swap.service}: {swap.new_digest} did not report healthy within "
+        f"{health_deadline_s:.0f}s -- rolling back to {swap.previous_digest}."
+    )
+    rollback_ok = _rollback_to_previous(
+        container, repo, swap.previous_digest, socket_path=socket_path
+    )
+    if not rollback_ok:
+        reason += " Rollback itself also failed -- manual intervention required."
+    _append_local_log(local_log_path, f"reconcile_desired_state: {reason}")
+    _save_pending_swap(pending_swap_path, None)
+    return ReconcileOutcome(successful=False, reason=reason, service=swap.service)
+
+
+def reconcile_desired_state(
+    desired: DesiredState,
+    *,
+    pilot_mode: bool,
+    backup_config: BackupConfig,
+    watchdog_state_path: Path,
+    pending_swap_path: Path,
+    local_log_path: Path,
+    now: Callable[[], datetime] = lambda: datetime.now().astimezone(),
+    health_reader: HealthReader = _default_health_reader,
+    outdoor_temp_reader: OutdoorTempReader = _default_outdoor_temp_reader,
+    disk_usage_reader: DiskUsageReader = _read_disk_usage,
+    socket_path: Path = DEFAULT_DOCKER_SOCKET,
+    health_deadline_s: float = RECONCILE_HEALTH_DEADLINE_S,
+    poll_interval_s: float = RECONCILE_HEALTH_POLL_INTERVAL_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> ReconcileOutcome:
+    """Reconciles the four containers against `desired` (section 13).
+
+    1. **If a swap is already pending** (`pending_swap_path`, an agent
+       restart mid-wait) -- resume waiting/rolling back for it
+       (`_await_or_rollback_pending_swap`) and return; nothing else in
+       this function runs for this call. Only one swap is ever in flight
+       at a time.
+    2. **Pre-check**, fail-closed, entirely local (`_reconcile_precheck`)
+       -- disk space, time window, outdoor temperature, control health,
+       `pilot_mode`. Nothing is pulled or backed up before this passes.
+    3. **Select one service** (`_select_service_to_update`) whose desired
+       digest differs from what is running -- at most one per call, so
+       zigbee2mqtt and thermoctl are structurally never swapped together
+       even if both differ.
+    4. **Check the digest format and the hard-coded source** for that one
+       service (`agent.sources`) -- before the backup, so a malformed or
+       off-source desired state costs nothing at all, not even a backup.
+    5. **Backup** (`run_before_update_backup`) -- a failure here aborts,
+       no change is made.
+    6. **Pull strictly by digest, verify `RepoDigests`** -- a pull failure
+       or a `RepoDigests` mismatch aborts, the old state stays (nothing
+       has been swapped yet at this point).
+    7. **`agent` service**: never swapped directly (security principle 6)
+       -- the checked digest is handed to the watchdog
+       (`report_watchdog_state`) and this call returns; the watchdog
+       performs the actual two-step self-swap.
+    8. **Any other service**: recreate the container with the new image,
+       persist the pending swap, then wait for health up to
+       `health_deadline_s`, rolling back on timeout
+       (`_await_or_rollback_pending_swap`).
+
+    `pilot_mode`, `health_reader`, `outdoor_temp_reader`, and
+    `disk_usage_reader` are all injected explicitly, per the implementation
+    plan's own instruction ("gets the DesiredState plus the pilot_mode
+    flag and local inputs as parameters/injected readers so it is
+    testable") -- there is no hidden global anywhere in this function.
+
+    **`now`'s default is the base station's own local time**
+    (`datetime.now().astimezone()`, cross-review, main session -- not
+    `datetime.now(UTC)`, which this function used to default to) --
+    `desired.window.from_`/`until` (section 13's own JSON example, a plain
+    `HH:MM` with no offset) are a landlord-facing maintenance window,
+    meant literally as "not in the evening" at the apartment, not at
+    Greenwich; comparing them against a UTC clock would silently shift the
+    window by the base station's own UTC offset. `_time_within_update_window`
+    additionally supports a window that crosses midnight (`from_ > until`).
+    """
+
+    pending = _load_pending_swap(pending_swap_path)
+    if pending is not None:
+        return _await_or_rollback_pending_swap(
+            pending,
+            pending_swap_path=pending_swap_path,
+            local_log_path=local_log_path,
+            socket_path=socket_path,
+            health_deadline_s=health_deadline_s,
+            poll_interval_s=poll_interval_s,
+            sleep=sleep,
+            now=now,
+        )
+
+    current_time = now()
+
+    rejection = _reconcile_precheck(
+        desired,
+        pilot_mode=pilot_mode,
+        now=current_time,
+        health_reader=health_reader,
+        outdoor_temp_reader=outdoor_temp_reader,
+        disk_usage_reader=disk_usage_reader,
+    )
+    if rejection is not None:
+        _append_local_log(local_log_path, f"reconcile_desired_state rejected: {rejection}")
+        return ReconcileOutcome(successful=False, reason=rejection)
+
+    service = _select_service_to_update(desired, socket_path=socket_path)
+    if service is None:
+        return ReconcileOutcome(successful=True, reason="already at the desired revision.")
+
+    service_state = getattr(desired.services, service)
+
+    if not agent_sources.digest_is_well_formed(service_state.digest):
+        reason = (
+            f"{service}: digest {service_state.digest!r} is not a plain "
+            "sha256 digest -- refusing to pull (security principle 2)."
+        )
+        _append_local_log(local_log_path, f"reconcile_desired_state rejected: {reason}")
+        return ReconcileOutcome(successful=False, reason=reason, service=service)
+
+    if not agent_sources.image_repo_matches_source(service, service_state.image):
+        allowed = agent_sources.ALLOWED_SOURCES.get(service)
+        reason = (
+            f"{service}: image {service_state.image!r} does not match the "
+            f"hard-coded source {allowed!r} -- refusing to pull "
+            "(security principle 2)."
+        )
+        _append_local_log(local_log_path, f"reconcile_desired_state rejected: {reason}")
+        return ReconcileOutcome(successful=False, reason=reason, service=service)
+
+    repo = agent_sources.ALLOWED_SOURCES[service]
+    digest = service_state.digest
+
+    try:
+        run_before_update_backup(backup_config, current_time)
+    except Exception as error:
+        reason = f"{service}: backup before update failed ({error}) -- aborting, no change made."
+        _append_local_log(local_log_path, f"reconcile_desired_state rejected: {reason}")
+        return ReconcileOutcome(successful=False, reason=reason, service=service)
+
+    try:
+        pull_image_by_digest(repo, digest, socket_path=socket_path)
+    except (httpx.HTTPError, RuntimeError) as error:
+        reason = f"{service}: pulling {repo}@{digest} failed ({error}) -- old state stays."
+        _append_local_log(local_log_path, f"reconcile_desired_state rejected: {reason}")
+        return ReconcileOutcome(successful=False, reason=reason, service=service)
+
+    if not verify_pulled_digest(repo, digest, socket_path=socket_path):
+        reason = (
+            f"{service}: pulled image's RepoDigests does not contain "
+            f"{repo}@{digest} -- aborting, old state stays."
+        )
+        _append_local_log(local_log_path, f"reconcile_desired_state rejected: {reason}")
+        return ReconcileOutcome(successful=False, reason=reason, service=service)
+
+    if service == "agent":
+        # Section 13 step 6, security principle 6: the agent never swaps
+        # itself -- it hands the checked digest to the watchdog, which
+        # performs the actual two-step self-swap (start the new revision,
+        # remove the old one only after a successful heartbeat,
+        # `watchdog/runtime.go`).
+        report_watchdog_state(watchdog_state_path, desired=digest)
+        _append_local_log(
+            local_log_path, f"agent: handed digest {digest} to the watchdog for self-swap."
+        )
+        return ReconcileOutcome(
+            successful=True, reason="pulled, verified, handed off to the watchdog.", service=service
+        )
+
+    container = SERVICE_CONTAINER_NAMES[service]
+    previous_digest = current_repo_digest(container, repo, socket_path=socket_path)
+    if previous_digest is None:
+        reason = (
+            f"{service}: current running digest could not be determined -- "
+            "refusing to swap without a rollback target."
+        )
+        _append_local_log(local_log_path, f"reconcile_desired_state rejected: {reason}")
+        return ReconcileOutcome(successful=False, reason=reason, service=service)
+
+    image_ref = f"{repo}@{digest}"
+    try:
+        _recreate_container_with_image(container, image_ref, socket_path=socket_path)
+    except httpx.HTTPError as error:
+        reason = f"{service}: swapping the container failed ({error})."
+        if _rollback_to_previous(container, repo, previous_digest, socket_path=socket_path):
+            reason += f" Rolled back to {previous_digest}."
+        else:
+            reason += " Rollback itself also failed -- manual intervention required."
+        _append_local_log(local_log_path, f"reconcile_desired_state: {reason}")
+        return ReconcileOutcome(successful=False, reason=reason, service=service)
+
+    swap = PendingSwap(
+        service=service,
+        previous_digest=previous_digest,
+        new_digest=digest,
+        since=current_time.timestamp(),
+    )
+    _save_pending_swap(pending_swap_path, swap)
+    _append_local_log(
+        local_log_path,
+        f"{service}: swapped to {digest}, waiting up to {health_deadline_s:.0f}s for health.",
+    )
+
+    return _await_or_rollback_pending_swap(
+        swap,
+        pending_swap_path=pending_swap_path,
+        local_log_path=local_log_path,
+        socket_path=socket_path,
+        health_deadline_s=health_deadline_s,
+        poll_interval_s=poll_interval_s,
+        sleep=sleep,
+        now=now,
     )
 
 
