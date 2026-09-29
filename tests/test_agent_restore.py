@@ -43,6 +43,7 @@ from agent.restore import (
     MOVER_STATUS_REPORTED_MARKER_FILENAME,
     RestoreTargets,
     _check_and_report_mover_status,
+    _resolve_prospective,
     apply_pending_restore,
     check_and_apply_pending_restore,
     ensure_age_recipient_reported,
@@ -556,6 +557,125 @@ def test_apply_pending_restore_succeeds_with_an_unresolved_tempdir_base(tmp_path
         assert (staging_dir / "thermoctl.db").read_bytes() == THERMOCTL_DB_CONTENT
     finally:
         shutil.rmtree(unresolved_base, ignore_errors=True)
+
+
+# -- P5.5d: `_resolve_prospective`'s own ".." handling in a not-yet-existing
+# suffix (open point from the P5.5b merge) -------------------------------
+
+
+def test_resolve_prospective_collapses_dotdot_in_the_missing_suffix(tmp_path: Path) -> None:
+    """The exact P5.5b-merge open point: a ".." inside the not-yet-existing
+    suffix (here "foo" does not exist) must resolve to the same real
+    location `path.mkdir(parents=True)` actually creates --
+    "tmp_path/foo/../staged" collapses to "tmp_path/staged", never a
+    literal, un-collapsed ".." path component that would then mismatch
+    `Path.resolve(strict=True)`'s own post-`mkdir` value."""
+
+    prospective = tmp_path / "foo" / ".." / "staged"
+
+    resolved = _resolve_prospective(prospective)
+
+    assert resolved == tmp_path.resolve(strict=True) / "staged"
+    assert ".." not in resolved.parts
+
+
+def test_resolve_prospective_resolves_dotdot_after_an_existing_symlink_via_the_os(
+    tmp_path: Path,
+) -> None:
+    """The other half of the fix's own safety condition: a ".." that
+    follows an *existing* symlink component must be resolved through that
+    symlink's real target by the OS (`Path.resolve`), never collapsed
+    lexically against the symlink's own literal position -- a purely
+    lexical collapse here could turn a genuinely different real location
+    into one that looks, syntactically, like a location it is not."""
+
+    real_target = tmp_path / "real-target"
+    real_target.mkdir()
+    link_container = tmp_path / "container"
+    link_container.mkdir()
+    link = link_container / "link"
+    link.symlink_to(real_target, target_is_directory=True)
+
+    # Lexically, "link/../x" looks like it should collapse to
+    # "container/x" (popping "link" based on its own literal position).
+    # The OS instead resolves "link" to `real_target` first, then applies
+    # ".." to *that* target's own parent (tmp_path) before appending "x".
+    prospective = link / ".." / "x"
+
+    resolved = _resolve_prospective(prospective)
+
+    assert resolved == tmp_path.resolve(strict=True) / "x"
+    assert resolved != link_container.resolve(strict=True) / "x"
+
+
+def test_apply_pending_restore_succeeds_with_a_dotdot_in_the_not_yet_existing_staging_suffix(
+    tmp_path: Path,
+) -> None:
+    """The P5.5b-merge open point, reproduced end to end through
+    `apply_pending_restore` itself: `foo` does not exist, so
+    "data/foo/../staged" must resolve (and actually stage into) the real
+    "data/staged" -- not be refused as `DETAIL_UNSAFE_STAGING` by the
+    post-`mkdir` re-check (`_create_and_verify_safe_dir`) mismatching
+    against an un-collapsed prospective value."""
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    staging_dir = data_dir / "foo" / ".." / "staged"
+
+    targets = RestoreTargets(
+        data_dir=data_dir,
+        thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
+        zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+        staging_dir=staging_dir,
+        mover_status_path=tmp_path / "mover-status.json",
+    )
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is True
+    assert result.detail == DETAIL_STAGED
+    assert (data_dir / "staged" / "thermoctl.db").read_bytes() == THERMOCTL_DB_CONTENT
+
+
+def test_apply_pending_restore_refuses_a_dotdot_that_resolves_through_a_symlink_into_a_live_dir(
+    tmp_path: Path,
+) -> None:
+    """The safety condition the fix must never violate, reproduced end to
+    end through the real refusal path: `link` is an *existing* symlink
+    whose target sits one level inside the live Zigbee2MQTT directory, so
+    "link/../staged" resolves, through the OS, right back into that same
+    live directory -- this must be refused exactly like any other
+    live-directory overlap, never allowed through by a purely lexical
+    reading of "link/.." that would incorrectly treat it as a sibling of
+    `link`'s own (unrelated) literal container."""
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    live_zigbee_dir = tmp_path / "zigbee2mqtt"
+    live_zigbee_dir.mkdir()
+    marker = live_zigbee_dir / "existing.txt"
+    marker.write_bytes(_LIVE_MARKER_CONTENT)
+
+    nested_real = live_zigbee_dir / "nested-real"
+    nested_real.mkdir()
+    link = data_dir / "link"
+    link.symlink_to(nested_real, target_is_directory=True)
+
+    targets = RestoreTargets(
+        data_dir=data_dir,
+        thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
+        zigbee2mqtt_dir=live_zigbee_dir,
+        staging_dir=link / ".." / "staged",
+        mover_status_path=tmp_path / "mover-status.json",
+    )
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is False
+    assert result.detail == DETAIL_UNSAFE_STAGING
+    assert marker.read_bytes() == _LIVE_MARKER_CONTENT
 
 
 def test_apply_pending_restore_wrong_key_fails_cleanly_nothing_staged(tmp_path: Path) -> None:

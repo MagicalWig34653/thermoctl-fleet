@@ -260,14 +260,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_parser.add_argument(
         "--restore-mover-status-file",
-        default="/run/thermoctl-restore-mover/status.json",
+        default="/var/lib/thermoctl-restore-mover/status.json",
         help=(
             "P5.5c: where the separate Go mover reports whether it actually "
             "moved a staged restore -- matches "
-            "watchdog/cmd/thermoctl-restore-mover's own -status-file default; "
-            "this device has no other way to learn that program's outcome "
-            "(it has no fleet connection of its own, section 18.3's own "
-            "no-network condition)."
+            "watchdog/cmd/thermoctl-restore-mover's own -status-file default "
+            "(persistent, not /run -- P5.5d moved this directory so the "
+            "mover's own pre-rename journal, held alongside it, survives a "
+            "reboot); this device has no other way to learn that program's "
+            "outcome (it has no fleet connection of its own, section 18.3's "
+            "own no-network condition)."
         ),
     )
 

@@ -87,6 +87,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import stat
 import tarfile
 import threading
@@ -117,9 +118,15 @@ DEFAULT_RESTORE_POLL_INTERVAL_S = 60.0
 # staged data file has already been written successfully (see
 # `apply_pending_restore`'s own docstring for the exact ordering). Its
 # *presence* is also this module's own "is a staged restore already
-# waiting for the mover" check -- P5.5c's own mover is expected to remove
-# the whole staging directory (manifest included) once it has moved the
-# data, which is what allows a later restore to stage again.
+# waiting for the mover" check -- P5.5c's own mover removes it (along with
+# every staged data file and the fixed `zigbee2mqtt/` subdirectory) once
+# it has moved the data, which is what allows a later restore to stage
+# again. **P5.5d:** the mover only ever clears `staging_dir`'s *contents*
+# now, never the directory entry itself (narrower `ReadWritePaths=`,
+# `watchdog/cmd/thermoctl-restore-mover/move.go::removeStagingContents`)
+# -- `_staged_restore_already_pending` below already only ever checked
+# this manifest's own presence, never the staging directory's own
+# presence, so this change needs no update on this side of the contract.
 MANIFEST_FILENAME = "manifest.json"
 
 # The small, local dedupe marker this module writes once it has reported
@@ -284,28 +291,62 @@ def _resolve_prospective(path: Path) -> Path:
 
     If `path` already exists, this is simply `path.resolve(strict=True)`.
     If it does not, this resolves the longest already-existing *prefix* of
-    `path` (following any symlinks in *that* prefix) and appends the
-    remaining, not-yet-existing suffix components literally, since there
-    is nothing to resolve there yet -- recursing on `path.parent` until an
-    existing ancestor is found (the filesystem root always exists, so this
-    always terminates).
+    `path` (following any symlinks in *that* prefix, via a real
+    `path.exists()` check at each step -- correct regardless of what the
+    not-yet-existing suffix literally contains, including a `..`, since a
+    real `stat()` always resolves `..` through whatever the kernel says a
+    component actually is) and appends the remaining, not-yet-existing
+    suffix components onto that fully-resolved prefix.
 
-    **Deliberately does not treat an unrelated, already-resolved ancestor
-    symlink as a problem** (cross-review round 3 fix for a false positive
-    an earlier version of this module's own ancestor-walk produced: macOS
-    resolves `/var` to `/private/var`, some container layouts have their
-    own such redirects -- neither has anything to do with this module's
-    own `staging_dir`/`zigbee2mqtt` components, and refusing every restore
-    because of it would be a self-inflicted denial of service, not a
-    security improvement). This function's only job is to compute where
-    `path` *really* is, symlinks and all -- `_create_and_verify_safe_dir`
-    is what decides whether that real location is a problem, by comparing
-    it against the live directories' own equally-resolved locations, never
-    by objecting to a symlink's mere existence somewhere upstream."""
+    **P5.5d fix (open point from the P5.5b merge, cross-review round 1):
+    the not-yet-existing suffix is now folded onto the resolved prefix
+    with `os.path.normpath`, not appended component by component.** The
+    earlier version built the result as
+    `_resolve_prospective(path.parent) / path.name`, recursing one
+    component at a time -- for a suffix containing a literal `..` (e.g.
+    `staging_dir = "data/foo/../staged"` with `foo` missing), this left an
+    un-collapsed `".."` token inside the resulting `Path`, which then
+    never compared equal to what `path.mkdir(parents=True)` actually
+    creates on disk (the OS itself *does* collapse `..` during path
+    resolution, both for `mkdir` and for the `Path.resolve(strict=True)`
+    call `_create_and_verify_safe_dir` makes immediately afterward) --
+    `_create_and_verify_safe_dir`'s own post-`mkdir` re-check then refused
+    a genuinely safe path as `DETAIL_UNSAFE_STAGING`, a false positive,
+    never a bypass (the P5.5b merge's own open point already established
+    this could only ever fail closed).
+
+    **Why collapsing the suffix lexically is safe, and why a symlink
+    inside the *existing* prefix is never collapsed this way:** the
+    boundary between "prefix" and "suffix" is found by the same real
+    `path.exists()` walk as before (unchanged) -- a component that is an
+    existing symlink is, by definition, part of the *resolved* prefix
+    (`current.resolve(strict=True)` below, which follows it exactly as
+    the OS would, `..` included, e.g. `"link/../x"` where `link` is an
+    existing symlink resolves through `link`'s real target before `..` is
+    ever applied). Only the components that come *after* that boundary --
+    which cannot possibly be symlinks, since none of them exist yet -- are
+    ever folded in with a plain lexical `normpath`, and only against a
+    prefix that is already fully symlink-free (`.resolve(strict=True)`
+    output). Collapsing `..` lexically against real, symlink-free ground
+    is exactly what the OS itself would do; it is never applied to
+    anything that could still redirect through a symlink."""
 
     if path.exists():
         return path.resolve(strict=True)
-    return _resolve_prospective(path.parent) / path.name
+
+    missing_parts: list[str] = [path.name]
+    current = path.parent
+    while not current.exists():
+        missing_parts.append(current.name)
+        parent = current.parent
+        if parent == current:  # pragma: no cover -- the filesystem root always exists
+            break
+        current = parent
+    missing_parts.reverse()
+
+    resolved_prefix = current.resolve(strict=True)
+    combined = os.path.normpath(str(resolved_prefix.joinpath(*missing_parts)))
+    return Path(combined)
 
 
 def _assert_component_is_safe(path: Path) -> None:

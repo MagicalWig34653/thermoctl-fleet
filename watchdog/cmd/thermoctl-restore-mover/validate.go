@@ -48,6 +48,11 @@ type preparedFile struct {
 	TempPath  string
 	FinalPath string
 	DestDir   string
+	// SHA256 (P5.5d): the already-verified content hash of this entry --
+	// equal to the manifest's own entry.SHA256 (checked against it in
+	// prepareFile below), carried here too so journal.go::buildJournal
+	// does not need to re-look the value up from the manifest by path.
+	SHA256 string
 }
 
 // validateAll runs every check from this program's own top docstring
@@ -268,7 +273,13 @@ func prepareFile(stagingDir string, entry ManifestFile, targets Targets) (prepar
 		return preparedFile{}, err
 	}
 
-	return preparedFile{RelPath: entry.Path, TempPath: tempPath, FinalPath: dstPath, DestDir: destDir}, nil
+	return preparedFile{
+		RelPath:   entry.Path,
+		TempPath:  tempPath,
+		FinalPath: dstPath,
+		DestDir:   destDir,
+		SHA256:    digest,
+	}, nil
 }
 
 // createTempInDir creates a new, exclusively-owned regular file inside

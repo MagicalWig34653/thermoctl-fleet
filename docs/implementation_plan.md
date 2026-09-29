@@ -856,6 +856,44 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Read back by:** main session (CLAUDE.md security principle 5/6: the
   authoritative empty-check and the no-network/no-dependency constraint).
 
+### P5.5d -- Restore mover open points (resumable finalize, narrower
+### ReadWritePaths=, a `_resolve_prospective` false positive)
+- [x] done -- see `docs/STATUS.md`'s P5.5d section for the full design.
+- **Goal:** close the three open points left after the P5.5c/P5.5b
+  cross-review merges: (1) a partial finalize (some files already renamed,
+  a later rename failed) left the mover refusing every retry forever
+  (`DetailLiveStoreNotEmpty`) even after the underlying problem was fixed
+  -- fixed with a small, root-owned pre-rename journal
+  (`backup_id`/manifest sha256/final paths+hashes) that authorizes a later
+  run to resume, but only if every live file that exists still matches it
+  exactly; (2) the mover's systemd unit granted write access to the whole
+  of `/var/lib/thermoctl-agent` (holding the agent's own device token and
+  age identity) only so it could remove the staging directory *entry* --
+  narrowed to clearing only the directory's *contents*, so
+  `ReadWritePaths=` now names exactly the staging directory itself; (3)
+  `agent.restore._resolve_prospective` produced a false-positive refusal
+  for a `..` inside the not-yet-existing suffix of a staging path --
+  fixed by folding the missing suffix onto the already-resolved existing
+  prefix with `os.path.normpath`, never resolving a `..` that follows an
+  existing (possibly symlinked) component lexically.
+- **Files:** `watchdog/cmd/thermoctl-restore-mover/{journal.go (new),
+  atomicwrite.go (new), main.go, move.go, manifest.go, validate.go,
+  status.go, mover.go, thermoctl-restore-mover.service}`,
+  `image/common/tmpfiles.d/{thermoctl-agent.conf,
+  thermoctl-restore-mover.conf}`, `image/common/agent-compose.yml`,
+  `tools/check_image_config.py`, `agent/restore.py`, `agent/__main__.py`,
+  `watchdog/check_contract.sh`, `tests/{test_image_config.py,
+  test_agent_restore.py}`,
+  `watchdog/cmd/thermoctl-restore-mover/{mover_test.go,
+  validate_test.go}`.
+- **Section:** 15.3's second "Decided afterward" paragraph, 17, 18.3/18.4.
+- **Depends on:** P5.5b, P5.5c (this package only closes their own open
+  points, no new design surface).
+- **Read back by:** main session (CLAUDE.md security principle 5/6: the
+  resumability decision, the narrower systemd sandboxing, and the staging
+  path safety check are all part of the security boundary this package
+  touches).
+
 ### P5.6 -- Watchdog main loop (`watchdog/watch.go`)
 - **Goal:** actually implement `AgentStopped`, `StartDigest`,
   `AwaitHealthReport`, `RollBackToProven`. Stays **without** a dependency

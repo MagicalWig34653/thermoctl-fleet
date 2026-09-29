@@ -26,6 +26,7 @@ from tools.check_image_config import (
     check_package_list,
     check_restore_mover_tmpfiles_entry,
     check_restore_mover_units,
+    check_restore_staging_tmpfiles_entry,
     check_tmpfiles_entry,
     check_udev_rule,
 )
@@ -138,8 +139,8 @@ _HARDENED_RESTORE_MOVER_SERVICE_BODY = (
     "ProtectHome=yes\n"
     "PrivateTmp=yes\n"
     "ProtectSystem=strict\n"
-    "ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl "
-    "/var/lib/zigbee2mqtt /run/thermoctl-restore-mover\n"
+    "ReadWritePaths=/var/lib/thermoctl-agent/pending-restore /var/lib/thermoctl "
+    "/var/lib/zigbee2mqtt /var/lib/thermoctl-restore-mover\n"
 )
 
 
@@ -184,8 +185,39 @@ def test_restore_mover_service_without_all_readwrite_paths_is_rejected(tmp_path:
         "ProtectHome=yes\n"
         "PrivateTmp=yes\n"
         "ProtectSystem=strict\n"
-        # Missing /run/thermoctl-restore-mover.
-        "ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl /var/lib/zigbee2mqtt\n",
+        # Missing /var/lib/thermoctl-restore-mover.
+        "ReadWritePaths=/var/lib/thermoctl-agent/pending-restore /var/lib/thermoctl "
+        "/var/lib/zigbee2mqtt\n",
+        encoding="utf-8",
+    )
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n"
+        "Unit=thermoctl-restore-mover.service\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(service, path_unit)
+
+
+def test_restore_mover_service_with_the_broad_agent_dir_is_rejected(tmp_path: Path) -> None:
+    # P5.5d: the previous, broader grant on /var/lib/thermoctl-agent
+    # itself (the staging directory's *parent*, which also holds the
+    # agent's own device token and age identity) must not reappear, even
+    # though every individually-required path is technically still named
+    # (the staging directory's own path is not present at all here,
+    # exercising the "only the broad parent, not the narrow child" case).
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(
+        "[Service]\n"
+        "ExecStart=/usr/local/bin/thermoctl-restore-mover\n"
+        "PrivateNetwork=true\n"
+        "NoNewPrivileges=yes\n"
+        "ProtectHome=yes\n"
+        "PrivateTmp=yes\n"
+        "ProtectSystem=strict\n"
+        "ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl "
+        "/var/lib/zigbee2mqtt /var/lib/thermoctl-restore-mover\n",
         encoding="utf-8",
     )
     path_unit = tmp_path / "thermoctl-restore-mover.path"
@@ -212,7 +244,7 @@ def test_restore_mover_tmpfiles_entry_without_the_directory_is_rejected(tmp_path
 
 def test_restore_mover_tmpfiles_entry_with_too_few_fields_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "thermoctl-restore-mover.conf"
-    path.write_text("d /run/thermoctl-restore-mover 0755\n", encoding="utf-8")
+    path.write_text("d /var/lib/thermoctl-restore-mover 0755\n", encoding="utf-8")
     with pytest.raises(ImageError):
         check_restore_mover_tmpfiles_entry(path)
 
@@ -221,7 +253,9 @@ def test_restore_mover_tmpfiles_entry_owned_by_the_agent_uid_is_rejected(tmp_pat
     # This directory's only writer is thermoctl-restore-mover itself,
     # which runs as root -- not the agent's own uid/gid.
     path = tmp_path / "thermoctl-restore-mover.conf"
-    path.write_text("d /run/thermoctl-restore-mover 0755 10002 10002 -\n", encoding="utf-8")
+    path.write_text(
+        "d /var/lib/thermoctl-restore-mover 0755 10002 10002 -\n", encoding="utf-8"
+    )
     with pytest.raises(ImageError):
         check_restore_mover_tmpfiles_entry(path)
 
@@ -230,10 +264,55 @@ def test_restore_mover_tmpfiles_entry_owned_by_root_passes(tmp_path: Path) -> No
     path = tmp_path / "thermoctl-restore-mover.conf"
     path.write_text(
         "# a comment before the real entry\n"
-        "d /run/thermoctl-restore-mover 0755 root root -\n",
+        "d /var/lib/thermoctl-restore-mover 0755 root root -\n",
         encoding="utf-8",
     )
     check_restore_mover_tmpfiles_entry(path)
+
+
+def test_restore_staging_tmpfiles_entry_missing_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ImageError):
+        check_restore_staging_tmpfiles_entry(tmp_path / "does-not-exist.conf")
+
+
+def test_restore_staging_tmpfiles_entry_without_the_directory_is_rejected(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "thermoctl-agent.conf"
+    path.write_text("d /run/thermoctl-agent 0755 10002 10002 -\n", encoding="utf-8")
+    with pytest.raises(ImageError):
+        check_restore_staging_tmpfiles_entry(path)
+
+
+def test_restore_staging_tmpfiles_entry_with_too_few_fields_is_rejected(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "thermoctl-agent.conf"
+    path.write_text("d /var/lib/thermoctl-agent/pending-restore 0700\n", encoding="utf-8")
+    with pytest.raises(ImageError):
+        check_restore_staging_tmpfiles_entry(path)
+
+
+def test_restore_staging_tmpfiles_entry_owned_by_root_is_rejected(tmp_path: Path) -> None:
+    # This directory holds a landlord's decrypted operational-data backup
+    # while it waits for the mover -- only the agent container's own
+    # uid/gid ever writes it, never root.
+    path = tmp_path / "thermoctl-agent.conf"
+    path.write_text(
+        "d /var/lib/thermoctl-agent/pending-restore 0700 root root -\n", encoding="utf-8"
+    )
+    with pytest.raises(ImageError):
+        check_restore_staging_tmpfiles_entry(path)
+
+
+def test_restore_staging_tmpfiles_entry_owned_by_agent_uid_passes(tmp_path: Path) -> None:
+    path = tmp_path / "thermoctl-agent.conf"
+    path.write_text(
+        "d /run/thermoctl-agent 0755 10002 10002 -\n"
+        "d /var/lib/thermoctl-agent/pending-restore 0700 10002 10002 -\n",
+        encoding="utf-8",
+    )
+    check_restore_staging_tmpfiles_entry(path)
 
 
 def test_agent_compose_file_missing_is_rejected(tmp_path: Path) -> None:

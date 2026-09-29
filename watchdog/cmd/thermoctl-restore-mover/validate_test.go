@@ -176,7 +176,7 @@ func TestParseManifestUnreadableFile(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores file permission bits")
 	}
-	_, present, err := parseManifest(path)
+	_, _, present, err := parseManifest(path)
 	if !present || err == nil {
 		t.Fatalf("expected present=true, err!=nil for an unreadable manifest, got present=%v err=%v", present, err)
 	}
@@ -190,7 +190,7 @@ func TestParseManifestRefusesASymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	_, present, err := parseManifest(link)
+	_, _, present, err := parseManifest(link)
 	if !present || err == nil {
 		t.Fatalf("expected present=true, err!=nil for a symlinked manifest, got present=%v err=%v", present, err)
 	}

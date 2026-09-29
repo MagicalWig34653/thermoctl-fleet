@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
@@ -29,10 +27,7 @@ func writeFile(t *testing.T, path string, data []byte) {
 	}
 }
 
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
+// sha256Hex (production helper, journal.go) is reused here too.
 
 // setup builds a fully valid staging directory (manifest + thermoctl.db +
 // both zigbee2mqtt files) and a fully empty live destination -- every
@@ -44,6 +39,7 @@ type setup struct {
 	thermoctlDBPath string
 	zigbee2mqttDir  string
 	statusFile      string
+	journalFile     string
 	manifestPath    string
 	thermoctlBytes  []byte
 	z2mDBBytes      []byte
@@ -59,6 +55,7 @@ func newSetup(t *testing.T) setup {
 		thermoctlDBPath: filepath.Join(dir, "live", "thermoctl", "thermoctl.db"),
 		zigbee2mqttDir:  filepath.Join(dir, "live", "zigbee2mqtt"),
 		statusFile:      filepath.Join(dir, "status", "status.json"),
+		journalFile:     filepath.Join(dir, "status", "journal.json"),
 		thermoctlBytes:  []byte("thermoctl-db-bytes"),
 		z2mDBBytes:      []byte("z2m-db-bytes"),
 		z2mBackupBytes:  []byte("z2m-backup-bytes"),
@@ -112,6 +109,7 @@ func (s setup) config() Config {
 		ThermoctlDBPath: s.thermoctlDBPath,
 		Zigbee2mqttDir:  s.zigbee2mqttDir,
 		StatusFilePath:  s.statusFile,
+		JournalFilePath: s.journalFile,
 	}
 }
 
@@ -176,8 +174,17 @@ func TestRunSuccess(t *testing.T) {
 		t.Fatalf("timestamp = %d, want %d", status.Timestamp, testNow().Unix())
 	}
 
-	if _, err := os.Stat(s.stagingDir); !os.IsNotExist(err) {
-		t.Fatalf("staging directory should have been removed after full success")
+	// P5.5d: only the staging directory's *contents* are removed on
+	// success now, never the directory entry itself (see move.go's own
+	// docstring) -- the directory stays present, but empty.
+	if _, err := os.Stat(s.stagingDir); err != nil {
+		t.Fatalf("staging directory itself should still exist after full success: %v", err)
+	}
+	if entries, err := os.ReadDir(s.stagingDir); err != nil || len(entries) != 0 {
+		t.Fatalf("staging directory should be empty after full success: entries=%v err=%v", entries, err)
+	}
+	if _, err := os.Stat(s.journalFile); !os.IsNotExist(err) {
+		t.Fatalf("journal should have been removed after full success")
 	}
 
 	moved, err := os.ReadFile(s.thermoctlDBPath)
@@ -701,6 +708,249 @@ func TestRunTwiceIsIdempotentAfterSuccess(t *testing.T) {
 	after := s.readStatus(t)
 	if before != after {
 		t.Fatalf("status file changed on a no-op second run: %+v -> %+v", before, after)
+	}
+}
+
+// forcePartialFinalizeState (P5.5d) sets the world up exactly as a real
+// partial finalize would have left it -- the first two manifest entries
+// ("thermoctl.db", "zigbee2mqtt/database.db") already correctly renamed
+// into their live destinations, a journal describing all three entries
+// this run originally intended to move (buildJournal always covers the
+// *whole* prepared set, written before the first rename -- see journal.go),
+// and the third entry ("zigbee2mqtt/coordinator_backup.json") still only
+// present in staging, never renamed.
+//
+// Built directly (rather than by actually causing finalizeAll to fail
+// partway through a real run()) because forcing that the "normal" way
+// would need pre-occupying one of the three fixed live destination paths
+// -- exactly the same paths liveStoreIsEmpty itself checks, so a real
+// run() would refuse at that check before finalizeAll is ever reached.
+// finalizeAll's own partial-failure mechanics are already covered
+// directly by TestFinalizeAllPartialFailureRemovesPendingTempsButKeepsRenamedFiles
+// and TestRunPartialMoveFailureIsReportedHonestly; this helper exists to
+// exercise the *new* resume decision a later run() makes when it finds
+// exactly this state, which is what actually matters for P5.5d.
+func forcePartialFinalizeState(t *testing.T, s setup) {
+	t.Helper()
+	manifest := s.defaultManifest()
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	journal := Journal{
+		BackupID:       manifest.BackupID,
+		ManifestSHA256: sha256Hex(manifestBytes),
+		Files: []JournalFile{
+			{FinalPath: s.thermoctlDBPath, SHA256: sha256Hex(s.thermoctlBytes)},
+			{FinalPath: filepath.Join(s.zigbee2mqttDir, "database.db"), SHA256: sha256Hex(s.z2mDBBytes)},
+			{FinalPath: filepath.Join(s.zigbee2mqttDir, "coordinator_backup.json"), SHA256: sha256Hex(s.z2mBackupBytes)},
+		},
+	}
+	if err := writeJournal(s.journalFile, journal); err != nil {
+		t.Fatalf("writeJournal: %v", err)
+	}
+	writeFile(t, s.thermoctlDBPath, s.thermoctlBytes)
+	writeFile(t, filepath.Join(s.zigbee2mqttDir, "database.db"), s.z2mDBBytes)
+	// coordinator_backup.json deliberately left un-renamed; staging (set
+	// up by newSetup) still has all three staged files and the manifest,
+	// exactly as a real partial finalize would leave them.
+}
+
+// TestRunPartialFinalizeCanBeResumedToCompletion is the headline P5.5d
+// fix: a retry after a partial finalize (once the underlying problem is
+// fixed) must complete, not be refused forever by DetailLiveStoreNotEmpty.
+func TestRunPartialFinalizeCanBeResumedToCompletion(t *testing.T) {
+	s := newSetup(t)
+	forcePartialFinalizeState(t, s)
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 0 {
+		t.Fatalf("resumed run exit code = %d, want 0", code)
+	}
+	status := s.readStatus(t)
+	if status.Result != ResultSuccess || status.Detail != DetailApplied {
+		t.Fatalf("unexpected status after resume: %+v", status)
+	}
+	if _, err := os.Stat(s.journalFile); !os.IsNotExist(err) {
+		t.Fatalf("journal should have been removed once the resumed run completed")
+	}
+	moved, err := os.ReadFile(filepath.Join(s.zigbee2mqttDir, "coordinator_backup.json"))
+	if err != nil || string(moved) != string(s.z2mBackupBytes) {
+		t.Fatalf("coordinator_backup.json not moved correctly after resume: %v %q", err, moved)
+	}
+	if entries, err := os.ReadDir(s.stagingDir); err != nil || len(entries) != 0 {
+		t.Fatalf("staging directory should be empty once the resumed run completed: entries=%v err=%v", entries, err)
+	}
+}
+
+// TestRunPartialFinalizeRefusesResumeWhenALiveFileWasTampered: a live
+// file this program itself already wrote during the partial run, but
+// which no longer matches the journal's own hash for it, must refuse
+// resumption -- never silently overwrite it and never guess.
+func TestRunPartialFinalizeRefusesResumeWhenALiveFileWasTampered(t *testing.T) {
+	s := newSetup(t)
+	forcePartialFinalizeState(t, s)
+	if err := os.WriteFile(s.thermoctlDBPath, []byte("tampered-between-runs"), 0o644); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (a tampered live file must refuse resumption)", code)
+	}
+	status := s.readStatus(t)
+	if status.Detail != DetailLiveStoreNotEmpty {
+		t.Fatalf("detail = %q, want %q", status.Detail, DetailLiveStoreNotEmpty)
+	}
+}
+
+// TestRunPartialFinalizeRefusesResumeForADifferentManifest: a journal
+// written for one backup_id/manifest must never authorize resuming a
+// *different* one, even though the live store happens to be non-empty in
+// exactly the same way.
+func TestRunPartialFinalizeRefusesResumeForADifferentManifest(t *testing.T) {
+	s := newSetup(t)
+	forcePartialFinalizeState(t, s)
+	m := s.defaultManifest()
+	m.BackupID = "backup-2"
+	s.writeManifest(t, m)
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (a different backup_id must refuse resumption)", code)
+	}
+	status := s.readStatus(t)
+	if status.Detail != DetailLiveStoreNotEmpty {
+		t.Fatalf("detail = %q, want %q", status.Detail, DetailLiveStoreNotEmpty)
+	}
+}
+
+// TestRunPartialFinalizeRefusesResumeWhenJournalIsMissing covers the
+// "journal missing -> refused" requirement directly (e.g. the journal's
+// own state directory was lost some other way) -- the pre-P5.5d behavior
+// for a non-empty live store with nothing to prove it.
+func TestRunPartialFinalizeRefusesResumeWhenJournalIsMissing(t *testing.T) {
+	s := newSetup(t)
+	forcePartialFinalizeState(t, s)
+	if err := os.Remove(s.journalFile); err != nil {
+		t.Fatalf("remove journal: %v", err)
+	}
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (a missing journal must refuse resumption)", code)
+	}
+	status := s.readStatus(t)
+	if status.Detail != DetailLiveStoreNotEmpty {
+		t.Fatalf("detail = %q, want %q", status.Detail, DetailLiveStoreNotEmpty)
+	}
+}
+
+// TestRunPartialFinalizeRefusesResumeWhenJournalIsTampered: a journal
+// file that fails to parse must be treated exactly like a missing one --
+// never a crash, never a guessed "trust it anyway".
+func TestRunPartialFinalizeRefusesResumeWhenJournalIsTampered(t *testing.T) {
+	s := newSetup(t)
+	forcePartialFinalizeState(t, s)
+	if err := os.WriteFile(s.journalFile, []byte("not valid json"), 0o600); err != nil {
+		t.Fatalf("tamper journal: %v", err)
+	}
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (a corrupted journal must refuse resumption)", code)
+	}
+	status := s.readStatus(t)
+	if status.Detail != DetailLiveStoreNotEmpty {
+		t.Fatalf("detail = %q, want %q", status.Detail, DetailLiveStoreNotEmpty)
+	}
+}
+
+// TestRunPartialFinalizeRefusesResumeWhenJournalIsSymlinked: the journal
+// gets the same lstat/O_NOFOLLOW discipline as every other file this
+// program reads (readJournal -> openRegularNoFollow) -- a symlink planted
+// at the journal's own path (its state directory is root-owned, but
+// defense in depth applies here exactly as everywhere else) is refused,
+// never followed.
+func TestRunPartialFinalizeRefusesResumeWhenJournalIsSymlinked(t *testing.T) {
+	s := newSetup(t)
+	forcePartialFinalizeState(t, s)
+	data, err := os.ReadFile(s.journalFile)
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	target := filepath.Join(s.dir, "elsewhere-journal.json")
+	if err := os.WriteFile(target, data, 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := os.Remove(s.journalFile); err != nil {
+		t.Fatalf("remove journal: %v", err)
+	}
+	if err := os.Symlink(target, s.journalFile); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	code := run(s.config(), noopWarn, testNow)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1 (a symlinked journal must refuse resumption)", code)
+	}
+	status := s.readStatus(t)
+	if status.Detail != DetailLiveStoreNotEmpty {
+		t.Fatalf("detail = %q, want %q", status.Detail, DetailLiveStoreNotEmpty)
+	}
+}
+
+// TestReadJournalRefusesOversizedFile mirrors the manifest's own
+// MaxManifestBytes cap test -- the journal is only ever written by this
+// program itself, but is still capped and lstat-checked like everything
+// else it reads back.
+func TestReadJournalRefusesOversizedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, JournalFilename)
+	huge := make([]byte, MaxJournalBytes+1)
+	if err := os.WriteFile(path, huge, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, present := readJournal(path); present {
+		t.Fatalf("expected present=false for an oversized journal")
+	}
+}
+
+// TestCanResumeFinalizeRefusesLiveFileNotInJournal exercises the
+// "no other operational file exists" requirement directly: a live
+// operational file the journal never wrote at all (not merely a
+// mismatched hash for one it did) must also refuse resumption. Built as
+// a direct unit test against canResumeFinalize (rather than through a
+// forced partial run) since a manifest with all three known files always
+// journals all three -- this scenario needs a journal that is honestly
+// incomplete relative to what actually exists live.
+func TestCanResumeFinalizeRefusesLiveFileNotInJournal(t *testing.T) {
+	s := newSetup(t)
+	targets := Targets{ThermoctlDBPath: s.thermoctlDBPath, Zigbee2mqttDir: s.zigbee2mqttDir}
+	manifest := s.defaultManifest()
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	manifestSHA256 := sha256Hex(manifestBytes)
+
+	journal := Journal{
+		BackupID:       manifest.BackupID,
+		ManifestSHA256: manifestSHA256,
+		Files: []JournalFile{
+			{FinalPath: s.thermoctlDBPath, SHA256: sha256Hex(s.thermoctlBytes)},
+		},
+	}
+	if err := writeJournal(s.journalFile, journal); err != nil {
+		t.Fatalf("writeJournal: %v", err)
+	}
+	writeFile(t, s.thermoctlDBPath, s.thermoctlBytes)
+	// A live operational file this (incomplete, for this test) journal
+	// never wrote at all.
+	writeFile(t, filepath.Join(s.zigbee2mqttDir, "database.db"), []byte("unaccounted-for"))
+
+	if canResumeFinalize(s.journalFile, &manifest, manifestSHA256, targets) {
+		t.Fatalf("expected canResumeFinalize=false for a live file the journal never accounted for")
 	}
 }
 

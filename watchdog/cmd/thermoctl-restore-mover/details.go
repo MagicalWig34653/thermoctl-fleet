@@ -24,4 +24,11 @@ const (
 	DetailHashMismatch       = "staged file sha256 does not match the manifest"
 	DetailDestinationMissing = "destination directory does not exist"
 	DetailPartialMove        = "move failed partway; remaining files left staged"
+	// DetailJournalWriteFailed (P5.5d): the pre-rename journal (journal.go)
+	// could not be persisted before the first rename -- this program
+	// refuses to rename anything without first recording what it is about
+	// to do (see journal.go's own docstring for why), so a failure here
+	// aborts the run exactly like a validation failure would, before a
+	// single file has been renamed.
+	DetailJournalWriteFailed = "could not persist the pre-rename journal"
 )

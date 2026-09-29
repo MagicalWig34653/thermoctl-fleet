@@ -78,6 +78,14 @@
 // `stagingDir` stays there untouched (never deleted on failure) so a
 // later run -- after the underlying problem, e.g. a full disk, is fixed
 // -- can finish the job without asking the landlord to restore a second
-// time. Staging (including the manifest) is removed only once every file
-// has been renamed into place successfully.
+// time. **P5.5d: a partial finalize is resumable, not stuck forever** --
+// before the first rename of a run, journal.go's own pre-rename journal
+// records exactly what is about to be renamed into place; a later run
+// that finds the live store non-empty consults it (canResumeFinalize)
+// and, only if every live file that exists still matches it exactly,
+// re-validates staging from scratch and finishes the remaining renames
+// instead of refusing forever. Staging's *contents* (the manifest
+// included, never the staging directory entry itself -- P5.5d, see
+// move.go::removeStagingContents) and the journal are removed only once
+// every file has been renamed into place successfully.
 package main
