@@ -156,3 +156,19 @@ services:
       # files to bundle them into an operational-data backup, it has no
       # legitimate reason to write through this mount.
       - /var/lib/zigbee2mqtt:/var/lib/zigbee2mqtt:ro
+      # P5.5c: `watchdog/cmd/thermoctl-restore-mover`'s own status file
+      # (status.json, written atomically -- see that program's status.go)
+      # -- **read-only**: the agent only ever reads this directory
+      # (agent.restore._check_and_report_mover_status) to forward the
+      # mover's outcome to the fleet, it never writes through this mount.
+      # A directory mount, not a single-file one, for the same
+      # temp-file-plus-rename reasoning documented at length above for
+      # /var/lib/thermoctl-watchdog and /run/thermoctl-agent -- applies
+      # here too even though the *writer* on this mount (the mover) is a
+      # different program running outside this container entirely.
+      # Recreated on every boot by
+      # image/common/tmpfiles.d/thermoctl-restore-mover.conf, owned
+      # root:root (not the agent's own uid/gid, since the agent never
+      # writes here) but world-readable, so this container can still read
+      # it despite running as its own unprivileged uid (10002).
+      - /run/thermoctl-restore-mover:/run/thermoctl-restore-mover:ro

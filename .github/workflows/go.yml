@@ -4,12 +4,16 @@ on:
     paths:
       - "watchdog/**"
       - "agent/loop.py"
+      - "agent/restore.py"
+      - "agent/safe_io.py"
       - "protocol/**"
       - ".github/workflows/go.yml"
   pull_request:
     paths:
       - "watchdog/**"
       - "agent/loop.py"
+      - "agent/restore.py"
+      - "agent/safe_io.py"
       - "protocol/**"
       - ".github/workflows/go.yml"
   # Manual run for a specific commit, e.g. to confirm a merge commit on main.
@@ -39,10 +43,11 @@ jobs:
   # with a checksum -- exactly the condition from section 18.3. Nothing is
   # compiled on the device; these files are what later goes into the
   # prepared image (image/) (section 19.3, 19.4). thermoctl-leds (P5.7,
-  # section 23, "Decided afterward") is built the same way, from the same
-  # go.mod, as a second binary -- it lives in the same module but is not
-  # part of the watchdog's own 300-line budget (docs/STATUS.md's P5.7
-  # entry).
+  # section 23, "Decided afterward") and thermoctl-restore-mover (P5.5c,
+  # section 15.3's second "Decided afterward" paragraph) are built the
+  # same way, from the same go.mod, as two further binaries -- both live
+  # in the same module but are not part of the watchdog's own
+  # 300-line budget (docs/STATUS.md's P5.7/P5.5c entries).
   build:
     runs-on: ubuntu-latest
     needs: check
@@ -68,8 +73,14 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: 0
         run: go build -o thermoctl-leds-${{ matrix.arch }} ./cmd/thermoctl-leds
+      - env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: go build -o thermoctl-restore-mover-${{ matrix.arch }} ./cmd/thermoctl-restore-mover
       - run: sha256sum thermoctl-watchdog-${{ matrix.arch }} > thermoctl-watchdog-${{ matrix.arch }}.sha256
       - run: sha256sum thermoctl-leds-${{ matrix.arch }} > thermoctl-leds-${{ matrix.arch }}.sha256
+      - run: sha256sum thermoctl-restore-mover-${{ matrix.arch }} > thermoctl-restore-mover-${{ matrix.arch }}.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: thermoctl-watchdog-${{ matrix.arch }}
@@ -82,6 +93,12 @@ jobs:
           path: |
             watchdog/thermoctl-leds-${{ matrix.arch }}
             watchdog/thermoctl-leds-${{ matrix.arch }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thermoctl-restore-mover-${{ matrix.arch }}
+          path: |
+            watchdog/thermoctl-restore-mover-${{ matrix.arch }}
+            watchdog/thermoctl-restore-mover-${{ matrix.arch }}.sha256
 
   # The cross-language contract test from section 18.3: Python writes the
   # state file (with the same code that later runs on the device --
@@ -90,7 +107,11 @@ jobs:
   # comment for the reasoning why this is its own job and not pytest or
   # go test alone. Extended for P5.7: the script also builds
   # cmd/thermoctl-leds and checks its reading of the new agent-written
-  # status file (agent.loop.report_led_status) the same way.
+  # status file (agent.loop.report_led_status) the same way. Extended
+  # again for P5.5c: a full round trip -- Python stages a real restore via
+  # agent.restore's own manifest writer, cmd/thermoctl-restore-mover
+  # validates and moves it, Python reads its status file back via
+  # agent.restore._check_and_report_mover_status.
   contract-test:
     runs-on: ubuntu-latest
     needs: check

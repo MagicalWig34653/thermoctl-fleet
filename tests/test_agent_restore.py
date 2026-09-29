@@ -40,12 +40,15 @@ from agent.restore import (
     DETAIL_STORE_NOT_EMPTY,
     DETAIL_UNSAFE_STAGING,
     MANIFEST_FILENAME,
+    MOVER_STATUS_REPORTED_MARKER_FILENAME,
     RestoreTargets,
+    _check_and_report_mover_status,
     apply_pending_restore,
     check_and_apply_pending_restore,
     ensure_age_recipient_reported,
     run_restore_poll_loop,
 )
+from agent.safe_io import UnsafeStateFileError
 from protocol.restore import PendingRestore
 
 THERMOCTL_DB_CONTENT = b"a real sqlite file, or close enough for this test"
@@ -116,6 +119,7 @@ def _targets(tmp_path: Path) -> RestoreTargets:
         thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
         zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
         staging_dir=tmp_path / "staging",
+        mover_status_path=tmp_path / "mover-status.json",
     )
 
 
@@ -359,6 +363,7 @@ def test_apply_pending_restore_refuses_when_an_ancestor_of_staging_dir_is_a_syml
         thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
         zigbee2mqtt_dir=live_zigbee_dir,
         staging_dir=ancestor_link / "staging",
+        mover_status_path=tmp_path / "mover-status.json",
     )
     pending = _build_pending_restore(targets.data_dir)
 
@@ -405,6 +410,7 @@ def test_apply_pending_restore_refuses_when_staging_dir_is_nested_inside_a_live_
         thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
         zigbee2mqtt_dir=live_zigbee_dir,
         staging_dir=live_zigbee_dir / "staging",  # nested inside the live dir
+        mover_status_path=tmp_path / "mover-status.json",
     )
     pending = _build_pending_restore(targets.data_dir)
 
@@ -436,6 +442,7 @@ def test_apply_pending_restore_refuses_when_a_live_dir_is_nested_inside_staging(
         thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
         zigbee2mqtt_dir=live_zigbee_dir,
         staging_dir=staging_dir,
+        mover_status_path=tmp_path / "mover-status.json",
     )
     pending = _build_pending_restore(targets.data_dir)
 
@@ -462,6 +469,7 @@ def test_apply_pending_restore_refuses_when_staging_dir_exactly_equals_a_live_di
         thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
         zigbee2mqtt_dir=live_zigbee_dir,
         staging_dir=live_zigbee_dir,  # exactly the same path, not merely nested
+        mover_status_path=tmp_path / "mover-status.json",
     )
     pending = _build_pending_restore(targets.data_dir)
 
@@ -496,6 +504,7 @@ def test_apply_pending_restore_succeeds_through_an_unrelated_symlinked_ancestor(
         thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
         zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
         staging_dir=link / "staging",
+        mover_status_path=tmp_path / "mover-status.json",
     )
     pending = _build_pending_restore(targets.data_dir)
 
@@ -536,6 +545,7 @@ def test_apply_pending_restore_succeeds_with_an_unresolved_tempdir_base(tmp_path
             thermoctl_db_path=unresolved_base / "thermoctl" / "thermoctl.db",
             zigbee2mqtt_dir=unresolved_base / "zigbee2mqtt",
             staging_dir=staging_dir,
+            mover_status_path=tmp_path / "mover-status.json",
         )
         pending = _build_pending_restore(targets.data_dir)
 
@@ -785,3 +795,233 @@ def test_run_restore_poll_loop_swallows_iteration_exceptions(tmp_path: Path) -> 
         client, targets, interval_s=0.0, sleep=fake_sleep, stop_event=stop_event
     )
     assert calls == 1
+
+
+# ---------------------------------------------------------------------------
+# P5.5c: `_check_and_report_mover_status` -- the agent-side half of reading
+# back `watchdog/cmd/thermoctl-restore-mover`'s own status file and
+# forwarding it to the fleet. The mover itself is not run here (a separate
+# Go program, tested in `watchdog/cmd/thermoctl-restore-mover`) -- these
+# tests write the same small, fixed JSON shape it writes by hand.
+# ---------------------------------------------------------------------------
+
+
+def _write_mover_status(
+    targets: RestoreTargets, *, backup_id: str, result: str, detail: str
+) -> None:
+    targets.mover_status_path.parent.mkdir(parents=True, exist_ok=True)
+    targets.mover_status_path.write_text(
+        json.dumps({"backup_id": backup_id, "result": result, "detail": detail}),
+        encoding="utf-8",
+    )
+
+
+def test_check_and_report_mover_status_no_file_is_a_no_op(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be made when no status file exists")
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)  # must not raise, nothing posted
+
+
+def test_check_and_report_mover_status_forwards_success(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    _write_mover_status(targets, backup_id="backup-9", result="success", detail="applied")
+    reported: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/restore/result"
+        reported["json"] = json.loads(request.content)
+        return httpx.Response(204)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)
+    assert reported["json"] == {"success": True, "detail": "applied"}
+    assert (
+        targets.data_dir / MOVER_STATUS_REPORTED_MARKER_FILENAME
+    ).read_text(encoding="utf-8") == "backup-9"
+
+
+def test_check_and_report_mover_status_forwards_failure(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    _write_mover_status(
+        targets,
+        backup_id="backup-9",
+        result="failure",
+        detail="live operational data store is not empty",
+    )
+    reported: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reported["json"] = json.loads(request.content)
+        return httpx.Response(204)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)
+    assert reported["json"] == {
+        "success": False,
+        "detail": "live operational data store is not empty",
+    }
+
+
+def test_check_and_report_mover_status_does_not_report_the_same_backup_id_twice(
+    tmp_path: Path,
+) -> None:
+    targets = _targets(tmp_path)
+    _write_mover_status(targets, backup_id="backup-9", result="success", detail="applied")
+    call_count = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(204)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)
+    _check_and_report_mover_status(client, targets)
+    _check_and_report_mover_status(client, targets)
+    assert call_count == 1
+
+
+def test_check_and_report_mover_status_reports_again_for_a_new_backup_id(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    _write_mover_status(targets, backup_id="backup-1", result="success", detail="applied")
+    reported: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reported.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)
+
+    _write_mover_status(targets, backup_id="backup-2", result="success", detail="applied")
+    _check_and_report_mover_status(client, targets)
+
+    assert len(reported) == 2
+
+
+def test_check_and_report_mover_status_ignores_malformed_json(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    targets.mover_status_path.parent.mkdir(parents=True, exist_ok=True)
+    targets.mover_status_path.write_text("{not valid json", encoding="utf-8")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("nothing should be posted for a malformed status file")
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)  # must not raise
+
+
+def test_check_and_report_mover_status_ignores_missing_fields(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    targets.mover_status_path.parent.mkdir(parents=True, exist_ok=True)
+    targets.mover_status_path.write_text(json.dumps({"backup_id": "x"}), encoding="utf-8")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("nothing should be posted for a status file missing fields")
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)  # must not raise
+
+
+def test_check_and_report_mover_status_ignores_a_non_string_backup_id(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    targets.mover_status_path.parent.mkdir(parents=True, exist_ok=True)
+    targets.mover_status_path.write_text(
+        json.dumps({"backup_id": 123, "result": "success", "detail": "applied"}),
+        encoding="utf-8",
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("nothing should be posted for a non-string backup_id")
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)  # must not raise
+
+
+def test_check_and_report_mover_status_ignores_an_invalid_result_value(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    _write_mover_status(targets, backup_id="backup-9", result="maybe", detail="applied")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("nothing should be posted for an invalid result value")
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)  # must not raise
+
+
+def test_check_and_report_mover_status_ignores_an_empty_backup_id(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    _write_mover_status(targets, backup_id="", result="success", detail="applied")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("nothing should be posted for an empty backup_id")
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)  # must not raise
+
+
+def test_check_and_report_mover_status_refuses_a_symlinked_status_file(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text(
+        json.dumps({"backup_id": "backup-9", "result": "success", "detail": "applied"}),
+        encoding="utf-8",
+    )
+    targets.mover_status_path.parent.mkdir(parents=True, exist_ok=True)
+    targets.mover_status_path.symlink_to(outside)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("nothing should be posted for a symlinked status file")
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(UnsafeStateFileError):
+        _check_and_report_mover_status(client, targets)
+
+
+def test_run_restore_poll_loop_also_reports_mover_status(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    _write_mover_status(targets, backup_id="backup-9", result="success", detail="applied")
+    reported_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reported_paths.append(request.url.path)
+        return httpx.Response(204)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    stop_event = threading.Event()
+
+    def fake_sleep(_seconds: float) -> None:
+        stop_event.set()
+
+    run_restore_poll_loop(
+        client, targets, interval_s=0.0, sleep=fake_sleep, stop_event=stop_event
+    )
+    assert "/v1/restore/result" in reported_paths

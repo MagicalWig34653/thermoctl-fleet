@@ -1,0 +1,91 @@
+# Unit for the restore mover (P5.5c, section 15.3's second "Decided
+# afterward" paragraph). Triggered by ../../thermoctl-restore-mover.path,
+# not enabled/started directly (its own [Install] section is present only
+# for `systemctl enable` to work uniformly with the other two units this
+# image ships).
+#
+# Installation: see thermoctl-restore-mover.path's own comment -- both
+# units are installed together, only the .path unit is ever
+# `systemctl enable --now`d.
+
+[Unit]
+Description=thermoctl restore mover (P5.5c, moves a staged restore into place, no network, no registry)
+# Deliberately no ordering against docker.service/the agent container:
+# this program only ever touches the local filesystem (staging directory,
+# live thermoctl/Zigbee2MQTT data directories, its own status file) --
+# section 18.3/18.4's "runs on the bare system" reasoning applies to this
+# program exactly as it does to the watchdog and thermoctl-leds.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Statically built (CGO_ENABLED=0, section 18.3) -- no runtime
+# environment, no venv, matching thermoctl-watchdog/thermoctl-leds.
+# Every flag has a sane on-device default (main.go) that matches
+# agent/__main__.py's own --thermoctl-db-file/--zigbee2mqtt-dir/
+# --restore-staging-dir defaults -- this line only needs to exist for
+# systemd to have something to start.
+ExecStart=/usr/local/bin/thermoctl-restore-mover
+# Retries on a genuine failure (e.g. a full disk, a destination directory
+# temporarily missing) with backoff -- the manifest this program refuses
+# to delete on failure (see its own top docstring) means the path unit
+# above will not itself re-trigger for an already-present, unchanged file
+# (systemd's PathExists only fires on the absent -> present transition);
+# this restart policy is what actually gives a transient failure a real
+# second chance without requiring a reboot or manual intervention.
+Restart=on-failure
+RestartSec=30
+# No network, as required by this program's own top docstring (mirrors
+# CLAUDE.md security principle 6, adopted for this program too): moving
+# already-decrypted, already-validated local files needs no network
+# access whatsoever.
+PrivateNetwork=true
+# Runs as root (unlike the watchdog/thermoctl-leds, both deliberately
+# unprivileged): this program needs to write into thermoctl's and
+# Zigbee2MQTT's live data directories (whichever uid those not-yet-shipped
+# containers end up running as, tracked as an open point in
+# docs/STATUS.md's P5.4/P5.6 sections) and to chown the files it moves to
+# match, which only root can do for an arbitrary target uid/gid --
+# unprivileged users can only chown files they own to a group they
+# belong to, never to an arbitrary uid. Everything this program is
+# authorized to do beyond that is bounded by its own validation (manifest
+# hash/size checks, the closed file-name allowlist, the authoritative
+# empty-store re-check) -- CLAUDE.md security principle 5 applied to a
+# program that runs as root, not despite it.
+#
+# **Sandboxing (cross-review hardening, P5.5c):** running as root without
+# any further confinement would mean a bug in this program (or a flaw
+# this review missed) has the run of the entire filesystem. The
+# directives below narrow that down to exactly the paths this program's
+# own design ever touches -- nothing here substitutes for the
+# application-level checks above, it bounds what a mistake in them could
+# still reach.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+# ProtectSystem=strict makes the entire filesystem read-only for this
+# unit except the API virtual filesystems and whatever is explicitly
+# listed below -- the opposite of the default "everything writable",
+# applied on top of running as root specifically because root is not
+# otherwise bound by filesystem permissions at all.
+ProtectSystem=strict
+# Exactly the four directories this program's own Config (main.go) ever
+# names, nothing more:
+#   - /var/lib/thermoctl-agent: agent/__main__.py's own
+#     --restore-staging-dir default lives here (pending-restore/) -- this
+#     program creates nothing else in this directory, but removing the
+#     staging directory itself (os.RemoveAll, on full success) requires
+#     write access to *its* parent too, not only to the staging directory
+#     itself (rmdir(2)'s own requirement), which is why the parent is
+#     listed rather than only the pending-restore/ subdirectory.
+#   - /var/lib/thermoctl: thermoctl's live data directory
+#     (--thermoctl-db-file's own parent).
+#   - /var/lib/zigbee2mqtt: Zigbee2MQTT's live data directory
+#     (--zigbee2mqtt-dir).
+#   - /run/thermoctl-restore-mover: this program's own status file
+#     directory (--status-file's own parent,
+#     image/common/tmpfiles.d/thermoctl-restore-mover.conf).
+ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl /var/lib/zigbee2mqtt /run/thermoctl-restore-mover
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,23 @@
 # under the same contract, read not by the watchdog itself but by the
 # separate cmd/thermoctl-leds program -- same sequence, same reasoning,
 # just a second built binary and a second "-check-mode".
+#
+# Extended again for P5.5c (section 15.3's second "Decided afterward"
+# paragraph): a full round trip through *both* directions of that same
+# contract, not just Python-writes/Go-reads --
+#   Python (agent.restore's own manifest writer, the exact code
+#   apply_pending_restore itself calls) stages a real restore + manifest
+#   -> the built thermoctl-restore-mover validates and moves it
+#   -> Python (agent.restore._check_and_report_mover_status, the exact
+#      code run_restore_poll_loop itself calls) reads the mover's status
+#      file back and reports it (captured here via a MockTransport
+#      instead of a real fleet, the same test double
+#      tests/test_agent_restore.py already uses for this function).
+# The staged file contents are written directly (not through a real
+# pyrage-encrypted PendingRestore) -- this script's own job is the
+# manifest/status-file contract between the two languages, not
+# re-proving the encryption path tests/test_agent_restore.py already
+# covers end to end.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,4 +116,95 @@ check_leds "CLOUD_CONTACT=$expected_cloud_contact"
 check_leds "FAULT=$expected_fault"
 check_leds "CONTROL=$expected_control"
 
-echo "Contract test passed: written by Python, read by Go (watchdog and thermoctl-leds), values identical."
+echo "5. Building thermoctl-restore-mover ..."
+restore_mover_binary="$work_dir/thermoctl-restore-mover"
+(cd "$here" && go build -o "$restore_mover_binary" ./cmd/thermoctl-restore-mover)
+
+echo "6. Python stages a real restore via agent.restore's own manifest writer ..."
+restore_data_dir="$work_dir/agent-data"
+restore_staging_dir="$work_dir/pending-restore"
+restore_live_thermoctl_dir="$work_dir/live/thermoctl"
+restore_live_zigbee_dir="$work_dir/live/zigbee2mqtt"
+restore_mover_status_file="$work_dir/restore-mover-status.json"
+mkdir -p "$restore_data_dir" "$restore_live_thermoctl_dir" "$restore_live_zigbee_dir"
+
+PYTHONPATH="$root" python3 -c "
+from datetime import UTC, datetime
+from pathlib import Path
+
+from agent.restore import RestoreTargets, _StagedFile, _write_manifest
+from agent.safe_io import write_bytes_safe
+
+targets = RestoreTargets(
+    data_dir=Path('$restore_data_dir'),
+    thermoctl_db_path=Path('$restore_live_thermoctl_dir/thermoctl.db'),
+    zigbee2mqtt_dir=Path('$restore_live_zigbee_dir'),
+    staging_dir=Path('$restore_staging_dir'),
+    mover_status_path=Path('$restore_mover_status_file'),
+)
+targets.staging_dir.mkdir(parents=True, exist_ok=True)
+(targets.staging_dir / 'zigbee2mqtt').mkdir(parents=True, exist_ok=True)
+
+staged = [
+    _StagedFile('thermoctl.db', b'contract-test-thermoctl-db'),
+    _StagedFile('zigbee2mqtt/database.db', b'contract-test-z2m-database'),
+    _StagedFile('zigbee2mqtt/coordinator_backup.json', b'contract-test-z2m-coordinator'),
+]
+for staged_file in staged:
+    write_bytes_safe(
+        targets.staging_dir / staged_file.relative_path, staged_file.content, mode=0o600
+    )
+_write_manifest(targets, 'contract-test-backup-1', staged, datetime.now(UTC))
+"
+
+echo "7. thermoctl-restore-mover validates and moves the staged restore ..."
+"$restore_mover_binary" \
+    -staging-dir "$restore_staging_dir" \
+    -thermoctl-db-file "$restore_live_thermoctl_dir/thermoctl.db" \
+    -zigbee2mqtt-dir "$restore_live_zigbee_dir" \
+    -status-file "$restore_mover_status_file"
+
+if [ ! -f "$restore_live_thermoctl_dir/thermoctl.db" ]; then
+    echo "ERROR: thermoctl.db was not moved into its live destination." >&2
+    exit 1
+fi
+if [ -d "$restore_staging_dir" ]; then
+    echo "ERROR: the staging directory should have been removed after a full success." >&2
+    exit 1
+fi
+
+echo "8. Python reads the mover's status file back and reports it (agent.restore) ..."
+restore_report="$(PYTHONPATH="$root" python3 -c "
+import json
+from pathlib import Path
+
+import httpx
+
+from agent.restore import RestoreTargets, _check_and_report_mover_status
+
+reported = {}
+
+
+def handler(request: httpx.Request) -> httpx.Response:
+    reported['json'] = json.loads(request.content)
+    return httpx.Response(204)
+
+
+client = httpx.Client(base_url='https://fleet.invalid', transport=httpx.MockTransport(handler))
+targets = RestoreTargets(
+    data_dir=Path('$restore_data_dir'),
+    thermoctl_db_path=Path('$restore_live_thermoctl_dir/thermoctl.db'),
+    zigbee2mqtt_dir=Path('$restore_live_zigbee_dir'),
+    staging_dir=Path('$restore_staging_dir'),
+    mover_status_path=Path('$restore_mover_status_file'),
+)
+_check_and_report_mover_status(client, targets)
+print(json.dumps(reported['json']))
+")"
+echo "$restore_report"
+if [[ "$restore_report" != '{"success": true, "detail": "applied"}' ]]; then
+    echo "ERROR: the restore result Python read back and reported does not match the mover's own outcome." >&2
+    exit 1
+fi
+
+echo "Contract test passed: written by Python, read by Go (watchdog, thermoctl-leds, and thermoctl-restore-mover); the restore-mover's own status file, written by Go, read back by Python -- values identical in both directions."

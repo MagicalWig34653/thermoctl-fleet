@@ -24,6 +24,8 @@ from tools.check_image_config import (
     check_docker_packages_from_official_repo,
     check_leds_unit,
     check_package_list,
+    check_restore_mover_tmpfiles_entry,
+    check_restore_mover_units,
     check_tmpfiles_entry,
     check_udev_rule,
 )
@@ -78,6 +80,160 @@ def test_agent_registration_template_with_missing_field_is_rejected(
 def test_leds_unit_missing_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ImageError):
         check_leds_unit(tmp_path / "does-not-exist.service")
+
+
+def test_restore_mover_service_missing_is_rejected(tmp_path: Path) -> None:
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n"
+        "Unit=thermoctl-restore-mover.service\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(tmp_path / "does-not-exist.service", path_unit)
+
+
+def test_restore_mover_path_unit_missing_is_rejected(tmp_path: Path) -> None:
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(
+        "[Service]\nExecStart=/usr/local/bin/thermoctl-restore-mover\n", encoding="utf-8"
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(service, tmp_path / "does-not-exist.path")
+
+
+def test_restore_mover_path_unit_without_target_is_rejected(tmp_path: Path) -> None:
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(
+        "[Service]\nExecStart=/usr/local/bin/thermoctl-restore-mover\n", encoding="utf-8"
+    )
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(service, path_unit)
+
+
+def test_restore_mover_path_unit_without_the_watched_path_is_rejected(tmp_path: Path) -> None:
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(
+        "[Service]\nExecStart=/usr/local/bin/thermoctl-restore-mover\n", encoding="utf-8"
+    )
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/some/other/path\nUnit=thermoctl-restore-mover.service\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(service, path_unit)
+
+
+_HARDENED_RESTORE_MOVER_SERVICE_BODY = (
+    "[Service]\n"
+    "ExecStart=/usr/local/bin/thermoctl-restore-mover\n"
+    "PrivateNetwork=true\n"
+    "NoNewPrivileges=yes\n"
+    "ProtectHome=yes\n"
+    "PrivateTmp=yes\n"
+    "ProtectSystem=strict\n"
+    "ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl "
+    "/var/lib/zigbee2mqtt /run/thermoctl-restore-mover\n"
+)
+
+
+def test_restore_mover_units_present_and_wired_passes(tmp_path: Path) -> None:
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(_HARDENED_RESTORE_MOVER_SERVICE_BODY, encoding="utf-8")
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n"
+        "Unit=thermoctl-restore-mover.service\n",
+        encoding="utf-8",
+    )
+    check_restore_mover_units(service, path_unit)
+
+
+def test_restore_mover_service_without_sandboxing_is_rejected(tmp_path: Path) -> None:
+    # Cross-review hardening finding: this program runs as root, so its
+    # unit must sandbox it -- every other required line present (wiring,
+    # PrivateNetwork) but none of the newer hardening directives.
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(
+        "[Service]\nExecStart=/usr/local/bin/thermoctl-restore-mover\nPrivateNetwork=true\n",
+        encoding="utf-8",
+    )
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n"
+        "Unit=thermoctl-restore-mover.service\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(service, path_unit)
+
+
+def test_restore_mover_service_without_all_readwrite_paths_is_rejected(tmp_path: Path) -> None:
+    service = tmp_path / "thermoctl-restore-mover.service"
+    service.write_text(
+        "[Service]\n"
+        "ExecStart=/usr/local/bin/thermoctl-restore-mover\n"
+        "PrivateNetwork=true\n"
+        "NoNewPrivileges=yes\n"
+        "ProtectHome=yes\n"
+        "PrivateTmp=yes\n"
+        "ProtectSystem=strict\n"
+        # Missing /run/thermoctl-restore-mover.
+        "ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl /var/lib/zigbee2mqtt\n",
+        encoding="utf-8",
+    )
+    path_unit = tmp_path / "thermoctl-restore-mover.path"
+    path_unit.write_text(
+        "[Path]\nPathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json\n"
+        "Unit=thermoctl-restore-mover.service\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError):
+        check_restore_mover_units(service, path_unit)
+
+
+def test_restore_mover_tmpfiles_entry_missing_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ImageError):
+        check_restore_mover_tmpfiles_entry(tmp_path / "does-not-exist.conf")
+
+
+def test_restore_mover_tmpfiles_entry_without_the_directory_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "thermoctl-restore-mover.conf"
+    path.write_text("d /run/some-other-thing 0755 root root -\n", encoding="utf-8")
+    with pytest.raises(ImageError):
+        check_restore_mover_tmpfiles_entry(path)
+
+
+def test_restore_mover_tmpfiles_entry_with_too_few_fields_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "thermoctl-restore-mover.conf"
+    path.write_text("d /run/thermoctl-restore-mover 0755\n", encoding="utf-8")
+    with pytest.raises(ImageError):
+        check_restore_mover_tmpfiles_entry(path)
+
+
+def test_restore_mover_tmpfiles_entry_owned_by_the_agent_uid_is_rejected(tmp_path: Path) -> None:
+    # This directory's only writer is thermoctl-restore-mover itself,
+    # which runs as root -- not the agent's own uid/gid.
+    path = tmp_path / "thermoctl-restore-mover.conf"
+    path.write_text("d /run/thermoctl-restore-mover 0755 10002 10002 -\n", encoding="utf-8")
+    with pytest.raises(ImageError):
+        check_restore_mover_tmpfiles_entry(path)
+
+
+def test_restore_mover_tmpfiles_entry_owned_by_root_passes(tmp_path: Path) -> None:
+    path = tmp_path / "thermoctl-restore-mover.conf"
+    path.write_text(
+        "# a comment before the real entry\n"
+        "d /run/thermoctl-restore-mover 0755 root root -\n",
+        encoding="utf-8",
+    )
+    check_restore_mover_tmpfiles_entry(path)
 
 
 def test_agent_compose_file_missing_is_rejected(tmp_path: Path) -> None:

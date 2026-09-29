@@ -25,7 +25,15 @@ and is copied into both images at build time. The status-LED program's own
 unit (section 23, P5.7) follows the same rule, next to *its* code at
 [`../watchdog/cmd/thermoctl-leds/thermoctl-leds.service`](../watchdog/cmd/thermoctl-leds/thermoctl-leds.service)
 -- both units are copied into both images the same way, at the same build
-step.
+step. The restore mover's own two units (P5.5c, section 15.3's second
+"Decided afterward" paragraph) follow the same rule again, next to *their*
+code at
+[`../watchdog/cmd/thermoctl-restore-mover/thermoctl-restore-mover.service`](../watchdog/cmd/thermoctl-restore-mover/thermoctl-restore-mover.service)
+and
+[`../watchdog/cmd/thermoctl-restore-mover/thermoctl-restore-mover.path`](../watchdog/cmd/thermoctl-restore-mover/thermoctl-restore-mover.path)
+-- a `.path` unit (not a periodic timer, see that unit's own comment for
+why) that triggers the oneshot service whenever a staged restore's
+manifest appears.
 
 **Why exactly these two targets and not Alpine:** Raspberry Pi OS *is*
 Debian. One recipe, two targets, one maintenance path -- the same package
