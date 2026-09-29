@@ -1,0 +1,40 @@
+# Trigger for thermoctl-restore-mover.service (P5.5c) -- a systemd path
+# unit watching for agent/restore.py's own manifest file
+# (agent.restore.MANIFEST_FILENAME, "manifest.json") to appear under the
+# staging directory, rather than a periodic timer.
+#
+# **Why a path unit, not a oneshot timer:** a restore is a rare,
+# landlord-initiated, "just happened" event (section 15.3: the landlord is
+# standing at the swapped device, in person, while it happens) -- the same
+# reasoning docs/specification.md section 3 already gives for choosing SSE
+# over polling for the command stream applies here in spirit: react to the
+# actual event instead of adding latency by waiting for the next tick of
+# an arbitrary poll interval. A timer would also either poll far more
+# often than this event ever occurs (wasted wakeups, the opposite of
+# section 18.3's "as small and as reliably correct as possible" for
+# anything running outside the container runtime) or add minutes of
+# needless delay to something a landlord is actively waiting on.
+#
+# Installation (example, not an automated tool -- same reasoning as
+# ../../thermoctl-watchdog.service, see docs/STATUS.md):
+#   install -m 644 watchdog/cmd/thermoctl-restore-mover/thermoctl-restore-mover.path /etc/systemd/system/
+#   install -m 644 watchdog/cmd/thermoctl-restore-mover/thermoctl-restore-mover.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now thermoctl-restore-mover.path
+
+[Unit]
+Description=Watch for a staged restore manifest (P5.5c)
+
+[Path]
+# Matches agent/__main__.py's own --restore-staging-dir default
+# (/var/lib/thermoctl-agent/pending-restore) plus
+# agent.restore.MANIFEST_FILENAME. PathExists triggers the associated
+# service whenever the file transitions from absent to present -- exactly
+# "a staged restore just became available", the same presence-based check
+# agent/restore.py::_staged_restore_already_pending already uses on the
+# agent's own side of this same file.
+PathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json
+Unit=thermoctl-restore-mover.service
+
+[Install]
+WantedBy=multi-user.target

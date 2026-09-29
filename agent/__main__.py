@@ -123,6 +123,7 @@ def _run_agent(args: argparse.Namespace) -> int:
                 thermoctl_db_path=Path(args.thermoctl_db_file),
                 zigbee2mqtt_dir=Path(args.zigbee2mqtt_dir),
                 staging_dir=Path(args.restore_staging_dir),
+                mover_status_path=Path(args.restore_mover_status_file),
             )
             loop.run(
                 client,
@@ -251,6 +252,18 @@ def main(argv: list[str] | None = None) -> int:
             "decrypted-but-not-yet-applied restore (owner decision, 2026-09-28: "
             "the agent never writes the live thermoctl/Zigbee2MQTT data -- a "
             "separate program, P5.5c, moves staged data into place)."
+        ),
+    )
+    run_parser.add_argument(
+        "--restore-mover-status-file",
+        default="/run/thermoctl-restore-mover/status.json",
+        help=(
+            "P5.5c: where the separate Go mover reports whether it actually "
+            "moved a staged restore -- matches "
+            "watchdog/cmd/thermoctl-restore-mover's own -status-file default; "
+            "this device has no other way to learn that program's outcome "
+            "(it has no fleet connection of its own, section 18.3's own "
+            "no-network condition)."
         ),
     )
 

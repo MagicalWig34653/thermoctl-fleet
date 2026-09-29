@@ -743,7 +743,8 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Read back by:** main session (security principle 3: the landlord's
   decryption key must only ever be passed through, never stored).
 
-### P5.5c -- Restore mover (Go, next to the watchdog) -- **open, not started**
+### P5.5c -- Restore mover (Go, next to the watchdog)
+- [x] done -- see `docs/STATUS.md`'s P5.5c section for the full design.
 - **Goal:** the other half of section 15.3's second "Decided afterward"
   paragraph (2026-09-28): "Moving it into the real data directories is
   done by a small, separate Go program on the bare system next to the

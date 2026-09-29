@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-09-28.
+Last updated: 2026-09-29.
 
 ## Merge: P5.5b onto main (main session, 2026-09-29)
 
@@ -17,7 +17,8 @@ Last updated: 2026-09-28.
   (`DETAIL_UNSAFE_STAGING`). Never a bypass -- a misprediction always
   trips the re-check. Operator-configured path only; fix with `normpath`
   on the suffix when next touching this module.
-- Restore is not usable in production until P5.5c (Go mover) exists.
+- Restore is not usable in production until P5.5c (Go mover) exists --
+  **now done, see that section below.**
 
 ## P5.4 -- desired-state reconciliation, agent side -- done but inactive
 
@@ -840,18 +841,10 @@ situation one revision earlier. Verified: `upgrade` from empty,
 
 **Open points:**
 
-- **P5.5c (new, open, not started -- see `docs/implementation_plan.md`):**
-  a small, separate Go program next to the watchdog moves a staged
-  restore (`agent/restore.py`'s own staging directory and manifest) into
-  the live thermoctl/Zigbee2MQTT directories -- the authoritative
-  "is the live store actually empty" re-check (this package's own check is
-  advisory only, since the agent process has no write access to those
-  directories in the first place), manifest hash verification, refusing
-  symlinks/non-regular files in staging, and a status file the agent reads
-  back to report the final result. Same constraints as the watchdog
-  (CLAUDE.md security principle 6): Go, no dependency, no network, no
-  registry. Nothing in this package builds it -- P5.5b's own scope stops
-  at "decrypt and stage".
+- **P5.5c -- now done, see that section below.** Nothing in *this*
+  package (P5.5b) builds the mover itself -- P5.5b's own scope stops at
+  "decrypt and stage"; P5.5c consumes exactly the staging layout and
+  manifest format this package produces.
 - Device-configuration restore is currently "write the fetched JSON to
   `device_config.json` in the agent's data dir" -- there is no code yet
   that *applies* any of its fields (broker settings, WireGuard peer,
@@ -860,6 +853,239 @@ situation one revision earlier. Verified: `upgrade` from empty,
   work once those features themselves exist. Unaffected by the staging
   change above -- device configuration carries no tenant data (section
   15.1's own table), so it is still written directly, not staged.
+
+## P5.5c -- Restore mover, Go, next to the watchdog (section 15.3's second "Decided afterward" paragraph) -- done
+
+**What:** the other half of P5.5b -- a small, separate Go program,
+`watchdog/cmd/thermoctl-restore-mover` (same module as the watchdog and
+`cmd/thermoctl-leds`, `go.mod` still has no `require`), that moves a
+restore `agent/restore.py` has already decrypted and staged into the live
+`thermoctl_db_path`/`zigbee2mqtt_dir` directories -- the one piece of
+P5.5b's own design that explicitly could not live in the agent container
+at all (owner decision, 2026-09-28: "the agent container never gets write
+access to the live tenant data").
+
+**Design:**
+
+1. **Trigger: a systemd path unit, not a periodic timer**
+   (`watchdog/cmd/thermoctl-restore-mover/thermoctl-restore-mover.path`,
+   `PathExists=` on `agent/__main__.py`'s own `--restore-staging-dir`
+   default plus `agent.restore.MANIFEST_FILENAME`,
+   `/var/lib/thermoctl-agent/pending-restore/manifest.json`), triggering a
+   `Type=oneshot` service. Justification (documented at length in the
+   `.path` unit's own comment): a restore is a rare, landlord-initiated,
+   "just happened" event (section 15.3 -- the landlord is standing at the
+   swapped device while it happens), so reacting to the actual file
+   appearing is both lower-latency and far less wasteful than a timer that
+   either polls far more often than this event ever occurs or adds minutes
+   of needless delay. **Known limitation, documented in the `.service`
+   unit's own comment:** `PathExists` only fires on the absent -> present
+   transition, so a manifest that is still present after a *failed* run
+   (this program never deletes staging on failure, see below) does not by
+   itself re-trigger the path unit again within the same boot --
+   `Restart=on-failure`/`RestartSec=30` on the service unit itself is what
+   actually gives a persistent failure (e.g. a full disk) a second chance
+   without requiring a reboot or manual `systemctl restart`.
+2. **Authoritative checks, never trusting the agent** (CLAUDE.md security
+   principle 5, applied to a program that is itself the last line of
+   defense, not merely a peer of the agent):
+   - **Live-store emptiness** (`live.go::liveStoreIsEmpty`) re-implements,
+     byte for byte, the *same* definition
+     `agent.restore._operational_store_is_empty` already uses for its own
+     advisory check -- **documented explicitly as a shared contract
+     between the two languages**, not a coincidence: thermoctl's database
+     counts as empty if absent or zero bytes, Zigbee2MQTT's directory if
+     neither `database.db` nor `coordinator_backup.json` exists yet. A
+     future change to this definition on either side without the other is
+     a contract break.
+   - **Every manifest entry is re-validated from scratch**
+     (`validate.go`): lstat before open (`safeopen.go::openRegularNoFollow`,
+     the Go port of `agent/safe_io.py`'s own `O_NOFOLLOW`/`fstat`-on-the-
+     descriptor discipline), regular files only (refuses symlinks, FIFOs,
+     device nodes), a **closed allowlist** of exactly the three relative
+     names `apply_pending_restore` can ever stage (`thermoctl.db`,
+     `zigbee2mqtt/database.db`, `zigbee2mqtt/coordinator_backup.json`),
+     manifest paths checked relative/clean/no-`..`/no-absolute via the
+     `path` package's forward-slash semantics (the manifest is always
+     `/`-separated, written on the Python side, regardless of this
+     program's own OS), and size/sha256 checked against the manifest,
+     both computed from the already-open file descriptor -- never a
+     second, separate stat/open of the path, which would reopen the exact
+     TOCTOU window `agent/restore.py`'s own module docstring says is "not
+     this process's to fully close on its own".
+   - **Staging directory contents checked in both directions**
+     (`validate.go::validateStagingContentsMatchManifest`): every manifest
+     entry must exist and validate, *and* every entry actually present
+     under staging (including inside its `zigbee2mqtt/` subdirectory) must
+     be accounted for by the manifest -- an unlisted extra file is refused
+     outright, not silently ignored.
+   - The staging directory itself (and its `zigbee2mqtt/` subdirectory)
+     is lstat-checked to be a real directory, not a symlink, before
+     anything else runs.
+3. **Same-filesystem move, never copy-then-delete:** `sameDevice`
+   (`*syscall.Stat_t.Dev` comparison, stdlib only) refuses upfront if
+   staging and a file's destination directory are not on the same
+   filesystem; `os.Rename` is additionally checked for `EXDEV` at move
+   time as defense in depth (never falls back to a copy either way --
+   `move.go::moveFiles`/`isExdev`).
+4. **Ownership/mode of the moved files -- an explicit open point, not a
+   guess:** `image/common/agent-compose.yml`/`tools/check_image_config.py`
+   do not yet define a compose file or a fixed uid/gid for the
+   thermoctl/Zigbee2MQTT containers themselves (tracked in this file's own
+   P5.4/P5.6 sections -- those containers are reconciled by the agent, not
+   shipped by this image, and their own uid/gid is not fixed anywhere in
+   this repository yet). Hard-coding a numeric uid in the mover would
+   therefore be an unverifiable guess. Decision: chown each moved file to
+   match its **destination directory's own existing owner/group**
+   (`move.go::applyDestinationOwnership`) and set mode `0644` -- whichever
+   process created that live directory already set it up for the uid that
+   actually needs to read it, the same reasoning
+   `image/common/tmpfiles.d/thermoctl-agent.conf` already applies to
+   `/run/thermoctl-agent`'s own pinned numeric uid/gid. Best-effort, not
+   fatal to the move itself: a chown/chmod failure is logged, never rolls
+   back an already-successful rename.
+5. **Order: validate everything first, then move; honest partial
+   failure.** `main.go::run` never moves a single file until every file
+   named in the manifest has validated. A move failure partway through
+   (e.g. a destination directory made read-only mid-run) is reported as
+   `DetailPartialMove`, and whatever is still in staging (manifest
+   included) is left exactly where it was -- **never deleted on
+   failure**, so a later run (after the underlying problem is fixed) can
+   finish the job without asking the landlord to restore a second time.
+   Staging (including the manifest) is removed only once every file has
+   moved successfully (`move.go::removeStagingDir`) -- this is also what
+   lets a later restore stage again
+   (`agent.restore._staged_restore_already_pending` checks exactly this
+   directory's manifest).
+6. **Status file, closed set of detail strings**
+   (`watchdog/cmd/thermoctl-restore-mover/status.go`/`details.go`): a
+   fixed, small JSON document (`backup_id`, `result` [`success`/
+   `failure`], `detail` [one of 15 closed `DETAIL_*` strings, `details.go`
+   -- never anything decrypted, never a raw Go error string], `timestamp`)
+   written atomically (temp file in the same directory, fsync, chmod
+   `0644`, rename) to `/run/thermoctl-restore-mover/status.json` -- a
+   **new** directory (`image/common/tmpfiles.d
+   /thermoctl-restore-mover.conf`, owned `root:root` since this program's
+   only writer runs as root, mode `0755` so the agent container can still
+   read it) bind-mounted **read-only** into the agent container
+   (`image/common/agent-compose.yml`'s new mount, a directory mount for
+   the same temp-file-plus-rename reasoning as every other atomically-
+   written file mount in that file, even though the writer here is a
+   different, bare-system program). This program has no fleet connection
+   of its own (no network, per its own top docstring, same constraint as
+   the watchdog) and therefore cannot call `POST /v1/restore/result`
+   itself -- the agent is the only piece that can.
+7. **Agent-side read-back** (`agent/restore.py
+   ::_check_and_report_mover_status`, wired into `run_restore_poll_loop`'s
+   existing per-iteration loop, right after `check_and_apply_pending_restore`):
+   reads the status file via `agent.safe_io.read_text_safe` (the same
+   symlink/non-regular-file discipline this package already applies to
+   every other local state file), and forwards it to the fleet via the
+   *same* `POST /v1/restore/result` endpoint `_report_restore_result`
+   already uses for the staging outcome -- **a second, later report for
+   the same restore**, not a duplicate: the first says "staged, awaiting
+   apply", this one says whether the mover actually applied it. A small
+   local marker file (`RestoreTargets.data_dir /
+   mover_status_reported_backup_id`) records the last-reported
+   `backup_id` so the same outcome is never re-reported on every ~60s poll
+   iteration -- the mover's status file is the *last* outcome, not a
+   queue, and has no reason to ever be deleted or rewritten to signal
+   "already read". A malformed/absent status file, or one naming an
+   `backup_id` already reported, is a silent no-op (logged at most), the
+   same "one failure must not take the whole periodic loop down"
+   reasoning every other step of that loop already follows.
+   `RestoreTargets` gained the new required field `mover_status_path`
+   (internal Python constructor, not the wire protocol -- every existing
+   call site across `agent/__main__.py` and the test suite updated).
+8. **No `PROTOCOL_VERSION` bump.** `protocol.restore.RestoreResult.detail`
+   is, and stays, an unconstrained, bounded-length wire string, not an
+   enum -- forwarding a value from the mover's own, independent closed set
+   of Go-side detail strings needs no change to any `protocol/` model, so
+   `PROTOCOL_VERSION` stays at **7** (last bumped by P5.5b). Documented
+   explicitly here per the task's own instruction to check this, since
+   P5.4b (parallel, also touching `protocol/`) may bump it independently
+   before these two branches are re-chained at merge.
+
+**Cross-language contract test** (`watchdog/check_contract.sh`, extended,
+run by `.github/workflows/go.yml`'s `contract-test` job): Python stages a
+real restore via `agent.restore`'s own manifest writer
+(`_write_manifest`/`_StagedFile`, the exact code `apply_pending_restore`
+itself calls, staged file contents written directly rather than through a
+real pyrage-encrypted `PendingRestore` -- the encryption path itself is
+already covered end to end by `tests/test_agent_restore.py`) -> the built
+`thermoctl-restore-mover` validates and moves it -> Python reads the
+mover's status file back and reports it
+(`_check_and_report_mover_status`, captured via `httpx.MockTransport`) --
+verified to actually move the file into its live destination, remove
+staging on success, and produce the exact `{"success": true, "detail":
+"applied"}` report on the Python side. `.github/workflows/go.yml`'s
+`build` job now also builds `thermoctl-restore-mover` for `amd64`/`arm64`
+(`CGO_ENABLED=0`) with a `sha256sum`, same shape as `thermoctl-watchdog`/
+`thermoctl-leds`; its `push`/`pull_request` path filters extended to
+`agent/restore.py`/`agent/safe_io.py` (imported by the contract test).
+
+**Verification numbers:**
+- Go: 31 tests in `cmd/thermoctl-restore-mover` (every branch the task
+  asked for: tampered hash, tampered size, missing file, extra file in
+  staging and in the `zigbee2mqtt/` subdirectory, a manifest entry with no
+  file present, symlink in staging, symlinked staging dir, symlinked
+  `zigbee2mqtt/` subdirectory, `..`/absolute path in the manifest, unknown
+  file name, malformed manifest, empty `backup_id`, non-empty live
+  directory on both sides, empty-file-still-counts-as-empty, destination
+  directory missing, partial move failure leaving staging intact, a
+  second no-op run after success, plus direct unit tests for
+  `isSafeManifestPath`/`sameDevice`/`isExdev`/`applyDestinationOwnership`/
+  `errUnsafe`/`detailOf`/`writeStatusFile`/`parseManifest`/
+  `lstatIsDirNoSymlink`), 80.0% statement coverage (uncovered: `main()`
+  itself, an entry point, and a handful of I/O-error branches that would
+  need an artificially broken filesystem to reach honestly -- the same
+  "no real path here is known" stance this codebase's other untested
+  entry points already take, e.g. `tools/check_image_config.py::main`).
+  `go vet ./...`/`gofmt -l .` clean across the whole module;
+  `watchdog/go.mod` still has no `require`; the watchdog's own root
+  package (not `cmd/`) is untouched, so its previously-measured 299
+  statement lines are unaffected -- this new program is not counted
+  toward that budget, the same rule `cmd/thermoctl-leds` already
+  established.
+- Python: `agent/restore.py` 100% line coverage (`_check_and_report_mover_status`
+  covered by 12 new tests in `tests/test_agent_restore.py` -- every
+  malformed-input branch, the dedupe marker, a new `backup_id` re-firing
+  it, and the symlinked-status-file refusal); `tools/check_image_config.py`
+  extended with `check_restore_mover_units`/
+  `check_restore_mover_tmpfiles_entry`, 14 new tests in
+  `tests/test_image_config.py`. Full suite: 1611 passed, 1 skipped
+  (pre-existing, unrelated to this package), 99% coverage (repository
+  floor unchanged). `ruff check .`/`mypy .`/`mypy protocol fleet agent
+  tools` clean.
+
+**Open points:**
+
+- The thermoctl/Zigbee2MQTT containers' own uid/gid is still not fixed
+  anywhere in this repository (P5.4/P5.6's own open point, restated here
+  because P5.5c's own ownership decision depends on it) -- once a real
+  compose file for those two containers exists, revisit whether matching
+  the destination directory's existing owner (this package's own
+  decision, point 4 above) is still the right call, or whether a fixed,
+  documented uid/gid (the same pattern `docker/Dockerfile.agent`/
+  `image/common/tmpfiles.d/thermoctl-agent.conf` already use for the
+  agent's own 10002) should replace it.
+- `PathExists`'s "only fires on the absent -> present transition"
+  limitation (design point 1 above) means a manifest left behind by a
+  failed run relies entirely on `Restart=on-failure`/`RestartSec=30` for
+  its retry, not on the path unit firing again -- sufficient for a
+  transient failure within the current boot, but a failure that outlives
+  a reboot is untested here (the path unit re-evaluates its condition at
+  start, so it should still fire then, but this has not been verified
+  against a real systemd, only reasoned about; `image/README.md`'s own
+  "State of this scaffold" already documents that no real image build/
+  boot exists yet to verify this against).
+- The image build step that actually creates `/var/lib/thermoctl` and
+  `/var/lib/zigbee2mqtt` (so they exist, with the right ownership, before
+  either the agent container or this program ever runs) is itself part of
+  the still-unimplemented section 19.4/19.5 build step (existing open
+  point, `image/README.md`) -- this package's own
+  `DetailDestinationMissing` refusal is what a real device would report
+  if that step were skipped, not a new gap this package introduces.
 
 ## P5.1c -- SSE resume survives a fleet database restore (sections 3, 7)
 

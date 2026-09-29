@@ -100,7 +100,7 @@ import httpx
 import pyrage
 
 from agent.age_identity import load_or_create_identity, recipient_for
-from agent.safe_io import write_bytes_safe
+from agent.safe_io import read_text_safe, write_bytes_safe
 from protocol.restore import AgeRecipientReport, PendingRestore, RestoreResult
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,17 @@ DEFAULT_RESTORE_POLL_INTERVAL_S = 60.0
 # the whole staging directory (manifest included) once it has moved the
 # data, which is what allows a later restore to stage again.
 MANIFEST_FILENAME = "manifest.json"
+
+# The small, local dedupe marker this module writes once it has reported
+# a given mover-status backup_id to the fleet (`_check_and_report_mover_status`
+# below) -- P5.5c's mover has no reason to ever delete or rewrite its own
+# status file to signal "already read" (it is not a queue, only ever the
+# *last* outcome), so without this marker every poll iteration would
+# re-report the same, already-forwarded result forever. Lives directly
+# under `RestoreTargets.data_dir`, the same place every other small local
+# marker in this package (the agent token, the age identity) already
+# lives.
+MOVER_STATUS_REPORTED_MARKER_FILENAME = "mover_status_reported_backup_id"
 
 # Bounded, closed set of `RestoreResult.detail` values this module ever
 # sends -- listed here, together, so it is easy to audit that none of them
@@ -159,12 +170,24 @@ class RestoreTargets:
     directory (mode `0700`) -- every byte `apply_pending_restore` ever
     writes for a restore goes there, never anywhere under the two paths
     above.
+
+    `mover_status_path` (P5.5c): the small, fixed JSON status file
+    `watchdog/cmd/thermoctl-restore-mover` writes once it has actually
+    moved (or refused to move) a staged restore -- this module has no way
+    to observe that program's outcome any other way (P5.5c's own module
+    docstring: it has no network, so it cannot call `POST
+    /v1/restore/result` itself). `_check_and_report_mover_status` below is
+    this side of that same shared contract: read-only, read via
+    `agent.safe_io.read_text_safe` (the same symlink/non-regular-file
+    discipline every other local state file in this package already
+    gets), never written by this module.
     """
 
     data_dir: Path
     thermoctl_db_path: Path
     zigbee2mqtt_dir: Path
     staging_dir: Path
+    mover_status_path: Path
 
 
 def ensure_age_recipient_reported(client: httpx.Client, data_dir: Path) -> None:
@@ -608,6 +631,71 @@ def _report_restore_result(client: httpx.Client, result: RestoreResult) -> None:
         logger.exception("Reporting the restore result to the fleet failed.")
 
 
+def _check_and_report_mover_status(client: httpx.Client, targets: RestoreTargets) -> None:
+    """Reads P5.5c's mover status file (`targets.mover_status_path`), and,
+    if it names a `backup_id` not already reported (the marker file,
+    `MOVER_STATUS_REPORTED_MARKER_FILENAME`), forwards it to the fleet via
+    the same `POST /v1/restore/result` endpoint `_report_restore_result`
+    already uses for the staging outcome -- **this is a second, later
+    report for the same restore**, not a duplicate of the first: the first
+    (`apply_pending_restore`'s own `RestoreResult`) says "staged, awaiting
+    apply"; this one says whether P5.5c's mover actually applied it.
+
+    Read via `agent.safe_io.read_text_safe` -- the same symlink/
+    non-regular-file discipline this module's own module docstring already
+    applies to everything it touches under `staging_dir`, applied here to
+    a file this module does not own but still must not blindly trust the
+    *type* of (a compromised or buggy writer at that path is exactly the
+    kind of local attacker `agent.safe_io` already defends every other
+    state file in this package against). A missing file (mover has not
+    run yet, or never will for this device) or one that fails to parse as
+    the small, fixed JSON shape P5.5c's mover writes is treated as
+    "nothing to report yet" -- logged at most, never raised, the same
+    "one failure must not take the whole periodic loop down" reasoning
+    `run_restore_poll_loop`'s own docstring already gives for every one of
+    its per-iteration steps.
+
+    **`result.detail` is forwarded exactly as the mover wrote it** --
+    P5.5c's own closed set of detail strings
+    (`watchdog/cmd/thermoctl-restore-mover/details.go`) is a *second*,
+    independent closed set from this module's own `DETAIL_*` constants
+    above (the mover reports on a different step: whether the already-
+    staged data was actually moved, not whether it could be staged in the
+    first place) -- `protocol.restore.RestoreResult.detail` itself stays
+    an unconstrained, bounded-length string on the wire (not a wire-level
+    enum), so forwarding a value from a second closed set on the device
+    side needs no protocol schema change and therefore no
+    `PROTOCOL_VERSION` bump (see `docs/STATUS.md`'s P5.5c section for the
+    explicit reasoning)."""
+
+    raw = read_text_safe(targets.mover_status_path)
+    if raw is None:
+        return
+
+    try:
+        payload = json.loads(raw)
+        backup_id = payload["backup_id"]
+        result = payload["result"]
+        detail = payload["detail"]
+        if not isinstance(backup_id, str) or not isinstance(detail, str):
+            raise TypeError
+        if result not in ("success", "failure"):
+            raise ValueError
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.warning("Restore-mover status file is malformed -- ignoring.")
+        return
+
+    if not backup_id:
+        return
+
+    marker_path = targets.data_dir / MOVER_STATUS_REPORTED_MARKER_FILENAME
+    if read_text_safe(marker_path) == backup_id:
+        return
+
+    _report_restore_result(client, RestoreResult(success=result == "success", detail=detail))
+    write_bytes_safe(marker_path, backup_id.encode("utf-8"))
+
+
 def check_and_apply_pending_restore(client: httpx.Client, targets: RestoreTargets) -> bool:
     """One full cycle: fetch, stage if present, report the outcome.
     Returns `True` if a restore was found (regardless of whether staging
@@ -647,6 +735,16 @@ def run_restore_poll_loop(
     (a transient network issue right after registration) keeps retrying
     for as long as this loop runs, not only once at startup.
 
+    **Also checks P5.5c's mover status file every iteration**
+    (`_check_and_report_mover_status`) -- the mover has no fleet
+    connection of its own, so this is the only place its outcome ever
+    reaches the fleet. Checked every iteration, not only right after
+    `check_and_apply_pending_restore` finds nothing pending: the mover
+    typically runs asynchronously, some time after this device staged a
+    restore (it is triggered by its own systemd path unit watching the
+    manifest, see `image/common/thermoctl-restore-mover.path`), so its
+    result can land on any later iteration of this same loop.
+
     Every exception from one iteration is logged and swallowed -- a single
     failed poll (a transient network issue) must not stop every later
     poll, mirroring `run_daily_backup_scheduler`'s own "log and continue"
@@ -657,6 +755,7 @@ def run_restore_poll_loop(
         try:
             ensure_age_recipient_reported(client, targets.data_dir)
             check_and_apply_pending_restore(client, targets)
+            _check_and_report_mover_status(client, targets)
         except Exception:
             logger.exception("Restore poll iteration failed.")
         sleep(interval_s)

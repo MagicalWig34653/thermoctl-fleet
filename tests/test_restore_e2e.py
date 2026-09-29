@@ -237,6 +237,7 @@ def test_restore_end_to_end_over_the_real_fleet_app(
                 thermoctl_db_path=thermoctl_db_path,
                 zigbee2mqtt_dir=zigbee2mqtt_dir,
                 staging_dir=staging_dir,
+                mover_status_path=tmp_path / "mover-status.json",
             )
             found = check_and_apply_pending_restore(device_client, targets)
             assert found is True

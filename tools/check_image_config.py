@@ -280,6 +280,43 @@ def check_leds_unit(path: Path) -> None:
         raise ImageError(f"{path}: thermoctl-leds unit is missing.")
 
 
+def check_restore_mover_units(service_path: Path, path_unit_path: Path) -> None:
+    """Checks that both of `watchdog/cmd/thermoctl-restore-mover`'s own
+    systemd units exist (P5.5c, section 15.3's second "Decided afterward"
+    paragraph) -- the oneshot `.service` and the `.path` unit that
+    triggers it, same reasoning and same shape as `check_watchdog_unit`/
+    `check_leds_unit` above, extended to two files instead of one because
+    this program (unlike the watchdog/thermoctl-leds) is triggered by a
+    path unit rather than running continuously -- see the `.path` unit's
+    own comment for why a path unit was chosen over a periodic timer.
+
+    Also asserts the `.path` unit actually names the `.service` unit as
+    its `Unit=` target, and that the watched path matches
+    `agent/__main__.py`'s own `--restore-staging-dir` default plus
+    `agent.restore.MANIFEST_FILENAME` -- a plausibility check, not a real
+    systemd config validation, the same bound this whole module's own
+    docstring already states.
+    """
+
+    if not service_path.is_file():
+        raise ImageError(f"{service_path}: thermoctl-restore-mover service unit is missing.")
+    if not path_unit_path.is_file():
+        raise ImageError(f"{path_unit_path}: thermoctl-restore-mover path unit is missing.")
+
+    path_unit_content = path_unit_path.read_text(encoding="utf-8")
+    if "Unit=thermoctl-restore-mover.service" not in path_unit_content:
+        raise ImageError(
+            f"{path_unit_path}: does not name thermoctl-restore-mover.service as its "
+            f"Unit= target."
+        )
+    if "PathExists=/var/lib/thermoctl-agent/pending-restore/manifest.json" not in path_unit_content:
+        raise ImageError(
+            f"{path_unit_path}: does not watch "
+            f"/var/lib/thermoctl-agent/pending-restore/manifest.json (agent/__main__.py's "
+            f"own --restore-staging-dir default plus agent.restore.MANIFEST_FILENAME)."
+        )
+
+
 def check_agent_compose_file(path: Path) -> None:
     """Checks the fixed compose file the watchdog re-applies on every swap
     (P5.6, cross-review R5) -- not a real YAML parse (no third-party
@@ -333,6 +370,12 @@ def check_agent_compose_file(path: Path) -> None:
         "- /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro",
         "- /var/lib/thermoctl:/var/lib/thermoctl:ro",
         "- /var/lib/zigbee2mqtt:/var/lib/zigbee2mqtt:ro",
+        # P5.5c: the mover's status file directory -- read-only, and a
+        # directory mount (not a single-file one) for the same
+        # temp-file-plus-rename reasoning as the other two directory
+        # mounts above, even though this mount's *writer* is a different,
+        # bare-system program, not this container.
+        "- /run/thermoctl-restore-mover:/run/thermoctl-restore-mover:ro",
     ]
     missing = [line for line in required if line not in content]
     if missing:
@@ -401,6 +444,45 @@ def check_tmpfiles_entry(path: Path) -> None:
         )
 
 
+def check_restore_mover_tmpfiles_entry(path: Path) -> None:
+    """Checks the tmpfiles.d snippet recreating `/run/thermoctl-restore-mover`
+    on every boot (P5.5c) -- same shape as `check_tmpfiles_entry` above,
+    but expecting `root:root` ownership instead of the agent's own uid/gid:
+    this directory's only writer is `watchdog/cmd/thermoctl-restore-mover`
+    itself, which runs as root (see that program's own `.service` unit for
+    why), not the agent container. The agent container only ever reads it
+    (read-only mount, `image/common/agent-compose.yml`), which mode 0755
+    already permits regardless of which uid owns the directory."""
+
+    if not path.is_file():
+        raise ImageError(
+            f"{path}: tmpfiles.d entry for /run/thermoctl-restore-mover is missing."
+        )
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    entries = [
+        line for line in lines if line.split()[1:2] == ["/run/thermoctl-restore-mover"]
+    ]
+    if not entries:
+        raise ImageError(f"{path}: does not define /run/thermoctl-restore-mover.")
+    fields = entries[0].split()
+    if len(fields) < 5:
+        raise ImageError(
+            f"{path}: entry for /run/thermoctl-restore-mover has too few fields: "
+            f"{entries[0]!r}."
+        )
+    _entry_type, _entry_path, _mode, uid, gid = fields[:5]
+    if uid != "root" or gid != "root":
+        raise ImageError(
+            f"{path}: /run/thermoctl-restore-mover is owned by {uid}:{gid}, must be "
+            f"root:root -- its only writer (thermoctl-restore-mover) runs as root, "
+            f"not the agent's own uid/gid."
+        )
+
+
 def check_all(root: Path = IMAGE_DIR) -> None:
     """Runs all checks; raises on the first failure."""
 
@@ -414,8 +496,21 @@ def check_all(root: Path = IMAGE_DIR) -> None:
     check_agent_registration_template(common / "agent-registration.empty.json")
     check_watchdog_unit(root.parent / "watchdog" / "thermoctl-watchdog.service")
     check_leds_unit(root.parent / "watchdog" / "cmd" / "thermoctl-leds" / "thermoctl-leds.service")
+    check_restore_mover_units(
+        root.parent
+        / "watchdog"
+        / "cmd"
+        / "thermoctl-restore-mover"
+        / "thermoctl-restore-mover.service",
+        root.parent
+        / "watchdog"
+        / "cmd"
+        / "thermoctl-restore-mover"
+        / "thermoctl-restore-mover.path",
+    )
     check_agent_compose_file(common / "agent-compose.yml")
     check_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-agent.conf")
+    check_restore_mover_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-restore-mover.conf")
 
 
 def main() -> int:
