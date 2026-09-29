@@ -2,6 +2,23 @@
 
 Last updated: 2026-09-28.
 
+## Merge: P5.5b onto main (main session, 2026-09-29)
+
+- Cross-reviewed in four rounds (final: PASS). Main-session read-back of
+  the key form (`fleet/templates/ui/apartment.html`,
+  `fleet/static/ui/restore_form.js`: plaintext field has no `name`, only
+  the age ciphertext is submitted, the field is cleared, no fallback) and
+  of `Storage.fetch_and_delete_pending_restore` (single guarded
+  `DELETE ... RETURNING`; the fallback read only purges expired rows).
+- **Open point (low, fail-safe):** `agent.restore._resolve_prospective`
+  does not collapse a `..` inside the *not-yet-existing* suffix of
+  `--restore-staging-dir` (e.g. `data/foo/../staged` with `foo` missing);
+  the post-`mkdir` re-check then refuses a genuinely safe path
+  (`DETAIL_UNSAFE_STAGING`). Never a bypass -- a misprediction always
+  trips the re-check. Operator-configured path only; fix with `normpath`
+  on the suffix when next touching this module.
+- Restore is not usable in production until P5.5c (Go mover) exists.
+
 ## P5.4 -- desired-state reconciliation, agent side -- done but inactive
 
 Implements the owner decision below in full: `agent.loop.reconcile_desired_state`
