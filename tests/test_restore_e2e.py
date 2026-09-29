@@ -19,18 +19,22 @@ package's own work order):
    vendored bundle) by `tests/test_restore_vendor.py`.
 4. The fleet UI route stores the ciphertext (`POST /ui/apartments/{id}
    /restore`, real HTTP call, real login, real CSRF).
-5. The device fetches (`GET /v1/restore`, real HTTP call) and unpacks
-   (`agent.restore.apply_pending_restore`) -- the restored files are
-   compared byte-for-byte against the originals.
+5. The device fetches (`GET /v1/restore`, real HTTP call) and **stages**
+   (`agent.restore.apply_pending_restore`) -- owner decision, 2026-09-28:
+   the agent never writes the live thermoctl/Zigbee2MQTT data, only its
+   own staging directory. The staged files, and the manifest describing
+   them, are compared byte-for-byte/hash-for-hash against the originals.
 6. The landlord's key string is confirmed absent from the fleet's own
    sqlite database file, every file under the blob storage directory, and
-   every file under the agent's own tmp tree.
+   every file under the agent's own tmp tree (staging directory included).
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import json
 import re
 import secrets
 import ssl
@@ -46,6 +50,7 @@ from pyrage import x25519
 
 from agent.age_identity import load_or_create_identity
 from agent.restore import (
+    MANIFEST_FILENAME,
     RestoreTargets,
     check_and_apply_pending_restore,
     ensure_age_recipient_reported,
@@ -53,6 +58,7 @@ from agent.restore import (
 from agent.transport import build_client
 from fleet.app import app
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
+from fleet.restore_vendor import AGE_VENDOR_JS_SHA256
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from protocol.backups import BackupKind
@@ -167,6 +173,7 @@ def test_restore_end_to_end_over_the_real_fleet_app(
     agent_data_dir.mkdir()
     thermoctl_db_path = tmp_path / "thermoctl" / "thermoctl.db"
     zigbee2mqtt_dir = tmp_path / "zigbee2mqtt"
+    staging_dir = tmp_path / "restore-staging"
 
     with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
         # -- Step 1: the device reports its own age recipient over real HTTP.
@@ -202,6 +209,10 @@ def test_restore_end_to_end_over_the_real_fleet_app(
 
             apartment_page = ui_client.get(f"/ui/apartments/{APARTMENT}")
             assert "restore-form" in apartment_page.text
+            # Owner decision (a), cross-review: the page shows the vendored
+            # script's own sha256, so the landlord can compare it against
+            # the value named in the operating manual.
+            assert AGE_VENDOR_JS_SHA256 in apartment_page.text
             csrf_token = _extract_hidden_field(apartment_page.text, "csrf_token")
 
             key_block = pyrage.encrypt(
@@ -225,15 +236,32 @@ def test_restore_end_to_end_over_the_real_fleet_app(
                 data_dir=agent_data_dir,
                 thermoctl_db_path=thermoctl_db_path,
                 zigbee2mqtt_dir=zigbee2mqtt_dir,
+                staging_dir=staging_dir,
             )
             found = check_and_apply_pending_restore(device_client, targets)
             assert found is True
 
-    assert thermoctl_db_path.read_bytes() == THERMOCTL_DB_CONTENT
-    assert (zigbee2mqtt_dir / "database.db").read_bytes() == Z2M_DATABASE_CONTENT
+    # Owner decision, 2026-09-28: the agent never writes the live
+    # thermoctl/Zigbee2MQTT data -- only its own staging directory. The
+    # "live" paths above stay untouched; only P5.5c's separate mover (not
+    # part of this package) would ever move staged data into them.
+    assert not thermoctl_db_path.exists()
+    assert not zigbee2mqtt_dir.exists()
+    assert (staging_dir / "thermoctl.db").read_bytes() == THERMOCTL_DB_CONTENT
     assert (
-        zigbee2mqtt_dir / "coordinator_backup.json"
+        staging_dir / "zigbee2mqtt" / "database.db"
+    ).read_bytes() == Z2M_DATABASE_CONTENT
+    assert (
+        staging_dir / "zigbee2mqtt" / "coordinator_backup.json"
     ).read_bytes() == Z2M_COORDINATOR_CONTENT
+
+    manifest = json.loads((staging_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["backup_id"] == backup_summary.backup_id
+    files_by_path = {entry["path"]: entry for entry in manifest["files"]}
+    assert files_by_path["thermoctl.db"]["sha256"] == hashlib.sha256(
+        THERMOCTL_DB_CONTENT
+    ).hexdigest()
+    assert files_by_path["thermoctl.db"]["size_bytes"] == len(THERMOCTL_DB_CONTENT)
 
     # The restore is single-fetch and gone.
     assert app_storage.get_pending_restore_status(APARTMENT) is None

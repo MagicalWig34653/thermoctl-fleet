@@ -30,10 +30,10 @@ between the two packages of this repository and future compatibility checks.
 # paragraph. Originally also numbered 4 (developed in parallel with P5.3a's
 # own `LogExcerpt` addition above) -- re-numbered to 5 when the two
 # branches were merged, since both cannot occupy the same version number.
-# 6: reserved by a parallel branch developed alongside P5.5b (not merged as
-# of this package) -- skipped here, not reused, so the two branches never
-# collide on the same number at merge time (the same "re-number, never
-# reuse" precedent set by 5's own note above).
+# 6: adds `protocol.diagnostics` (`DiagnosticBundleUploadAccepted`) for
+# `POST /v1/commands/{id}/bundle` (P5.3b, sections 15.1, 21.5) -- a wholly
+# new module, same "counts as a change to the models" reading as every
+# prior bump above.
 # 7: adds `protocol.registration.RegistrationRequest.age_recipient` and the
 # wholly new `protocol.restore` module (`AgeRecipientReport`,
 # `PendingRestore`, `RestoreResult`) for P5.5b (section 15.2/15.3's

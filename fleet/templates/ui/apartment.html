@@ -183,6 +183,14 @@
                 {% endif %}
             </div>
             {% endif %}
+            {% if cmd.bundle %}
+            <div class="command-history__log">
+                <p class="command-history__meta">Diagnosepaket erstellt {{ cmd.bundle.created_text }}, {{ cmd.bundle.size_text }}</p>
+                <p class="command-history__meta">Hash: {{ cmd.bundle.content_hash }}</p>
+                <a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ cmd.bundle.command_id | urlpath }}/bundle/download">Herunterladen</a>
+                <p class="command-history__meta">Entschlüsseln: <code>{{ cmd.bundle.age_decrypt_command }}</code></p>
+            </div>
+            {% endif %}
         </li>
         {% endfor %}
     </ul>
@@ -245,6 +253,17 @@
         <p id="restore-error" role="alert"></p>
         <button type="submit">Wiederherstellung anstoßen</button>
     </form>
+    {# Owner decision (a), cross-review, 2026-09-28: this protects against
+       a leaked database, logs, server backups, or passive reading of the
+       fleet -- it does NOT protect against an actively taken-over fleet
+       server serving a modified script at the next restore (accepted
+       deliberately, spec section 15.3's own "limit of the browser-side
+       encryption" paragraph). The landlord compares this value against
+       the one named in the operating manual before trusting the form. #}
+    <p class="command-history__meta">
+        Prüfsumme des Verschlüsselungsskripts (sha256, siehe Betriebshandbuch):
+        <code>{{ detail.restore_vendor_js_sha256 }}</code>
+    </p>
     {% endif %}
 </section>
 

@@ -228,6 +228,7 @@ def test_run_starts_and_stops_the_restore_poll_thread_when_configured(
                 data_dir=tmp_path / "agent-data",
                 thermoctl_db_path=tmp_path / "thermoctl.db",
                 zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+                staging_dir=tmp_path / "restore-staging",
             )
             run(
                 client,

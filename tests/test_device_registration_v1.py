@@ -28,9 +28,10 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
+from pyrage import x25519
 
 from fleet.app import app
-from fleet.storage import Storage, create_storage, get_storage, hash_token, upgrade
+from fleet.storage import DeviceRecord, Storage, create_storage, get_storage, hash_token, upgrade
 from protocol.registration import encode_bytes, verification_code_for
 
 USERNAME = "landlord"
@@ -770,3 +771,132 @@ def test_raw_token_never_stored_or_logged(
     for db_file in db_files:
         raw_bytes = db_file.read_bytes()
         assert token.encode("utf-8") not in raw_bytes
+
+
+# -- P5.5b: age_recipient handling in POST /v1/registration -----------------
+
+
+def test_registration_with_age_recipient_stores_it(client: TestClient, storage: Storage) -> None:
+    _register_device(storage)
+    raw_code = storage.prepare_device(
+        DEVICE, ui_username=USERNAME, confirmed_reset=False, now=datetime.now(UTC)
+    )
+    _private_key, public_key = _keypair()
+    recipient = str(x25519.Identity.generate().to_public())
+
+    response = client.post(
+        "/v1/registration",
+        json={
+            "registration_code": raw_code,
+            "public_key": public_key,
+            "age_recipient": recipient,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    device = storage.get_device(DEVICE)
+    assert device is not None
+    assert device.age_recipient == recipient
+
+
+def test_registration_with_a_conflicting_age_recipient_is_refused_with_409(
+    client: TestClient, storage: Storage
+) -> None:
+    """Cross-review bug fix: `report_device_registration` used to ignore
+    `Storage.set_device_age_recipient`'s `False` entirely, silently
+    keeping the stale recipient on file. A device that already carries a
+    *different* age recipient (e.g. its local identity file was reset)
+    must instead be refused, `409` -- the same conflict shape the
+    dedicated `POST /v1/device/age-recipient` endpoint already gives."""
+
+    _register_device(storage)
+    first_code = storage.prepare_device(
+        DEVICE, ui_username=USERNAME, confirmed_reset=False, now=datetime.now(UTC)
+    )
+    _private_key_one, public_key_one = _keypair()
+    recipient_one = str(x25519.Identity.generate().to_public())
+    first_response = client.post(
+        "/v1/registration",
+        json={
+            "registration_code": first_code,
+            "public_key": public_key_one,
+            "age_recipient": recipient_one,
+        },
+    )
+    assert first_response.status_code == 201, first_response.text
+
+    # Force the device back to `registered` so `prepare_device` accepts a
+    # second cycle -- mirrors a real re-registration (a factory reset, or
+    # this same physical device being prepared again), without going
+    # through the whole confirm/assign flow this test does not need.
+    with storage.session() as session:
+        device = session.get(DeviceRecord, DEVICE)
+        assert device is not None
+        device.state = "registered"
+
+    second_code = storage.prepare_device(
+        DEVICE, ui_username=USERNAME, confirmed_reset=False, now=datetime.now(UTC)
+    )
+    _private_key_two, public_key_two = _keypair()
+    recipient_two = str(x25519.Identity.generate().to_public())
+    assert recipient_two != recipient_one
+
+    second_response = client.post(
+        "/v1/registration",
+        json={
+            "registration_code": second_code,
+            "public_key": public_key_two,
+            "age_recipient": recipient_two,
+        },
+    )
+
+    assert second_response.status_code == 409, second_response.text
+    # The original recipient is untouched.
+    device = storage.get_device(DEVICE)
+    assert device is not None
+    assert device.age_recipient == recipient_one
+
+
+def test_registration_with_the_same_age_recipient_again_is_idempotent(
+    client: TestClient, storage: Storage
+) -> None:
+    """The same value reported again (a retried registration attempt, or
+    this same physical device genuinely re-registering with its
+    unchanged identity) must not be treated as a conflict."""
+
+    _register_device(storage)
+    first_code = storage.prepare_device(
+        DEVICE, ui_username=USERNAME, confirmed_reset=False, now=datetime.now(UTC)
+    )
+    _private_key_one, public_key_one = _keypair()
+    recipient = str(x25519.Identity.generate().to_public())
+    first_response = client.post(
+        "/v1/registration",
+        json={
+            "registration_code": first_code,
+            "public_key": public_key_one,
+            "age_recipient": recipient,
+        },
+    )
+    assert first_response.status_code == 201, first_response.text
+
+    with storage.session() as session:
+        device = session.get(DeviceRecord, DEVICE)
+        assert device is not None
+        device.state = "registered"
+
+    second_code = storage.prepare_device(
+        DEVICE, ui_username=USERNAME, confirmed_reset=False, now=datetime.now(UTC)
+    )
+    _private_key_two, public_key_two = _keypair()
+
+    second_response = client.post(
+        "/v1/registration",
+        json={
+            "registration_code": second_code,
+            "public_key": public_key_two,
+            "age_recipient": recipient,
+        },
+    )
+
+    assert second_response.status_code == 201, second_response.text

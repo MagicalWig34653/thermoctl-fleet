@@ -558,7 +558,8 @@ storage, heartbeat sending **SR**
 - Per-command follow-ups, each an honest failed result naming the package
   that will replace it: `report_now` needs P2.3 heartbeat acquisition;
   `fetch_logs` needed P5.3a masking/upload (done, see below);
-  `diagnostic_bundle` needs P5.3b; `backup_now` needs P5.5.
+  `diagnostic_bundle` needed P5.3b end-to-end encryption (done, see below);
+  `backup_now` needs P5.5.
 - LED `cloud_contact` follows the command channel's own already-existing
   WARNING log (no change to `agent/commands_channel.py`); `fault`/`control`
   stay honestly unknown (not a fabricated "no fault") via a deliberately
@@ -600,7 +601,7 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Depends on:** P5.2. **Read back by:** main session (filtering is
   security-relevant).
 
-#### P5.3b -- `create_diagnostic_bundle`, end-to-end encrypted **SR** -- open
+#### P5.3b -- `create_diagnostic_bundle`, end-to-end encrypted **SR** -- done
 - **Goal:** complete `create_diagnostic_bundle` (stage 1): logs of the four
   services, versions/digests, container states, memory/disk usage, Zigbee
   network state, the last control decisions -- packaged and **end-to-end
@@ -611,18 +612,33 @@ they must also stay conceptually separate, not just separately scheduled.
   decisions or heat-demand readings over time (section 6, section 21.5's
   own "Decided afterward" paragraph) -- a bundle is a snapshot over a few
   hours, not a channel.
-- **Files:** `agent/loop.py` (`create_diagnostic_bundle`), reusing
-  `agent/encryption.py` (P5.5a, done) directly rather than duplicating its
-  own recipients-file handling -- the project owner's 2026-09-26/27 backup
-  decision explicitly asks for the same encryption mechanism to be "reused
-  later by the encrypted diagnostic bundle", and `load_recipients`/
-  `encrypt_stream` are already general-purpose (a recipients file path, a
-  byte stream in, a byte stream out), not backup-specific, precisely for
-  this.
+- [x] done -- see `docs/STATUS.md`'s P5.3b section for the full design
+  (bundle contents, size bounds, retention) and verification output.
+- **Files:** `agent/loop.py` (`create_diagnostic_bundle`, `_handle_diagnostic_bundle`,
+  `upload_diagnostic_bundle`, `read_container_log_window`,
+  `read_container_state`), reusing `agent/encryption.py` (P5.5a, done)
+  directly rather than duplicating its own recipients-file handling -- the
+  project owner's 2026-09-26/27 backup decision explicitly asks for the
+  same encryption mechanism to be "reused later by the encrypted
+  diagnostic bundle", and `load_recipients`/`encrypt_stream` are already
+  general-purpose (a recipients file path, a byte stream in, a byte stream
+  out), not backup-specific, precisely for this. `protocol/diagnostics.py`
+  (new, `DiagnosticBundleUploadAccepted`, `PROTOCOL_VERSION` bumped to 6).
+  `fleet/app.py` (`POST /v1/commands/{id}/bundle`, retention loop),
+  `fleet/upload_streaming.py` (new, factored out of P5.5a's own
+  `upload_backup` so both endpoints share the streaming-cap/age-plausibility
+  logic), `fleet/bundle_storage.py` (new), `fleet/storage.py`
+  (`diagnostic_bundles` table, migration `0013_diagnostic_bundles.py`,
+  re-chained onto P5.1c's parallel `0012_fleet_epoch.py` at merge time),
+  `fleet/ui_apartment.py`/`fleet/ui_routes.py`/`fleet/templates/ui/
+  apartment.html` (shown next to its command in "Befehle", not a separate
+  list).
 - **Section:** 15.1, 21.5.
-- **Acceptance:** test demonstrates the cloud never sees plaintext content,
-  and that a series of bundles cannot be used to reconstruct a heat-demand
-  timeline (only ever one bundle at a time, no accumulation).
+- **Acceptance:** test demonstrates the cloud never sees plaintext content
+  (real crypto throughout, marker-scanning tests), and that a bundle stays
+  a one-off snapshot, never accumulated as a series (one bundle per
+  command id, enforced at the database level; 14-day retention deletes the
+  fleet's own stored copy the same way `fetch_logs`'s excerpts expire).
 - **Depends on:** P5.2, P5.5a (done -- `agent/encryption.py`).
 - **Read back by:** main session (encryption and the "never a series"
   boundary are both security-relevant).
@@ -686,27 +702,93 @@ they must also stay conceptually separate, not just separately scheduled.
   `age_recipient` field), `protocol/restore.py` (new), `fleet/app.py`
   (three new endpoints), `fleet/age_key_block.py` (new), `fleet/storage.py`
   (`devices.age_recipient`, new `pending_restores` table),
-  `fleet/migrations/versions/0013_restore.py` (new), `fleet/ui_routes.py`/
-  `fleet/ui_apartment.py` (the "Wiederherstellen" form), `fleet/templates
-  /ui/apartment.html`, `fleet/static/ui/vendor/age-encryption.vendor.js`
-  (new, vendored), `fleet/static/ui/restore_form.js` (new),
-  `fleet/restore_vendor.py` (new), `agent/age_identity.py` (new),
-  `agent/restore.py` (new), `agent/registration.py`, `agent/loop.py`,
+  `fleet/migrations/versions/0014_restore.py` (new), `fleet/ui_routes.py`/
+  `fleet/ui_apartment.py` (the "Wiederherstellen" form, incl. the vendored
+  script's own sha256 shown next to it), `fleet/templates/ui/apartment.html`,
+  `fleet/static/ui/vendor/age-encryption.vendor.js` (new, vendored),
+  `fleet/static/ui/restore_form.js` (new), `fleet/restore_vendor.py` (new),
+  `agent/age_identity.py` (new), `agent/restore.py` (new -- **stages** into
+  the agent's own directory, never writes the live thermoctl/Zigbee2MQTT
+  data, see P5.5c below), `agent/registration.py`, `agent/loop.py`,
   `agent/__main__.py`, `agent/safe_io.py` (new `write_bytes_safe`).
-- **Section:** 15.2, 15.3 step 4 (and its "Decided afterward" paragraph,
-  2026-09-28: the browser encrypts the entered key to a device-generated age
-  recipient; the fleet only forwards the opaque block, never the plain key).
+- **Section:** 15.2, 15.3 step 4 and its two "Decided afterward" paragraphs
+  (2026-09-28): (1) the browser encrypts the entered key to a
+  device-generated age recipient, the fleet only forwards the opaque
+  block, never the plain key; (2) the browser-side encryption script's
+  limit (protects against a leaked database/logs/backups/passive reading,
+  not against an actively taken-over fleet server -- the UI shows the
+  script's sha256 so the landlord can compare it against the operating
+  manual); (3) the agent never writes the live tenant data at all --
+  thermoctl/Zigbee2MQTT stay mounted read-only, the agent only stages, a
+  separate Go program (**P5.5c**, below) moves staged data into place.
 - **Acceptance:** real end-to-end test over the real fleet app and real
   TLS (browser step simulated with `pyrage`, plus a real `node` + the real
   vendored JS interop test); plaintext key rejected; wrong/second device
-  cannot fetch; expired block gone; block deleted after one fetch; the
+  cannot fetch; expired block gone; block deleted after one fetch (proven
+  race-safe under real concurrent access, not just sequentially); the
   landlord's key string never appears in the fleet's sqlite file, the
   blob-storage directory, or the agent's own tmp tree; agent refuses to
-  restore over existing data; wrong key fails clean, nothing written.
+  stage over an already non-empty live store, and refuses a second staging
+  while a previous one is still unconsumed; wrong key fails clean, nothing
+  staged; a conflicting `age_recipient` at registration time is refused
+  (`409`), not silently accepted.
 - **Depends on:** P5.5a (this package) -- reuses `protocol.backups`,
   `fleet.backup_storage`, and the same age recipients/identity concept.
 - **Read back by:** main session (security principle 3: the landlord's
   decryption key must only ever be passed through, never stored).
+
+### P5.5c -- Restore mover (Go, next to the watchdog) -- **open, not started**
+- **Goal:** the other half of section 15.3's second "Decided afterward"
+  paragraph (2026-09-28): "Moving it into the real data directories is
+  done by a small, separate Go program on the bare system next to the
+  watchdog (same module, no dependency, no network, section 18.4's
+  language rule), and only if no operational data exists there yet." P5.5b
+  (agent-side) only ever stages a decrypted restore into its own directory
+  plus a manifest (`agent/restore.py`, `MANIFEST_FILENAME`,
+  `docs/STATUS.md`'s P5.5b section) -- nothing in this scaffold yet reads
+  that staging directory back out and moves it into
+  `thermoctl_db_path`/`zigbee2mqtt_dir`.
+- **What it has to do**, per the manifest P5.5b already writes
+  (`{staging_dir}/manifest.json`: `backup_id`, `staged_at`, and a `files`
+  list of `{path, size_bytes, sha256}` relative to `staging_dir`):
+  1. Notice a staged restore is waiting (the manifest's presence, same
+     check `agent/restore.py::_staged_restore_already_pending` already
+     uses on the agent side) -- likely watched via the same kind of
+     periodic poll the watchdog's own main loop already uses, not a new
+     mechanism.
+  2. **Re-check the live directories are empty itself, authoritatively**
+     (CLAUDE.md security principle 5, and this package's own "the agent's
+     own check is advisory only" reasoning) -- never trusts that the
+     agent already checked this; a compromised or buggy agent process
+     must not be able to route around this by staging anyway.
+  3. Validate every file named in the manifest actually exists in
+     `staging_dir`, is a **regular file** (refuses symlinks, FIFOs,
+     device nodes, directories masquerading as a listed path -- the same
+     `lstat`-before-`open` discipline `agent/safe_io.py` already applies,
+     ported to Go, no dependency), and its size/sha256 match the manifest
+     exactly.
+  4. Move (not copy-then-delete, to stay atomic per file -- `os.Rename`
+     within the same filesystem) each validated file into its real
+     destination (`thermoctl_db_path`/`zigbee2mqtt_dir`), then remove the
+     staging directory (manifest included) so a later restore can stage
+     again.
+  5. Write a status file the agent itself reads back to report the final
+     result to the fleet (mirrors `agent.loop`'s own LED/health status
+     file convention, section 22.3/17) -- the mover has no fleet
+     connection of its own (no network, per the module's own constraint)
+     and cannot call `POST /v1/restore/result` itself.
+- **Constraints, same as the watchdog's own (CLAUDE.md security principle
+  6, adopted for this program too):** Go, statically built, `go.mod`
+  without a single third-party dependency, **no network access, no
+  registry** -- this program only ever touches the local filesystem and
+  (for step 5) a local status file the agent polls.
+- **Section:** 15.3's second "Decided afterward" paragraph, 17, 18.3/18.4.
+- **Depends on:** P5.5b (this package) -- consumes exactly the staging
+  layout and manifest format `agent/restore.py` already produces; a change
+  to that format is a contract change between the two, not a private
+  detail of either.
+- **Read back by:** main session (CLAUDE.md security principle 5/6: the
+  authoritative empty-check and the no-network/no-dependency constraint).
 
 ### P5.6 -- Watchdog main loop (`watchdog/watch.go`)
 - **Goal:** actually implement `AgentStopped`, `StartDigest`,

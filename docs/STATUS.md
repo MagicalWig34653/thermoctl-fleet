@@ -15,17 +15,324 @@ afterward") and `docs/implementation_plan.md`:
   gate protects against *accidental* arming, not against a compromised
   cloud -- that protection stays with the hard-coded sources, the digest
   check, and the local pre-check (security principles 2 and 5).
+- **P5.5b follow-up decisions (2026-09-28):** (a) the browser-JS limit is
+  accepted and documented (spec 15.3) -- protects against DB leak, logs,
+  backups, passive compromise, not against an actively taken-over fleet
+  server; the UI shows the script's sha256. (b) The agent writes restores
+  only into its own staging directory; thermoctl/Zigbee2MQTT mounts stay
+  read-only; a separate small Go program next to the watchdog (no deps, no
+  network) moves staged data into place, only onto an empty device.
 - **P5.5b** restore key: encrypted in the landlord's browser to a
   device-generated age recipient; the fleet stores and forwards only the
   opaque block and deletes it after fetch or expiry.
+## Merge integration: P5.3b onto P5.1c (main session)
 
-## P5.5b -- Restore (sections 15.2, 15.3 step 4, and its "Decided
-afterward" paragraph, 2026-09-28)
+- Migration re-chained: P5.3b's `0012_diagnostic_bundles` is now
+  `0013_diagnostic_bundles` (`down_revision = "0012"`, P5.1c's
+  `0012_fleet_epoch`). Verified: `upgrade` from empty, `downgrade` to
+  `0012`, `downgrade` to `base`, `upgrade` again. `PROTOCOL_VERSION` stays
+  6 (main was 5).
+- `tests/test_agent_diagnostic_bundle.py`'s module-scoped real-server
+  fixture had the same ordering gap P5.1c fixed in
+  `tests/test_agent_fetch_logs.py`: the server started with no storage
+  override, and since P5.1c the epoch rotation at startup aborts loudly by
+  design -- `test_diagnostic_bundle_end_to_end_success` failed with
+  "Connection refused". Fixed the same way (module-scoped bootstrap storage
+  registered before `fleet_base_url`); test-only, production unchanged.
+  These two files are the only module-scoped `uvicorn.Config` fixtures.
+- Verification (main session): `ruff check .` clean, `mypy .` (110 files)
+  and `mypy protocol fleet agent tools` (58) clean, pytest twice: 1357
+  passed, 1 skipped, TOTAL 5260 stmts / 20 missed / 99% both runs;
+  `go vet`, `go test`, `check_contract.sh` passing.
+
+## P5.3b -- end-to-end encrypted diagnostic bundle (sections 15.1, 21.5)
+
+`diagnostic_bundle` is now genuinely executed, per the project owner's
+2026-09-27 decision: **full content, end-to-end encrypted on the device with
+the landlord's public keys -- the exact same mechanism as the operational-data
+backup (`agent/encryption.py`, no second procedure)**, never a series (the
+distinction section 21.5's own "Decided afterward" paragraph draws between a
+bundle and a channel).
+
+**Agent** (`agent/loop.py`): `create_diagnostic_bundle` collects, into a
+private staging directory (`tempfile.mkdtemp`, `chmod 0700`, every file in it
+`chmod 0600`) built directly under `BackupConfig.staging_dir`:
+
+- **Logs of the four services** (`thermoctl`, `zigbee2mqtt`, `mosquitto`,
+  `agent`) -- read from the local Docker Engine API over the Unix socket
+  (`read_container_log_window`, the same "no Docker SDK, local socket only,
+  never a registry" reasoning `agent.loop.read_container_log_lines` already
+  established for `fetch_logs`, P5.3a), bounded to the last **6 hours**
+  (`DIAGNOSTIC_BUNDLE_WINDOW_HOURS`, a fixed constant, deliberately **not** a
+  caller-supplied parameter -- widening it is exactly the "series instead of
+  a snapshot" shift section 21.5 forbids) and capped per service at **2000
+  lines / 2 MB** (`DIAGNOSTIC_BUNDLE_MAX_LINES_PER_SERVICE`/
+  `_MAX_BYTES_PER_SERVICE`), whichever is hit first; truncation is recorded
+  in the manifest, never silent. **Unfiltered, unlike `fetch_logs`'s own
+  allowlist** -- this bundle is end-to-end encrypted end to end, so masking
+  would only discard exactly the detail a real troubleshooting session needs,
+  for no confidentiality gain the encryption does not already provide (the
+  project owner's own framing: "a cumbersome path leads to weakening the
+  filter instead", applied here to content instead of to the download UX).
+  A single service's log (or state) read failing does **not** abort the
+  whole bundle -- recorded as `"available": false` with the error text in
+  the manifest instead, and the corresponding `services/<name>.log` file
+  gets a one-line explanation; a diagnostic tool that refuses to produce
+  anything just because one of four services is down would defeat its own
+  purpose.
+- **Versions/digests**: the watchdog's own self-swap `agent_digest`/
+  `agent_proven_digest`, exactly the same reader and the same honest
+  limitation `_build_device_config_snapshot` (P5.5a) already documents --
+  the four service desired-state digests need P5.4's reconciliation, not yet
+  built, so nothing is invented for them.
+- **Container states**: `read_container_state` (`GET /containers/{name}/json`
+  over the same local socket) -- status, start time, restart count, health
+  check status, running image.
+- **Memory/disk usage**: `/proc/meminfo` and `shutil.disk_usage("/")`,
+  stdlib only (no new dependency such as `psutil`) -- both degrade to
+  `None`/best-effort on a platform without `/proc` (this development
+  machine) rather than fabricating a value.
+- **Zigbee network state, "if cheaply available" read literally**:
+  Zigbee2MQTT's own already-written `state.json`, verbatim, capped at 500 kB
+  -- **not** a fresh MQTT round trip to the broker, exactly the "cheap" case
+  the specification names. Its own outcome (included, absent, unreadable,
+  too large) is always recorded in the manifest.
+- **Control decisions, honestly scoped down**: this scaffold has no
+  thermoctl endpoint that exposes control decisions as their own structured
+  feed (section 10's "what needs to change in thermoctl" does not yet list
+  one) -- the manifest's `control_decisions` entry says exactly that,
+  `available: false`, pointing at `services/thermoctl.log` within the same
+  bundle instead of duplicating an extraction this scaffold cannot honestly
+  perform yet ("if nothing is available without new thermoctl endpoints, say
+  so and include what exists" -- the work order's own words).
+
+**Recipients validated first, before anything else is read or written**
+(security principle 4, mirrors `create_backup`'s own ordering exactly) --
+`agent.encryption.load_recipients`/`encrypt_stream`, reused directly, not
+duplicated. Every intermediate plaintext file (the whole staging directory,
+the plaintext tar) is removed unconditionally in a `finally` block,
+**including on every error path**. The whole plaintext tar is checked
+against a defense-in-depth cap (`DIAGNOSTIC_BUNDLE_MAX_TOTAL_BYTES`, 20 MB)
+before encryption -- refused with a clear `ValueError`, not silently
+truncated, if ever exceeded (the per-service caps already bound this in
+practice). `_handle_diagnostic_bundle` reuses `ExecutionContext.backup_config`
+entirely (`apartment_id`, `agent_version`, `staging_dir`, `zigbee2mqtt_dir`,
+`client`, `recipients_file`) -- **no second, duplicated configuration
+object**, mirroring `_handle_backup_now`'s own shape; every failure
+(`RecipientsError`, an unanticipated file/tar/cryptography error, a refused
+upload) is an honest failed `CommandResult`, never a fabricated success, and
+the staged artifact is always removed in this handler's own `finally`.
+
+**Protocol**: `protocol/diagnostics.py` (new) --
+`DiagnosticBundleUploadAccepted`, `MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES` (50 MB,
+independent of `protocol.backups.MAX_BACKUP_UPLOAD_BYTES`). A deliberate
+separate module from `protocol.backups`, not a third `BackupKind` -- a
+diagnostic bundle is not part of the "swap a device in minutes" flow, carries
+no retention rotation, and is keyed by *command id*, not by
+`(apartment, kind)`. `PROTOCOL_VERSION` bumped to 6 (a wholly new module,
+same "counts as a change to the models" reading every prior bump already
+established).
+
+**Fleet**: `POST /v1/commands/{id}/bundle` (`fleet/app.py::upload_diagnostic_bundle`,
+agent token, `require_apartment_token_by_hash`) -- the command named by the
+path `id` must belong to the authenticated apartment and be a
+`diagnostic_bundle` command (otherwise 404, deliberately indistinguishable
+from "unknown", mirroring `receive_log_excerpt`'s own reasoning), one bundle
+per command (`409` on a second upload), the body must look like a real age
+file (header line + a recipient stanza -- unconditionally, unlike
+`upload_backup`'s own kind-dependent check, since a diagnostic bundle has
+only ever one possible kind). **Reuses P5.5a's own streaming-cap and
+age-plausibility mechanics, factored out rather than copied**: new
+`fleet/upload_streaming.py` (`stream_upload_body`, `looks_like_an_age_file`,
+`AGE_PLAUSIBILITY_PREFIX_BYTES`) is now the single home for both, and
+`fleet.app.upload_backup` was refactored to import from there too --
+identical behaviour, one implementation. Storage:
+`fleet/bundle_storage.py::DiagnosticBundleBlobStorage` (new, a deliberate
+sibling of `BackupBlobStorage`, not a shared class -- see that module's own
+docstring for why a bundle's *command-id* keying does not fit the
+*apartment+kind* shape `BackupBlobStorage` uses), `diagnostic_bundles` table
+(`fleet/migrations/versions/0013_diagnostic_bundles.py` -- originally `0012`,
+chained onto `0011_backups.py`, the head when this package started; P5.1c's
+own `0012_fleet_epoch.py` landed on `main` in parallel, also numbered
+`0012`, so this migration was re-chained onto it and renumbered `0013` at
+merge time, the same main-session convention P5.3a/P5.5a's own parallel
+`0010` collision already established; `command_id` carries its own unique
+index, enforcing "one bundle per command" at the database level, not only
+in application code),
+`fleet.storage.Storage.store_diagnostic_bundle`/
+`get_diagnostic_bundle_for_command`/`get_diagnostic_bundle_for_apartment_command`/
+`get_diagnostic_bundle_storage_path`/`delete_expired_diagnostic_bundles`.
+
+**Retention** (project owner condition, mirrors P5.3a's own `fetch_logs`
+retention exactly): 14 days by default, both the window
+(`FLEET_DIAGNOSTIC_BUNDLE_RETENTION_DAYS`) and the check interval
+(`FLEET_DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_S`) env-configurable, run
+periodically from `fleet/app.py`'s own lifespan
+(`_diagnostic_bundle_retention_loop`) -- the same "thin scheduling wrapper,
+tested via an injected clock on the logic it calls" pattern the existing
+alarm/backup/log-retention loops already establish. A bundle's content lives
+on the filesystem, not in the database (like a backup, unlike a log
+excerpt) -- `Storage.delete_expired_diagnostic_bundles` deletes the metadata
+rows and returns each one's `storage_path`; the blob itself is deleted only
+after that transaction commits (mirrors `run_backup_retention`'s own "row
+first, then blob" ordering). **This retention governs only the fleet's own
+stored copy** -- the bundle stays a one-off snapshot per command regardless;
+retention prevents old snapshots from *accumulating* into the "series"
+section 21.5 forbids, it does not itself enforce the "one at a time" rule
+(the database's unique index on `command_id` already does that,
+independent of retention).
+
+**UI** ("Eine Wohnung", `fleet/ui_apartment.py`/`fleet/ui_routes.py`): shown
+**next to its own command** in the "Befehle" history (unlike backups, which
+get their own list-of-many section) -- size, capture time, the SHA-256
+content hash, a download link
+(`GET /ui/apartments/{id}/commands/{command_id}/bundle/download`, behind the
+P3.0 login, scoped to the apartment -- another apartment's command id is a
+404), and the ready-made
+`age -d -i <dein-schluessel.txt> -o diagnose.tar <datei>` command right
+there (project owner: "a cumbersome path leads to weakening the filter
+instead" -- the exact wording the project owner specified for this button).
+
+**Constraints honoured**: `protocol.commands.CommandType` unchanged
+(`DIAGNOSTIC_BUNDLE` already existed since P5.2); `watchdog/` untouched (`go
+vet`/`go test`/`check_contract.sh` all still pass); no private key anywhere
+in the repo, the image, the agent, or the fleet -- every identity generated
+in this package's own tests is freshly generated at test runtime
+(`pyrage.x25519.Identity.generate()`), never committed.
+
+**Tests** (`tests/test_agent_diagnostic_bundle.py`,
+`tests/test_fleet_diagnostic_bundle.py`,
+`tests/test_storage_diagnostic_bundles.py`, `tests/test_bundle_storage.py`,
+`tests/test_ui_diagnostic_bundle.py`, `tests/test_agent_docker_socket.py`
+(new, cross-review addition, see below), `tests/docker_api_support.py` (new,
+not a test file itself); plus small updates to `tests/test_agent_loop.py`,
+`tests/test_agent_loop_execution.py`, and `tests/test_fleet_backups.py`, see
+below) -- real cryptography throughout, never a mock of `pyrage`/age: two
+freshly generated X25519 identities, each decrypts alone; a marker string
+planted in fake service logs/state is asserted absent from every staged
+plaintext file, every uploaded request body, and every stored blob, in both
+the success and every failure case (missing recipients, only one recipient,
+an encryption failure); a single service's log/state read failing is proven
+to still produce a bundle for the other three, with an honest per-service
+note; an oversized plaintext bundle (monkeypatched cap) is refused before
+encryption, cleanly, with every plaintext file removed; the fleet endpoint
+rejects a non-age upload (with and without a recipient stanza), a
+content-hash mismatch, an oversized body (both a declared-`Content-Length`
+check and a genuinely streamed-oversized body with no `Content-Length` at
+all, mirroring P5.5a's own two-pronged streaming-cap tests), another
+apartment's command, a non-`diagnostic_bundle` command, and a second upload
+for the same command (`409`, first upload's content unchanged); retention is
+proven with an injected clock (only expired rows/paths returned, fresh ones
+untouched); the UI download route requires login, returns the exact stored
+bytes unmodified, and is 404 for an unknown or another apartment's command
+id; handler-level tests prove `_handle_diagnostic_bundle`'s own two
+preconditions (`backup_config`/`client` missing) and that an unanticipated
+`create_diagnostic_bundle` failure is caught, reported as a failed result
+(never propagated to crash the agent's main loop), with cleanup still having
+run; one true end-to-end test drives the command through `execute_command`
+against the real `fleet.app.app`, with stub (never real Docker-socket)
+log/state readers standing in for the four services, and proves the stored
+blob decrypts, with either generated identity, to a tar containing the
+manifest.
+
+**Cross-review addition: a real Docker-socket test double, plus two
+directly-testable branches the first draft of this section incorrectly
+called "unreachable".** Cross-review confirmed the plaintext path, the
+shared-streaming reuse, apartment/command-type/duplicate scoping, the fixed
+6-hour window, and the migration chain, but required two fixes:
+
+1. **`tests/docker_api_support.py`** (new) -- a small, real Docker Engine
+   API double (`FakeDockerAPI`, a raw ASGI callable, no FastAPI/Starlette
+   dependency needed for two routes) served by `uvicorn` over a **real Unix
+   domain socket**, short-named directly under the system temp directory
+   (not pytest's own nested `tmp_path`, whose path can exceed
+   `sockaddr_un.sun_path`'s own length limit). **`tests/test_agent_docker_socket.py`**
+   (new) uses it to exercise `read_container_log_lines` (P5.3a),
+   `read_container_log_window`, and `read_container_state` (both P5.3b)
+   against a real socket and a real HTTP response for the first time -- not
+   only via the stub readers every other test in this package (and P5.3a's
+   own `tests/test_agent_fetch_logs.py`) deliberately uses instead: the
+   normal case; byte-cap truncation where a single real chunk read from the
+   wire already overruns the cap (`FakeDockerAPI`'s single-`bytes` logs
+   value); byte-cap truncation where the cap is exactly reached by an
+   earlier chunk and a later, separate chunk must be discarded entirely (a
+   distinct branch in `read_container_log_window`'s own read loop --
+   `FakeDockerAPI`'s `logs` value can also be a `list[bytes]`, sent as
+   genuinely separate ASGI body frames with a short sleep between them, so
+   the two chunks are not coalesced into one read on the client side); the
+   line-cap truncation, keeping the newest lines; an unknown container
+   (`404` -> `httpx.HTTPStatusError`, an `HTTPError`); and a connection
+   error (no socket listening at all).
+2. **Two branches this section's first draft called unreachable were, in
+   fact, directly testable, and are now tested**: `_read_disk_usage`'s own
+   `except OSError: return None` (`shutil.disk_usage` on a path that does
+   not exist, no monkeypatching needed) and `_read_memory_usage`'s
+   malformed-value `except ValueError: continue` (extended the existing
+   `Path.read_text`-monkeypatched `/proc/meminfo` fixture with one
+   deliberately non-numeric value line, and asserted the earlier, valid
+   value for the same key survives unharmed). Both were only ever
+   "unreachable *from `create_diagnostic_bundle`'s own call sites* on this
+   development machine" -- calling either function directly with a
+   constructed input reaches them without any artificial trick, which is
+   exactly what a direct unit test is for; the original wording
+   conflated "not naturally reached by this package's own higher-level
+   tests" with "not testable", which cross-review correctly rejected.
+
+**Small, adjacent test/doc fixes, not weakening what any existing test
+protects:**
+
+- `tests/test_agent_loop.py`/`tests/test_agent_loop_execution.py`:
+  `create_diagnostic_bundle`'s own former "reports missing implementation"
+  stub test removed (the function is no longer a stub); the
+  `DIAGNOSTIC_BUNDLE` case removed from the shared "not yet available"
+  parametrization and replaced with a dedicated "refused, honestly, when
+  `ctx.backup_config is None`" test, mirroring `backup_now`'s own existing
+  precedent exactly.
+- `tests/test_fleet_backups.py`: the two direct unit tests of the
+  streaming-cap function (`test_stream_backup_body_stops_reading_...`/
+  `test_stream_backup_body_reads_every_chunk_...`) now import
+  `fleet.upload_streaming.stream_upload_body` instead of the now-removed
+  `fleet.app._stream_backup_body` -- same behaviour, same tests, only the
+  import path changed to follow the P5.3b refactor.
+
+**Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`): `ruff check .` -- `All checks passed!`; `mypy .` --
+`Success: no issues found in 109 source files`; `mypy protocol fleet agent
+tools` -- `Success: no issues found in 57 source files`; `python -m
+tools.check_image_config` -- `Image configuration plausible (not a real
+build -- see docstring).`; `python -m pytest -W ignore::ResourceWarning -rA`
+**2x**, both exit code 0, **1316 passed, 1 skipped** each run (the one skip:
+no `age` CLI binary on this machine, same pre-existing case every prior
+package's own verification already notes), coverage **99%** both runs (5185
+statements; run 1: 20 missed; run 2: 19 missed) -- the one-line difference is
+`fleet/storage.py`'s own pre-existing inventory-assignment concurrent-race
+branch (line 3336), the same timing-based coverage wobble this file's own
+P5.1b cross-review entry already documents for a different race branch,
+unrelated to this package. Every remaining miss in both runs is pre-existing
+and unrelated to this package (`agent.loop`'s own still-open
+`collect_heartbeat`/`send_heartbeat` placeholders, P5.3a's own
+`_handle_fetch_logs` transport-error branch, `reconcile_desired_state`'s own
+placeholder, `fleet/admin.py`'s own pre-existing gap, `tools
+/check_image_config.py`'s own pre-existing CLI-entry-point gaps) --
+**none of this package's own new code remains uncovered**, including the
+two branches point 2 above corrects and the real Docker-socket bodies of
+`read_container_log_window`/`read_container_state`, now exercised for real
+by `tests/test_agent_docker_socket.py` rather than only via stub readers;
+that test file also gives `read_container_log_lines`'s own real-socket body
+(P5.3a) its first real-socket coverage. In `watchdog/`: `go vet ./...`
+clean, `go test ./...` -- all three packages `ok`, `bash check_contract.sh`
+-- "Contract test passed" (run with the `agent` extra installed, same as
+every prior package since P5.5a -- the watchdog's own `go.mod` has and needs
+no new dependency, untouched by this package).
+
+## P5.5b -- Restore (sections 15.2, 15.3 step 4, and its two "Decided
+afterward" paragraphs, 2026-09-28)
 
 **What:** the counterpart to P5.5a: a swapped/freshly-commissioned device
 fetches the device-configuration backup and, on a swap, the encrypted
 operational-data backup -- with the landlord's decryption key never
-reaching the fleet in plain text (owner decision, above).
+reaching the fleet in plain text, and the agent never writing the live
+tenant data itself (both owner decisions, below).
 
 **Design, end to end:**
 
@@ -35,8 +342,10 @@ reaching the fleet in plain text (owner decision, above).
    recipient is ever reported to the fleet:
    - as part of registration (`protocol.registration.RegistrationRequest
      .age_recipient`, new, optional field -- `PROTOCOL_VERSION` bumped to
-     **7**; 6 is reserved for a parallel branch not yet merged, skipped
-     rather than reused, see `protocol/version.py`'s own note);
+     **7**, chained after P5.3b's `6` -- both packages branched from `5`
+     in parallel, re-numbered at merge, same convention this file's own
+     "Merge integration" section above already documents for the
+     migration chain);
    - for a device that registered before this package existed:
      `POST /v1/device/age-recipient` (`protocol.restore
      .AgeRecipientReport`, token-authenticated, set-once/idempotent,
@@ -47,6 +356,13 @@ reaching the fleet in plain text (owner decision, above).
    .validate_age_recipient`), plus an explicit, independently tested
    refusal of anything containing `AGE-SECRET-KEY-` (belt and braces on
    top of `pyrage` already rejecting it by its own bech32 prefix).
+   **Cross-review fix:** `report_device_registration` (`POST
+   /v1/registration`) used to ignore `set_device_age_recipient`'s `False`
+   entirely -- a device already carrying a *different* recipient on file
+   kept the stale one, silently, while the rest of registration proceeded
+   as if nothing had happened. Now: `409`, the same conflict shape the
+   dedicated endpoint already gives (`tests/test_device_registration_v1.py
+   ::test_registration_with_a_conflicting_age_recipient_is_refused_with_409`).
 2. **Fleet UI, login required:** "Wiederherstellen" form on "Eine Wohnung"
    (`fleet/templates/ui/apartment.html`, `fleet/ui_routes.py
    ::apartment_restore_create`), offered only when the apartment has a
@@ -72,6 +388,20 @@ reaching the fleet in plain text (owner decision, above).
    `(apartment, device, backup)`, with a 15-minute (configurable,
    `FLEET_RESTORE_KEY_BLOCK_TTL_S`) expiry, and an audit-log entry (who,
    when, which backup id -- never the payload).
+
+   **Owner decision (a), cross-review, precise guarantee:** the page shows
+   the vendored script's own sha256 (`ApartmentDetail
+   .restore_vendor_js_sha256`) next to a German hint to compare it with
+   the value named in the operating manual
+   (`tests/test_ui_restore.py::test_restore_form_shows_the_vendored_js_sha256`,
+   `tests/test_restore_e2e.py`'s own end-to-end check). Stated precisely,
+   not just claimed: this protects against a **leaked database, logs,
+   server backups, or passive reading** of the fleet -- it does **not**
+   protect against an **actively taken-over fleet server that serves a
+   modified script** at the next restore and captures the key then. That
+   gap is accepted deliberately by the project owner (restores are rare
+   and consciously triggered) -- the sha256 display is the mitigation the
+   spec itself names for it, not a claim that the gap is closed.
 3. **Device fetch, single endpoint:** `GET /v1/restore`
    (`fleet.app.fetch_pending_restore`, token-authenticated) -- `204` when
    nothing is pending, otherwise the key block, the chosen operational
@@ -87,55 +417,103 @@ reaching the fleet in plain text (owner decision, above).
    (`fleet.app._restore_purge_loop`) deletes anything expired that nobody
    ever fetched. Not a command -- `protocol.commands.CommandType` is
    untouched.
-4. **Agent unpack** (`agent/restore.py::apply_pending_restore`, the
-   security boundary, principle 5): refuses if the operational-data store
-   already has content (`_operational_store_is_empty`, checked **before**
-   any decryption) -- otherwise a compromised cloud could roll an
-   apartment back to an old backup. Decrypts the key block with its own
-   identity (landlord identity, in memory only, never written or logged),
-   then the operational backup with that identity, extracts the tar
-   **fully into memory** before writing anything, then writes atomically
-   via `agent.safe_io.write_bytes_safe`. Reports success/failure (a
-   closed, non-sensitive set of `detail` strings, never content) via
-   `POST /v1/restore/result`. Polled for at startup and periodically
-   (`agent.loop.run`'s own `restore_targets`/`restore_poll_interval_s`,
-   default 60s, its own background thread, same shape as the daily backup
-   scheduler).
 
-**Verification (this package's own run):** `ruff check .` clean; `mypy
-protocol fleet agent tools` clean; `pytest` -- 76 new tests across
-`tests/test_age_key_block.py`, `tests/test_age_identity.py`,
-`tests/test_restore_vendor.py` (includes a real `node` + the real
-vendored bundle interop test, decrypted with `pyrage`),
-`tests/test_fleet_restore.py`, `tests/test_agent_restore.py`,
-`tests/test_ui_restore.py`, `tests/test_restore_e2e.py` (full end-to-end
-over the real fleet app and real TLS: browser step simulated with
-`pyrage`, device fetch and unpack for real, restored files compared
-byte-for-byte, and the landlord's key string confirmed absent from the
-fleet's sqlite file, every blob-storage file, and every file under the
-agent's own tmp tree afterward) -- plus fixes to five pre-existing tests
-whose own assertions pinned the *previous* CSP value/"no script anywhere"
-invariant (now: `script-src 'self'`, external same-origin `<script>`
-permitted only for this feature's own vendored files).
+   **Cross-review finding and fix (concurrency bug):** `fetch_and_delete
+   _pending_restore` used to `SELECT` the row, decide in Python, and only
+   then `DELETE` it -- a classic check-then-act race. Two concurrent
+   fetches for the same apartment (a retry racing the original, or a
+   genuine second device) could both read the row before either `DELETE`
+   ran, and **both** received the same key block -- reproduced directly
+   (ten real threads, one real sqlite **file** database, separate
+   sessions, `results.count(successes) == 2` before the fix). Fixed with a
+   single, atomic, guarded `DELETE ... WHERE apartment_id = ? AND
+   device_id = ? AND expires_at > ? RETURNING ...` statement -- exactly
+   one concurrent caller's `DELETE` can ever match and remove the row;
+   every other caller's statement matches zero rows in the same instant.
+   Proven fixed by `tests/test_fleet_restore.py
+   ::test_fetch_and_delete_pending_restore_is_race_safe_under_concurrency`
+   (ten threads, exactly one winner, every run -- checked six times in a
+   row during this fix with no flake).
+4. **Agent stages, never writes the live tenant data** (`agent/restore.py
+   ::apply_pending_restore`, the security boundary, principle 5; owner
+   decision, 2026-09-28, second "Decided afterward" paragraph: "the agent
+   container never gets write access to the live tenant data ... the
+   agent writes the decrypted operational data only into its own staging
+   directory"): refuses early (advisory only -- reading the read-only
+   mounts is fine) if the live operational-data store already has content
+   (`_operational_store_is_empty`), and refuses if a previous restore is
+   still staged and unconsumed (`_staged_restore_already_pending`, the
+   manifest's own presence is the check) -- both **before** any
+   decryption. Decrypts the key block with its own identity (landlord
+   identity, in memory only, never written or logged), then the
+   operational backup with that identity, extracts the tar **fully into
+   memory** before writing anything, then writes every staged file
+   atomically (`agent.safe_io.write_bytes_safe`, mode `0600`, staging
+   directory mode `0700`) under `RestoreTargets.staging_dir` -- never
+   under `thermoctl_db_path`/`zigbee2mqtt_dir`, which this module only
+   ever *reads*. Writes `manifest.json` **last**, atomically, once every
+   staged file has already been written successfully -- backup id, staged-
+   at timestamp, and each file's relative path/size/sha256, for **P5.5c**
+   (below) to verify before it moves anything. Reports **"staged, awaiting
+   apply"** -- never "restored" -- via `POST /v1/restore/result` (a
+   closed, non-sensitive set of `detail` strings, never content). Polled
+   for at startup and periodically (`agent.loop.run`'s own
+   `restore_targets`/`restore_poll_interval_s`, default 60s, its own
+   background thread, same shape as the daily backup scheduler).
+
+**Verification (this package's own run, after the cross-review fixes
+above):** `ruff check .` clean; `mypy .` and `mypy protocol fleet agent
+tools` clean; `pytest` -- REPLACE_PYTEST_LINE; `go vet`/`go test`/
+`check_contract.sh` unaffected and passing (Python-only package). New/
+updated test files: `tests/test_age_key_block.py`,
+`tests/test_age_identity.py`, `tests/test_restore_vendor.py` (includes a
+real `node` + the real vendored bundle interop test, decrypted with
+`pyrage`), `tests/test_fleet_restore.py` (incl. the concurrency fix
+above), `tests/test_agent_restore.py` (rewritten for staging),
+`tests/test_ui_restore.py` (incl. the sha256 display),
+`tests/test_restore_e2e.py` (rewritten for staging; full end-to-end over
+the real fleet app and real TLS: browser step simulated with `pyrage`,
+device fetch and staging for real, staged files and manifest compared
+byte-for-byte/hash-for-hash, and the landlord's key string confirmed
+absent from the fleet's sqlite file, every blob-storage file, and every
+file under the agent's own tmp tree afterward), `tests
+/test_device_registration_v1.py` (the `age_recipient` conflict fix) --
+plus fixes to five pre-existing tests whose own assertions pinned the
+*previous* CSP value/"no script anywhere" invariant (now: `script-src
+'self'`, external same-origin `<script>` permitted only for this
+feature's own vendored files).
+
+**Migration re-chaining (merge with main, 2026-09-28):** originally
+branched from `0012_fleet_epoch` (P5.1c) as `0013_restore`, in parallel
+with P5.3b's own `0013_diagnostic_bundles` (also branched from `0012`) --
+re-chained at merge onto `0014_restore`, `down_revision = "0013"`, the
+same "re-number, never reuse" convention this file's own "Merge
+integration" section above already established for the identical
+situation one revision earlier. Verified: `upgrade` from empty,
+`downgrade` to `0013`, `downgrade` to `base`, `upgrade` again.
 
 **Open points:**
 
-- `image/common/agent-compose.yml` still mounts `--thermoctl-db-file`/
-  `--zigbee2mqtt-dir` **read-only** (P5.5a's own choice, since backups
-  only ever read them) -- a real restore needs write access to those
-  paths, which this package's own agent-side code assumes but does not
-  itself change the compose file for (a deployment/image concern, not
-  exercised by this package's own tests, which write to plain `tmp_path`
-  directories instead).
+- **P5.5c (new, open, not started -- see `docs/implementation_plan.md`):**
+  a small, separate Go program next to the watchdog moves a staged
+  restore (`agent/restore.py`'s own staging directory and manifest) into
+  the live thermoctl/Zigbee2MQTT directories -- the authoritative
+  "is the live store actually empty" re-check (this package's own check is
+  advisory only, since the agent process has no write access to those
+  directories in the first place), manifest hash verification, refusing
+  symlinks/non-regular files in staging, and a status file the agent reads
+  back to report the final result. Same constraints as the watchdog
+  (CLAUDE.md security principle 6): Go, no dependency, no network, no
+  registry. Nothing in this package builds it -- P5.5b's own scope stops
+  at "decrypt and stage".
 - Device-configuration restore is currently "write the fetched JSON to
   `device_config.json` in the agent's data dir" -- there is no code yet
   that *applies* any of its fields (broker settings, WireGuard peer,
   timezone), matching `agent.loop.create_backup`'s own "nothing invented"
   reasoning for the same fields on the create side; applying it is future
-  work once those features themselves exist.
-- `protocol.version.PROTOCOL_VERSION` re-chaining: this package used 7,
-  leaving 6 for whichever other branch reserved it -- re-verify at merge
-  that no third branch also picked 7 independently.
+  work once those features themselves exist. Unaffected by the staging
+  change above -- device configuration carries no tenant data (section
+  15.1's own table), so it is still written directly, not staged.
 
 ## P5.1c -- SSE resume survives a fleet database restore (sections 3, 7)
 

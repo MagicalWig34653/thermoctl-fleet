@@ -21,6 +21,7 @@ from pyrage import x25519
 
 from fleet.app import app
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
+from fleet.restore_vendor import AGE_VENDOR_JS_SHA256
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from protocol.backups import BackupKind
@@ -173,6 +174,27 @@ def test_restore_form_offered_with_recipient_and_operational_backup(
     )
     assert key_field_match is not None
     assert "name=" not in key_field_match.group(0)
+
+
+def test_restore_form_shows_the_vendored_js_sha256(
+    client: TestClient,
+    storage: Storage,
+    blob_storage: BackupBlobStorage,
+    password: str,
+    totp_secret: str,
+    user_id: int,
+) -> None:
+    """Owner decision (a), cross-review, 2026-09-28: the page shows the
+    vendored script's own sha256 next to the form, so the landlord can
+    compare it against the value named in the operating manual."""
+
+    now = datetime.now(UTC)
+    _confirmed_device_with_recipient(storage, now)
+    _create_operational_backup(storage, blob_storage, now)
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}")
+    assert AGE_VENDOR_JS_SHA256 in response.text
 
 
 def test_restore_create_stores_the_ciphertext_and_redirects(

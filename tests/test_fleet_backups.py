@@ -252,10 +252,11 @@ def test_a_body_with_no_content_length_that_exceeds_the_cap_is_rejected_while_st
     client that is honest (or careless) about the header -- a request
     with no `Content-Length` at all (a generator body, matching how a real
     chunked-transfer upload would look) must still be caught by the
-    running-total check inside `_stream_backup_body`, whose `413`
-    propagates through `upload_backup`'s own outer `except BaseException:
-    pending.abort(); raise` wrapper -- exercised here, not only in the
-    narrower, `_stream_backup_body`-only unit tests below."""
+    running-total check inside `fleet.upload_streaming.stream_upload_body`,
+    whose `413` propagates through `upload_backup`'s own outer
+    `except BaseException: pending.abort(); raise` wrapper -- exercised
+    here, not only in the narrower, `stream_upload_body`-only unit tests
+    below."""
 
     import fleet.app as fleet_app_module
 
@@ -277,21 +278,25 @@ def test_a_body_with_no_content_length_that_exceeds_the_cap_is_rejected_while_st
 def test_stream_backup_body_stops_reading_as_soon_as_the_cap_is_exceeded(
     tmp_path: Path,
 ) -> None:
-    """Direct unit test of `fleet.app._stream_backup_body` (cross-review:
-    `await request.body()` used to buffer the entire body before the size
-    check ever ran) -- a synthetic async generator stands in for the
-    request body, counting how many chunks it actually yielded before the
-    function raises. Deliberately **not** an HTTP-level test: Starlette's
-    own `TestClient` buffers a request body fully before an app ever sees
-    it (verified empirically while building this fix), which would make
-    "did the handler stop reading early" untestable through an HTTP call
-    at all -- this function is factored out of the endpoint specifically
-    so its own, real streaming behaviour is directly testable instead."""
+    """Direct unit test of `fleet.upload_streaming.stream_upload_body`
+    (cross-review: `await request.body()` used to buffer the entire body
+    before the size check ever ran) -- a synthetic async generator stands
+    in for the request body, counting how many chunks it actually yielded
+    before the function raises. Deliberately **not** an HTTP-level test:
+    Starlette's own `TestClient` buffers a request body fully before an app
+    ever sees it (verified empirically while building this fix), which
+    would make "did the handler stop reading early" untestable through an
+    HTTP call at all -- this function is factored out of the endpoint
+    specifically so its own, real streaming behaviour is directly testable
+    instead. Moved here from `fleet.app` (P5.3b): the function itself now
+    lives in `fleet.upload_streaming`, shared with `POST
+    /v1/commands/{id}/bundle`'s own upload -- this test's own behaviour is
+    unchanged by that move."""
 
     import asyncio
 
-    from fleet.app import _stream_backup_body
     from fleet.backup_storage import BackupBlobStorage
+    from fleet.upload_streaming import stream_upload_body
     from protocol.backups import BackupKind
 
     chunks_yielded = 0
@@ -308,7 +313,7 @@ def test_stream_backup_body_stops_reading_as_soon_as_the_cap_is_exceeded(
     async def run() -> None:
         try:
             with pytest.raises(Exception) as excinfo:
-                await _stream_backup_body(body(), pending, max_bytes=250)
+                await stream_upload_body(body(), pending, max_bytes=250)
             assert getattr(excinfo.value, "status_code", None) == 413
         finally:
             pending.abort()
@@ -324,8 +329,8 @@ def test_stream_backup_body_stops_reading_as_soon_as_the_cap_is_exceeded(
 def test_stream_backup_body_reads_every_chunk_when_under_the_cap(tmp_path: Path) -> None:
     import asyncio
 
-    from fleet.app import _stream_backup_body
     from fleet.backup_storage import BackupBlobStorage
+    from fleet.upload_streaming import stream_upload_body
     from protocol.backups import BackupKind
 
     async def body() -> AsyncIterator[bytes]:
@@ -336,7 +341,7 @@ def test_stream_backup_body_reads_every_chunk_when_under_the_cap(tmp_path: Path)
     pending = storage.begin_upload(APARTMENT, BackupKind.DEVICE_CONFIG)
 
     async def run() -> tuple[int, str]:
-        return await _stream_backup_body(body(), pending, max_bytes=1000)
+        return await stream_upload_body(body(), pending, max_bytes=1000)
 
     total_bytes, content_hash = asyncio.run(run())
 
@@ -371,7 +376,7 @@ def test_operational_data_upload_with_the_header_but_no_recipient_stanza_is_reje
 def test_operational_data_upload_with_the_magic_but_no_newline_after_it_is_rejected(
     client: TestClient, token: str
 ) -> None:
-    """`_looks_like_an_age_file`'s own second check: the header magic
+    """`fleet.upload_streaming.looks_like_an_age_file`'s own second check: the header magic
     string glued directly onto something else, with no line break at all,
     is not a real age header line either (every real one is terminated by
     `\\n` before the first recipient stanza)."""

@@ -110,15 +110,19 @@ def _run_agent(args: argparse.Namespace) -> int:
             # P5.5b: always configured (unlike `backup_config`, restore has
             # no meaningful "disabled" state -- a freshly commissioned or
             # swapped device always needs to be able to notice a pending
-            # restore, section 15.3 step 4). Reuses the same
-            # `--thermoctl-db-file`/`--zigbee2mqtt-dir` paths as backups --
-            # see `docs/STATUS.md`'s P5.5b section for the open point that
-            # `image/common/agent-compose.yml` mounts them read-only today,
-            # which a real restore needs write access to.
+            # restore, section 15.3 step 4). `thermoctl_db_path`/
+            # `zigbee2mqtt_dir` reuse the same (owner decision:
+            # **read-only**) paths as backups -- `apply_pending_restore`
+            # only ever reads them for its early, advisory empty check.
+            # `staging_dir` is this device's own, agent-writable directory
+            # -- everything a restore actually writes goes there; moving
+            # it into the two paths above is P5.5c's separate mover's job
+            # (see `docs/STATUS.md`'s P5.5c section).
             restore_targets = RestoreTargets(
                 data_dir=data_dir,
                 thermoctl_db_path=Path(args.thermoctl_db_file),
                 zigbee2mqtt_dir=Path(args.zigbee2mqtt_dir),
+                staging_dir=Path(args.restore_staging_dir),
             )
             loop.run(
                 client,
@@ -237,6 +241,16 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "P5.5b: how often to poll the fleet for a pending restore "
             f"(section 15.3 step 4), default {DEFAULT_RESTORE_POLL_INTERVAL_S}s."
+        ),
+    )
+    run_parser.add_argument(
+        "--restore-staging-dir",
+        default=str(DEFAULT_DATA_DIR / "pending-restore"),
+        help=(
+            "P5.5b: this device's own, agent-writable staging directory for a "
+            "decrypted-but-not-yet-applied restore (owner decision, 2026-09-28: "
+            "the agent never writes the live thermoctl/Zigbee2MQTT data -- a "
+            "separate program, P5.5c, moves staged data into place)."
         ),
     )
 

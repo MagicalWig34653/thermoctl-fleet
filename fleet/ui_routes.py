@@ -27,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 from fleet.age_key_block import AgeKeyBlockError, validate_single_x25519_stanza
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
+from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
 from fleet.storage import Storage, get_storage
 from fleet.ui_apartment import (
@@ -1474,6 +1475,52 @@ def apartment_backup_download(
 
     extension = "age" if summary.kind == "operational_data" else "json"
     filename = f"{summary.kind}-{summary.backup_id}.{extension}"
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/apartments/{apartment_id:path}/commands/{command_id}/bundle/download")
+def apartment_diagnostic_bundle_download(
+    apartment_id: str,
+    command_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    bundle_storage: DiagnosticBundleBlobStorage = Depends(get_bundle_storage),  # noqa: B008
+) -> Response:
+    """Downloads one `diagnostic_bundle`'s raw, still-encrypted stored
+    bytes (P5.3b) -- **behind login** (`require_ui_user`, same as every
+    other `/ui` route and the same explicit condition `apartment_backup_download`
+    above already documents), keyed by the *command* it belongs to rather
+    than by a separate bundle id (a diagnostic bundle is displayed next to
+    its command in the "Befehle" history, not in its own list the way
+    backups are -- there is no second id the template would otherwise need
+    to carry).
+
+    Unknown `command_id`, or one that belongs to a different apartment
+    (`Storage.get_diagnostic_bundle_for_apartment_command` returns `None`
+    for both, deliberately indistinguishable -- see that method's own
+    docstring) -> 404. Served as `application/octet-stream`, **not**
+    decrypted, re-parsed, or otherwise touched -- exactly the age file the
+    agent produced, decryptable with `age -d -i <key> -o diagnose.tar
+    <file>` unchanged (the ready-made command
+    `fleet/templates/ui/apartment.html` already shows next to the download
+    link, `DiagnosticBundleDisplay.age_decrypt_command`)."""
+
+    summary = storage.get_diagnostic_bundle_for_apartment_command(apartment_id, command_id)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Unknown diagnostic bundle.")
+    storage_path = storage.get_diagnostic_bundle_storage_path(apartment_id, command_id)
+    if storage_path is None:  # pragma: no cover -- would mean the row above vanished mid-request
+        raise HTTPException(status_code=404, detail="Unknown diagnostic bundle.")
+    content = bundle_storage.read(storage_path)
+
+    filename = f"diagnostic-bundle-{summary.bundle_id}.age"
     return Response(
         content=content,
         media_type="application/octet-stream",

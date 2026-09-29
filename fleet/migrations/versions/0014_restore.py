@@ -18,15 +18,18 @@ Two changes:
   landlord's browser produced -- the fleet never sees, stores, or logs the
   plaintext key at any point (CLAUDE.md security principle 3).
 
-`down_revision` **"0012"** (`0012_fleet_epoch.py`, P5.1c) -- the current
-head at the time this package started; another package may also branch
-from "0012" in parallel, in which case the main session re-chains at
-merge, per this repository's own established convention (see
-`0012_fleet_epoch.py`'s own docstring for the identical situation one
-revision earlier).
+`down_revision` **"0013"** (`0013_diagnostic_bundles.py`, P5.3b) -- this
+package originally branched from "0012" (`0012_fleet_epoch.py`, P5.1c),
+the head at the time it started; re-chained onto "0013" at merge time (the
+main session's own established convention when two packages branch from
+the same head in parallel -- see `0012_fleet_epoch.py`'s and
+`0013_diagnostic_bundles.py`'s own docstrings for two earlier instances of
+the identical situation). Originally numbered `0013` itself -- renumbered
+to `0014` at the same merge, since `0013_diagnostic_bundles.py` already
+claimed that number.
 
-Revision ID: 0013
-Revises: 0012
+Revision ID: 0014
+Revises: 0013
 Create Date: 2026-09-28
 """
 
@@ -37,8 +40,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0013"
-down_revision: str | Sequence[str] | None = "0012"
+revision: str = "0014"
+down_revision: str | Sequence[str] | None = "0013"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

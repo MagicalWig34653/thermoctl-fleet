@@ -671,6 +671,73 @@ class CommandLogExcerptRecord(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
 
+class DiagnosticBundleRecord(Base):
+    """P5.3b: one stored `diagnostic_bundle` upload's metadata -- the
+    filesystem half (`fleet.bundle_storage.DiagnosticBundleBlobStorage`)
+    holds the actual, opaque, age-encrypted bytes, mirroring `BackupRecord`
+    /`fleet.backup_storage.BackupBlobStorage`'s own split exactly (a "few
+    hours" diagnostic bundle is not "kilobytes" either -- it does not
+    belong in a row a `SELECT *` might otherwise drag along).
+
+    `bundle_id` mirrors `BackupRecord.backup_id`'s own reasoning: a fresh,
+    random, wire-facing id, unique and indexed, deliberately not the
+    primary key. `command_id` is **also** unique and indexed -- "one bundle
+    per command" (section 7's own at-most-once execution contract, applied
+    here to storage, the same reasoning `CommandLogExcerptRecord.command_id`
+    already documents for `fetch_logs`) is a database-enforced constraint,
+    not only an application-level check in `Storage
+    .store_diagnostic_bundle`. `content_hash` is the SHA-256 hex digest of
+    the *uploaded* (encrypted) bytes, verified against the upload's own
+    claimed hash by `fleet.app.upload_diagnostic_bundle` before this row is
+    ever written -- shown nowhere in the UI beyond what the download
+    itself already proves, kept for the same "compare after decrypting"
+    convenience `BackupRecord.content_hash`'s own docstring describes.
+    """
+
+    __tablename__ = "diagnostic_bundles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bundle_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    command_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(512), nullable=False)
+
+
+@dataclass(frozen=True)
+class DiagnosticBundleSummary:
+    """What `fleet.ui_apartment`'s "Befehle" history and
+    `fleet.ui_routes.apartment_diagnostic_bundle_download` need -- mirrors
+    `BackupSummary`'s own "already detached from the session" shape."""
+
+    bundle_id: str
+    command_id: str
+    created_at: datetime
+    size_bytes: int
+    content_hash: str
+
+
+class StoreDiagnosticBundleOutcome(StrEnum):
+    """What `Storage.store_diagnostic_bundle` actually did --
+    `fleet.app.upload_diagnostic_bundle` maps each value to its own HTTP
+    status, mirroring `StoreLogExcerptOutcome`'s own established pattern
+    (below) for the sibling `fetch_logs` upload."""
+
+    # No `diagnostic_bundle` command with this id at all, for *this*
+    # apartment -- an unknown id, an id belonging to a different
+    # apartment, and an id naming a different command type are all
+    # deliberately the same outcome (see `store_diagnostic_bundle`'s own
+    # docstring for why, mirrors `StoreLogExcerptOutcome.NOT_FOUND`).
+    NOT_FOUND = "not_found"
+    # Stored for the first time.
+    STORED = "stored"
+    # A bundle already exists for this command id -- refused, not
+    # overwritten (one bundle per command).
+    ALREADY_EXISTS = "already_exists"
+
+
 class FleetEpochRecord(Base):
     """P5.1c: the one-row `fleet_epoch` table -- see
     `0012_fleet_epoch.py`'s own docstring for the full reasoning (SSE
@@ -1851,21 +1918,40 @@ class Storage:
         self, apartment_id: str, device_id: str, now: datetime
     ) -> tuple[PendingRestoreSummary, bytes] | None:
         """The device's own fetch (`fleet.app.fetch_pending_restore`) --
-        **atomic delete-then-return**: the row is removed in the same
-        statement that reads it (`DELETE ... RETURNING`), so a concurrent
-        second fetch (a retry, a replay, a second device racing the first)
-        always finds nothing, never the same block twice (owner decision:
-        "deletes it after one fetch").
+        **atomic delete-then-return, via a single guarded `DELETE ...
+        RETURNING` statement**, not a separate `SELECT` followed by a
+        `DELETE`: two threads (or processes) calling this at once for the
+        same apartment must never both see a row to return -- exactly one
+        `DELETE` can ever match and remove the row, the database's own
+        transaction isolation decides which, and the loser's statement
+        simply matches zero rows.
 
-        Returns `None` for no pending restore, an **expired** one (treated
-        identically to "none" -- also opportunistically deleted here, so
-        an expired row does not linger until some future sweep), or one
-        bound to a **different** device than `device_id` (security
-        principle 5's "only the device currently assigned to that
-        apartment" -- checked here, in storage, not left to the caller to
-        remember; see `PendingRestoreRecord`'s own docstring for why this
-        check is defense in depth on top of the apartment token itself
-        already having been revoked by any device swap in between).
+        **Cross-review finding (fixed here):** an earlier version of this
+        method read the row with a plain `SELECT`, decided in Python
+        whether to return/delete it, and only issued the `DELETE`
+        afterward -- a classic check-then-act race: two concurrent callers
+        could both read the same still-present row before either one's
+        `DELETE` ran, and both would return the same key block. Proven
+        fixed by `tests/test_fleet_restore.py
+        ::test_fetch_and_delete_pending_restore_is_race_safe_under_concurrency`
+        (ten threads, one real sqlite file database, separate sessions --
+        exactly one winner, every run).
+
+        The guarded `DELETE` below matches only a row for `apartment_id`,
+        bound to exactly `device_id` (security principle 5's "only the
+        device currently assigned to that apartment" -- checked here, in
+        storage, not left to the caller to remember; see
+        `PendingRestoreRecord`'s own docstring for why this check is
+        defense in depth on top of the apartment token itself already
+        having been revoked by any device swap in between), and not yet
+        expired. If it matches nothing, a second, best-effort (not
+        race-critical -- worst case, the periodic purge loop or a later
+        call catches it) read distinguishes "nothing pending" from "the
+        pending row is expired" so an expired row does not linger
+        needlessly; a row belonging to a **different** device is
+        deliberately never deleted by this method at all (owner decision:
+        "only the device currently assigned ... may fetch", not "the first
+        device to ask, successful or not, consumes it").
 
         Returns `(summary, key_block)` on success -- the raw ciphertext
         bytes, still age-encrypted, never decrypted anywhere in this
@@ -1873,30 +1959,43 @@ class Storage:
 
         normalized_now = _naive_utc(now)
         with self.session() as session:
-            row = session.scalar(
-                select(PendingRestoreRecord).where(
-                    PendingRestoreRecord.apartment_id == apartment_id
+            guarded_delete = (
+                delete(PendingRestoreRecord)
+                .where(
+                    PendingRestoreRecord.apartment_id == apartment_id,
+                    PendingRestoreRecord.device_id == device_id,
+                    PendingRestoreRecord.expires_at > normalized_now,
+                )
+                .returning(
+                    PendingRestoreRecord.id,
+                    PendingRestoreRecord.backup_id,
+                    PendingRestoreRecord.created_at,
+                    PendingRestoreRecord.expires_at,
+                    PendingRestoreRecord.key_block,
                 )
             )
+            row = session.execute(guarded_delete).first()
             if row is None:
-                return None
-            if row.expires_at <= normalized_now:
-                session.execute(
-                    delete(PendingRestoreRecord).where(PendingRestoreRecord.id == row.id)
+                # Either nothing pending, a wrong device, or an expired
+                # row -- distinguished only for the opportunistic cleanup
+                # below, never for the return value (always `None` here).
+                existing = session.scalar(
+                    select(PendingRestoreRecord).where(
+                        PendingRestoreRecord.apartment_id == apartment_id
+                    )
                 )
-                return None
-            if row.device_id != device_id:
-                # Deliberately **not** deleted here -- a wrong/second
-                # device asking does not consume the legitimate device's
-                # still-pending restore (owner decision: "only the device
-                # currently assigned ... may fetch", not "the first device
-                # to ask, successful or not, consumes it").
+                if existing is not None and existing.expires_at <= normalized_now:
+                    session.execute(
+                        delete(PendingRestoreRecord).where(
+                            PendingRestoreRecord.id == existing.id
+                        )
+                    )
                 return None
 
             summary = PendingRestoreSummary(
                 id=row.id,
-                apartment_id=row.apartment_id,
-                device_id=row.device_id,
+                apartment_id=apartment_id,
+                device_id=device_id,
                 backup_id=row.backup_id,
                 created_at=row.created_at.replace(tzinfo=UTC),
                 expires_at=row.expires_at.replace(tzinfo=UTC),
@@ -1911,9 +2010,8 @@ class Storage:
                 action="fetched",
                 reason=None,
                 before=None,
-                after={"backup_id": row.backup_id, "device_id": row.device_id},
+                after={"backup_id": row.backup_id, "device_id": device_id},
             )
-            session.execute(delete(PendingRestoreRecord).where(PendingRestoreRecord.id == row.id))
         return summary, key_block
 
     def purge_expired_pending_restores(self, now: datetime) -> int:
@@ -2410,6 +2508,189 @@ class Storage:
                 ),
             )
             return result.rowcount
+
+    # -- diagnostic bundles (P5.3b, sections 15.1, 21.5) --------------------------
+
+    def store_diagnostic_bundle(
+        self,
+        apartment_id: str,
+        command_id: str,
+        *,
+        size_bytes: int,
+        content_hash: str,
+        storage_path: str,
+        now: datetime,
+    ) -> tuple[StoreDiagnosticBundleOutcome, DiagnosticBundleSummary | None]:
+        """Stores one `diagnostic_bundle` upload's metadata
+        (`POST /v1/commands/{id}/bundle`).
+
+        **Scoped exactly like `store_log_excerpt`**: the command named by
+        `command_id` must exist, belong to `apartment_id`, and be a
+        `diagnostic_bundle` command -- any other case (unknown id, another
+        apartment's id, or an id naming a different command type) is
+        `NOT_FOUND`, deliberately indistinguishable (mirrors `store_log_excerpt`'s
+        own "an agent must not learn from this response that a given id
+        exists at all, just as the wrong type" reasoning).
+
+        **One bundle per command** -- a second upload for a command that
+        already has one is `ALREADY_EXISTS`, not silently overwritten (same
+        "a legitimate retry answers 'already stored', not a second,
+        possibly different row" reasoning `store_log_excerpt` already
+        documents, plus the database's own unique index on `command_id`
+        as a second, structural backstop).
+
+        Returns `(outcome, summary)` -- `summary` is only ever non-`None`
+        when `outcome is STORED`; the caller (`fleet.app
+        .upload_diagnostic_bundle`) needs the freshly generated `bundle_id`
+        and normalized `created_at` for the response body, which only this
+        method (not its caller) is in a position to produce.
+        """
+
+        with self.session() as session:
+            command = session.scalar(
+                select(CommandRecord).where(
+                    CommandRecord.command_id == command_id,
+                    CommandRecord.apartment_id == apartment_id,
+                    CommandRecord.command_type == str(CommandType.DIAGNOSTIC_BUNDLE),
+                )
+            )
+            if command is None:
+                return StoreDiagnosticBundleOutcome.NOT_FOUND, None
+
+            exists_already = session.scalar(
+                select(DiagnosticBundleRecord.id).where(
+                    DiagnosticBundleRecord.command_id == command_id
+                )
+            )
+            if exists_already is not None:
+                return StoreDiagnosticBundleOutcome.ALREADY_EXISTS, None
+
+            bundle_id = uuid.uuid4().hex
+            created_at = _naive_utc(now)
+            session.add(
+                DiagnosticBundleRecord(
+                    bundle_id=bundle_id,
+                    command_id=command_id,
+                    apartment_id=apartment_id,
+                    created_at=created_at,
+                    size_bytes=size_bytes,
+                    content_hash=content_hash,
+                    storage_path=storage_path,
+                )
+            )
+            return StoreDiagnosticBundleOutcome.STORED, DiagnosticBundleSummary(
+                bundle_id=bundle_id,
+                command_id=command_id,
+                created_at=created_at.replace(tzinfo=UTC),
+                size_bytes=size_bytes,
+                content_hash=content_hash,
+            )
+
+    def get_diagnostic_bundle_for_command(self, command_id: str) -> DiagnosticBundleSummary | None:
+        """The stored bundle's metadata for `command_id`, or `None` if none
+        was ever uploaded -- `fleet/ui_apartment.py`'s "Befehle" history
+        calls this once per `diagnostic_bundle` row it renders. **Not
+        itself scoped to an apartment** -- mirrors `get_log_excerpt_for_command`'s
+        own reasoning exactly: every caller already reads this only for
+        command rows obtained from `list_commands_for_apartment` (already
+        scoped)."""
+
+        with self.session() as session:
+            row = session.scalar(
+                select(DiagnosticBundleRecord).where(
+                    DiagnosticBundleRecord.command_id == command_id
+                )
+            )
+            if row is None:
+                return None
+            return DiagnosticBundleSummary(
+                bundle_id=row.bundle_id,
+                command_id=row.command_id,
+                created_at=row.created_at.replace(tzinfo=UTC),
+                size_bytes=row.size_bytes,
+                content_hash=row.content_hash,
+            )
+
+    def get_diagnostic_bundle_for_apartment_command(
+        self, apartment_id: str, command_id: str
+    ) -> DiagnosticBundleSummary | None:
+        """The stored bundle's metadata, scoped to `apartment_id` -- `None`
+        for an unknown command id *or* a bundle that belongs to a different
+        apartment (deliberately indistinguishable, mirrors `get_backup_for_apartment`'s
+        own "wrong token vs. unknown apartment" precedent): a landlord
+        logged in cannot even probe for another apartment's command ids via
+        the download route's response shape. Used by the download route
+        (`fleet.ui_routes.apartment_diagnostic_bundle_download`), unlike
+        `get_diagnostic_bundle_for_command` above (used only for display of
+        already-apartment-scoped rows)."""
+
+        with self.session() as session:
+            row = session.scalar(
+                select(DiagnosticBundleRecord).where(
+                    DiagnosticBundleRecord.apartment_id == apartment_id,
+                    DiagnosticBundleRecord.command_id == command_id,
+                )
+            )
+            if row is None:
+                return None
+            return DiagnosticBundleSummary(
+                bundle_id=row.bundle_id,
+                command_id=row.command_id,
+                created_at=row.created_at.replace(tzinfo=UTC),
+                size_bytes=row.size_bytes,
+                content_hash=row.content_hash,
+            )
+
+    def get_diagnostic_bundle_storage_path(
+        self, apartment_id: str, command_id: str
+    ) -> str | None:
+        """The stored blob's relative path, scoped to `apartment_id`
+        exactly like `get_diagnostic_bundle_for_apartment_command` -- a
+        separate method (rather than a field the UI dataclass carries
+        around) so the raw filesystem path is never accidentally threaded
+        through a view layer that has no business seeing it (mirrors
+        `get_backup_storage_path`'s own reasoning)."""
+
+        with self.session() as session:
+            return session.scalar(
+                select(DiagnosticBundleRecord.storage_path).where(
+                    DiagnosticBundleRecord.apartment_id == apartment_id,
+                    DiagnosticBundleRecord.command_id == command_id,
+                )
+            )
+
+    def delete_expired_diagnostic_bundles(self, now: datetime, retention: timedelta) -> list[str]:
+        """Deletes every stored bundle's metadata row whose `created_at` is
+        older than `retention` before `now`, and returns each deleted row's
+        `storage_path` -- the caller (`fleet.app
+        ._diagnostic_bundle_retention_loop`) deletes the corresponding blob
+        via `fleet.bundle_storage.DiagnosticBundleBlobStorage.delete`
+        **after** this transaction commits, never before (mirrors
+        `delete_backups`'s own "row first, then blob" ordering and its own
+        docstring's reasoning for why: a blob deleted first and a crash
+        before the row delete follows would leave a dangling row pointing
+        at nothing, the wrong way around for this "acceptable to retry"
+        cleanup job).
+
+        Counted from `created_at` (the fleet's own receipt time, the only
+        timestamp this table has -- unlike `CommandLogExcerptRecord`, there
+        is no separate agent-side `captured_at` to prefer over it here, a
+        diagnostic bundle upload has no equivalent field)."""
+
+        cutoff = _naive_utc(now) - retention
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(DiagnosticBundleRecord).where(
+                        DiagnosticBundleRecord.created_at < cutoff
+                    )
+                ).all()
+            )
+            paths = [row.storage_path for row in rows]
+            session.execute(
+                delete(DiagnosticBundleRecord).where(DiagnosticBundleRecord.created_at < cutoff)
+            )
+        return paths
 
     # -- alarms (P2.2, section 8) -------------------------------------------------
 

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import base64
 import secrets
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pyrage
 import pytest
@@ -356,3 +358,59 @@ def test_create_pending_restore_refuses_without_a_currently_assigned_device(
             now=NOW,
             ttl_s=900,
         )
+
+
+def test_fetch_and_delete_pending_restore_is_race_safe_under_concurrency(
+    storage: Storage, blob_storage: BackupBlobStorage
+) -> None:
+    """Two threads fetching the same pending restore at once, against the
+    real sqlite **file** database `storage` is backed by (not `:memory:`)
+    -- each thread opens its own session (`Storage.fetch_and_delete_pending
+    _restore` always does, via `Storage.session()`), the same "separate
+    sessions, one file-backed database" shape a real deployment's two
+    concurrent requests would actually have. Exactly one must get the key
+    block and summary back; the other must get `None`, never both, and
+    never neither."""
+
+    make_confirmed_device(
+        storage,
+        apartment_id=APARTMENT,
+        device_id=DEVICE,
+        verification_code="verif-concurrency",
+        now=NOW,
+        token="unused-token-for-this-test",
+    )
+    backup_id = _create_operational_backup(storage, blob_storage)
+    key_block = pyrage.encrypt(b"key", [x25519.Identity.generate().to_public()])
+    storage.create_pending_restore(
+        APARTMENT, backup_id, key_block, ui_username="landlord", now=NOW, ttl_s=900
+    )
+
+    results: list[tuple[Any, bytes] | None] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(10)
+
+    def _attempt() -> None:
+        barrier.wait()  # start all ten as close to simultaneously as possible
+        fetched = storage.fetch_and_delete_pending_restore(APARTMENT, DEVICE, NOW)
+        with lock:
+            results.append(fetched)
+
+    threads = [threading.Thread(target=_attempt) for _ in range(10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    successes = [result for result in results if result is not None]
+    failures = [result for result in results if result is None]
+    assert len(successes) == 1, f"expected exactly one winner, got {len(successes)}"
+    assert len(failures) == 9
+
+    winning_summary, winning_key_block = successes[0]
+    assert winning_summary.backup_id == backup_id
+    assert winning_key_block == key_block
+
+    # And the row is genuinely gone afterward -- not just invisible to the
+    # nine losers.
+    assert storage.get_pending_restore_status(APARTMENT) is None

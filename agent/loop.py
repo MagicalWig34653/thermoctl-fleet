@@ -16,20 +16,24 @@ additive, optional parameter for this package (`on_contact`, cross-review
 finding -- see that module's own docstring): every other P5.1 behaviour
 and test is unaffected.
 
-Only `report_now`/`fetch_logs`/`diagnostic_bundle`'s actual *effects* stay
-honest failures for now (each names the follow-up package that will
-replace it -- P2.3, P5.3) -- **never** a fake success. `agent_restart` is
-the one stage-1 command genuinely executed since P5.2; **`backup_now` is
-genuinely executed since P5.5a** (`create_backup`, `agent/encryption.py`,
-`_handle_backup_now`) -- both kinds of backup (device configuration,
-plain JSON; operational data, real `age` encryption to two recipients
-before anything touches an upload buffer, security principle 4), plus a
-daily scheduler (`run_daily_backup_scheduler`) and P5.4's future
-before-an-update hook (`run_before_update_backup`). Every other function
-below this point (`collect_heartbeat`, `send_heartbeat`,
-`reconcile_desired_state`, `factory_reset`, `create_diagnostic_bundle`,
-`open_access`, the eSIM stubs) is still a placeholder with
-`NotImplementedError` and a reference to the relevant section of the
+Only `report_now`'s actual *effect* stays an honest failure for now
+(names the follow-up package that will replace it -- P2.3) -- **never** a
+fake success. `agent_restart` is the one stage-1 command genuinely
+executed since P5.2; **`backup_now` is genuinely executed since P5.5a**
+(`create_backup`, `agent/encryption.py`, `_handle_backup_now`) -- both
+kinds of backup (device configuration, plain JSON; operational data, real
+`age` encryption to two recipients before anything touches an upload
+buffer, security principle 4), plus a daily scheduler
+(`run_daily_backup_scheduler`) and P5.4's future before-an-update hook
+(`run_before_update_backup`). **`diagnostic_bundle` is genuinely executed
+since P5.3b** (`create_diagnostic_bundle`, `_handle_diagnostic_bundle`) --
+end-to-end encrypted with the exact same mechanism as the operational-data
+backup (`agent/encryption.py`, no second procedure), a snapshot over a
+bounded recent window, never a series (section 21.5's own "Decided
+afterward" paragraph). Every other function below this point
+(`collect_heartbeat`, `send_heartbeat`, `reconcile_desired_state`,
+`factory_reset`, `open_access`, the eSIM stubs) is still a placeholder
+with `NotImplementedError` and a reference to the relevant section of the
 specification -- **none** of them contains an invented stopgap (such as a
 `print` instead of a real HTTP call), so that a test run immediately and
 unambiguously shows what is missing, instead of faking success.
@@ -67,6 +71,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import tarfile
@@ -75,7 +80,7 @@ import threading
 import time
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -100,6 +105,7 @@ from agent.safe_io import append_bytes_safe, read_text_safe
 from protocol import Command, CommandResult, DesiredState, Heartbeat, LogExcerpt
 from protocol.backups import BackupKind, BackupUploadAccepted
 from protocol.commands import CommandType
+from protocol.diagnostics import DiagnosticBundleUploadAccepted
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +433,199 @@ def read_container_log_lines(
         return _demultiplex_docker_log_stream(response.content)
 
 
+# `diagnostic_bundle` (P5.3b, section 21.5): "logs of the four services" --
+# the fixed set `protocol.desired_state.Services` already names
+# (thermoctl, zigbee2mqtt, mosquitto, agent) plus the agent's own
+# container, read the same local-socket-only way `read_container_log_lines`
+# already reads thermoctl's for `fetch_logs` (security principles 2/6: no
+# registry, no network, read-only).
+DIAGNOSTIC_BUNDLE_CONTAINERS: tuple[str, ...] = ("thermoctl", "zigbee2mqtt", "mosquitto", "agent")
+
+# Section 21.5's own "a bundle is a snapshot over a few hours, not a
+# channel" (also section 6's "Decided afterward" paragraph): the time
+# window every per-service log read below is bounded to. Deliberately a
+# small, fixed number of hours, not a caller-supplied one -- widening it
+# is exactly the "series instead of a snapshot" shift the specification
+# forbids, so it is not exposed as a `Command`/CLI parameter at all.
+DIAGNOSTIC_BUNDLE_WINDOW_HOURS = 6.0
+
+# Per-service bounds -- "Bound the bundle size" (work order): each of the
+# four services' own log is capped independently, both by line count and
+# by raw byte count (whichever is hit first), so one unusually chatty
+# service cannot make the whole bundle unboundedly large. 2000 lines is
+# four times `protocol.commands.MAX_LOG_EXCERPT_LINES` (500, `fetch_logs`'
+# own cap) -- generous, since this bundle is end-to-end encrypted and never
+# read unfiltered in the cloud the way `fetch_logs`'s masked output is, so
+# there is no per-line masking cost to bound against here, only overall
+# bundle size.
+DIAGNOSTIC_BUNDLE_MAX_LINES_PER_SERVICE = 2000
+DIAGNOSTIC_BUNDLE_MAX_BYTES_PER_SERVICE = 2_000_000
+# A best-effort cap on how much of Zigbee2MQTT's own `state.json` (if
+# present at all -- "if cheaply available", work order) is included
+# verbatim.
+DIAGNOSTIC_BUNDLE_MAX_ZIGBEE_STATE_BYTES = 500_000
+# A defense-in-depth backstop on the whole plaintext tar, checked once
+# after every per-service/manifest piece has already been added -- the
+# per-service caps above already bound this in practice (4 x 2 MB logs +
+# a small manifest + at most 500 kB of Zigbee state is well under this),
+# this only guards against a future change to one of those caps silently
+# producing an unexpectedly large bundle instead of a loud failure.
+DIAGNOSTIC_BUNDLE_MAX_TOTAL_BYTES = 20_000_000
+
+
+def read_container_log_window(
+    container: str,
+    since: datetime,
+    max_lines: int,
+    max_bytes: int,
+    *,
+    socket_path: Path = DEFAULT_DOCKER_SOCKET,
+) -> tuple[list[str], bool]:
+    """The real reader `create_diagnostic_bundle` uses for each of the four
+    services: every log line at or after `since` (the Docker Engine API's
+    own `since` query parameter, unix seconds -- section 21.5/6: a *bounded
+    recent window*, not the whole log), read from the local Unix socket
+    exactly like `read_container_log_lines` (no registry, no network,
+    read-only -- security principles 2/6 apply here too).
+
+    Capped at `max_lines` lines and `max_bytes` raw bytes of the underlying
+    (still-multiplexed) stream, **whichever is hit first** -- the response
+    is read in chunks (`httpx.Response.iter_bytes`) so an oversized log
+    never has to be fully buffered before the cap can take effect. Returns
+    `(lines, truncated)`; `truncated=True` means the cap, not the time
+    window, is why some of this window's own lines are missing -- the
+    manifest records this per service so a truncated service is visible,
+    never silently indistinguishable from "this service was quiet".
+
+    Raises `httpx.HTTPError`/`OSError` on any failure (socket missing,
+    container not found, ...) -- `create_diagnostic_bundle`'s own per-
+    service loop turns that into an honest "unavailable" note for that one
+    service, not a hard failure of the whole bundle (a diagnostic tool that
+    refuses to produce anything just because one of four services is down
+    would defeat its own purpose)."""
+
+    transport = httpx.HTTPTransport(uds=str(socket_path))
+    raw = bytearray()
+    truncated = False
+    with httpx.Client(transport=transport, base_url="http://docker") as client, client.stream(
+        "GET",
+        f"/containers/{container}/logs",
+        params={"stdout": "1", "stderr": "1", "since": str(int(since.timestamp()))},
+        timeout=30.0,
+    ) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            remaining = max_bytes - len(raw)
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(chunk) > remaining:
+                raw.extend(chunk[:remaining])
+                truncated = True
+                break
+            raw.extend(chunk)
+
+    lines = _demultiplex_docker_log_stream(bytes(raw))
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        truncated = True
+    return lines, truncated
+
+
+def read_container_state(
+    container: str, *, socket_path: Path = DEFAULT_DOCKER_SOCKET
+) -> dict[str, object]:
+    """One container's state, as reported by the local Docker Engine API
+    (`GET /containers/{name}/json`, local socket only, same reasoning as
+    `read_container_log_lines`) -- the small subset of that inspect
+    response section 21.5's "container states" actually asks for: running
+    status, when it started, its restart count, its health check status
+    (if any), and the image reference it is actually running (not the
+    desired-state digest, which `_build_device_config_snapshot`'s own
+    watchdog-state reading already covers separately).
+
+    Raises `httpx.HTTPError`/`OSError` on failure, exactly like
+    `read_container_log_window` -- the caller treats one container's
+    unreadable state the same "note it, do not abort the bundle" way."""
+
+    transport = httpx.HTTPTransport(uds=str(socket_path))
+    with httpx.Client(transport=transport, base_url="http://docker") as client:
+        response = client.get(f"/containers/{container}/json", timeout=30.0)
+        response.raise_for_status()
+        data = response.json()
+    state = data.get("State") or {}
+    health = state.get("Health") or {}
+    return {
+        "status": state.get("Status"),
+        "started_at": state.get("StartedAt"),
+        "restart_count": data.get("RestartCount"),
+        "health": health.get("Status"),
+        "image": data.get("Image"),
+    }
+
+
+def _read_memory_usage() -> dict[str, int] | None:
+    """A best-effort read of `/proc/meminfo` (Linux only -- the base
+    station's own OS, section 19.3/19.7) -- `None` if unreadable (a
+    non-Linux development machine, a sandboxed test environment, or a
+    genuinely missing `/proc`), never a fabricated value. No new dependency
+    (`psutil` or similar) for three numbers this module can read directly
+    from a well-known, stable kernel interface."""
+
+    try:
+        raw = Path("/proc/meminfo").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    values: dict[str, int] = {}
+    for line in raw.splitlines():
+        key, _, rest = line.partition(":")
+        rest = rest.strip()
+        if rest.endswith("kB"):
+            try:
+                values[key] = int(rest[:-2].strip()) * 1024
+            except ValueError:
+                continue
+    wanted = ("MemTotal", "MemFree", "MemAvailable")
+    filtered = {key: values[key] for key in wanted if key in values}
+    return filtered or None
+
+
+def _read_disk_usage(path: Path = Path("/")) -> dict[str, int] | None:
+    """`shutil.disk_usage`, wrapped so a path that does not exist in a test
+    environment degrades to "unavailable" rather than raising -- mirrors
+    `_read_memory_usage`'s own "best-effort, never fabricated" contract."""
+
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None
+    return {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free}
+
+
+def _read_zigbee_state(zigbee2mqtt_dir: Path | None, *, max_bytes: int) -> tuple[str | None, str]:
+    """Zigbee2MQTT's own `state.json` (device/group state, written by Z2M
+    itself as part of its normal operation), if present -- section 21.5's
+    "Zigbee network state, if cheaply available" read **literally**: this
+    is an already-written local file, not a fresh MQTT round trip to the
+    broker, exactly the "cheap" case the specification asks for. Returns
+    `(content, note)` -- `content` is `None` and `note` explains why
+    whenever `zigbee2mqtt_dir` was not configured, the file does not exist,
+    is unreadable, or exceeds `max_bytes` (never silently omitted without
+    saying so, the same "say so" rule the work order gives for the control-
+    decisions gap below)."""
+
+    if zigbee2mqtt_dir is None:
+        return None, "zigbee2mqtt_dir not configured for this agent."
+    state_path = zigbee2mqtt_dir / "state.json"
+    try:
+        raw = state_path.read_bytes()
+    except OSError as error:
+        return None, f"state.json not readable ({error})."
+    if len(raw) > max_bytes:
+        return None, f"state.json exceeds {max_bytes} bytes, skipped."
+    return raw.decode("utf-8", errors="replace"), "ok"
+
+
 @dataclass(frozen=True)
 class BackupConfig:
     """Everything `_handle_backup_now` (and the scheduled jobs,
@@ -476,7 +675,13 @@ class ExecutionContext:
     never executes `fetch_logs` (most existing tests of the other four
     handlers) -- see that handler's own docstring for why a missing client
     is an honest failure, not a crash.
-    """
+
+    `log_window_reader`/`state_reader` (P5.3b addition): what
+    `_handle_diagnostic_bundle` needs beyond `backup_config`/`client`
+    above -- the same "overridable reader, real Docker-socket default"
+    shape as `log_reader`, but for the diagnostic bundle's own time-
+    windowed, multi-container reads (`create_diagnostic_bundle`, not
+    `_handle_fetch_logs`, is what actually calls these)."""
 
     watchdog_state_path: Path
     local_log_path: Path
@@ -485,6 +690,14 @@ class ExecutionContext:
     client: httpx.Client | None = None
     log_reader: LogReader = read_container_log_lines
     thermoctl_container: str = DEFAULT_THERMOCTL_CONTAINER
+    log_window_reader: Callable[[str, datetime, int, int], tuple[list[str], bool]] = (
+        lambda container, since, max_lines, max_bytes: read_container_log_window(
+            container, since, max_lines, max_bytes
+        )
+    )
+    state_reader: Callable[[str], dict[str, object]] = (
+        lambda container: read_container_state(container)
+    )
 
 
 @dataclass(frozen=True)
@@ -590,7 +803,6 @@ def receive_commands(
 
 
 _HANDLER_MESSAGE_P23 = "Herzschlag-Erfassung noch nicht verfügbar (P2.3)."
-_HANDLER_MESSAGE_P53 = "noch nicht verfügbar (P5.3: Maskierung und Upload)."
 
 
 def _handle_report_now(command: Command, ctx: ExecutionContext) -> _HandlerResult:
@@ -683,14 +895,81 @@ def _handle_fetch_logs(command: Command, ctx: ExecutionContext) -> _HandlerResul
 
 
 def _handle_diagnostic_bundle(command: Command, ctx: ExecutionContext) -> _HandlerResult:
-    """`diagnostic_bundle` (section 21.5) needs the same masking as
-    `fetch_logs` above -- P5.3, not invented here. `create_diagnostic_bundle`
-    itself stays the `NotImplementedError` stub `tests/test_agent_loop.py`
-    already exercises directly; this handler does not call it, so a future
-    P5.3 replacing that stub does not have to also touch this mapping."""
+    """`diagnostic_bundle` (P5.3b, sections 15.1, 21.5): builds and uploads
+    the end-to-end encrypted diagnostic bundle -- mirrors `_handle_backup_now`'s
+    own shape exactly (reuses `ctx.backup_config` for `apartment_id`,
+    `agent_version`, `staging_dir`, `zigbee2mqtt_dir`, `client`, and
+    `recipients_file` -- **no second, duplicated configuration object**, the
+    project owner's own reasoning for reusing `agent/encryption.py` directly
+    applied one level up).
+
+    **Refuses cleanly** (an honest failed result, never a fake success) if
+    `ctx.backup_config` is `None` (the CLI's own `--apartment-id` etc. were
+    not given, same precondition `_handle_backup_now` already checks) or
+    `ctx.client` is `None` (no fleet client configured, same check
+    `_handle_fetch_logs` already makes) -- neither is a bug in this handler
+    itself.
+
+    Every failure from `create_diagnostic_bundle` (most prominently
+    `agent.encryption.RecipientsError` -- missing, unsafe, or insufficient
+    recipients, security principle 4's fail-closed rule) or from the upload
+    itself is caught and reported as a failed `CommandResult`, exactly like
+    `_handle_backup_now`'s own broadened `except Exception` (see that
+    handler's own docstring for why a plain `Exception`, not a narrow
+    tuple, is the right catch here too). The staged plaintext-free artifact
+    (`create_diagnostic_bundle` itself already removes every *intermediate*
+    plaintext file in its own `finally`, see that function's docstring) is
+    removed here in this handler's own `finally`, success or failure alike.
+    """
+
+    if ctx.backup_config is None:
+        return _HandlerResult(
+            successful=False,
+            error_text=(
+                "diagnostic_bundle abgelehnt: keine Backup-Konfiguration "
+                "(fehlende CLI-Argumente für 'python -m agent run', siehe --help)."
+            ),
+        )
+    if ctx.client is None:
+        return _HandlerResult(
+            successful=False,
+            error_text="diagnostic_bundle abgelehnt: kein Fleet-Client konfiguriert.",
+        )
+
+    try:
+        artifact = create_diagnostic_bundle(
+            apartment_id=ctx.backup_config.apartment_id,
+            agent_version=ctx.backup_config.agent_version,
+            staging_dir=ctx.backup_config.staging_dir,
+            now=ctx.now(),
+            watchdog_state_path=ctx.watchdog_state_path,
+            zigbee2mqtt_dir=ctx.backup_config.zigbee2mqtt_dir,
+            recipients_file=ctx.backup_config.recipients_file,
+            log_window_reader=ctx.log_window_reader,
+            state_reader=ctx.state_reader,
+        )
+    except Exception as error:
+        # Broad on purpose -- see `_handle_backup_now`'s own docstring for
+        # the identical reasoning, applied here to the same class of
+        # unanticipated file/tar/cryptography failure.
+        return _HandlerResult(
+            successful=False,
+            error_text=f"diagnostic_bundle fehlgeschlagen: {error}",
+        )
+
+    try:
+        accepted = upload_diagnostic_bundle(ctx.backup_config.client, command.id, artifact)
+    except httpx.HTTPError as error:
+        return _HandlerResult(
+            successful=False,
+            error_text=f"diagnostic_bundle: Upload fehlgeschlagen ({error}).",
+        )
+    finally:
+        artifact.path.unlink(missing_ok=True)
 
     return _HandlerResult(
-        successful=False, error_text=f"diagnostic_bundle {_HANDLER_MESSAGE_P53}"
+        successful=True,
+        error_text=f"Diagnosepaket hochgeladen ({accepted.size_bytes} Bytes).",
     )
 
 
@@ -1818,26 +2097,284 @@ def factory_reset() -> None:
     )
 
 
-def create_diagnostic_bundle() -> None:
-    """Builds a diagnostic bundle (section 21.5, command `diagnostic_bundle`,
-    stage 1).
+@dataclass(frozen=True)
+class DiagnosticBundleArtifact:
+    """One staged, **already-encrypted** diagnostic bundle, ready to
+    upload -- mirrors `BackupArtifact`'s own shape (`path`/`content_hash`/
+    `size_bytes`), minus `kind`: a diagnostic bundle is always exactly one
+    kind of thing, unlike a backup, so there is nothing for a `kind` field
+    to distinguish. `path` always points at the **encrypted** (`age`)
+    artifact -- there is no value of this type anywhere in this module that
+    represents an unencrypted bundle, the same invariant `BackupArtifact`'s
+    own docstring already states for `BackupKind.OPERATIONAL_DATA`."""
 
-    Logs of the four services, versions and digests, container states, memory and
-    disk usage, Zigbee network state, the last control decisions -- masked,
-    packaged, uploaded. **Explicitly there to make SSH access (section 21.4)
-    unnecessary in most cases**: a diagnostic bundle should answer the question for
-    which someone would otherwise open a session, without a back-channel ever
-    being created for it.
+    path: Path
+    content_hash: str
+    size_bytes: int
 
-    Like `create_backup`: masking is security-relevant (a log entry can contain
-    credentials or tenant data) and belongs, in the real implementation, in the
-    main session for cross-reading.
+
+def create_diagnostic_bundle(
+    *,
+    apartment_id: str,
+    agent_version: str,
+    staging_dir: Path,
+    now: datetime,
+    watchdog_state_path: Path | None = None,
+    containers: tuple[str, ...] = DIAGNOSTIC_BUNDLE_CONTAINERS,
+    zigbee2mqtt_dir: Path | None = None,
+    recipients_file: Path = DEFAULT_RECIPIENTS_FILE,
+    window_hours: float = DIAGNOSTIC_BUNDLE_WINDOW_HOURS,
+    log_window_reader: Callable[[str, datetime, int, int], tuple[list[str], bool]] = (
+        lambda container, since, max_lines, max_bytes: read_container_log_window(
+            container, since, max_lines, max_bytes
+        )
+    ),
+    state_reader: Callable[[str], dict[str, object]] = (
+        lambda container: read_container_state(container)
+    ),
+) -> DiagnosticBundleArtifact:
+    """Builds one `diagnostic_bundle` (P5.3b, sections 15.1, 21.5, and
+    section 6's own "Decided afterward" paragraph) and stages it, **already
+    end-to-end encrypted**, ready to upload -- the caller
+    (`_handle_diagnostic_bundle`) uploads the returned artifact and then
+    removes its `path`.
+
+    **Contents** (a tar, built under a private staging directory, mode
+    `0700`, every file in it mode `0600` -- `tempfile.mkdtemp`'s own
+    default plus an explicit `os.chmod`, and `tempfile.mkstemp`'s own
+    default respectively):
+
+    - `manifest.json` -- `apartment_id`, `agent_version`, `created_at`,
+      `window_hours`, the watchdog's own self-swap `agent_digest`/
+      `agent_proven_digest` if available (same reasoning and same reader,
+      `_read_watchdog_state`, as `_build_device_config_snapshot` -- section
+      13's own four service digests need P5.4's desired-state
+      reconciliation, not yet built, so they are **not** invented here
+      either), one entry per service under `containers` describing what was
+      captured (line/byte counts, whether it was truncated by the caps
+      below, or a short reason it was unavailable), each service's own
+      container state (`state_reader`), memory/disk usage
+      (`_read_memory_usage`/`_read_disk_usage`, `None` where unavailable),
+      Zigbee network state's own outcome (`_read_zigbee_state`), and an
+      explicit, honest note about control decisions (see below).
+    - `services/<container>.log` -- one file per entry in `containers`,
+      the last `window_hours` hours of that container's own log
+      (`log_window_reader`, capped per service by
+      `DIAGNOSTIC_BUNDLE_MAX_LINES_PER_SERVICE`/`_BYTES_PER_SERVICE`) --
+      **unfiltered**, unlike `agent.log_filter`'s allowlist for
+      `fetch_logs`: this bundle is end-to-end encrypted end to end
+      (project owner, 2026-09-27: "full content, encrypted ... the cloud
+      only ever sees an opaque block"), so masking would only discard
+      exactly the detail a real troubleshooting session needs, for no
+      confidentiality gain the encryption does not already provide. A
+      service whose log could not be read at all gets a one-line file
+      explaining why instead of being silently omitted.
+    - `zigbee/state.json` -- Zigbee2MQTT's own state file, verbatim, only
+      if `_read_zigbee_state` found one within its own size cap; its own
+      outcome is always recorded in the manifest regardless.
+
+    **Control decisions, honestly scoped down (work order): "if nothing is
+    available without new thermoctl endpoints, say so and include what
+    exists"** -- this scaffold has no thermoctl endpoint that exposes
+    control decisions as their own structured feed (section 10's "what
+    needs to change in thermoctl for this" does not yet list one), so
+    `manifest.json`'s own `control_decisions` entry records exactly that,
+    `available: false`, with a pointer to `services/thermoctl.log` within
+    this same bundle -- thermoctl's own log lines already carry whatever
+    decision-related detail it logs, within the same bounded window, and
+    are not duplicated into a second, redundant extraction here.
+
+    **Recipients validated before anything else is read or written**
+    (security principle 4, mirrors `create_backup`'s own ordering exactly):
+    `load_recipients` is called first, so a missing/unsafe/insufficient
+    recipients file (`agent.encryption.RecipientsError`) refuses the whole
+    bundle before a single log line has even been requested from Docker,
+    let alone written to disk. Every intermediate plaintext file (the tar,
+    the staging directory itself) is removed unconditionally in a `finally`
+    block, **including on every error path** -- exactly `create_backup`'s
+    own "no plaintext survives this call, success or failure" guarantee,
+    applied here to a tar built from several independent, individually-
+    fallible sources instead of one sqlite snapshot.
+
+    Raises `agent.encryption.RecipientsError` (recipients file missing,
+    unsafe, or insufficient) or an `OSError`/`tarfile.TarError` from the
+    underlying file operations -- `_handle_diagnostic_bundle` catches all
+    of these (a broad `except Exception`, same reasoning as
+    `_handle_backup_now`) and reports a failed result, never a fabricated
+    success. A single service's own log/state being unreadable is
+    **not** one of these -- see "Contents" above, it degrades to a note
+    instead of aborting the whole bundle.
     """
 
-    raise NotImplementedError(
-        "Creating and uploading the diagnostic bundle is missing -- see "
-        "docs/specification.md section 21.5."
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # **Recipients validated before any content is touched** (security
+    # principle 4) -- see this function's own docstring.
+    recipients = load_recipients(recipients_file)
+
+    since = now - timedelta(hours=window_hours)
+
+    bundle_dir = Path(tempfile.mkdtemp(dir=staging_dir, prefix="diagnostic-bundle-"))
+    os.chmod(bundle_dir, 0o700)
+    tar_fd, tar_path_str = tempfile.mkstemp(
+        dir=staging_dir, prefix="diagnostic-bundle-", suffix=".tar"
     )
+    os.close(tar_fd)
+    tar_path = Path(tar_path_str)
+
+    try:
+        services_manifest: dict[str, dict[str, object]] = {}
+        with tarfile.open(tar_path, mode="w") as tar:
+            for container in containers:
+                log_path = bundle_dir / f"{container}.log"
+                try:
+                    lines, truncated = log_window_reader(
+                        container,
+                        since,
+                        DIAGNOSTIC_BUNDLE_MAX_LINES_PER_SERVICE,
+                        DIAGNOSTIC_BUNDLE_MAX_BYTES_PER_SERVICE,
+                    )
+                except Exception as error:  # noqa: BLE001 -- one service's failure must not abort the bundle
+                    log_path.write_text(
+                        f"log unavailable for {container!r}: {error}\n", encoding="utf-8"
+                    )
+                    os.chmod(log_path, 0o600)
+                    services_manifest[container] = {"available": False, "error": str(error)}
+                else:
+                    content = "\n".join(lines) + ("\n" if lines else "")
+                    log_path.write_text(content, encoding="utf-8")
+                    os.chmod(log_path, 0o600)
+                    services_manifest[container] = {
+                        "available": True,
+                        "lines": len(lines),
+                        "truncated": truncated,
+                    }
+                try:
+                    services_manifest[container]["state"] = state_reader(container)
+                except Exception as error:  # noqa: BLE001 -- same "note, do not abort" reasoning
+                    services_manifest[container]["state_error"] = str(error)
+                tar.add(log_path, arcname=f"services/{container}.log")
+
+            zigbee_content, zigbee_note = _read_zigbee_state(
+                zigbee2mqtt_dir, max_bytes=DIAGNOSTIC_BUNDLE_MAX_ZIGBEE_STATE_BYTES
+            )
+            zigbee_manifest: dict[str, object] = {"note": zigbee_note}
+            if zigbee_content is not None:
+                zigbee_path = bundle_dir / "zigbee-state.json"
+                zigbee_path.write_text(zigbee_content, encoding="utf-8")
+                os.chmod(zigbee_path, 0o600)
+                tar.add(zigbee_path, arcname="zigbee/state.json")
+                zigbee_manifest["included"] = True
+            else:
+                zigbee_manifest["included"] = False
+
+            manifest: dict[str, object] = {
+                "apartment_id": apartment_id,
+                "agent_version": agent_version,
+                "created_at": now.astimezone(UTC).isoformat(),
+                "window_hours": window_hours,
+                "services": services_manifest,
+                "memory": _read_memory_usage(),
+                "disk": _read_disk_usage(),
+                "zigbee_state": zigbee_manifest,
+                "control_decisions": {
+                    "available": False,
+                    "note": (
+                        "No dedicated thermoctl endpoint exposes control decisions "
+                        "locally yet (see docs/specification.md section 21.5, "
+                        "P5.3b scope) -- see services/thermoctl.log in this same "
+                        "bundle for what that container's own log records within "
+                        "the same time window instead."
+                    ),
+                },
+            }
+            if watchdog_state_path is not None:
+                watchdog_state = _read_watchdog_state(watchdog_state_path)
+                if watchdog_state is not None:
+                    desired, proven = watchdog_state
+                    manifest["agent_digest"] = desired
+                    manifest["agent_proven_digest"] = proven
+
+            manifest_path = bundle_dir / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+            os.chmod(manifest_path, 0o600)
+            tar.add(manifest_path, arcname="manifest.json")
+
+        plaintext_size = tar_path.stat().st_size
+        if plaintext_size > DIAGNOSTIC_BUNDLE_MAX_TOTAL_BYTES:
+            raise ValueError(
+                f"diagnostic bundle exceeds {DIAGNOSTIC_BUNDLE_MAX_TOTAL_BYTES} "
+                f"bytes ({plaintext_size} bytes) before encryption -- refusing to "
+                "encrypt and upload an unexpectedly large bundle."
+            )
+
+        enc_fd, enc_path_str = tempfile.mkstemp(
+            dir=staging_dir, prefix="diagnostic-bundle-", suffix=".age"
+        )
+        os.close(enc_fd)
+        enc_path = Path(enc_path_str)
+        try:
+            with tar_path.open("rb") as source, enc_path.open("wb") as destination:
+                encrypt_stream(source, destination, recipients)
+        except BaseException:
+            enc_path.unlink(missing_ok=True)
+            raise
+
+        return DiagnosticBundleArtifact(
+            path=enc_path,
+            content_hash=_sha256_of_file(enc_path),
+            size_bytes=enc_path.stat().st_size,
+        )
+    finally:
+        # Every plaintext file this function created -- the whole staging
+        # directory (per-service logs, Zigbee state, manifest) and the
+        # plaintext tar -- is removed unconditionally, on every path
+        # through this block, success or exception alike. Never the
+        # encrypted `enc_path` above, this function's actual intended
+        # return value.
+        shutil.rmtree(bundle_dir, ignore_errors=True)
+        tar_path.unlink(missing_ok=True)
+
+
+def _read_diagnostic_bundle_upload_chunks(
+    path: Path, *, chunk_size: int = 1 << 20
+) -> Iterator[bytes]:
+    """Streams `path` in fixed-size chunks -- identical shape to
+    `_read_backup_upload_chunks`, kept as its own small function rather
+    than reusing that one directly so a future change to either upload's
+    own chunking need not accidentally couple the two."""
+
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+
+
+def upload_diagnostic_bundle(
+    client: httpx.Client, command_id: str, artifact: DiagnosticBundleArtifact
+) -> DiagnosticBundleUploadAccepted:
+    """`POST /v1/commands/{command_id}/bundle` (P5.3b) -- streams
+    `artifact.path` as the raw request body, `content_hash` as a query
+    parameter, mirrors `upload_backup`'s own documented reasoning for why
+    the metadata is not wrapped around the bytes as JSON. Raises
+    `httpx.HTTPError` (via `raise_for_status`) on anything other than
+    `201` -- `_handle_diagnostic_bundle` is this function's only caller and
+    turns that into a failed `CommandResult`, never a silent "uploaded"
+    that was not."""
+
+    response = client.post(
+        f"/v1/commands/{command_id}/bundle",
+        params={"content_hash": artifact.content_hash},
+        content=_read_diagnostic_bundle_upload_chunks(artifact.path),
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    response.raise_for_status()
+    return DiagnosticBundleUploadAccepted.model_validate(response.json())
 
 
 def open_access(pilot_mode: bool) -> None:

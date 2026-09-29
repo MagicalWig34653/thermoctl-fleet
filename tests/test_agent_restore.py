@@ -3,16 +3,26 @@ filesystem, no mocks of the encryption or unpacking logic; the fleet's own
 HTTP responses are simulated via `httpx.MockTransport`, the same pattern
 `tests/test_agent_registration.py` already establishes for this codebase's
 agent-side HTTP tests.
+
+Owner decision, 2026-09-28 (second "Decided afterward" paragraph, section
+15.3): the agent never writes the live thermoctl/Zigbee2MQTT data --
+`apply_pending_restore` only ever *stages* into its own, agent-writable
+directory. `thermoctl_db_path`/`zigbee2mqtt_dir` in these tests stand in
+for the **read-only** live mounts (only ever read, for the early advisory
+empty check); every assertion about what a successful restore actually
+*writes* looks under `targets.staging_dir` instead.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import tarfile
 import threading
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pyrage
@@ -20,10 +30,12 @@ from pyrage import x25519
 
 from agent.age_identity import load_or_create_identity, recipient_for
 from agent.restore import (
+    DETAIL_ALREADY_STAGED,
     DETAIL_DECRYPT_FAILED,
     DETAIL_MALFORMED_ARCHIVE,
+    DETAIL_STAGED,
     DETAIL_STORE_NOT_EMPTY,
-    DETAIL_SUCCESS,
+    MANIFEST_FILENAME,
     RestoreTargets,
     apply_pending_restore,
     check_and_apply_pending_restore,
@@ -63,6 +75,7 @@ def _build_pending_restore(
     landlord_identity: x25519.Identity | None = None,
     device_identity: x25519.Identity | None = None,
     device_config: bytes | None = None,
+    operational_backup_id: str = "backup-1",
 ) -> PendingRestore:
     """Builds a real, fully-encrypted `PendingRestore` -- mirrors exactly
     what `fleet.app.fetch_pending_restore` would hand the agent, and what
@@ -82,7 +95,7 @@ def _build_pending_restore(
     )
     return PendingRestore(
         key_block_b64=base64.b64encode(key_block).decode("ascii"),
-        operational_backup_id="backup-1",
+        operational_backup_id=operational_backup_id,
         operational_data_b64=base64.b64encode(operational_ciphertext).decode("ascii"),
         device_config_backup_id="backup-2" if device_config is not None else None,
         device_config_b64=(
@@ -98,25 +111,97 @@ def _targets(tmp_path: Path) -> RestoreTargets:
         data_dir=data_dir,
         thermoctl_db_path=tmp_path / "thermoctl" / "thermoctl.db",
         zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+        staging_dir=tmp_path / "staging",
     )
 
 
-def test_apply_pending_restore_writes_the_decrypted_files(tmp_path: Path) -> None:
+def _manifest(targets: RestoreTargets) -> dict[str, Any]:
+    manifest: dict[str, Any] = json.loads(
+        (targets.staging_dir / MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    return manifest
+
+
+def test_apply_pending_restore_stages_the_decrypted_files(tmp_path: Path) -> None:
     targets = _targets(tmp_path)
     pending = _build_pending_restore(targets.data_dir)
 
     result = apply_pending_restore(pending, targets)
 
     assert result.success is True
-    assert result.detail == DETAIL_SUCCESS
-    assert targets.thermoctl_db_path.read_bytes() == THERMOCTL_DB_CONTENT
-    assert (targets.zigbee2mqtt_dir / "database.db").read_bytes() == Z2M_DATABASE_CONTENT
+    assert result.detail == DETAIL_STAGED
+    assert (targets.staging_dir / "thermoctl.db").read_bytes() == THERMOCTL_DB_CONTENT
     assert (
-        targets.zigbee2mqtt_dir / "coordinator_backup.json"
+        targets.staging_dir / "zigbee2mqtt" / "database.db"
+    ).read_bytes() == Z2M_DATABASE_CONTENT
+    assert (
+        targets.staging_dir / "zigbee2mqtt" / "coordinator_backup.json"
     ).read_bytes() == Z2M_COORDINATOR_CONTENT
+    # Never the live, read-only mounts -- staging is the only place this
+    # function ever writes tenant data to.
+    assert not targets.thermoctl_db_path.exists()
+    assert not targets.zigbee2mqtt_dir.exists()
 
 
-def test_apply_pending_restore_writes_device_config_when_present(tmp_path: Path) -> None:
+def test_apply_pending_restore_never_claims_restored(tmp_path: Path) -> None:
+    """The success detail must never say "restored" -- only ever "staged,
+    awaiting apply" (owner decision, cross-review): this module only ever
+    stages; P5.5c's separate mover is what actually applies it."""
+
+    targets = _targets(tmp_path)
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is True
+    assert "restored" not in result.detail.lower()
+    assert result.detail == DETAIL_STAGED
+
+
+def test_apply_pending_restore_writes_a_manifest_with_correct_hashes(tmp_path: Path) -> None:
+    targets = _targets(tmp_path)
+    pending = _build_pending_restore(targets.data_dir, operational_backup_id="backup-xyz")
+
+    apply_pending_restore(pending, targets)
+
+    manifest = _manifest(targets)
+    assert manifest["backup_id"] == "backup-xyz"
+    assert isinstance(manifest["staged_at"], str) and manifest["staged_at"]
+    files_by_path = {entry["path"]: entry for entry in manifest["files"]}
+    assert set(files_by_path) == {
+        "thermoctl.db",
+        "zigbee2mqtt/database.db",
+        "zigbee2mqtt/coordinator_backup.json",
+    }
+    assert files_by_path["thermoctl.db"]["size_bytes"] == len(THERMOCTL_DB_CONTENT)
+    assert files_by_path["thermoctl.db"]["sha256"] == hashlib.sha256(
+        THERMOCTL_DB_CONTENT
+    ).hexdigest()
+    assert files_by_path["zigbee2mqtt/database.db"]["sha256"] == hashlib.sha256(
+        Z2M_DATABASE_CONTENT
+    ).hexdigest()
+
+
+def test_apply_pending_restore_manifest_written_last(tmp_path: Path) -> None:
+    """The manifest's own presence is this module's "already staged" check
+    -- it must therefore never exist before every staged data file has
+    already been written successfully. Exercised indirectly: a malformed
+    archive (fails after the empty/already-staged checks but before any
+    file is staged) must leave no manifest behind at all."""
+
+    targets = _targets(tmp_path)
+    pending = _build_pending_restore(targets.data_dir, tar_bytes=b"not a tar file")
+
+    apply_pending_restore(pending, targets)
+
+    assert not (targets.staging_dir / MANIFEST_FILENAME).exists()
+
+
+def test_apply_pending_restore_writes_device_config_directly_not_staged(tmp_path: Path) -> None:
+    """Device configuration is not tenant data (section 15.1's own table)
+    -- written straight to `data_dir`, never staged, never gated by the
+    empty-store check."""
+
     targets = _targets(tmp_path)
     device_config = b'{"apartment_id": "house7-a03"}'
     pending = _build_pending_restore(targets.data_dir, device_config=device_config)
@@ -125,6 +210,7 @@ def test_apply_pending_restore_writes_device_config_when_present(tmp_path: Path)
 
     assert result.success is True
     assert (targets.data_dir / "device_config.json").read_bytes() == device_config
+    assert not (targets.staging_dir / "device_config.json").exists()
 
 
 def test_apply_pending_restore_refuses_when_thermoctl_db_already_has_content(
@@ -139,10 +225,10 @@ def test_apply_pending_restore_refuses_when_thermoctl_db_already_has_content(
 
     assert result.success is False
     assert result.detail == DETAIL_STORE_NOT_EMPTY
-    # Nothing was touched -- the pre-existing file is untouched, and no
-    # Zigbee2MQTT directory was ever created.
+    # Nothing was touched -- the pre-existing (read-only, in real
+    # deployment) file is untouched, and nothing was staged.
     assert targets.thermoctl_db_path.read_bytes() == b"existing tenant data"
-    assert not targets.zigbee2mqtt_dir.exists()
+    assert not targets.staging_dir.exists()
 
 
 def test_apply_pending_restore_refuses_when_zigbee2mqtt_already_has_content(
@@ -157,7 +243,7 @@ def test_apply_pending_restore_refuses_when_zigbee2mqtt_already_has_content(
 
     assert result.success is False
     assert result.detail == DETAIL_STORE_NOT_EMPTY
-    assert not targets.thermoctl_db_path.exists()
+    assert not targets.staging_dir.exists()
 
 
 def test_apply_pending_restore_empty_thermoctl_file_still_counts_as_empty(
@@ -177,7 +263,27 @@ def test_apply_pending_restore_empty_thermoctl_file_still_counts_as_empty(
     assert result.success is True
 
 
-def test_apply_pending_restore_wrong_key_fails_cleanly_nothing_written(tmp_path: Path) -> None:
+def test_apply_pending_restore_refuses_when_a_staged_restore_already_exists(
+    tmp_path: Path,
+) -> None:
+    """Owner decision: "Refuse if a staged restore already exists and has
+    not been consumed" -- a manifest already present means a previous
+    restore is still waiting for P5.5c's mover; nothing is overwritten."""
+
+    targets = _targets(tmp_path)
+    targets.staging_dir.mkdir(parents=True, mode=0o700)
+    (targets.staging_dir / MANIFEST_FILENAME).write_text('{"already": "here"}')
+    pending = _build_pending_restore(targets.data_dir)
+
+    result = apply_pending_restore(pending, targets)
+
+    assert result.success is False
+    assert result.detail == DETAIL_ALREADY_STAGED
+    # The pre-existing manifest is untouched.
+    assert (targets.staging_dir / MANIFEST_FILENAME).read_text() == '{"already": "here"}'
+
+
+def test_apply_pending_restore_wrong_key_fails_cleanly_nothing_staged(tmp_path: Path) -> None:
     """A key block encrypted to a *different* device identity than the one
     actually stored on disk -- the device cannot unwrap it at all."""
 
@@ -191,8 +297,7 @@ def test_apply_pending_restore_wrong_key_fails_cleanly_nothing_written(tmp_path:
 
     assert result.success is False
     assert result.detail == DETAIL_DECRYPT_FAILED
-    assert not targets.thermoctl_db_path.exists()
-    assert not targets.zigbee2mqtt_dir.exists()
+    assert not targets.staging_dir.exists()
 
 
 def test_apply_pending_restore_malformed_archive_fails_cleanly(tmp_path: Path) -> None:
@@ -205,7 +310,7 @@ def test_apply_pending_restore_malformed_archive_fails_cleanly(tmp_path: Path) -
 
     assert result.success is False
     assert result.detail == DETAIL_MALFORMED_ARCHIVE
-    assert not targets.thermoctl_db_path.exists()
+    assert not targets.staging_dir.exists()
 
 
 def test_apply_pending_restore_thermoctl_member_as_a_directory_fails_cleanly(
@@ -243,8 +348,7 @@ def test_apply_pending_restore_missing_thermoctl_member_fails_cleanly(tmp_path: 
 
     assert result.success is False
     assert result.detail == DETAIL_MALFORMED_ARCHIVE
-    assert not targets.thermoctl_db_path.exists()
-    assert not targets.zigbee2mqtt_dir.exists()
+    assert not targets.staging_dir.exists()
 
 
 def test_apply_pending_restore_never_writes_the_landlord_identity_string_anywhere(
@@ -327,8 +431,8 @@ def test_check_and_apply_pending_restore_applies_and_reports_success(tmp_path: P
     )
 
     assert check_and_apply_pending_restore(client, targets) is True
-    assert reported["json"] == {"success": True, "detail": DETAIL_SUCCESS}
-    assert targets.thermoctl_db_path.read_bytes() == THERMOCTL_DB_CONTENT
+    assert reported["json"] == {"success": True, "detail": DETAIL_STAGED}
+    assert (targets.staging_dir / "thermoctl.db").read_bytes() == THERMOCTL_DB_CONTENT
 
 
 def test_check_and_apply_pending_restore_reports_failure_on_wrong_key(tmp_path: Path) -> None:

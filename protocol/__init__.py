@@ -21,6 +21,10 @@ from protocol.backups import (
 )
 from protocol.commands import Command, CommandResult, CommandType, LogExcerpt
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
+from protocol.diagnostics import (
+    MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES,
+    DiagnosticBundleUploadAccepted,
+)
 from protocol.events import (
     Event,
     FaultEvent,
@@ -60,6 +64,7 @@ from protocol.version import PROTOCOL_VERSION
 __all__ = [
     "AGE_HEADER_MAGIC",
     "MAX_BACKUP_UPLOAD_BYTES",
+    "MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES",
     "PROTOCOL_VERSION",
     "AgeRecipientReport",
     "AgentRegistrationFile",
@@ -76,6 +81,7 @@ __all__ = [
     "Device",
     "DeviceLifecycle",
     "DeviceState",
+    "DiagnosticBundleUploadAccepted",
     "Event",
     "FaultEvent",
     "FaultKind",
