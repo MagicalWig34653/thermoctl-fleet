@@ -2506,13 +2506,37 @@ class Storage:
         new revision number and the per-service digests -- never a
         temperature, setpoint, or any other section-6 value, since none of
         those exist on `DesiredState` to begin with).
+
+        **Race (cross-review, main-session): "SELECT max() then INSERT" is
+        not atomic on its own** -- two concurrent submissions for the same
+        apartment (a genuine double-click, or two landlords) can both read
+        the same current-max revision and both try to insert the same
+        `(apartment_id, revision)` pair, which `uq_desired_states_apartment
+        _revision` then refuses for the loser as an `IntegrityError`. Fixed
+        the same way `create_command_unless_duplicate` already fixes the
+        identical shape of race for commands: the apartment row is locked
+        for the duration of this transaction before the `max()` read even
+        runs (`BEGIN IMMEDIATE` on SQLite -- this repository's only tested
+        dialect, `with_for_update()` elsewhere), so a second concurrent
+        caller simply waits for the first transaction to commit or roll
+        back (SQLite's own 30s busy timeout, `create_engine_from_url`) and
+        then computes its revision against the now-committed result,
+        rather than racing it. No `IntegrityError` can reach this method's
+        caller under this lock; belt-and-braces, not a substitute for the
+        lock -- see `tests/test_fleet_desired_state.py
+        ::test_create_desired_state_revision_serializes_concurrent_callers`
+        for a real two-thread test against a file-backed SQLite database.
         """
 
         if not reason.strip():
             raise ValueError("A reason is required for every desired-state change.")
 
         with self.session() as session:
-            apartment = session.get(ApartmentRecord, apartment_id)
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            apartment = session.scalar(
+                select(ApartmentRecord).where(ApartmentRecord.id == apartment_id).with_for_update()
+            )
             if apartment is None:
                 raise ValueError(f"Unknown apartment {apartment_id!r}.")
             if apartment.state == "retired":

@@ -24,11 +24,12 @@ from fastapi.testclient import TestClient
 
 import fleet.storage as storage_module
 from fleet.alarms import ABSENCE_THRESHOLD
-from fleet.storage import Storage, create_storage, get_storage, upgrade
+from fleet.storage import DesiredStateOutcomeRecord, Storage, create_storage, get_storage, upgrade
 from fleet.ui_apartment import (
     DEFAULT_HISTORY_DAYS,
     MAX_HISTORY_DAYS,
     build_apartment_detail,
+    build_desired_state_outcome_display,
     clamp_history_days,
 )
 from fleet.ui_auth import generate_totp_secret, hash_password
@@ -933,3 +934,41 @@ def test_no_inline_style_or_script_in_the_apartment_template() -> None:
     for line in text.splitlines():
         if "<script" in line:
             assert 'src="/ui/static/' in line, line
+
+
+def test_build_desired_state_outcome_display_service_none_maps_to_none_label() -> None:
+    """`fleet/ui_apartment.py`'s own service-label ternary: a reported
+    outcome with no `service` (the pre-check rejected before a service was
+    ever selected, `agent.loop.ReconcileOutcome.service`'s own default)
+    must render with no label at all, not a crash or a placeholder
+    string."""
+
+    record = DesiredStateOutcomeRecord(
+        id=1,
+        apartment_id=APARTMENT,
+        revision=1,
+        successful=False,
+        reason="pilot_mode is not set for this apartment.",
+        service=None,
+        reported_at=BASE_TIME,
+    )
+
+    display = build_desired_state_outcome_display(record)
+
+    assert display.service_label is None
+
+
+def test_build_desired_state_outcome_display_known_service_maps_to_its_label() -> None:
+    record = DesiredStateOutcomeRecord(
+        id=1,
+        apartment_id=APARTMENT,
+        revision=2,
+        successful=True,
+        reason="swap confirmed healthy.",
+        service="zigbee2mqtt",
+        reported_at=BASE_TIME,
+    )
+
+    display = build_desired_state_outcome_display(record)
+
+    assert display.service_label == "Zigbee2MQTT"

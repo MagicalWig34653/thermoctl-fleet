@@ -1,15 +1,16 @@
-"""P5.4b: `agent.loop.run`'s own desired-state wiring -- receive the SSE
-`desired_state` event, ignore a stale revision, persist the new one, call
-`reconcile_desired_state` with the delivered `pilot_mode`, and report the
-outcome via `POST /v1/desired-state/result`.
+"""P5.4b: `agent.loop.run`'s own desired-state wiring, end to end against
+the **real** `fleet.app.app` over **real** TLS, mirroring
+`tests/test_agent_loop_run.py`'s own approach exactly.
 
-Against the **real** `fleet.app.app` over **real** TLS, mirroring
-`tests/test_agent_loop_run.py`'s own approach exactly -- no mock of TLS or
-of the fleet app's behaviour anywhere in this file. Every test also
-delivers an `agent_restart` command after the desired-state revision, so
-`run`'s own existing, already-tested exit path (`exit_after_report`) is
-what stops the loop -- this file's own job is only whether the
-desired-state item was handled correctly along the way.
+The bookkeeping one layer below `run` (hold/ignore/persist/retry/dedup) is
+exhaustively unit-tested in `tests/test_agent_desired_state_reconciler.py`
+-- this file's own job is only whether `run` wires the SSE delivery, the
+held-state file, and the background reconcile thread together correctly,
+using `reconcile_desired_state` for real (never monkeypatched here).
+
+Every test also delivers an `agent_restart` command after the
+desired-state revision, so `run`'s own existing, already-tested exit path
+(`exit_after_report`) is what stops the loop.
 """
 
 from __future__ import annotations
@@ -21,12 +22,18 @@ from pathlib import Path
 
 import pytest
 
-from agent.loop import BackupConfig, run
+from agent.loop import BackupConfig, _load_held_desired_state, _save_held_desired_state, run
 from agent.transport import build_client
 from fleet.app import app
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from protocol.commands import CommandType
-from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
+from protocol.desired_state import (
+    DesiredState,
+    DesiredStateEvent,
+    Services,
+    ServiceState,
+    UpdateWindow,
+)
 from tests.tls_support import run_tls_fleet_app
 
 APARTMENT = "house7-a03"
@@ -82,6 +89,34 @@ def _issue_token(storage: Storage, apartment: str = APARTMENT) -> str:
     return token
 
 
+def _run(
+    client: object,
+    tmp_path: Path,
+    *,
+    backup_config: BackupConfig | None = None,
+    held_state_path: Path | None = None,
+    interval_s: float = 3600.0,
+) -> None:
+    run(
+        client,  # type: ignore[arg-type]
+        last_event_id_path=tmp_path / "last-event-id",
+        outbox_path=tmp_path / "outbox.json",
+        executed_ids_path=tmp_path / "executed-ids",
+        local_log_path=tmp_path / "agent.log",
+        watchdog_state_path=tmp_path / "watchdog-state.env",
+        led_status_path=tmp_path / "led-status.env",
+        backup_config=backup_config,
+        pending_swap_path=tmp_path / "pending-swap.json",
+        desired_state_held_state_path=held_state_path or (tmp_path / "desired-state-held"),
+        # Long enough that the background thread's own periodic tick never
+        # fires during these short-lived tests -- every outcome asserted
+        # here comes from the *immediate* attempt `_handle_desired_state_received`
+        # triggers, not a coincidental periodic one.
+        desired_state_reconcile_interval_s=interval_s,
+        exit_fn=lambda code: None,
+    )
+
+
 def test_run_reports_pilot_mode_rejection_for_a_delivered_desired_state(
     tmp_path: Path, app_storage: Storage
 ) -> None:
@@ -101,6 +136,7 @@ def test_run_reports_pilot_mode_rejection_for_a_delivered_desired_state(
         now=datetime.now(UTC),
     )
 
+    held_state_path = tmp_path / "desired-state-held"
     with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
         with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
             client.headers["Authorization"] = f"Bearer {token}"
@@ -113,35 +149,23 @@ def test_run_reports_pilot_mode_rejection_for_a_delivered_desired_state(
                 client=client,
                 recipients_file=tmp_path / "recipients.txt",
             )
-            run(
-                client,
-                last_event_id_path=tmp_path / "last-event-id",
-                outbox_path=tmp_path / "outbox.json",
-                executed_ids_path=tmp_path / "executed-ids",
-                local_log_path=tmp_path / "agent.log",
-                watchdog_state_path=tmp_path / "watchdog-state.env",
-                led_status_path=tmp_path / "led-status.env",
-                backup_config=backup_config,
-                pending_swap_path=tmp_path / "pending-swap.json",
-                desired_state_last_revision_path=tmp_path / "desired-state-last-revision",
-                exit_fn=lambda code: None,
-            )
+            _run(client, tmp_path, backup_config=backup_config, held_state_path=held_state_path)
 
     outcome = app_storage.latest_desired_state_outcome(APARTMENT)
     assert outcome is not None
     assert outcome.successful is False
     assert "pilot_mode" in outcome.reason
 
-    persisted = (tmp_path / "desired-state-last-revision").read_text(encoding="utf-8").strip()
-    assert persisted == "1"
+    held = _load_held_desired_state(held_state_path)
+    assert held is not None
+    assert held.desired_state.revision == 1
 
 
 def test_run_ignores_a_stale_desired_state_revision(
     tmp_path: Path, app_storage: Storage
 ) -> None:
-    """A revision no greater than what was already persisted as applied
-    must never reach `reconcile_desired_state`/report an outcome at all
-    (P5.4b scope item 4)."""
+    """A revision no greater than the currently held one must never
+    replace it or trigger a fresh reconcile attempt at all."""
 
     token = _issue_token(app_storage)
     app_storage.create_desired_state_revision(
@@ -153,38 +177,26 @@ def test_run_ignores_a_stale_desired_state_revision(
         now=datetime.now(UTC),
     )
 
-    last_revision_path = tmp_path / "desired-state-last-revision"
-    last_revision_path.write_text("1", encoding="utf-8")
+    held_state_path = tmp_path / "desired-state-held"
+    # Already holding revision 2 -- the delivered revision 1 must be
+    # ignored as stale, never replacing this.
+    already_held = DesiredStateEvent(desired_state=_desired_state(revision=2), pilot_mode=False)
+    _save_held_desired_state(held_state_path, already_held)
 
     with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
         with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
             client.headers["Authorization"] = f"Bearer {token}"
-            run(
-                client,
-                last_event_id_path=tmp_path / "last-event-id",
-                outbox_path=tmp_path / "outbox.json",
-                executed_ids_path=tmp_path / "executed-ids",
-                local_log_path=tmp_path / "agent.log",
-                watchdog_state_path=tmp_path / "watchdog-state.env",
-                led_status_path=tmp_path / "led-status.env",
-                desired_state_last_revision_path=last_revision_path,
-                exit_fn=lambda code: None,
-            )
+            _run(client, tmp_path, held_state_path=held_state_path)
 
-    # Ignored -- never reconciled, never reported.
-    assert app_storage.latest_desired_state_outcome(APARTMENT) is None
-    # The bookmark is unchanged (still exactly what was pre-written), not
-    # bumped for an ignored revision.
-    assert last_revision_path.read_text(encoding="utf-8").strip() == "1"
+    # The held state is unchanged -- still revision 2, not overwritten by
+    # the stale revision-1 delivery.
+    held = _load_held_desired_state(held_state_path)
+    assert held == already_held
 
 
-def test_run_reports_a_newer_revision_after_ignoring_a_stale_one(
+def test_run_accepts_a_newer_revision_and_replaces_the_held_state(
     tmp_path: Path, app_storage: Storage
 ) -> None:
-    """The mirror image of the stale-revision test: revision 2 (greater
-    than the persisted 1) must still be picked up and reported, proving
-    the stale-check is a `<=` comparison, not an unconditional skip."""
-
     token = _issue_token(app_storage)
     app_storage.create_desired_state_revision(
         APARTMENT, _desired_state(revision=1), ui_username="landlord", reason="first",
@@ -199,8 +211,11 @@ def test_run_reports_a_newer_revision_after_ignoring_a_stale_one(
         now=datetime.now(UTC),
     )
 
-    last_revision_path = tmp_path / "desired-state-last-revision"
-    last_revision_path.write_text("1", encoding="utf-8")
+    held_state_path = tmp_path / "desired-state-held"
+    _save_held_desired_state(
+        held_state_path,
+        DesiredStateEvent(desired_state=_desired_state(revision=1), pilot_mode=False),
+    )
 
     with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
         with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
@@ -214,23 +229,14 @@ def test_run_reports_a_newer_revision_after_ignoring_a_stale_one(
                 client=client,
                 recipients_file=tmp_path / "recipients.txt",
             )
-            run(
-                client,
-                last_event_id_path=tmp_path / "last-event-id",
-                outbox_path=tmp_path / "outbox.json",
-                executed_ids_path=tmp_path / "executed-ids",
-                local_log_path=tmp_path / "agent.log",
-                watchdog_state_path=tmp_path / "watchdog-state.env",
-                led_status_path=tmp_path / "led-status.env",
-                backup_config=backup_config,
-                desired_state_last_revision_path=last_revision_path,
-                exit_fn=lambda code: None,
-            )
+            _run(client, tmp_path, backup_config=backup_config, held_state_path=held_state_path)
 
     outcome = app_storage.latest_desired_state_outcome(APARTMENT)
     assert outcome is not None
     assert outcome.revision == 2
-    assert last_revision_path.read_text(encoding="utf-8").strip() == "2"
+    held = _load_held_desired_state(held_state_path)
+    assert held is not None
+    assert held.desired_state.revision == 2
 
 
 def test_run_reports_disabled_reconciliation_when_backup_config_missing(
@@ -253,19 +259,25 @@ def test_run_reports_disabled_reconciliation_when_backup_config_missing(
     with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
         with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
             client.headers["Authorization"] = f"Bearer {token}"
-            run(
-                client,
-                last_event_id_path=tmp_path / "last-event-id",
-                outbox_path=tmp_path / "outbox.json",
-                executed_ids_path=tmp_path / "executed-ids",
-                local_log_path=tmp_path / "agent.log",
-                watchdog_state_path=tmp_path / "watchdog-state.env",
-                led_status_path=tmp_path / "led-status.env",
-                desired_state_last_revision_path=tmp_path / "desired-state-last-revision",
-                exit_fn=lambda code: None,
-            )
+            _run(client, tmp_path)
 
     outcome = app_storage.latest_desired_state_outcome(APARTMENT)
     assert outcome is not None
     assert outcome.successful is False
     assert "backup_config" in outcome.reason
+
+
+# "Restart keeps the held state" is covered deterministically at the unit
+# level (`tests/test_agent_desired_state_reconciler.py
+# ::test_a_fresh_reconciler_instance_picks_up_a_previously_held_state`) --
+# a fresh `_DesiredStateReconciler` reconciling a pre-existing held-state
+# file with no new SSE delivery at all, exactly what a restart looks like.
+# An end-to-end equivalent here would have to race the background
+# reconcile thread's own periodic tick against `agent_restart`'s exit,
+# which is inherently flaky; `test_run_reports_pilot_mode_rejection_for_a
+# _delivered_desired_state` above already proves the held-state file is
+# correctly *written* end to end (`_load_held_desired_state` reads back
+# what `run` itself wrote via the real SSE channel), and the unit test
+# proves a *pre-existing* file left over from a previous process is
+# correctly *read* and acted on -- together the same guarantee, without
+# the flakiness.

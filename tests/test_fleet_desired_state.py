@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -164,6 +165,58 @@ def test_create_desired_state_revision_refuses_retired_apartment(storage: Storag
             APARTMENT, _desired_state(), ui_username="landlord", reason="initial",
             now=datetime.now(UTC),
         )
+
+
+def test_create_desired_state_revision_serializes_concurrent_callers(
+    db_path: str,
+) -> None:
+    """Cross-review fix: "SELECT max() then INSERT" is not atomic on its
+    own -- two concurrent callers used to be able to both read the same
+    current-max revision and both try to insert the same
+    `(apartment_id, revision)` pair, raising `IntegrityError` for the
+    loser. A real two-thread test against a file-backed SQLite database
+    (not `:memory:` -- a fresh connection per thread must actually
+    contend on the same file), each opening its own `Storage` bound to
+    the same URL (mirrors how two separate fleet worker processes/
+    connections would actually contend, not two threads sharing one
+    already-open connection)."""
+
+    url = f"sqlite:///{db_path}"
+    upgrade(url)
+    bootstrap = create_storage(url)
+    bootstrap.set_apartment_token(APARTMENT, f"agent_{APARTMENT}_{secrets.token_urlsafe(16)}")
+
+    errors: list[BaseException] = []
+    revisions: list[int] = []
+    lock = threading.Lock()
+
+    def _create(reason: str) -> None:
+        try:
+            store = create_storage(url)
+            record = store.create_desired_state_revision(
+                APARTMENT, _desired_state(), ui_username="landlord", reason=reason,
+                now=datetime.now(UTC),
+            )
+            with lock:
+                revisions.append(record.revision)
+        except BaseException as exc:  # noqa: BLE001 -- captured to fail the test explicitly
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=_create, args=(f"reason-{i}",)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    # Every concurrent caller got a distinct, contiguous revision number --
+    # no duplicate, no gap, no `IntegrityError` ever reached a caller.
+    assert sorted(revisions) == list(range(1, 9))
+
+    history = bootstrap.desired_state_history(APARTMENT)
+    assert len(history) == 8
+    assert [row.revision for row in history] == list(range(8, 0, -1))
 
 
 def test_get_desired_state_none_when_never_set(storage: Storage) -> None:

@@ -486,3 +486,191 @@ def test_apartment_page_shows_desired_state_and_inactive_notice(
     assert response.status_code == 200
     assert "derzeit inaktiv" in response.text
     assert _VALID_DIGEST_A in response.text
+
+
+# -- confirm-step re-validation (cross-review: coverage of every branch) -------
+
+
+def _csrf_from_index(client: TestClient) -> str:
+    """A session-level CSRF token, obtainable without any apartment
+    existing at all -- used by the tests below that post directly to a
+    step without first visiting an apartment's own edit page."""
+
+    return _extract_hidden_field(client.get("/ui/").text, "csrf_token")
+
+
+def test_edit_post_unknown_apartment_is_404(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Posting straight to step one for an apartment that does not exist
+    -- never reached via the GET-first `_login`/`_make_apartment` helper
+    flow every other test in this file uses."""
+
+    _login(client, password, totp_secret)
+    csrf_token = _csrf_from_index(client)
+
+    response = client.post(
+        "/ui/apartments/does-not-exist/desired-state/edit",
+        data={**_valid_form(), "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 404
+
+
+def test_edit_post_version_too_long_is_rejected(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+    csrf_token = _extract_hidden_field(
+        client.get(f"/ui/apartments/{APARTMENT}/desired-state/edit").text, "csrf_token"
+    )
+
+    form = {**_valid_form(), "version_thermoctl": "x" * 100}
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/edit",
+        data={**form, "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    assert storage.get_desired_state(APARTMENT) is None
+
+
+def test_confirm_post_unknown_apartment_is_404(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Posting straight to step two (the actual write) for an apartment
+    that does not exist -- the confirm route re-validates independently
+    of whatever step one may or may not have checked."""
+
+    _login(client, password, totp_secret)
+    csrf_token = _csrf_from_index(client)
+
+    response = client.post(
+        "/ui/apartments/does-not-exist/desired-state/confirm",
+        data={**_valid_form(), "csrf_token": csrf_token, "reason": "test"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_confirm_post_retired_apartment_is_400(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, state="retired")
+    _login(client, password, totp_secret)
+    csrf_token = _csrf_from_index(client)
+
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/confirm",
+        data={**_valid_form(), "csrf_token": csrf_token, "reason": "test"},
+    )
+
+    assert response.status_code == 400
+    assert storage.get_desired_state(APARTMENT) is None
+
+
+def test_confirm_post_reason_too_long_is_rejected(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+    csrf_token = _csrf_from_index(client)
+
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/confirm",
+        data={**_valid_form(), "csrf_token": csrf_token, "reason": "x" * 1000},
+    )
+
+    assert response.status_code == 400
+    assert storage.get_desired_state(APARTMENT) is None
+
+
+def test_confirm_post_malformed_digest_is_rejected_even_without_visiting_edit_first(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Step two re-validates the digest itself -- a hand-crafted POST
+    straight to `/confirm` (skipping step one entirely) with a malformed
+    digest must still be refused, not trusted because "it must already
+    have been checked by step one"."""
+
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+    csrf_token = _csrf_from_index(client)
+
+    form = _valid_form(digest_thermoctl="not-a-digest")
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/confirm",
+        data={**form, "csrf_token": csrf_token, "reason": "test"},
+    )
+
+    assert response.status_code == 400
+    assert storage.get_desired_state(APARTMENT) is None
+
+
+def test_confirm_post_malformed_window_is_rejected_even_without_visiting_edit_first(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+    csrf_token = _csrf_from_index(client)
+
+    form = {**_valid_form(), "window_from": "not-a-time"}
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/confirm",
+        data={**form, "csrf_token": csrf_token, "reason": "test"},
+    )
+
+    assert response.status_code == 400
+    assert storage.get_desired_state(APARTMENT) is None
+
+
+def test_confirm_post_maps_a_storage_value_error_to_400(
+    client: TestClient,
+    storage: Storage,
+    password: str,
+    totp_secret: str,
+    user_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`Storage.create_desired_state_revision` is the actual source of
+    truth (it re-checks the apartment under a lock, cross-review fix 3) --
+    a `ValueError` it raises for any reason must still surface as a clean
+    `400`, not an unhandled `500`, even though the route's own earlier
+    checks already cover the two cases this storage method itself can
+    raise for in the normal, non-racing path."""
+
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+    csrf_token = _csrf_from_index(client)
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise ValueError("Apartment was retired by a concurrent request.")
+
+    monkeypatch.setattr(storage, "create_desired_state_revision", _raise)
+
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/confirm",
+        data={**_valid_form(), "csrf_token": csrf_token, "reason": "test"},
+    )
+
+    assert response.status_code == 400
+
+
+def test_edit_post_non_numeric_window_temp_is_rejected(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+    csrf_token = _extract_hidden_field(
+        client.get(f"/ui/apartments/{APARTMENT}/desired-state/edit").text, "csrf_token"
+    )
+
+    form = {**_valid_form(), "window_temp": "not-a-number"}
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/edit",
+        data={**form, "csrf_token": csrf_token},
+    )
+
+    assert response.status_code == 400
+    assert storage.get_desired_state(APARTMENT) is None

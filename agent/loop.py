@@ -86,6 +86,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
+import pydantic
 
 from agent import sources as agent_sources
 from agent.commands_channel import (
@@ -108,7 +109,7 @@ from agent.safe_io import UnsafeStateFileError, append_bytes_safe, read_text_saf
 from protocol import Command, CommandResult, DesiredState, Heartbeat, LogExcerpt
 from protocol.backups import BackupKind, BackupUploadAccepted
 from protocol.commands import CommandType
-from protocol.desired_state import DesiredStateOutcomeReport
+from protocol.desired_state import DesiredStateEvent, DesiredStateOutcomeReport
 from protocol.diagnostics import DiagnosticBundleUploadAccepted
 
 logger = logging.getLogger(__name__)
@@ -137,11 +138,12 @@ DEFAULT_LOCAL_LOG_FILE = Path("agent.log")
 # requires this name to already exist above `run`, not merely somewhere
 # else in the same module.
 DEFAULT_PENDING_SWAP_FILE = Path("pending_swap.json")
-# P5.4b: the last desired-state `revision` this agent has already started
-# reconciling toward (`_load_last_desired_state_revision`/
-# `_save_last_desired_state_revision`) -- see `run`'s own docstring for the
-# stale-revision-ignoring rule this guards.
-DEFAULT_DESIRED_STATE_LAST_REVISION_FILE = Path("desired_state_last_revision")
+# P5.4b (cross-review fix): the full `DesiredStateEvent` this agent
+# currently *holds* and keeps reconciling toward (`_load_held_desired_state`/
+# `_save_held_desired_state`) -- not merely the last-seen revision number;
+# see `_DesiredStateReconciler`'s own docstring for why a held value, not a
+# one-shot attempt, is what section 13 actually asks for.
+DEFAULT_DESIRED_STATE_HELD_STATE_FILE = Path("desired_state_held")
 
 # The watchdog's own state file (`watchdog/state.go`) -- the agent only ever
 # *reads* this for the `agent_restart` precondition below, never writes it
@@ -1700,45 +1702,59 @@ def report_led_status(
     temp.replace(path)
 
 
-def _load_last_desired_state_revision(path: Path) -> int:
-    """The last desired-state `revision` this agent has already started
-    reconciling toward (P5.4b scope item 4: "ignore a revision <= the last
-    applied one, persist last seen revision via safe_io").
+def _load_held_desired_state(path: Path) -> DesiredStateEvent | None:
+    """The desired state (plus `pilot_mode`) this agent currently holds
+    and reconciles toward (cross-review fix: spec section 13, "it ...
+    reconciles toward a desired state" -- a *held* state the agent keeps
+    working at, not a one-shot attempt at whatever arrived last).
 
-    **Fails safe, not closed** -- the same reasoning `agent.commands_channel
-    ._read_last_event_id` already applies to its own bookmark file: this is
-    not a security boundary (`reconcile_desired_state`'s own digest/source
-    checks, and `pilot_mode`, are), only a dedup optimization against
-    reapplying an already-current revision. An unreadable, missing, or
-    tampered file (`agent.safe_io.UnsafeStateFileError`, a symlink or a
-    non-regular file) is therefore treated exactly like "nothing applied
-    yet" (`0`) -- the worst case is one redundant `reconcile_desired_state`
-    pass, which is itself idempotent (it only ever changes anything if the
-    running digest still differs from the desired one)."""
+    **Fails closed, not safe** (cross-review, deliberately the opposite of
+    this file's own `_read_last_event_id`-style bookmarks): an unreadable,
+    missing, empty, or structurally invalid file (`agent.safe_io
+    .UnsafeStateFileError`, a symlink or non-regular file, corrupt JSON, a
+    `pydantic.ValidationError`) is treated as **holding nothing at all** --
+    `None` -- not as "hold whatever was last known good". Unlike the
+    dedup-only bookmarks this module's other small state files carry, this
+    file is the input to actual pull/swap decisions (via
+    `run_desired_state_reconcile_loop`'s own periodic re-attempts), so a
+    corrupted copy must never be quietly acted on: "nothing held" makes
+    every subsequent reconcile attempt a safe no-op (no `Docker` call is
+    ever reached, since `_DesiredStateReconciler.attempt` returns
+    immediately when this is `None`) until a fresh, valid `desired_state`
+    event is received and re-persists a trustworthy copy. This is a
+    defence-in-depth belt, not the actual boundary -- `reconcile_desired_state`
+    itself still separately re-validates the digest/source of whatever
+    `DesiredState` it is ever handed (CLAUDE.md security principle 5),
+    regardless of where that value came from.
+    """
 
     try:
         raw = read_text_safe(path)
     except (OSError, UnsafeStateFileError):
-        return 0
+        return None
     if raw is None:
-        return 0
+        return None
     raw = raw.strip()
     if not raw:
-        return 0
+        return None
     try:
-        return int(raw)
-    except ValueError:
-        return 0
+        return DesiredStateEvent.model_validate_json(raw)
+    except pydantic.ValidationError:
+        logger.warning("Held desired-state file is invalid; treating as unset.")
+        return None
 
 
-def _save_last_desired_state_revision(path: Path, revision: int) -> None:
+def _save_held_desired_state(path: Path, event: DesiredStateEvent) -> None:
     """Atomic temp-file-plus-replace write, the same pattern every other
     small state file in this package uses (`_write_last_event_id`,
-    `report_watchdog_state`, ...)."""
+    `report_watchdog_state`, ...) -- survives an agent restart
+    unchanged (cross-review requirement: "restart keeps the held state"),
+    since this is the one and only copy `_load_held_desired_state` reads
+    back."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(str(revision), encoding="utf-8")
+    temp.write_bytes(event.model_dump_json().encode("utf-8"))
     temp.replace(path)
 
 
@@ -1756,7 +1772,15 @@ def _report_desired_state_outcome(
     (`local_log_path`, already written by `reconcile_desired_state` itself
     before this is ever called) stays the authoritative on-device record
     of what happened regardless of whether this call ever reaches the
-    cloud. A failure here is logged and otherwise ignored."""
+    cloud. A failure here is logged and otherwise ignored.
+
+    **Callers dedup before calling this** (`_DesiredStateReconciler`) --
+    this function itself always sends, on the theory that a caller that
+    decided to call it already decided the outcome changed; the dedup
+    policy ("report on change, not every tick") lives one layer up so it
+    can be tested and reasoned about independently of the HTTP call
+    itself.
+    """
 
     report = DesiredStateOutcomeReport(
         revision=revision,
@@ -1777,69 +1801,175 @@ def _report_desired_state_outcome(
         )
 
 
+# Section 13's own periodic-retry cadence is not specified numerically --
+# "reconciles toward a desired state" (not "attempts once"). Ten minutes is
+# a deliberately conservative default: frequent enough that a transient
+# pre-check rejection (the time window not reached yet, a momentarily full
+# disk) does not sit unretried for hours, infrequent enough that a
+# permanently rejecting state (`pilot_mode` unset, the common case while
+# P5.4/P5.4b stays inactive) does not spam local logs or Docker Engine API
+# calls. Configurable (`run`'s own `desired_state_reconcile_interval_s`),
+# not hard-coded past this default.
+DEFAULT_DESIRED_STATE_RECONCILE_INTERVAL_S = 600.0
+
+
+@dataclass
+class _DesiredStateReconciler:
+    """Owns every reconcile attempt for the held desired state -- the one
+    place `reconcile_desired_state` is ever called from `run` (cross-review
+    fix), whether triggered immediately by a freshly received revision
+    (`agent.commands_channel.DesiredStateReceived`, the command-processing
+    thread) or by the periodic background loop
+    (`run_desired_state_reconcile_loop`, its own daemon thread). Both call
+    sites share this one instance and therefore this one `lock`
+    (`threading.Lock`, serializes the two -- two concurrent
+    `reconcile_desired_state` calls for the same apartment would otherwise
+    race on the same containers/pending-swap file) and this one
+    `last_reported`/`last_converged_revision` memory (so "report on
+    change, not every tick" and "stop retrying once converged" both work
+    correctly regardless of which call site triggered a given attempt).
+
+    Deliberately **not frozen** (unlike almost every other dataclass in
+    this module) -- its whole purpose is the mutable bookkeeping
+    `last_reported`/`last_converged_revision` carry between calls; a caller
+    holds exactly one instance for the lifetime of `run`, never
+    reconstructs one per attempt.
+    """
+
+    ctx: ExecutionContext
+    held_state_path: Path
+    pending_swap_path: Path
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    # `(revision, successful, reason, service)` of the last outcome actually
+    # reported to the fleet -- `None` until the first attempt ever reports
+    # anything. An identical tuple on a later attempt is never re-reported
+    # (cross-review: "report outcomes only on change").
+    last_reported: tuple[int, bool, str, str | None] | None = field(default=None, init=False)
+    # The revision `reconcile_desired_state` last reported "already at the
+    # desired revision" for (`ReconcileOutcome.successful and .service is
+    # None`, `reconcile_desired_state`'s own docstring) -- an `attempt()`
+    # for the *same* revision is skipped entirely once set (no Docker call
+    # at all, cross-review: "until reconcile reports nothing to do/
+    # converged"). Reset implicitly the moment a *different* revision is
+    # held (the comparison below is always against the currently held
+    # revision, never stored independently of it).
+    last_converged_revision: int | None = field(default=None, init=False)
+
+    def attempt(self) -> None:
+        """One reconcile attempt against whatever is currently held on
+        disk -- a no-op (no lock contention beyond the read, no Docker
+        call) if nothing is held or the held revision already converged.
+        Safe to call from either thread; overlapping calls simply queue on
+        `self.lock`."""
+
+        with self.lock:
+            held = _load_held_desired_state(self.held_state_path)
+            if held is None:
+                return
+            revision = held.desired_state.revision
+            if revision == self.last_converged_revision:
+                return
+
+            if self.ctx.backup_config is None:
+                outcome = ReconcileOutcome(
+                    successful=False,
+                    reason=(
+                        "backup_config is not configured on this agent (no "
+                        "--apartment-id at startup) -- desired-state "
+                        "reconciliation is disabled."
+                    ),
+                )
+            else:
+                outcome = reconcile_desired_state(
+                    held.desired_state,
+                    pilot_mode=held.pilot_mode,
+                    backup_config=self.ctx.backup_config,
+                    watchdog_state_path=self.ctx.watchdog_state_path,
+                    pending_swap_path=self.pending_swap_path,
+                    local_log_path=self.ctx.local_log_path,
+                )
+
+            if outcome.successful and outcome.service is None:
+                self.last_converged_revision = revision
+
+            report_key = (revision, outcome.successful, outcome.reason, outcome.service)
+            if report_key != self.last_reported and self.ctx.client is not None:
+                _report_desired_state_outcome(self.ctx.client, revision, outcome)
+                self.last_reported = report_key
+
+
+def run_desired_state_reconcile_loop(
+    reconciler: _DesiredStateReconciler,
+    *,
+    interval_s: float = DEFAULT_DESIRED_STATE_RECONCILE_INTERVAL_S,
+    sleep: Callable[[float], None] = time.sleep,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Runs forever (real production use) or until `stop_event` is set
+    (tests, and `agent.__main__`'s own shutdown path) -- the same "own
+    daemon thread, started by `run`" shape as `run_daily_backup_scheduler`/
+    `agent.restore.run_restore_poll_loop`, for the identical reason: the
+    agent has to keep retrying a held desired state even while
+    `receive_commands` is blocked waiting for the next SSE item.
+
+    Every exception from one iteration is logged and swallowed -- a single
+    failed attempt (a transient error) must not stop every later one,
+    mirroring those two schedulers' own "log and continue" reasoning
+    exactly."""
+
+    while stop_event is None or not stop_event.is_set():
+        try:
+            reconciler.attempt()
+        except Exception:
+            logger.exception("Desired-state reconcile iteration failed.")
+        sleep(interval_s)
+
+
 def _handle_desired_state_received(
     item: DesiredStateReceived,
-    ctx: ExecutionContext,
+    reconciler: _DesiredStateReconciler,
     *,
-    desired_state_last_revision_path: Path,
-    pending_swap_path: Path,
+    held_state_path: Path,
 ) -> None:
     """P5.4b scope item 4, the agent-side glue `docs/STATUS.md`'s P5.4
     section flagged as still missing: validate (already done by
     `agent.commands_channel._parse_desired_state_event` before this is
-    ever called -- a malformed event never reaches here at all), ignore a
-    stale revision, persist the new one, call `reconcile_desired_state`
-    with the delivered `pilot_mode`, then report the outcome.
+    ever called -- a malformed event never reaches here at all), update
+    the held state, and trigger one immediate reconcile attempt --
+    ongoing retries (a transient pre-check rejection, section 13: "it ...
+    reconciles toward a desired state") are `run_desired_state_reconcile
+    _loop`'s own job from here on, not this function's.
+
+    **Only a revision strictly lower than what is already held is
+    ignored; an equal revision is a no-op** (cross-review: "equal = same
+    state, no-op") -- neither updates the held file nor triggers an extra
+    attempt (the periodic loop, or the attempt this same revision already
+    triggered earlier, is what is already retrying it). A revision
+    strictly greater always replaces the held state and triggers an
+    attempt, even while a lower/equal one would have been rejected --
+    this is a `<`/`<=` comparison against the *held* revision, not the
+    last-*reported* one, so a superseded-but-never-successfully-applied
+    revision is still correctly replaced.
 
     **Stays fail-closed/inactive exactly like `reconcile_desired_state`
     itself** (section 13's "Decided afterward", 2026-09-28) -- this
     function does not loosen that in any way, it only ever supplies the
-    `pilot_mode` value the cloud attached to this delivery; a cloud that
-    never sets `pilot_mode` (the default) still gets rejected by
-    `reconcile_desired_state`'s own pre-check, unchanged.
-
-    **No `backup_config` configured** (`ctx.backup_config is None`, e.g.
-    `--apartment-id` was never given to `python -m agent run`) means
-    `reconcile_desired_state` cannot run at all (it requires a
-    `BackupConfig` to take the mandatory pre-swap backup) -- this is
-    reported as an honest failed outcome, not a crash of the whole
-    command loop, mirroring `_handle_fetch_logs`'s own "a missing client
-    is an honest failure" reasoning for the same class of "this agent was
-    started without a feature configured" case.
+    `pilot_mode` value the cloud attached to this delivery.
     """
 
     desired = item.event.desired_state
-    last_applied = _load_last_desired_state_revision(desired_state_last_revision_path)
-    if desired.revision <= last_applied:
-        logger.info(
-            "Ignoring desired-state revision %d (already at or past %d).",
-            desired.revision,
-            last_applied,
-        )
+    held = _load_held_desired_state(held_state_path)
+    if held is not None and desired.revision <= held.desired_state.revision:
+        if desired.revision < held.desired_state.revision:
+            logger.info(
+                "Ignoring desired-state revision %d (holding newer %d).",
+                desired.revision,
+                held.desired_state.revision,
+            )
         return
 
-    _save_last_desired_state_revision(desired_state_last_revision_path, desired.revision)
-
-    if ctx.backup_config is None:
-        outcome = ReconcileOutcome(
-            successful=False,
-            reason=(
-                "backup_config is not configured on this agent (no --apartment-id "
-                "at startup) -- desired-state reconciliation is disabled."
-            ),
-        )
-    else:
-        outcome = reconcile_desired_state(
-            desired,
-            pilot_mode=item.event.pilot_mode,
-            backup_config=ctx.backup_config,
-            watchdog_state_path=ctx.watchdog_state_path,
-            pending_swap_path=pending_swap_path,
-            local_log_path=ctx.local_log_path,
-        )
-
-    if ctx.client is not None:
-        _report_desired_state_outcome(ctx.client, desired.revision, outcome)
+    _save_held_desired_state(held_state_path, item.event)
+    reconciler.attempt()
 
 
 def run(
@@ -1855,7 +1985,8 @@ def run(
     restore_targets: RestoreTargets | None = None,
     restore_poll_interval_s: float = DEFAULT_RESTORE_POLL_INTERVAL_S,
     pending_swap_path: Path = DEFAULT_PENDING_SWAP_FILE,
-    desired_state_last_revision_path: Path = DEFAULT_DESIRED_STATE_LAST_REVISION_FILE,
+    desired_state_held_state_path: Path = DEFAULT_DESIRED_STATE_HELD_STATE_FILE,
+    desired_state_reconcile_interval_s: float = DEFAULT_DESIRED_STATE_RECONCILE_INTERVAL_S,
     exit_fn: Callable[[int], None] = lambda code: sys.exit(code),
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
@@ -1871,6 +2002,24 @@ def run(
     (`_report_desired_state_outcome`, best-effort, not buffered). Every
     other item type flows through the loop exactly as before this
     package.
+
+    **Cross-review fix: a held desired state, reconciled toward
+    repeatedly, not attempted once.** `_handle_desired_state_received`
+    only ever updates the held state (`desired_state_held_state_path`)
+    and triggers one immediate attempt; `run_desired_state_reconcile_loop`
+    runs in its own daemon thread (started unconditionally, the same
+    "runs even while `receive_commands` blocks" reasoning as the backup/
+    restore threads below) and keeps re-attempting the held state every
+    `desired_state_reconcile_interval_s` until `reconcile_desired_state`
+    reports it converged -- section 13's "it ... reconciles toward a
+    desired state", not a one-shot attempt that silently gives up on a
+    transient pre-check rejection (the time window not reached yet, a
+    momentarily full disk) until a new revision or a fresh SSE connection
+    happens to arrive. Both the immediate attempt and every periodic one
+    go through the same `_DesiredStateReconciler` instance (`reconciler`
+    below), so they can never race each other and outcomes are only ever
+    reported to the fleet when they change, not on every tick (see that
+    class's own docstring).
 
     **`CommandStreamAuthError` stops this loop** (propagated to the
     caller, `agent.__main__` turns it into a clear exit-1 message) -- the
@@ -1968,6 +2117,35 @@ def run(
         )
         restore_thread.start()
 
+    # P5.4b (cross-review fix): one `_DesiredStateReconciler` for the
+    # whole lifetime of this call, shared by the immediate attempt below
+    # and the periodic background thread -- see that class's own
+    # docstring for why one shared instance (and its one `lock`) is what
+    # makes the two call sites safe together. Started unconditionally
+    # (unlike the backup/restore threads above, which are conditional on
+    # their own configuration): even with `backup_config=None` there is
+    # still something useful to do every tick -- report, once, that
+    # reconciliation is disabled (`_DesiredStateReconciler.attempt`'s own
+    # `backup_config is None` branch), not silently do nothing forever.
+    desired_state_reconciler = _DesiredStateReconciler(
+        ctx=ctx,
+        held_state_path=desired_state_held_state_path,
+        pending_swap_path=pending_swap_path,
+    )
+    desired_state_stop_event = threading.Event()
+    desired_state_thread = threading.Thread(
+        target=run_desired_state_reconcile_loop,
+        args=(desired_state_reconciler,),
+        kwargs={
+            "interval_s": desired_state_reconcile_interval_s,
+            "sleep": sleep,
+            "stop_event": desired_state_stop_event,
+        },
+        daemon=True,
+        name="thermoctl-agent-desired-state-reconcile",
+    )
+    desired_state_thread.start()
+
     commands = receive_commands(
         client, last_event_id_path, sleep=sleep, on_contact=_on_contact
     )
@@ -1976,9 +2154,8 @@ def run(
             if isinstance(item, DesiredStateReceived):
                 _handle_desired_state_received(
                     item,
-                    ctx,
-                    desired_state_last_revision_path=desired_state_last_revision_path,
-                    pending_swap_path=pending_swap_path,
+                    desired_state_reconciler,
+                    held_state_path=desired_state_held_state_path,
                 )
                 continue
             if isinstance(item, RejectedCommand):
@@ -2007,6 +2184,7 @@ def run(
         commands.close()
         backup_stop_event.set()
         restore_stop_event.set()
+        desired_state_stop_event.set()
 
 
 # `protocol.desired_state.Services`' own field order, fixed here as the

@@ -361,3 +361,30 @@ def test_restore_create_rejects_unknown_backup_id(
         },
     )
     assert response.status_code == 400
+
+
+def test_restore_create_unknown_apartment_is_404(
+    client: TestClient,
+    storage: Storage,
+    password: str,
+    totp_secret: str,
+    user_id: int,
+) -> None:
+    """Posting the restore form for an apartment that does not exist at
+    all -- distinct from `test_restore_create_rejects_unknown_backup_id`
+    above, which uses a real, existing apartment with an unknown backup
+    id. `client.get("/ui/")` supplies a valid session-level CSRF token
+    without needing any apartment to exist first."""
+
+    _login(client, password, totp_secret)
+    csrf_token = _extract_hidden_field(client.get("/ui/").text, "csrf_token")
+
+    response = client.post(
+        "/ui/apartments/does-not-exist/restore",
+        data={
+            "backup_id": "irrelevant",
+            "key_block_b64": base64.b64encode(b"irrelevant").decode("ascii"),
+            "csrf_token": csrf_token,
+        },
+    )
+    assert response.status_code == 404
