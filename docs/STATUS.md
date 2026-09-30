@@ -1,6 +1,177 @@
 # Status
 
-Last updated: 2026-09-29.
+Last updated: 2026-09-30.
+
+## P5.4d -- pre-activation points from the P5.4b merge (section 13)
+
+Closes all four points the P5.4b merge review flagged as required before
+desired-state reconciliation may ever be activated (previous section
+below, now resolved) -- **P5.4/P5.4b stay inactive**, unchanged: the
+fail-closed pre-check (thermoctl health/outdoor temperature unreadable ->
+reject) and `pilot_mode` required at the target are exactly as P5.4 left
+them. This package only removes the four remaining objections to turning
+that gate on someday; it does not touch the gate itself.
+
+**Design:**
+
+- **One agent-wide lock** (`agent/loop.py::ExecutionContext.agent_lock`,
+  `threading.Lock`, `default_factory` so every existing caller/test that
+  never shares one gets its own private, uncontended lock unless it opts
+  in) -- **a single lock, not one per concern** (deliberately: a second,
+  separate lock for e.g. backups would only reintroduce the exact
+  ordering question a single lock sidesteps by construction). Shared by:
+  `_DesiredStateReconciler.attempt` (its own former private `lock` field
+  is gone -- it now uses `self.ctx.agent_lock`, so every
+  `reconcile_desired_state` call, including the new drift re-check below,
+  is covered); `_handle_backup_now` (the whole handler body, factored into
+  `_create_and_upload_both_backups`, runs under it -- a fleet-issued
+  `backup_now` must not interleave with an in-flight swap's own
+  `run_before_update_backup`); `run_daily_backup_scheduler` (a new,
+  optional `agent_lock` parameter, `None` by default so every existing
+  direct caller/test is unaffected -- `run` passes `ctx.agent_lock`
+  explicitly); and `_handle_agent_restart` (see below). **Deliberately
+  not taken** by `_handle_fetch_logs`/`_handle_diagnostic_bundle` -- both
+  only ever issue read-only Docker Engine API calls (log tail, container
+  inspect) and read-only file reads, never a container mutation or a
+  backup that could meaningfully race the reconciler's own swap; see
+  each handler's own docstring for the full reasoning (judged and
+  documented, per the work order). **Lock ordering:** only one lock
+  exists, so there is nothing to order and no deadlock to reason about --
+  every holder acquires it, does its work, and releases it (or, for
+  `agent_restart`'s success path only, deliberately never releases it --
+  see below), never acquires a second lock while holding this one.
+  `_handle_agent_restart` additionally cannot deadlock the reconciler:
+  it uses a **bounded-timeout** `acquire(timeout=AGENT_RESTART_LOCK
+  _TIMEOUT_S)` (30s), never a plain blocking `with`, specifically because
+  it has its own 15-minute command expiry to respect -- if the lock is
+  still held when the timeout elapses, it reports a clear, honest failure
+  ("Sperre ... nicht rechtzeitig frei") instead of hanging the command
+  thread for up to 15 minutes waiting on someone else's swap. On success,
+  it **deliberately never releases the lock** -- the process is about to
+  exit (`run`'s own `exit_after_report` handling, right after this result
+  is reported), so holding it for whatever remains of the process's
+  lifetime guarantees nothing else can start a container/backup operation
+  in the narrow window before the process actually stops.
+- **Non-blocking immediate trigger** (item 2): `_handle_desired_state
+  _received` no longer calls `reconciler.attempt()` itself -- it only
+  persists the held state, clears a stale `_FailedRollback` record (see
+  below) when a genuinely new revision is accepted, and `.set()`s a new
+  `threading.Event` (`desired_state_trigger_event`, owned by `run`).
+  `run_desired_state_reconcile_loop` gained an optional `trigger_event`
+  parameter: when given, it waits on that event (bounded by
+  `interval_s`, clearing it after each wake) instead of a plain
+  `sleep(interval_s)` -- woken immediately by a fresh revision rather than
+  waiting up to the full periodic interval, while the command-processing
+  loop (`run`'s own `for item in commands:`) stays completely free to keep
+  executing and reporting every other command concurrently. `None` (the
+  default) preserves the exact previous `sleep`-only behaviour for every
+  existing caller/test that does not pass one. Tested directly (a real
+  `threading.Event`, not a fake `sleep`) and, end to end, via a real
+  concurrent-attempt scenario (see item 4).
+- **Drift re-check after convergence** (item 3): once `attempt()` has
+  converged a revision, a further call for that same revision no longer
+  returns immediately doing nothing. If `pilot_mode` is currently `False`:
+  it still returns immediately, **zero Docker calls**, exactly like every
+  other inactive path (tested directly). Otherwise: `_select_service_to
+  _update` (the same read-only helper `reconcile_desired_state` itself
+  already uses to pick a service -- a handful of `GET` Engine API calls,
+  never a mutation) is run directly; no drift means still converged, no-op;
+  drift found falls back to a full `reconcile_desired_state` call, through
+  the complete fail-closed pre-check, exactly as a first attempt would --
+  **unless** the drifted `(revision, service, digest)` exactly matches a
+  `_FailedRollback` already recorded for it, in which case it is reported
+  once (if not already) and left alone. `ReconcileOutcome` gained a new
+  `rolled_back_unhealthy` field, set `True` only by `_await_or_rollback
+  _pending_swap`'s own health-deadline branch (a **structural** signal,
+  never a string match on `reason`) -- `attempt()` persists a
+  `_FailedRollback` (`revision`, `service`, `digest`) whenever an outcome
+  reports it, in a file **separate from** the held-state file
+  (`DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE` -- kept apart from
+  `protocol.desired_state.DesiredStateEvent`, the wire model the held-state
+  file reuses directly as its own format, so an agent-local field never
+  blurs that boundary), validated on load
+  (`_load_failed_rollback`, the same per-field checks `_load_pending_swap`
+  already applies to `PendingSwap` -- but **not** fail-closed the same way:
+  an invalid file here only ever suppresses a retry, never grants one, so
+  it is treated as absent, logged, not raised). Cleared exactly when
+  `_handle_desired_state_received` accepts a genuinely new (strictly
+  higher) revision -- "do not re-attempt until a new revision arrives" is
+  that arrival. A *different* digest for the same service/revision is
+  never blocked by an older record (exact three-way match only).
+- **Concurrency test** (item 4): `test_two_concurrent_attempt_calls_are
+  _strictly_serialized` proves the headline property directly -- a
+  blocking, event-gated fake `reconcile_desired_state` run from two real
+  threads, the second's own call recorded as still blocked on the lock
+  while the first is deliberately held open, then both complete in strict
+  "start, end, start, end" order once released. Plus lock-sharing tests
+  for item 1: `_handle_backup_now`/`run_daily_backup_scheduler` both
+  proven to run under a held-open `ctx.agent_lock`/explicit lock
+  (`.locked()` checked from inside the upload transport itself);
+  `agent_restart` proven to fail cleanly on a bounded timeout when the
+  lock is held, and to hold it afterward on success (a non-blocking
+  `acquire(blocking=False)` probe fails once the handler returns).
+
+**Verification.** `ruff check .` clean; `mypy .` (135 files) and
+`mypy protocol fleet agent tools` (67 files) clean; pytest: **1728
+passed, 1 skipped**, TOTAL **6525 stmts / 19 missed / 99%** (unchanged
+from the P5.4b baseline -- every line this package added is itself 100%
+covered, the 19 remaining misses all predate it, see the P5.4b section
+below for the list); Go: `go vet ./...`/`go test ./...` clean,
+`watchdog/check_contract.sh` passing (this package never touches
+`watchdog/`).
+
+**Tests** (all in existing files, no new test files): `tests
+/test_agent_desired_state_reconciler.py` gained the bulk of the new
+coverage -- `_load_failed_rollback`/`_save_failed_rollback` round-trips
+and every invalid-content case; the zero-Docker-calls-while-inactive
+drift path; drift-after-convergence triggering a full reconcile; the
+known-bad-digest guard (including "a different digest is not blocked");
+persisting/not-persisting a `_FailedRollback` depending on
+`rolled_back_unhealthy`; the two-thread strict-serialization test; the
+shared-lock-with-backup_now test; `_handle_desired_state_received`'s new
+signature (`trigger_event` instead of a `reconciler` argument, `held.
+pilot_mode`/`equal`/`lower`/`higher` revision cases updated, a stale
+`_FailedRollback` cleared on a new revision, kept on an ignored one);
+`run_desired_state_reconcile_loop`'s new `trigger_event`-wakes-immediately
+test. `tests/test_agent_loop_execution.py` gained the `agent_restart`
+lock-timeout-refusal and lock-held-after-success tests.
+`tests/test_agent_backup.py` gained `_handle_backup_now`/`run_daily
+_backup_scheduler` lock-sharing tests. `tests/test_agent_loop_desired
+_state.py::test_run_accepts_a_newer_revision_and_replaces_the_held_state`
+was restructured (P5.4d changed the guarantee it was asserting): since
+the immediate trigger no longer runs synchronously on the command thread,
+an `agent_restart` delivered in the same connect-time catch-up batch is
+no longer guaranteed to execute *after* the reconciler has reported the
+newer revision -- exactly the point of the fix. The test now runs `run`
+on its own thread, polls the real storage for the revision-2 outcome
+(bounded wait), and only then creates the `agent_restart` command,
+delivered live to the still-open SSE connection, to stop the loop.
+
+**Open points:**
+
+- **P5.4c, rollout queue -- still out of scope, not built** (unchanged
+  from P5.4b): the pilot-first, 48-hour-staggered, one-apartment-at-a-time
+  rollout sequencing (section 13, "Rules for the rollout") needs its own
+  package once `apply_update` is promoted out of stage 2.
+- **Still inactive** (unchanged from P5.4/P5.4b): activation still
+  requires a real thermoctl health/outdoor-temperature endpoint (closing
+  the `_default_health_reader`/`_default_outdoor_temp_reader` honesty gap)
+  and `pilot_mode` set per apartment.
+- **Agent-restart-vs-reconciler race is a genuine, accepted trade-off, not
+  a bug**: if `agent_restart` wins the lock-acquisition race against a
+  reconciler thread that has just been signalled but has not yet called
+  `attempt()`, the restart proceeds and the just-triggered attempt never
+  runs in that process's lifetime -- exactly as intended (a command must
+  not wait for a reconcile that has not even started). A real restart
+  picks the held state back up from disk on the next process start
+  (unchanged "restart keeps the held state" guarantee from P5.4b); this
+  is a delivery-timing detail, never a trust/security gap, since nothing
+  is ever acted on without the same fail-closed pre-check either way.
+
+**Files:** `agent/loop.py`, `agent/__main__.py`,
+`tests/test_agent_desired_state_reconciler.py`,
+`tests/test_agent_loop_execution.py`, `tests/test_agent_backup.py`,
+`tests/test_agent_loop_desired_state.py`.
 
 ## Merge: P5.5c onto main (main session, 2026-09-29)
 
@@ -28,23 +199,41 @@ before rename, fchown/fchmod on the new fd), the unit's sandboxing
 
 Cross-review PASS (round 2). P5.4/P5.4b stay inactive; before either is
 ever activated, these must be closed (all unreachable today, since the
-pre-check rejects at `pilot_mode` before any Docker or backup call):
+pre-check rejects at `pilot_mode` before any Docker or backup call).
+**All four resolved by P5.4d (see that section above the merges here) --
+kept below for history, not because they are still open:**
 
-- **Reconciler thread vs. command execution:** `run_desired_state_reconcile_loop`
+- ~~**Reconciler thread vs. command execution:** `run_desired_state_reconcile_loop`
   runs on its own thread with no lock shared with command execution --
   a periodic swap could overlap a fleet-issued `backup_now` or
   `agent_restart`. Needs one agent-wide lock for container/backup
-  operations.
-- **Main command loop blocked:** the immediate trigger in
+  operations.~~ **Resolved (P5.4d):** `ExecutionContext.agent_lock`,
+  shared by the reconciler, `backup_now`, the daily scheduler, and
+  `agent_restart`.
+- ~~**Main command loop blocked:** the immediate trigger in
   `_handle_desired_state_received` runs `reconcile_desired_state` on the
   command thread and can block it for up to 15 minutes (health deadline),
   long enough for other pending commands to hit their 15-minute expiry.
-  Move the immediate trigger onto the reconciler's own thread/queue.
-- **No drift re-check after convergence:** once a revision converged, the
+  Move the immediate trigger onto the reconciler's own thread/queue.~~
+  **Resolved (P5.4d):** `_handle_desired_state_received` now only signals
+  `desired_state_trigger_event`; the reconciler's own thread performs the
+  attempt.
+- ~~**No drift re-check after convergence:** once a revision converged, the
   agent does not re-verify running containers until a higher revision
   arrives. Consistent with spec 13's single update pass, but an explicit
-  assumption (nothing outside the agent changes the containers).
-- No test exercises two concurrent `attempt()` calls on the reconciler lock.
+  assumption (nothing outside the agent changes the containers).~~
+  **Resolved (P5.4d):** a cheap, read-only drift re-check runs on every
+  tick after convergence (zero Docker calls while inactive), guarded
+  against retrying a digest already rolled back as unhealthy.
+- ~~No test exercises two concurrent `attempt()` calls on the reconciler
+  lock.~~ **Resolved (P5.4d):** `test_two_concurrent_attempt_calls_are
+  _strictly_serialized`.
+
+**Still open, unchanged (P5.4c and activation itself -- see P5.4d's own
+"Open points" above for the current wording):** the P5.4c rollout queue
+is not built, and P5.4/P5.4b/P5.4d all stay **inactive** until a real
+thermoctl health/outdoor-temperature reader exists and `pilot_mode` is
+set per apartment.
 
 ## P5.4b -- desired-state delivery, fleet side + agent wiring (section 13)
 

@@ -144,6 +144,14 @@ DEFAULT_PENDING_SWAP_FILE = Path("pending_swap.json")
 # see `_DesiredStateReconciler`'s own docstring for why a held value, not a
 # one-shot attempt, is what section 13 actually asks for.
 DEFAULT_DESIRED_STATE_HELD_STATE_FILE = Path("desired_state_held")
+# P5.4d: the one `(revision, service, digest)` this agent's own
+# `_await_or_rollback_pending_swap` most recently rolled back because it
+# never reported healthy within the deadline -- see `_FailedRollback`'s own
+# docstring for why this is a *separate* file from the held state above,
+# not a field inside it, and `_DesiredStateReconciler.attempt`'s own
+# docstring for how it stops the new drift re-check (item 3 below) from
+# retrying a digest already known bad in a tight loop.
+DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE = Path("desired_state_failed_rollback")
 
 # The watchdog's own state file (`watchdog/state.go`) -- the agent only ever
 # *reads* this for the `agent_restart` precondition below, never writes it
@@ -944,7 +952,39 @@ class ExecutionContext:
     above -- the same "overridable reader, real Docker-socket default"
     shape as `log_reader`, but for the diagnostic bundle's own time-
     windowed, multi-container reads (`create_diagnostic_bundle`, not
-    `_handle_fetch_logs`, is what actually calls these)."""
+    `_handle_fetch_logs`, is what actually calls these).
+
+    `agent_lock` (P5.4d addition, CLAUDE.md security principles 2/5): the
+    **one** agent-wide lock for every container/backup operation that
+    could otherwise race a desired-state swap -- shared, by construction
+    (the same `ExecutionContext` instance is threaded through every call
+    site), by `_DesiredStateReconciler.attempt` (every
+    `reconcile_desired_state` call, including the periodic drift re-check),
+    `_handle_backup_now`, `run_daily_backup_scheduler` (via the explicit
+    `agent_lock` parameter `run` passes it), and `_handle_agent_restart`
+    (bounded-timeout acquire, see that handler's own docstring for why a
+    plain, uncontested block would be wrong there). **One lock, not one
+    per concern** (deliberately, per the work order): a second, separate
+    lock for e.g. backups would only reintroduce the exact ordering
+    question ("does a backup wait for a reconcile or the other way
+    around?") a single lock sidesteps by construction -- there is only
+    ever one thing to wait for. `_handle_fetch_logs`/`_handle_diagnostic_bundle`
+    deliberately do **not** take it (see their own docstrings) -- both only
+    ever issue read-only Docker Engine API calls (log tail, `GET
+    .../json` container inspect) and read-only file reads; the Docker
+    Engine API itself already serializes/isolates a concurrent read
+    against an in-flight container mutation, and neither handler ever
+    starts, stops, recreates, or backs up anything the reconciler's own
+    swap could be mutating concurrently in a way that would make a
+    half-updated read observably wrong (at worst, a `fetch_logs` running
+    exactly during a container recreate briefly returns "container not
+    found", already handled as an honest failure). Threading this through
+    every test's own `ExecutionContext` construction is unnecessary --
+    `default_factory=threading.Lock` gives every existing caller (this
+    module's own tests, mostly) its own private, uncontended lock unless a
+    caller shares one instance across threads on purpose, exactly the
+    shape `_DesiredStateReconciler`'s own former, now-removed private
+    `lock` field used to have alone."""
 
     watchdog_state_path: Path
     local_log_path: Path
@@ -961,6 +1001,7 @@ class ExecutionContext:
     state_reader: Callable[[str], dict[str, object]] = (
         lambda container: read_container_state(container)
     )
+    agent_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass(frozen=True)
@@ -1096,6 +1137,13 @@ def _handle_fetch_logs(command: Command, ctx: ExecutionContext) -> _HandlerResul
     with a short, non-sensitive `error_text`. None of these paths ever
     raise out of this function; `execute_command`'s own dispatch loop must
     keep running regardless of why one command's execution failed.
+
+    **P5.4d: deliberately does not take `ctx.agent_lock`** -- see that
+    field's own docstring for the full reasoning (a read-only Docker log
+    tail, never a container mutation or a backup, so nothing here can
+    corrupt or race an in-flight desired-state swap; the worst case is a
+    transient "container not found" during a recreate, already an honest
+    failure this handler already reports).
     """
 
     if ctx.client is None:
@@ -1183,6 +1231,18 @@ def _handle_diagnostic_bundle(command: Command, ctx: ExecutionContext) -> _Handl
     (`create_diagnostic_bundle` itself already removes every *intermediate*
     plaintext file in its own `finally`, see that function's docstring) is
     removed here in this handler's own `finally`, success or failure alike.
+
+    **P5.4d: deliberately does not take `ctx.agent_lock`** -- same
+    reasoning as `_handle_fetch_logs`'s own docstring: `create_diagnostic_bundle`
+    only ever reads (container log/state inspects, the watchdog state
+    file, the sqlite database for a device-config snapshot, never a
+    database *backup* the way `create_backup`'s operational-data branch
+    does) and stages its own, uniquely-named artifact file -- it never
+    starts, stops, or recreates a container, so it cannot race the
+    reconciler's own swap in any way that matters. Its own staging file
+    names (`tempfile.mkstemp`) are unique per call, so it also cannot
+    collide with a concurrent `backup_now`'s own artifacts under the same
+    `staging_dir`.
     """
 
     if ctx.backup_config is None:
@@ -1248,6 +1308,20 @@ def _handle_backup_now(command: Command, ctx: ExecutionContext) -> _HandlerResul
     this needs (`--apartment-id`, `--thermoctl-db-file`,
     `--zigbee2mqtt-dir`, `--backup-recipients-file`), not a bug in this
     handler itself.
+
+    **P5.4d: runs under `ctx.agent_lock`** (see `ExecutionContext
+    .agent_lock`'s own docstring for why this is the one shared,
+    agent-wide lock, not a lock private to this handler) -- a
+    fleet-issued `backup_now` and an in-flight desired-state swap's own
+    pre-update backup (`run_before_update_backup`, called from inside
+    `reconcile_desired_state` while the same lock is held) must not run
+    concurrently: `create_backup`'s online sqlite snapshot is safe against
+    concurrent *writers* to the source database, but not against a second,
+    unrelated `create_backup` call unpredictably interleaving with the
+    reconciler's own swap sequence (stop/recreate/start) that this
+    handler has no visibility into otherwise. A refusal above (no
+    `backup_config`) returns before ever touching the lock -- nothing to
+    serialize against.
     """
 
     if ctx.backup_config is None:
@@ -1259,20 +1333,32 @@ def _handle_backup_now(command: Command, ctx: ExecutionContext) -> _HandlerResul
             ),
         )
 
+    with ctx.agent_lock:
+        return _create_and_upload_both_backups(
+            ctx.backup_config, ctx.watchdog_state_path, ctx.now()
+        )
+
+
+def _create_and_upload_both_backups(
+    backup_config: BackupConfig, watchdog_state_path: Path, now: datetime
+) -> _HandlerResult:
+    """The actual body of `_handle_backup_now`, factored out so the lock
+    acquired by its caller covers exactly this and nothing more."""
+
     summaries: list[str] = []
     all_successful = True
     for operational_data, label in ((False, "Gerätekonfiguration"), (True, "Betriebsdaten")):
         try:
             artifact = create_backup(
                 operational_data,
-                apartment_id=ctx.backup_config.apartment_id,
-                agent_version=ctx.backup_config.agent_version,
-                staging_dir=ctx.backup_config.staging_dir,
-                now=ctx.now(),
-                watchdog_state_path=ctx.watchdog_state_path,
-                thermoctl_db_path=ctx.backup_config.thermoctl_db_path,
-                zigbee2mqtt_dir=ctx.backup_config.zigbee2mqtt_dir,
-                recipients_file=ctx.backup_config.recipients_file,
+                apartment_id=backup_config.apartment_id,
+                agent_version=backup_config.agent_version,
+                staging_dir=backup_config.staging_dir,
+                now=now,
+                watchdog_state_path=watchdog_state_path,
+                thermoctl_db_path=backup_config.thermoctl_db_path,
+                zigbee2mqtt_dir=backup_config.zigbee2mqtt_dir,
+                recipients_file=backup_config.recipients_file,
             )
         except Exception as error:
             # **Cross-review finding: broadened from a narrow
@@ -1298,7 +1384,7 @@ def _handle_backup_now(command: Command, ctx: ExecutionContext) -> _HandlerResul
             continue
 
         try:
-            accepted = upload_backup(ctx.backup_config.client, artifact)
+            accepted = upload_backup(backup_config.client, artifact)
         except httpx.HTTPError as error:
             all_successful = False
             summaries.append(f"{label}: Upload fehlgeschlagen ({error}).")
@@ -1356,12 +1442,37 @@ def _read_watchdog_state(path: Path) -> tuple[str, str] | None:
     return desired, proven
 
 
+# P5.4d: how long `_handle_agent_restart` waits for `ctx.agent_lock` before
+# giving up and reporting a clear failure, instead of blocking the command
+# thread for however long an in-flight reconcile happens to still need (up
+# to `RECONCILE_HEALTH_DEADLINE_S`, 15 minutes). Deliberately much shorter
+# than that deadline -- an operator who wants a restart badly enough to
+# retry gets a clear, prompt "try again shortly" instead of `agent_restart`
+# itself silently becoming the next thing to hit its own 15-minute command
+# expiry while stuck waiting.
+AGENT_RESTART_LOCK_TIMEOUT_S = 30.0
+
+
 def _handle_agent_restart(command: Command, ctx: ExecutionContext) -> _HandlerResult:
     """`agent_restart` is the one stage-1 command that is **really**
     executed by this scaffold (the other four above stay honest failures
     until their own follow-up package lands): reports its result first,
     then asks the main loop (`run`, below) to exit the process cleanly so
     the watchdog (P5.6) restarts it via the fixed compose file (section 17).
+
+    **P5.4d: also gated on `ctx.agent_lock`** (bounded-timeout acquire,
+    `AGENT_RESTART_LOCK_TIMEOUT_S`) -- independent of, and checked after,
+    the watchdog-state check below: that check only rules out ambiguity
+    with the *agent's own* self-swap signal (section 17 step 3); this lock
+    additionally rules out restarting the process while the reconciler
+    thread is mid-swap for `thermoctl`/`zigbee2mqtt`/`mosquitto` (section
+    13), which has nothing to do with the watchdog at all. A plain,
+    uncontested `with ctx.agent_lock:` would be wrong here specifically
+    (unlike every other lock user in this module): `agent_restart` has its
+    own 15-minute command expiry to respect, so it must fail fast and
+    clearly rather than silently block the whole command thread for
+    however long a swap's own health wait still has left -- see
+    `AGENT_RESTART_LOCK_TIMEOUT_S`'s own comment.
 
     **Refused while a swap is pending, or while that cannot be conclusively
     ruled out** (`watchdog/state.go`'s own `desired != proven`, or
@@ -1398,6 +1509,31 @@ def _handle_agent_restart(command: Command, ctx: ExecutionContext) -> _HandlerRe
                 "würde einen laufenden Rollout stören."
             ),
         )
+
+    if not ctx.agent_lock.acquire(timeout=AGENT_RESTART_LOCK_TIMEOUT_S):
+        return _HandlerResult(
+            successful=False,
+            error_text=(
+                "agent_restart abgelehnt: die Sperre für Container-/Backup-"
+                f"Operationen wurde nicht innerhalb von "
+                f"{AGENT_RESTART_LOCK_TIMEOUT_S:.0f}s frei -- vermutlich läuft "
+                "gerade ein Desired-State-Swap oder ein Backup; ein Neustart "
+                "jetzt würde diesen unterbrechen."
+            ),
+        )
+    # **Deliberately never released on this success path** (P5.4d): the
+    # process is about to exit (`run`'s own `exit_after_report` handling,
+    # right after this result is reported) -- holding `ctx.agent_lock` for
+    # whatever remains of this process's lifetime is exactly the point,
+    # not an oversight. It guarantees no reconcile attempt, backup, or a
+    # second `agent_restart` can start a container/backup operation in the
+    # narrow window between this handler returning and the process
+    # actually stopping (`report_result` itself still has to complete
+    # first). A test process that calls this handler with a no-op
+    # `exit_fn` and keeps running afterward is expected to construct its
+    # own fresh `ExecutionContext`/lock for whatever it does next, the
+    # same way a real process would start over with a fresh one after an
+    # actual restart.
     return _HandlerResult(successful=True, exit_after_report=True)
 
 
@@ -1758,6 +1894,108 @@ def _save_held_desired_state(path: Path, event: DesiredStateEvent) -> None:
     temp.replace(path)
 
 
+@dataclass(frozen=True)
+class _FailedRollback:
+    """One `(revision, service, digest)` this agent's own
+    `_await_or_rollback_pending_swap` rolled back because it never
+    reported healthy within the deadline (`ReconcileOutcome
+    .rolled_back_unhealthy`) -- P5.4d's drift re-check (item 3,
+    `_DesiredStateReconciler.attempt`) uses this to stop retrying that
+    exact digest in a tight loop every reconcile interval, without ever
+    weakening `reconcile_desired_state`'s own checks: a *different*
+    digest for the same service, or the same digest under a *different*
+    revision, is not blocked by this record at all -- only an exact
+    three-way match is.
+
+    **A separate file from the held desired state**
+    (`DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE`, not a field inside
+    `DesiredStateEvent`) -- deliberately, for two reasons: first,
+    `_load_held_desired_state`/`_save_held_desired_state` reuse
+    `protocol.desired_state.DesiredStateEvent`, the wire model, directly as
+    this file's own format (see that function's own docstring); adding an
+    agent-local, never-transmitted field to a `protocol/` model would blur
+    exactly the "protocol/ is the shared contract between both sides"
+    boundary CLAUDE.md draws for that package. Second, keeping it separate
+    means `_save_held_desired_state` never has to know this record exists
+    at all -- `_handle_desired_state_received` clears it explicitly,
+    alongside saving the new held state, whenever a genuinely new revision
+    is accepted (never on an ignored lower/equal one), which is exactly
+    the "do not re-attempt until a new revision arrives" rule stated,
+    without coupling the two files' write paths together."""
+
+    revision: int
+    service: str
+    digest: str
+
+
+def _load_failed_rollback(path: Path) -> _FailedRollback | None:
+    """Reads a persisted `_FailedRollback` record, the same
+    `agent.safe_io.read_text_safe` fail-closed-on-an-unsafe-path pattern
+    `_load_pending_swap` already uses. **Validated on load** (every field
+    checked, exactly the same shape of check `_load_pending_swap` applies
+    to `PendingSwap`) -- `service` must be one of `RECONCILE_SERVICE_ORDER`
+    and `digest` must satisfy `agent.sources.digest_is_well_formed`.
+
+    Unlike `_load_pending_swap`, an invalid/corrupt/unsafe file here is
+    **not security-relevant** enough to fail closed by raising: this
+    record only ever *suppresses* an automatic retry, it never grants one
+    -- `reconcile_desired_state`'s own digest/source/pre-check validation
+    runs in full regardless of what this file says or fails to say. So the
+    honest, simpler answer for "unreadable or invalid" is the same as
+    "absent": `None`, i.e. "nothing known to be blocked yet", logged, not
+    raised -- worst case, one already-unhealthy digest is attempted again
+    once more (safely: through the very same fail-closed pre-check and
+    swap/health-wait machinery that produced this record in the first
+    place), not a security boundary crossed.
+    """
+
+    try:
+        raw = read_text_safe(path)
+    except (OSError, UnsafeStateFileError):
+        return None
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Failed-rollback file is not valid JSON; treating as unset.")
+        return None
+    if not isinstance(data, dict):
+        logger.warning("Failed-rollback file is not a JSON object; treating as unset.")
+        return None
+    revision = data.get("revision")
+    service = data.get("service")
+    digest = data.get("digest")
+    if not isinstance(revision, int) or isinstance(revision, bool):
+        logger.warning("Failed-rollback file's revision is invalid; treating as unset.")
+        return None
+    if service not in RECONCILE_SERVICE_ORDER:
+        logger.warning("Failed-rollback file names an unknown service; treating as unset.")
+        return None
+    if not isinstance(digest, str) or not agent_sources.digest_is_well_formed(digest):
+        logger.warning("Failed-rollback file's digest is malformed; treating as unset.")
+        return None
+    return _FailedRollback(revision=revision, service=service, digest=digest)
+
+
+def _save_failed_rollback(path: Path, record: _FailedRollback | None) -> None:
+    """Persists (or, `record=None`, clears) the one known-bad-digest
+    record -- the same atomic temp-file-plus-replace pattern as every
+    other small state file in this module."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if record is None:
+        path.unlink(missing_ok=True)
+        return
+    payload = {"revision": record.revision, "service": record.service, "digest": record.digest}
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload), encoding="utf-8")
+    temp.replace(path)
+
+
 def _report_desired_state_outcome(
     client: httpx.Client, revision: int, outcome: ReconcileOutcome
 ) -> None:
@@ -1819,15 +2057,22 @@ class _DesiredStateReconciler:
     place `reconcile_desired_state` is ever called from `run` (cross-review
     fix), whether triggered immediately by a freshly received revision
     (`agent.commands_channel.DesiredStateReceived`, the command-processing
-    thread) or by the periodic background loop
-    (`run_desired_state_reconcile_loop`, its own daemon thread). Both call
-    sites share this one instance and therefore this one `lock`
-    (`threading.Lock`, serializes the two -- two concurrent
-    `reconcile_desired_state` calls for the same apartment would otherwise
-    race on the same containers/pending-swap file) and this one
-    `last_reported`/`last_converged_revision` memory (so "report on
-    change, not every tick" and "stop retrying once converged" both work
-    correctly regardless of which call site triggered a given attempt).
+    thread, via `_handle_desired_state_received`'s own `trigger_event` --
+    see that function's and `run_desired_state_reconcile_loop`'s own
+    docstrings for P5.4d's fix to how that trigger reaches this class) or
+    by the periodic background loop (`run_desired_state_reconcile_loop`,
+    its own daemon thread). Both call sites share this one instance and
+    therefore this one `ctx.agent_lock` (serializes the two -- two
+    concurrent `reconcile_desired_state` calls for the same apartment
+    would otherwise race on the same containers/pending-swap file; P5.4d:
+    **not a private lock of its own any more** -- see `ExecutionContext
+    .agent_lock`'s own docstring for why this is the one agent-wide lock,
+    shared with `_handle_backup_now`/`run_daily_backup_scheduler`/
+    `_handle_agent_restart` as well, not a lock scoped to this class
+    alone) and this one `last_reported`/`last_converged_revision` memory
+    (so "report on change, not every tick" and "stop retrying once
+    converged" both work correctly regardless of which call site
+    triggered a given attempt).
 
     Deliberately **not frozen** (unlike almost every other dataclass in
     this module) -- its whole purpose is the mutable bookkeeping
@@ -1839,7 +2084,11 @@ class _DesiredStateReconciler:
     ctx: ExecutionContext
     held_state_path: Path
     pending_swap_path: Path
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    # P5.4d: where a `_FailedRollback` (a digest already rolled back as
+    # unhealthy for the currently held revision) is persisted -- see that
+    # dataclass's own docstring for why this is a separate file from
+    # `held_state_path`.
+    failed_rollback_path: Path
     # `(revision, successful, reason, service)` of the last outcome actually
     # reported to the fleet -- `None` until the first attempt ever reports
     # anything. An identical tuple on a later attempt is never re-reported
@@ -1847,28 +2096,93 @@ class _DesiredStateReconciler:
     last_reported: tuple[int, bool, str, str | None] | None = field(default=None, init=False)
     # The revision `reconcile_desired_state` last reported "already at the
     # desired revision" for (`ReconcileOutcome.successful and .service is
-    # None`, `reconcile_desired_state`'s own docstring) -- an `attempt()`
-    # for the *same* revision is skipped entirely once set (no Docker call
-    # at all, cross-review: "until reconcile reports nothing to do/
-    # converged"). Reset implicitly the moment a *different* revision is
-    # held (the comparison below is always against the currently held
-    # revision, never stored independently of it).
+    # None`, `reconcile_desired_state`'s own docstring). **P5.4d changes
+    # what this means for a later `attempt()`**: it used to make every
+    # further attempt for the same revision a pure no-op forever; it now
+    # only skips the *expensive* full reconcile -- `attempt()` still does
+    # one cheap, read-only drift re-check per tick (item 3 below) and only
+    # falls through to a full `reconcile_desired_state` call again if that
+    # check finds the running containers no longer match. Reset implicitly
+    # the moment a *different* revision is held (the comparison below is
+    # always against the currently held revision, never stored
+    # independently of it).
     last_converged_revision: int | None = field(default=None, init=False)
 
     def attempt(self) -> None:
         """One reconcile attempt against whatever is currently held on
-        disk -- a no-op (no lock contention beyond the read, no Docker
-        call) if nothing is held or the held revision already converged.
-        Safe to call from either thread; overlapping calls simply queue on
-        `self.lock`."""
+        disk. Safe to call from either thread; overlapping calls simply
+        queue on `self.ctx.agent_lock`.
 
-        with self.lock:
+        **P5.4d, item 3 -- drift after convergence:** once a revision has
+        converged (`last_converged_revision`), a further `attempt()` for
+        that same revision no longer returns immediately doing nothing.
+        Instead:
+
+        - If `pilot_mode` is currently `False` on the held state: returns
+          immediately, **no Docker call at all** -- reconciliation stays
+          inactive, and inactive means zero Docker Engine API traffic,
+          exactly like every other path through this function (tested
+          directly, see `tests/test_agent_desired_state_reconciler.py`).
+        - Otherwise: `_select_service_to_update` -- the same read-only
+          "what, if anything, differs from the desired digest" helper
+          `reconcile_desired_state` itself uses to pick a service, a
+          handful of `GET` Engine API calls, never a mutation -- is run
+          directly. No drift (`None`): still converged, no-op, nothing
+          reported again. Drift found: unless this exact
+          `(revision, service, digest)` is the one this agent's own
+          `_await_or_rollback_pending_swap` already rolled back as
+          unhealthy (`_FailedRollback`, checked below) -- in which case
+          the drift is reported once (if it has not been already) and
+          left alone, not retried automatically -- convergence is
+          forgotten for this revision and the normal full-reconcile path
+          below runs, going through `reconcile_desired_state`'s complete
+          fail-closed pre-check exactly as a first attempt at this
+          revision would.
+
+        Any outcome whose `rolled_back_unhealthy` is `True` persists a
+        fresh `_FailedRollback` for the service/digest that failed --
+        this is the *only* place that file is ever written to a non-`None`
+        value; it is cleared only by `_handle_desired_state_received`
+        accepting a genuinely new revision.
+        """
+
+        with self.ctx.agent_lock:
             held = _load_held_desired_state(self.held_state_path)
             if held is None:
                 return
             revision = held.desired_state.revision
+
             if revision == self.last_converged_revision:
-                return
+                if not held.pilot_mode:
+                    # Inactive: stay at zero Docker calls, exactly like
+                    # every other path while `pilot_mode` is unset --
+                    # tested directly.
+                    return
+                drifted_service = _select_service_to_update(held.desired_state)
+                if drifted_service is None:
+                    return  # still converged, nothing to do
+                service_state = getattr(held.desired_state.services, drifted_service)
+                blocked = _load_failed_rollback(self.failed_rollback_path)
+                if (
+                    blocked is not None
+                    and blocked.revision == revision
+                    and blocked.service == drifted_service
+                    and blocked.digest == service_state.digest
+                ):
+                    reason = (
+                        f"{drifted_service}: digest {service_state.digest} was "
+                        "already rolled back as unhealthy for this revision -- "
+                        "not retried automatically; a new revision is required."
+                    )
+                    self._report_if_changed(
+                        revision,
+                        ReconcileOutcome(successful=False, reason=reason, service=drifted_service),
+                    )
+                    return
+                # Genuinely drifted, and not a digest already known bad for
+                # this revision -- forget convergence and fall through to a
+                # full reconcile below, fail-closed pre-check and all.
+                self.last_converged_revision = None
 
             if self.ctx.backup_config is None:
                 outcome = ReconcileOutcome(
@@ -1889,13 +2203,32 @@ class _DesiredStateReconciler:
                     local_log_path=self.ctx.local_log_path,
                 )
 
+            if outcome.rolled_back_unhealthy and outcome.service is not None:
+                service_state = getattr(held.desired_state.services, outcome.service)
+                _save_failed_rollback(
+                    self.failed_rollback_path,
+                    _FailedRollback(
+                        revision=revision,
+                        service=outcome.service,
+                        digest=service_state.digest,
+                    ),
+                )
+
             if outcome.successful and outcome.service is None:
                 self.last_converged_revision = revision
 
-            report_key = (revision, outcome.successful, outcome.reason, outcome.service)
-            if report_key != self.last_reported and self.ctx.client is not None:
-                _report_desired_state_outcome(self.ctx.client, revision, outcome)
-                self.last_reported = report_key
+            self._report_if_changed(revision, outcome)
+
+    def _report_if_changed(self, revision: int, outcome: ReconcileOutcome) -> None:
+        """`_report_desired_state_outcome`, deduplicated against
+        `self.last_reported` -- factored out of `attempt()` so both the
+        drift-blocked-report path and the full-reconcile path share
+        exactly one "report on change, not every tick" implementation."""
+
+        report_key = (revision, outcome.successful, outcome.reason, outcome.service)
+        if report_key != self.last_reported and self.ctx.client is not None:
+            _report_desired_state_outcome(self.ctx.client, revision, outcome)
+            self.last_reported = report_key
 
 
 def run_desired_state_reconcile_loop(
@@ -1904,6 +2237,7 @@ def run_desired_state_reconcile_loop(
     interval_s: float = DEFAULT_DESIRED_STATE_RECONCILE_INTERVAL_S,
     sleep: Callable[[float], None] = time.sleep,
     stop_event: threading.Event | None = None,
+    trigger_event: threading.Event | None = None,
 ) -> None:
     """Runs forever (real production use) or until `stop_event` is set
     (tests, and `agent.__main__`'s own shutdown path) -- the same "own
@@ -1915,41 +2249,76 @@ def run_desired_state_reconcile_loop(
     Every exception from one iteration is logged and swallowed -- a single
     failed attempt (a transient error) must not stop every later one,
     mirroring those two schedulers' own "log and continue" reasoning
-    exactly."""
+    exactly.
+
+    **P5.4d: `trigger_event`, the fix for "the immediate trigger must not
+    block the command thread"** -- `_handle_desired_state_received` no
+    longer calls `reconciler.attempt()` itself (which used to run a
+    potentially 15-minute-long reconcile, including its own health wait,
+    on the SSE command-processing thread, `run`'s own `for item in
+    commands:` loop -- long enough for other already-pending commands to
+    hit their own 15-minute expiry while stuck behind it). It now only
+    persists the held state and `.set()`s this event; **this** loop is
+    what actually performs the attempt, on its own thread, exactly as it
+    already does for every periodic retry. Waiting on the event instead of
+    a plain `sleep(interval_s)` (when one is given -- `None`, the default,
+    preserves the exact previous `sleep`-only behaviour byte for byte, for
+    every existing caller/test that does not pass one) means a freshly
+    received revision is attempted immediately rather than waiting up to
+    `interval_s` for the next tick, without this loop needing to poll.
+    """
 
     while stop_event is None or not stop_event.is_set():
         try:
             reconciler.attempt()
         except Exception:
             logger.exception("Desired-state reconcile iteration failed.")
-        sleep(interval_s)
+        if trigger_event is not None:
+            trigger_event.wait(timeout=interval_s)
+            trigger_event.clear()
+        else:
+            sleep(interval_s)
 
 
 def _handle_desired_state_received(
     item: DesiredStateReceived,
-    reconciler: _DesiredStateReconciler,
     *,
     held_state_path: Path,
+    failed_rollback_path: Path,
+    trigger_event: threading.Event,
 ) -> None:
     """P5.4b scope item 4, the agent-side glue `docs/STATUS.md`'s P5.4
     section flagged as still missing: validate (already done by
     `agent.commands_channel._parse_desired_state_event` before this is
     ever called -- a malformed event never reaches here at all), update
-    the held state, and trigger one immediate reconcile attempt --
-    ongoing retries (a transient pre-check rejection, section 13: "it ...
-    reconciles toward a desired state") are `run_desired_state_reconcile
-    _loop`'s own job from here on, not this function's.
+    the held state, and signal the reconciler's own thread to attempt it.
+
+    **P5.4d: no longer calls `reconciler.attempt()` directly** -- see
+    `run_desired_state_reconcile_loop`'s own docstring for the full
+    "must not block the command thread" reasoning. This function's own
+    job is now strictly bounded and fast: at most one file read, at most
+    two file writes, one `Event.set()`, never a Docker or network call --
+    `run`'s own command-processing loop stays free to keep executing
+    (and reporting the results of) every other pending command while a
+    slow reconcile attempt runs concurrently on the reconciler's own
+    thread. This is also why this function no longer takes the
+    `_DesiredStateReconciler` instance at all -- it has nothing left to
+    call on it.
 
     **Only a revision strictly lower than what is already held is
     ignored; an equal revision is a no-op** (cross-review: "equal = same
-    state, no-op") -- neither updates the held file nor triggers an extra
-    attempt (the periodic loop, or the attempt this same revision already
-    triggered earlier, is what is already retrying it). A revision
-    strictly greater always replaces the held state and triggers an
-    attempt, even while a lower/equal one would have been rejected --
-    this is a `<`/`<=` comparison against the *held* revision, not the
-    last-*reported* one, so a superseded-but-never-successfully-applied
-    revision is still correctly replaced.
+    state, no-op") -- neither updates the held file, clears the failed-
+    rollback record, nor signals the reconciler thread (the periodic loop,
+    or the attempt this same revision already triggered earlier, is what
+    is already retrying it). A revision strictly greater always replaces
+    the held state, **clears any `_FailedRollback` recorded for the
+    revision it replaces** (P5.4d: "do not re-attempt [a rolled-back
+    digest] until a new revision arrives" -- a new revision is exactly
+    that arrival), and signals the reconciler thread, even while a
+    lower/equal one would have been rejected -- this is a `<`/`<=`
+    comparison against the *held* revision, not the last-*reported* one,
+    so a superseded-but-never-successfully-applied revision is still
+    correctly replaced.
 
     **Stays fail-closed/inactive exactly like `reconcile_desired_state`
     itself** (section 13's "Decided afterward", 2026-09-28) -- this
@@ -1969,7 +2338,8 @@ def _handle_desired_state_received(
         return
 
     _save_held_desired_state(held_state_path, item.event)
-    reconciler.attempt()
+    _save_failed_rollback(failed_rollback_path, None)
+    trigger_event.set()
 
 
 def run(
@@ -1986,6 +2356,7 @@ def run(
     restore_poll_interval_s: float = DEFAULT_RESTORE_POLL_INTERVAL_S,
     pending_swap_path: Path = DEFAULT_PENDING_SWAP_FILE,
     desired_state_held_state_path: Path = DEFAULT_DESIRED_STATE_HELD_STATE_FILE,
+    desired_state_failed_rollback_path: Path = DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE,
     desired_state_reconcile_interval_s: float = DEFAULT_DESIRED_STATE_RECONCILE_INTERVAL_S,
     exit_fn: Callable[[int], None] = lambda code: sys.exit(code),
     sleep: Callable[[float], None] = time.sleep,
@@ -2003,23 +2374,41 @@ def run(
     other item type flows through the loop exactly as before this
     package.
 
-    **Cross-review fix: a held desired state, reconciled toward
+    **Cross-review fix (P5.4b): a held desired state, reconciled toward
     repeatedly, not attempted once.** `_handle_desired_state_received`
     only ever updates the held state (`desired_state_held_state_path`)
-    and triggers one immediate attempt; `run_desired_state_reconcile_loop`
+    and signals the reconciler thread; `run_desired_state_reconcile_loop`
     runs in its own daemon thread (started unconditionally, the same
     "runs even while `receive_commands` blocks" reasoning as the backup/
     restore threads below) and keeps re-attempting the held state every
-    `desired_state_reconcile_interval_s` until `reconcile_desired_state`
-    reports it converged -- section 13's "it ... reconciles toward a
-    desired state", not a one-shot attempt that silently gives up on a
-    transient pre-check rejection (the time window not reached yet, a
-    momentarily full disk) until a new revision or a fresh SSE connection
-    happens to arrive. Both the immediate attempt and every periodic one
-    go through the same `_DesiredStateReconciler` instance (`reconciler`
-    below), so they can never race each other and outcomes are only ever
-    reported to the fleet when they change, not on every tick (see that
-    class's own docstring).
+    `desired_state_reconcile_interval_s` (or immediately, once signalled)
+    until `reconcile_desired_state` reports it converged -- section 13's
+    "it ... reconciles toward a desired state", not a one-shot attempt
+    that silently gives up on a transient pre-check rejection (the time
+    window not reached yet, a momentarily full disk) until a new revision
+    or a fresh SSE connection happens to arrive. Both the immediate
+    attempt and every periodic one go through the same
+    `_DesiredStateReconciler` instance (`reconciler` below), so they can
+    never race each other (P5.4d: nor can they race `_handle_backup_now`/
+    `run_daily_backup_scheduler`/`_handle_agent_restart` any more, all
+    four sharing `ctx.agent_lock` -- see that field's own docstring) and
+    outcomes are only ever reported to the fleet when they change, not on
+    every tick (see that class's own docstring).
+
+    **P5.4d fix: the immediate trigger no longer runs on this loop's own
+    thread.** `_handle_desired_state_received` used to call
+    `reconciler.attempt()` directly, right here in this `for item in
+    commands:` loop -- a reconcile attempt can legitimately take up to 15
+    minutes (the post-swap health deadline), during which every other
+    already-pending command would have sat unexecuted behind it, long
+    enough to hit its own 15-minute expiry. `desired_state_trigger_event`
+    (a plain `threading.Event`) is the fix: `_handle_desired_state_received`
+    now only persists the held state and `.set()`s it; the reconciler's
+    own background thread (already started below, already the sole
+    caller of every periodic attempt) is what actually performs the
+    attempt, woken immediately instead of waiting for its next
+    `desired_state_reconcile_interval_s` tick. This loop stays free to
+    keep executing and reporting every other command concurrently.
 
     **`CommandStreamAuthError` stops this loop** (propagated to the
     caller, `agent.__main__` turns it into a clear exit-1 message) -- the
@@ -2093,7 +2482,9 @@ def run(
         backup_thread = threading.Thread(
             target=run_daily_backup_scheduler,
             args=(backup_config,),
-            kwargs={"stop_event": backup_stop_event},
+            # P5.4d: shares `ctx.agent_lock` with every other container/
+            # backup operation -- see that field's own docstring.
+            kwargs={"stop_event": backup_stop_event, "agent_lock": ctx.agent_lock},
             daemon=True,
             name="thermoctl-agent-daily-backup",
         )
@@ -2120,19 +2511,26 @@ def run(
     # P5.4b (cross-review fix): one `_DesiredStateReconciler` for the
     # whole lifetime of this call, shared by the immediate attempt below
     # and the periodic background thread -- see that class's own
-    # docstring for why one shared instance (and its one `lock`) is what
-    # makes the two call sites safe together. Started unconditionally
-    # (unlike the backup/restore threads above, which are conditional on
-    # their own configuration): even with `backup_config=None` there is
-    # still something useful to do every tick -- report, once, that
-    # reconciliation is disabled (`_DesiredStateReconciler.attempt`'s own
-    # `backup_config is None` branch), not silently do nothing forever.
+    # docstring for why one shared instance (and, P5.4d, `ctx.agent_lock`,
+    # not a lock private to this class) is what makes the two call sites
+    # safe together. Started unconditionally (unlike the backup/restore
+    # threads above, which are conditional on their own configuration):
+    # even with `backup_config=None` there is still something useful to do
+    # every tick -- report, once, that reconciliation is disabled
+    # (`_DesiredStateReconciler.attempt`'s own `backup_config is None`
+    # branch), not silently do nothing forever.
     desired_state_reconciler = _DesiredStateReconciler(
         ctx=ctx,
         held_state_path=desired_state_held_state_path,
         pending_swap_path=pending_swap_path,
+        failed_rollback_path=desired_state_failed_rollback_path,
     )
     desired_state_stop_event = threading.Event()
+    # P5.4d: what `_handle_desired_state_received` sets (instead of
+    # calling `reconciler.attempt()` itself) to wake this thread
+    # immediately for a freshly received revision -- see both that
+    # function's and `run_desired_state_reconcile_loop`'s own docstrings.
+    desired_state_trigger_event = threading.Event()
     desired_state_thread = threading.Thread(
         target=run_desired_state_reconcile_loop,
         args=(desired_state_reconciler,),
@@ -2140,6 +2538,7 @@ def run(
             "interval_s": desired_state_reconcile_interval_s,
             "sleep": sleep,
             "stop_event": desired_state_stop_event,
+            "trigger_event": desired_state_trigger_event,
         },
         daemon=True,
         name="thermoctl-agent-desired-state-reconcile",
@@ -2154,8 +2553,9 @@ def run(
             if isinstance(item, DesiredStateReceived):
                 _handle_desired_state_received(
                     item,
-                    desired_state_reconciler,
                     held_state_path=desired_state_held_state_path,
+                    failed_rollback_path=desired_state_failed_rollback_path,
+                    trigger_event=desired_state_trigger_event,
                 )
                 continue
             if isinstance(item, RejectedCommand):
@@ -2387,11 +2787,27 @@ class ReconcileOutcome:
     """What `reconcile_desired_state` returns -- `service` is `None` only
     when nothing needed reconciling at all (already at the desired
     revision) or the pre-check rejected before a service was even
-    selected."""
+    selected.
+
+    `rolled_back_unhealthy` (P5.4d): `True` only for the one specific
+    failure `_await_or_rollback_pending_swap` reports when its own health
+    deadline (section 13 step 5) expired and it rolled back on its own --
+    a **structural** signal, not a string match on `reason` (this
+    codebase's own established style: never decide something
+    security-relevant, or behaviour-changing, by pattern-matching free
+    text meant for a human/log). `_DesiredStateReconciler.attempt` uses
+    this, and only this, to decide whether to persist a `_FailedRollback`
+    record for its own drift re-check (item 3) -- every *other* kind of
+    failure (a pre-check rejection, a backup failure, a pull/verify
+    failure, a swap-execution failure) stays `False` and is simply
+    retried on the next tick/drift-check as before, since none of those
+    already spent a real swap-and-wait cycle on a digest now known to be
+    actually unhealthy at runtime."""
 
     successful: bool
     reason: str
     service: str | None = None
+    rolled_back_unhealthy: bool = False
 
 
 def _time_within_update_window(
@@ -2575,7 +2991,9 @@ def _await_or_rollback_pending_swap(
         reason += " Rollback itself also failed -- manual intervention required."
     _append_local_log(local_log_path, f"reconcile_desired_state: {reason}")
     _save_pending_swap(pending_swap_path, None)
-    return ReconcileOutcome(successful=False, reason=reason, service=swap.service)
+    return ReconcileOutcome(
+        successful=False, reason=reason, service=swap.service, rolled_back_unhealthy=True
+    )
 
 
 def reconcile_desired_state(
@@ -3196,6 +3614,7 @@ def run_daily_backup_scheduler(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     stop_event: threading.Event | None = None,
+    agent_lock: threading.Lock | None = None,
 ) -> None:
     """Section 15.2's own rhythm ("device configuration on every change,
     operational data daily") -- **applied to both kinds, daily**: "on
@@ -3219,13 +3638,28 @@ def run_daily_backup_scheduler(
     a temporarily unreadable recipients file) must not take down every
     later day's attempt, mirroring `fleet.app._alarm_check_loop`'s own
     "log and continue" reasoning for its background task.
+
+    **`agent_lock` (P5.4d)**: each iteration's pair of backup calls runs
+    under this lock, `ExecutionContext.agent_lock` in real use (`run`
+    passes it explicitly) -- the same "one shared, agent-wide lock" this
+    package's own container/backup operations all serialize on, see that
+    field's own docstring. `None` (the default) means "run unserialized" --
+    every existing direct caller of this function (most of this module's
+    own tests) that never passes one is unaffected; only `run`'s own
+    thread actually needs the real one.
     """
 
     while stop_event is None or not stop_event.is_set():
         current_now = now()
         for operational_data in (False, True):
             try:
-                create_and_upload_backup(config.client, config, operational_data, current_now)
+                if agent_lock is not None:
+                    with agent_lock:
+                        create_and_upload_backup(
+                            config.client, config, operational_data, current_now
+                        )
+                else:
+                    create_and_upload_backup(config.client, config, operational_data, current_now)
             except Exception:
                 logger.exception(
                     "Scheduled daily backup failed (operational_data=%s)", operational_data

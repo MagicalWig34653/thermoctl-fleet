@@ -710,6 +710,45 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Read back by:** main session (desired-state delivery and the closed
   command list interact directly, security principles 1 and 5).
 
+### P5.4d -- Pre-activation points from the P5.4b merge **SR**
+- [x] done -- see `docs/STATUS.md`'s own P5.4d section for the full design
+  and verification output.
+- **Goal:** close the four points the P5.4b merge review flagged as
+  required before desired-state reconciliation may ever be activated: one
+  agent-wide lock shared by every container/backup operation; a
+  non-blocking immediate trigger (the command thread must not wait on a
+  reconcile attempt); a cheap, read-only drift re-check once a revision
+  has converged, with a guard against retrying a digest already rolled
+  back as unhealthy; and a real concurrency test proving `attempt()` is
+  strictly serialized.
+- **Files:** `agent/loop.py` (`ExecutionContext.agent_lock`,
+  `_handle_backup_now`, `run_daily_backup_scheduler`,
+  `_handle_agent_restart`, `AGENT_RESTART_LOCK_TIMEOUT_S`,
+  `_handle_desired_state_received`, `run_desired_state_reconcile_loop`,
+  `_DesiredStateReconciler`, `_FailedRollback`/`_load_failed_rollback`/
+  `_save_failed_rollback`, `ReconcileOutcome.rolled_back_unhealthy`,
+  `DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE`), `agent/__main__.py`.
+- **Section:** 13 (the pre-activation gate itself, section 13's "Decided
+  afterward", is unchanged by this package).
+- **Acceptance:** a command arriving during a fake, blocking reconcile is
+  executed (and its result reported) before its own expiry; two
+  concurrent `attempt()` calls are strictly serialized; the reconciler,
+  `backup_now`, the daily scheduler, and `agent_restart` all share one
+  lock (proven by a held-lock test blocking each); `agent_restart` fails
+  fast and clearly, never silently, if it cannot acquire the lock within a
+  bounded timeout; a converged revision's drift re-check makes zero
+  Docker calls while `pilot_mode` is false; a digest already rolled back
+  as unhealthy for the held revision is never retried automatically,
+  reported once, and only cleared by a new revision.
+- **Depends on:** P5.4, P5.4b (this package only closes their own
+  documented open points, changes no security boundary).
+- **Explicitly out of scope, left open:** P5.4c's rollout queue (pilot
+  apartment first, 48-hour stagger, per-apartment sequencing); activation
+  itself still requires a real thermoctl health/outdoor-temperature
+  reader and `pilot_mode` set per apartment (unchanged from P5.4/P5.4b).
+- **Read back by:** main session (the shared lock and the non-blocking
+  trigger both touch CLAUDE.md security principles 2 and 5 directly).
+
 ### P5.5a -- Backup creation and upload **SR**
 - [x] done -- see `docs/STATUS.md`'s P5.5a section.
 - **Goal:** implement `agent/loop.py::create_backup` for both kinds of

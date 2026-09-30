@@ -766,3 +766,135 @@ def test_run_daily_backup_scheduler_runs_both_kinds_on_each_tick_and_survives_fa
     assert sleep_calls == [1.0, 1.0]
     assert uploaded_kinds.count("device_config") == 2
     assert uploaded_kinds.count("operational_data") == 1
+
+
+# --- P5.4d: the shared agent-wide lock ---------------------------------------
+
+
+def test_handle_backup_now_runs_under_ctx_agent_lock(tmp_path: Path) -> None:
+    """`_handle_backup_now` -- the one place a fleet-issued `backup_now`
+    could otherwise interleave with an in-flight desired-state swap's own
+    pre-update backup -- holds `ctx.agent_lock` for its whole duration,
+    verified here by checking `.locked()` from inside the upload handler
+    itself (this test's transport is the only thing that runs *while* the
+    lock is held, short of a real second thread)."""
+
+    lock_states: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        lock_states.append(ctx.agent_lock.locked())
+        body = request.read()
+        kind = request.url.params["kind"]
+        return httpx.Response(
+            201,
+            json={
+                "id": "backup-1", "kind": kind, "received_at": NOW.isoformat(),
+                "size_bytes": len(body), "content_hash": request.url.params["content_hash"],
+            },
+        )
+
+    client = httpx.Client(
+        base_url="https://fleet.example", transport=httpx.MockTransport(handler)
+    )
+    db_path = tmp_path / "thermoctl.db"
+    _write_fake_thermoctl_db(db_path)
+    z2m_dir = tmp_path / "zigbee2mqtt"
+    _write_fake_zigbee2mqtt_dir(z2m_dir)
+    recipients_file = tmp_path / "backup-recipients.txt"
+    _write_recipients_file(recipients_file)
+
+    backup_config = BackupConfig(
+        apartment_id="apt-7", agent_version="0.1.0-dev", staging_dir=tmp_path / "staging",
+        thermoctl_db_path=db_path, zigbee2mqtt_dir=z2m_dir, client=client,
+        recipients_file=recipients_file,
+    )
+    ctx = ExecutionContext(
+        watchdog_state_path=tmp_path / "state.env",
+        local_log_path=tmp_path / "agent.log",
+        now=lambda: NOW,
+        backup_config=backup_config,
+    )
+
+    result = _handle_backup_now(_backup_command(), ctx)
+
+    assert result.successful is True
+    assert lock_states == [True, True]  # both uploads ran with the lock held
+    assert ctx.agent_lock.locked() is False  # released once the handler returns
+
+
+def test_handle_backup_now_refused_without_backup_config_never_touches_the_lock(
+    tmp_path: Path,
+) -> None:
+    """The early, config-missing refusal returns before ever acquiring the
+    lock -- nothing to serialize against, and nothing left locked."""
+
+    ctx = ExecutionContext(
+        watchdog_state_path=tmp_path / "state.env",
+        local_log_path=tmp_path / "agent.log",
+        now=lambda: NOW,
+        backup_config=None,
+    )
+
+    result = _handle_backup_now(_backup_command(), ctx)
+
+    assert result.successful is False
+    assert ctx.agent_lock.locked() is False
+
+
+def test_run_daily_backup_scheduler_runs_under_the_given_agent_lock(tmp_path: Path) -> None:
+    """`run_daily_backup_scheduler`'s own `agent_lock` parameter -- passed
+    explicitly by `run` as `ctx.agent_lock` in real use -- serializes each
+    tick's pair of backup calls under it, verified the same way as
+    `_handle_backup_now` above."""
+
+    import threading
+
+    lock = threading.Lock()
+    lock_states: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        lock_states.append(lock.locked())
+        body = request.read()
+        kind = request.url.params["kind"]
+        return httpx.Response(
+            201,
+            json={
+                "id": "backup-1", "kind": kind, "received_at": NOW.isoformat(),
+                "size_bytes": len(body), "content_hash": request.url.params["content_hash"],
+            },
+        )
+
+    client = httpx.Client(
+        base_url="https://fleet.example", transport=httpx.MockTransport(handler)
+    )
+    db_path = tmp_path / "thermoctl.db"
+    _write_fake_thermoctl_db(db_path)
+    z2m_dir = tmp_path / "zigbee2mqtt"
+    _write_fake_zigbee2mqtt_dir(z2m_dir)
+    recipients_file = tmp_path / "backup-recipients.txt"
+    _write_recipients_file(recipients_file)
+
+    from agent.loop import run_daily_backup_scheduler
+
+    backup_config = BackupConfig(
+        apartment_id="apt-7", agent_version="0.1.0-dev", staging_dir=tmp_path / "staging",
+        thermoctl_db_path=db_path, zigbee2mqtt_dir=z2m_dir, client=client,
+        recipients_file=recipients_file,
+    )
+
+    stop_event = threading.Event()
+
+    def fake_sleep(seconds: float) -> None:
+        stop_event.set()
+
+    run_daily_backup_scheduler(
+        backup_config,
+        interval_s=1.0,
+        sleep=fake_sleep,
+        now=lambda: NOW,
+        stop_event=stop_event,
+        agent_lock=lock,
+    )
+
+    assert lock_states == [True, True]
+    assert lock.locked() is False

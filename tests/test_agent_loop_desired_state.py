@@ -16,6 +16,8 @@ desired-state revision, so `run`'s own existing, already-tested exit path
 from __future__ import annotations
 
 import secrets
+import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -197,6 +199,21 @@ def test_run_ignores_a_stale_desired_state_revision(
 def test_run_accepts_a_newer_revision_and_replaces_the_held_state(
     tmp_path: Path, app_storage: Storage
 ) -> None:
+    """P5.4d changed how this has to be tested: `_handle_desired_state
+    _received` no longer runs `reconcile_desired_state` on the command
+    thread (see that function's own docstring) -- it only signals the
+    reconciler's own background thread and returns. An `agent_restart`
+    command delivered in the very same connect-time catch-up batch is
+    therefore no longer guaranteed to be processed *after* the reconciler
+    thread has woken up, acquired `ctx.agent_lock`, and reported the
+    revision-2 outcome -- that race is exactly the point of the fix (a
+    command must not wait for a reconcile to finish). This test instead:
+    starts `run` on its own thread, polls the real storage for the
+    revision-2 outcome to appear (bounded wait), and only *then* creates
+    the `agent_restart` command -- delivered live to the still-open SSE
+    connection -- to stop the loop.
+    """
+
     token = _issue_token(app_storage)
     app_storage.create_desired_state_revision(
         APARTMENT, _desired_state(revision=1), ui_username="landlord", reason="first",
@@ -204,10 +221,6 @@ def test_run_accepts_a_newer_revision_and_replaces_the_held_state(
     )
     app_storage.create_desired_state_revision(
         APARTMENT, _desired_state(revision=2), ui_username="landlord", reason="second",
-        now=datetime.now(UTC),
-    )
-    app_storage.create_command(
-        APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
         now=datetime.now(UTC),
     )
 
@@ -229,11 +242,45 @@ def test_run_accepts_a_newer_revision_and_replaces_the_held_state(
                 client=client,
                 recipients_file=tmp_path / "recipients.txt",
             )
-            _run(client, tmp_path, backup_config=backup_config, held_state_path=held_state_path)
 
-    outcome = app_storage.latest_desired_state_outcome(APARTMENT)
-    assert outcome is not None
-    assert outcome.revision == 2
+            run_thread_errors: list[BaseException] = []
+
+            def _run_in_thread() -> None:
+                try:
+                    _run(
+                        client,
+                        tmp_path,
+                        backup_config=backup_config,
+                        held_state_path=held_state_path,
+                    )
+                except BaseException as error:  # noqa: BLE001 -- surfaced below
+                    run_thread_errors.append(error)
+
+            run_thread = threading.Thread(target=_run_in_thread)
+            run_thread.start()
+            try:
+                deadline = time.monotonic() + 5.0
+                outcome = None
+                while time.monotonic() < deadline:
+                    outcome = app_storage.latest_desired_state_outcome(APARTMENT)
+                    if outcome is not None and outcome.revision == 2:
+                        break
+                    time.sleep(0.02)
+
+                assert outcome is not None
+                assert outcome.revision == 2
+            finally:
+                # Stop the loop regardless of the assertion above -- created
+                # live, delivered to the already-open SSE connection.
+                app_storage.create_command(
+                    APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+                    now=datetime.now(UTC),
+                )
+                run_thread.join(timeout=10.0)
+
+            assert not run_thread.is_alive()
+            assert run_thread_errors == []
+
     held = _load_held_desired_state(held_state_path)
     assert held is not None
     assert held.desired_state.revision == 2

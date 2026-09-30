@@ -140,6 +140,9 @@ def _run_agent(args: argparse.Namespace) -> int:
                 desired_state_held_state_path=(
                     data_dir / loop.DEFAULT_DESIRED_STATE_HELD_STATE_FILE
                 ),
+                desired_state_failed_rollback_path=(
+                    data_dir / loop.DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE
+                ),
             )
     except CommandStreamAuthError:
         print(
