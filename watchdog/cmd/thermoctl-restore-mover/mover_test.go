@@ -955,21 +955,30 @@ func TestCanResumeFinalizeRefusesLiveFileNotInJournal(t *testing.T) {
 }
 
 // TestOpenStagedFileImmuneToPathSwapAfterOpen is the regression test for
-// the cross-review's TOCTOU finding: once openStagedFileNoFollow has
-// returned an open descriptor, nothing that subsequently happens to the
-// *path* -- including the untrusted agent process replacing it with a
-// symlink to unrelated, attacker-controlled content -- has any effect on
-// what is read from that descriptor. This is the exact property
-// prepareFile (validate.go) relies on: it opens once and reads/hashes/
-// copies from that one descriptor in a single, uninterrupted pass, never
-// reopening the path.
+// the cross-review's original TOCTOU finding: once
+// StagingRoot.openEntryNoFollow has returned an open descriptor, nothing
+// that subsequently happens to the *path* -- including the untrusted
+// agent process replacing it with a symlink to unrelated,
+// attacker-controlled content -- has any effect on what is read from that
+// descriptor. This is the exact property prepareFile (validate.go) relies
+// on: it opens once and reads/hashes/copies from that one descriptor in a
+// single, uninterrupted pass, never reopening the path. (Ported to
+// StagingRoot for P5.5d's cross-review fix -- see stagingroot_test.go for
+// the newer regression tests covering the *intermediate*-component gap
+// this same fix closes.)
 func TestOpenStagedFileImmuneToPathSwapAfterOpen(t *testing.T) {
 	dir := t.TempDir()
 	originalContent := []byte("original-validated-content")
 	path := filepath.Join(dir, "thermoctl.db")
 	writeFile(t, path, originalContent)
 
-	file, size, err := openStagedFileNoFollow(path)
+	sr, err := openStagingRoot(dir)
+	if err != nil || sr == nil {
+		t.Fatalf("openStagingRoot: sr=%v err=%v", sr, err)
+	}
+	defer sr.Close()
+
+	file, size, err := sr.openEntryNoFollow("thermoctl.db")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

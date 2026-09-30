@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -15,12 +14,35 @@ import (
 // Exit codes: 0 for "nothing to do" or "applied successfully", 1 for
 // every refusal/failure (still writes a status file wherever it has
 // enough information to -- see each branch below for when it does not).
+//
+// **Opens the staging directory as a *StagingRoot exactly once, here, and
+// reuses it for the rest of this call** (P5.5d cross-review fix) --
+// reading the manifest, validating/copying every entry, and cleaning up
+// staging afterward all go through this same sr, so a swap of the
+// staging directory's own name (or its "zigbee2mqtt" subdirectory's own
+// name) partway through a run cannot redirect a later step onto a
+// different location than an earlier one already resolved. See
+// stagingroot.go's own top docstring for the full reasoning.
 func run(cfg Config, warn func(format string, args ...any), now func() time.Time) int {
-	manifestPath := filepath.Join(cfg.StagingDir, ManifestFilename)
-	manifest, manifestBytes, present, err := parseManifest(manifestPath)
+	sr, err := openStagingRoot(cfg.StagingDir)
+	if err != nil {
+		warn("thermoctl-restore-mover: opening staging directory %s: %v", cfg.StagingDir, err)
+		writeOutcome(cfg, warn, now, "", ResultFailure, detailOf(err, DetailUnsafeStaging))
+		return 1
+	}
+	if sr == nil {
+		// Staging directory does not exist at all -- nothing pending
+		// (a staged restore cannot exist without it), exactly like an
+		// absent manifest.json below. Not an error, nothing written to
+		// the status file.
+		return 0
+	}
+	defer sr.Close()
+
+	manifest, manifestBytes, present, err := parseManifest(sr)
 	if !present {
 		if err != nil {
-			warn("thermoctl-restore-mover: reading %s: %v", manifestPath, err)
+			warn("thermoctl-restore-mover: reading %s: %v", ManifestFilename, err)
 			return 1
 		}
 		// No manifest at all -- nothing pending. Not an error, and
@@ -61,7 +83,7 @@ func run(cfg Config, warn func(format string, args ...any), now func() time.Time
 		warn("thermoctl-restore-mover: live store matches this program's own journal for backup %s; resuming the interrupted finalize", manifest.BackupID)
 	}
 
-	prepared, err := validateAll(cfg.StagingDir, manifest, targets)
+	prepared, err := validateAll(sr, manifest, targets)
 	if err != nil {
 		warn("thermoctl-restore-mover: validation failed: %v", err)
 		writeOutcome(cfg, warn, now, manifest.BackupID, ResultFailure, detailOf(err, DetailUnsafeStaging))
@@ -88,7 +110,7 @@ func run(cfg Config, warn func(format string, args ...any), now func() time.Time
 		return 1
 	}
 
-	if err := removeStagingContents(cfg.StagingDir, manifest); err != nil {
+	if err := removeStagingContents(sr, manifest); err != nil {
 		// Every file is already safely in its destination at this point
 		// -- a failure to clean up staging afterward must not be reported
 		// as a failed restore (that would be exactly the kind of

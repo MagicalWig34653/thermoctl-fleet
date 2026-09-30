@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	pathpkg "path"
-	"path/filepath"
 )
 
 // finalizeResult is what finalizeAll reports back to main.go: how many
@@ -104,85 +103,41 @@ func fsyncDir(dir string, warn func(format string, args ...any)) {
 // unaffected -- an already-existing, empty staging directory is exactly
 // what `mkdir(..., exist_ok=True)` already tolerates.
 //
-// **lstat-checked, not blindly path-based removal** -- every entry is
-// `os.Lstat`ed immediately before its own `os.Remove` and refused if it
-// is not exactly the type this function expects there (a leaf entry must
-// not turn out to be a directory; the "zigbee2mqtt" entry must be a real,
-// non-symlink directory). This is defense in depth on top of an operation
-// that is already safe against a symlink swap for the *entry itself* --
-// POSIX `unlink(2)`/`rmdir(2)` (what `os.Remove` calls, depending on the
-// entry's type) never dereference the final path component being
-// removed, so even an entry the untrusted agent process swapped for a
-// symlink pointing into a live directory is removed as *just the
-// symlink*, never traversed into. `rmdir(2)` additionally refuses
-// outright (`ENOTEMPTY`) if anything unexpected still exists inside
-// "zigbee2mqtt" -- this function only ever calls it after already
-// removing exactly the files the manifest named inside that
-// subdirectory, never a forced/recursive removal.
-func removeStagingContents(stagingDir string, manifest *Manifest) error {
-	subdirs := map[string]struct{}{}
+// **Routed entirely through the held sr, never a joined path (second
+// P5.5d fix, cross-review of the first): a plain
+// `os.Lstat(filepath.Join(stagingDir, "zigbee2mqtt/database.db"))` looked
+// safe (an Lstat immediately before an Remove) but was not -- Lstat and
+// Remove on a *multi-component* path both resolve every *intermediate*
+// component normally, protecting only the *final* one. If the agent swaps
+// "zigbee2mqtt" itself for a symlink into a live directory between this
+// program's earlier validation pass and this later cleanup pass, both the
+// Lstat check and the Remove call would silently follow it and delete the
+// live file this program had just restored.** `StagingRoot.removeEntry`/
+// `removeZigbeeDirIfPresent`/`removeManifest` (stagingroot.go) close this
+// by resolving "zigbee2mqtt" itself exactly once per run, into its own
+// held sub-root, and only ever performing single-component operations
+// through the top root or that sub-root afterward -- see stagingroot.go's
+// own top docstring for the full reasoning, including why a
+// single-component removal (POSIX `unlink(2)`/`rmdir(2)` never
+// dereferences its own final named component) is safe by construction
+// even without the sub-root, while a *multi*-component one is not.
+func removeStagingContents(sr *StagingRoot, manifest *Manifest) error {
+	needsZigbee := false
 	for _, entry := range manifest.Files {
-		full := filepath.Join(stagingDir, filepath.FromSlash(entry.Path))
-		if err := removeLeafEntry(full); err != nil {
+		if err := sr.removeEntry(entry.Path); err != nil {
 			return fmt.Errorf("removing staged file %s: %w", entry.Path, err)
 		}
 		if dirPart, _ := pathpkg.Split(entry.Path); dirPart != "" {
-			subdirs[pathpkg.Clean(dirPart)] = struct{}{}
+			needsZigbee = true
 		}
 	}
-	for subdir := range subdirs {
-		full := filepath.Join(stagingDir, filepath.FromSlash(subdir))
-		if err := removeEmptyDirEntry(full); err != nil {
-			return fmt.Errorf("removing staging subdirectory %s: %w", subdir, err)
+	if needsZigbee {
+		if err := sr.removeZigbeeDirIfPresent(); err != nil {
+			return fmt.Errorf("removing staging subdirectory %s: %w", zigbeeDirName, err)
 		}
 	}
-	manifestPath := filepath.Join(stagingDir, ManifestFilename)
-	if err := removeLeafEntry(manifestPath); err != nil {
+	if err := sr.removeManifest(); err != nil {
 		return fmt.Errorf("removing manifest %s: %w", ManifestFilename, err)
-	}
-	return nil
-}
-
-// removeLeafEntry removes a single, non-directory staging entry -- see
-// removeStagingContents's own docstring for why lstat-checking first,
-// though already redundant with unlink(2)'s own symlink-safety, is still
-// the more auditable choice here.
-func removeLeafEntry(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if info.IsDir() {
-		return fmt.Errorf("%s is unexpectedly a directory, refusing to remove it as a leaf entry", path)
-	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
-// removeEmptyDirEntry removes the fixed "zigbee2mqtt" staging
-// subdirectory once every file inside it has already been removed by
-// removeLeafEntry above -- lstat-checked first (refuses anything that is
-// not a real, non-symlink directory), then `os.Remove`, which for a
-// directory calls `rmdir(2)`: it fails outright if anything unexpected
-// still exists inside, rather than forcibly emptying it.
-func removeEmptyDirEntry(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("%s is not a real directory, refusing to remove it", path)
-	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
 	}
 	return nil
 }

@@ -88,4 +88,25 @@
 // included, never the staging directory entry itself -- P5.5d, see
 // move.go::removeStagingContents) and the journal are removed only once
 // every file has been renamed into place successfully.
+//
+// **P5.5d cross-review fix: every access to anything under staging goes
+// through a single, already-open os.Root, never a joined path.** The
+// first P5.5d commit still built plain, multi-component relative paths
+// (e.g. filepath.Join(stagingDir, "zigbee2mqtt/database.db")) for both
+// reading staged files and cleaning them up afterward. Lstat/O_NOFOLLOW
+// only protect the *final* path component -- "zigbee2mqtt" itself, an
+// *intermediate* component, was silently resolved through if the agent
+// swapped it for a symlink between an earlier check and a later access,
+// letting this root-running program read an arbitrary file elsewhere on
+// the filesystem (with a decoy hash crafted to pass validation) or, worse,
+// delete a live file through a symlink planted after a successful move.
+// stagingroot.go's own StagingRoot closes this: the staging directory is
+// opened exactly once, as an os.Root (Go 1.24+, still zero `go.mod`
+// dependencies -- a toolchain-version bump only), and reused across
+// validation, the resume decision's re-validation, and cleanup; its own
+// top docstring has the full reasoning, including why os.Root's own
+// "does not let anything escape the root" guarantee alone is not enough
+// (it still follows a relative symlink that stays *inside* the root) and
+// why "zigbee2mqtt" additionally gets its own held sub-root rather than
+// being resolved by name more than once per run.
 package main

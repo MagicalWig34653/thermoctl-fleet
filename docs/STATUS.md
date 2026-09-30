@@ -149,6 +149,137 @@ thermoctl-restore-mover.conf}`, `image/common/agent-compose.yml`,
 `watchdog/check_contract.sh`, `tests/test_image_config.py`,
 `tests/test_agent_restore.py`.
 
+## P5.5d cross-review fix: staging accessed through os.Root, closing an intermediate-symlink gap
+
+Cross-review of the P5.5d commit above found one HIGH-severity finding,
+demonstrated by the reviewer against the code as first committed:
+`removeStagingContents` (and, on the read side, `prepareFile`) built
+plain, multi-component relative paths -- e.g.
+`filepath.Join(stagingDir, "zigbee2mqtt/database.db")` -- and
+Lstat/O_NOFOLLOW/`os.Remove`d them as one joined string. Neither a bare
+`Lstat` nor `O_NOFOLLOW` protects anything but the *final* path
+component: "zigbee2mqtt" itself, an *intermediate* component, was
+silently resolved through if the agent (untrusted, CLAUDE.md security
+principle 5) swapped it for a symlink between an earlier check and a
+later access. Demonstrated two ways: (1) a decoy file elsewhere, with a
+hash crafted to match the manifest, reached through a swapped
+"zigbee2mqtt" symlink, would be read (hashed, copied) as if it were the
+real staged file, without this program ever opening anything actually
+inside the real staging directory; (2) after a successful move, swapping
+"zigbee2mqtt" (or the staging directory's own entry in *its* parent) for
+a symlink into the *live* directory just populated would make this
+root-running program's own cleanup step delete the live file it had just
+restored.
+
+**Fixed structurally: every filesystem access this program makes against
+the staging directory now goes through a single, already-open `os.Root`**
+(new file, `watchdog/cmd/thermoctl-restore-mover/stagingroot.go`,
+`StagingRoot`) -- opened exactly once at the top of `run()` and reused
+for reading the manifest, validating/copying every entry, the resume
+decision's re-validation, and final cleanup, so a swap of any path
+component partway through a run cannot redirect a later step onto a
+different location than an earlier one already resolved.
+`watchdog/go.mod`'s own `go` directive bumped from 1.23 to 1.24 for
+`os.Root` (stdlib, added in Go 1.24) -- a **toolchain-version
+requirement, not a dependency**: `go.mod` still names zero `require`
+lines, and `.github/workflows/go.yml`'s three `go-version: "1.23"`
+entries were bumped to `"1.24"` alongside it.
+
+**os.Root's own documented limit, closed explicitly, never relied on
+implicitly.** Verified empirically (both cross-compiled and against a
+real `golang:1.24-bookworm` container) before committing to this design:
+`os.Root` refuses anything that would resolve *outside* the directory it
+was opened for (an absolute symlink, a `..` escape, a relative symlink
+whose target lies outside) -- but it does **not** refuse a relative
+symlink that stays *inside* the root (`root.Open` on such a symlink
+follows it and returns the *other* file's content), and passing
+`syscall.O_NOFOLLOW` to `Root.OpenFile` does **not** change that (Root
+silently does not honor it). This program refuses ALL symlinks under
+staging, not only ones that would escape it: every entry -- and the
+fixed "zigbee2mqtt" subdirectory itself -- is `Lstat`-ed through the
+appropriate `*os.Root` and refused if it is a symlink, *before* any
+Open/Remove call ever reaches it.
+
+**Why "zigbee2mqtt" gets its own, separately-held sub-root, not just a
+one-time Lstat check.** Root's own path resolution handles a
+multi-component name safely with respect to *escaping* the root on every
+call, but each call independently re-resolves "zigbee2mqtt" from the top
+root's own held directory handle -- an Lstat performed once, followed
+later by a *separate* multi-component Open/Remove call, reopens exactly
+the same window the original bug had, only narrower. `StagingRoot`
+instead opens "zigbee2mqtt" exactly once (immediately after
+Lstat-confirming it is a real, non-symlink directory) as its own
+`os.Root`, and performs every later single-component operation on its
+two children through *that* held sub-root -- "zigbee2mqtt" is never
+looked up by name a second time within the same run. A genuinely
+single-component removal (the "zigbee2mqtt" directory entry itself, or
+`manifest.json`, both through the top root) needed no such sub-root to
+begin with: POSIX `unlink(2)`/`rmdir(2)` never dereference their own
+final named component, so that class of operation was already safe by
+construction, checked here for auditability rather than because it was
+exploitable.
+
+**`parseManifest` also moved onto `StagingRoot`** (`readManifestBytes`) --
+manifest.json is a single top-level component, so it was never part of
+the vulnerable class, but reading it before the staging directory's own
+root existed would have meant a second, separate path resolution of
+`stagingDir` itself; routing it through the same `sr` closes that too and
+keeps "read once, use everywhere" consistent for every file this program
+touches under staging.
+
+**`openStagedFileNoFollow` (the plain-path staged-file primitive this
+fix replaces) removed from `safeopen.go`** -- `openRegularNoFollow`
+(used by `journal.go` for the *live*-side journal/status files, which are
+fixed, non-agent-controlled, single-component paths outside this threat
+model) and `lstatIsDirNoSymlink` (used by `openStagingRoot` itself)
+stay.
+
+**Regression tests** (`watchdog/cmd/thermoctl-restore-mover/stagingroot_test.go`,
+new file), reproducing the reviewer's own demonstrated attacks directly:
+`TestRemoveStagingContentsImmuneToZigbeeSubdirSwapBeforeCleanup` (swap
+"zigbee2mqtt" for a symlink into the live directory between validation
+and cleanup -- cleanup refuses, the live files are untouched, the planted
+symlink itself is left alone); `TestStagingRootOperationsImmuneToStagingDirEntrySwapAfterOpen`
+(rename the staging directory away and symlink its old name into a live
+directory after opening -- every later operation still acts on the
+original, real directory); `TestValidateAllRefusesSymlinkedZigbeeSubdirWithMatchingHashDecoy`
+(a decoy directory with matching size/sha256 behind a symlinked
+"zigbee2mqtt", refused before anything is read, nothing reaches a live
+destination); `TestValidateAllRefusesSymlinkPointingToAnotherStagedFile`
+(a purely in-root, never-escaping symlink from one staged file to another
+-- refused by this program's own explicit check, not by any built-in
+`os.Root` escape protection). Plus full, direct coverage of every
+`StagingRoot` method (`removeEntry`/`removeZigbeeDirIfPresent`/
+`removeManifest`/`openEntryNoFollow`/`zigbeeRoot`/`openStagingRoot`,
+absent/present/symlink/wrong-type/non-empty-directory cases each) and the
+ported originals of the pre-existing `openStagedFileNoFollow` unit tests
+against the new `StagingRoot.openEntryNoFollow`. All of the above verified
+to pass both cross-compiled (`GOOS=linux`) and executed for real inside a
+`golang:1.24-bookworm` container, not only on the development machine's
+own platform.
+
+**Verification:** Go: `cmd/thermoctl-restore-mover` coverage rose from
+78.1% to 80.8% (the new StagingRoot code is thoroughly covered, not just
+exercised incidentally); `go vet ./...`/`gofmt -l .` clean;
+`watchdog/go.mod` still has zero `require` lines; full suite (including
+this package) green both natively and inside a real Linux container.
+Python side unaffected (no Python file touched by this fix) --
+`ruff`/`mypy`/pytest numbers below, from the same verification pass as
+this fix. `watchdog/check_contract.sh` and `python -m
+tools.check_image_config` both re-verified passing.
+
+**Not changed:** the journal/resume design, the narrower `ReadWritePaths=`
+(still exactly the staging directory, the two live dirs, and the mover's
+own state directory -- `removeStagingContents`'s own contract, "clear
+contents, never remove the staging directory entry itself", is unaffected
+by *how* it now resolves paths internally), the `_resolve_prospective`
+fix, and the closed `DETAIL_*` set (no new value needed).
+
+**Files:** `watchdog/cmd/thermoctl-restore-mover/{stagingroot.go (new),
+stagingroot_test.go (new), safeopen.go, manifest.go, validate.go,
+validate_test.go, move.go, main.go, mover.go, mover_test.go}`,
+`watchdog/go.mod`, `.github/workflows/go.yml`.
+
 ## Merge: P5.5c onto main (main session, 2026-09-29)
 
 Cross-review PASS (round 2). Main-session read-back of
