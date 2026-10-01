@@ -700,15 +700,46 @@ they must also stay conceptually separate, not just separately scheduled.
   an invalid digest is refused server-side; history/audit is written.
 - **Depends on:** P5.4 (agent-side `reconcile_desired_state`), P5.1c (the
   SSE channel and its epoch-prefixed ids).
-- **Open point carried forward -- P5.4c, rollout queue:** the pilot-first,
-  48-hour-staggered rollout queue that stops at the first apartment that
-  does not come back healthy (section 13, "Rules for the rollout") is
-  **out of scope for P5.4b** and not built -- this package only delivers
-  *one* apartment's desired state at a time by construction ("the fleet
-  service knows no 'for all'"), it does not sequence *across* apartments.
-  Needs its own package once `apply_update` is promoted out of stage 2.
 - **Read back by:** main session (desired-state delivery and the closed
   command list interact directly, security principles 1 and 5).
+
+### P5.4c -- Rollout queue, fleet side **SR**
+- [x] done -- see `docs/STATUS.md`'s own P5.4c section for the full design
+  and verification output.
+- **Goal:** the pilot-first, 48-hour-staggered rollout queue that stops at
+  the first apartment that does not come back healthy (section 13, "Rules
+  for the rollout") -- layered on top of P5.4b's own per-apartment
+  desired-state storage, which only ever delivers *one* apartment's
+  desired state at a time by construction ("the fleet service knows no
+  'for all'") and does not sequence *across* apartments. A rollout targets
+  exactly one service family (never thermoctl and Zigbee2MQTT mixed, one
+  target release), an ordered apartment queue with pilot apartments
+  automatically first, a background worker that advances one apartment at
+  a time and stops the rollout at the first failure or timeout, and a UI
+  list/detail page with resume/cancel.
+- **Files:** `fleet/storage.py` (`RolloutRecord`/`RolloutApartmentRecord`),
+  `fleet/migrations/versions/0016_rollouts.py`, `fleet/rollout.py` (new,
+  the worker logic), `fleet/ui_rollout.py` (new), `fleet/ui_routes.py`,
+  `fleet/app.py` (the new lifespan background task), `fleet/templates/ui
+  /rollout_list.html`/`rollout_new.html`/`rollout_confirm.html`
+  /`rollout_detail.html` (new), `fleet/templates/ui/base.html`.
+- **Section:** 13.
+- **Acceptance:** pilot apartment(s) always sequenced first; the rest
+  gated on 48h (configurable) after every pilot converged; never more
+  than one apartment in progress per rollout; never two rollouts touching
+  the same apartment concurrently; a stop at the first reported failure
+  or unmet timeout; resume/cancel only via explicit, audited UI action;
+  mixing thermoctl and Zigbee2MQTT in one rollout structurally refused;
+  CSRF/login required; the worker is idempotent across a restart. No
+  protocol change -- `protocol.desired_state.DesiredState` reused
+  unchanged, `PROTOCOL_VERSION` stays 8. **Still inactive**, unchanged
+  from P5.4/P5.4b's own gate (fail-closed pre-check, `pilot_mode`).
+- **Depends on:** P5.4b (`Storage.create_desired_state_revision`, the
+  desired-state delivery/outcome-report path this package reuses
+  unchanged).
+- **Read back by:** main session (a background worker sequencing
+  desired-state changes across apartments interacts directly with
+  security principles 1 and 5).
 
 ### P5.5a -- Backup creation and upload **SR**
 - [x] done -- see `docs/STATUS.md`'s P5.5a section.

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}Rollout bestätigen – thermoctl-fleet{% endblock %}
+
+{% block content %}
+<p><a href="/ui/rollouts/new">&larr; Zurück zur Bearbeitung</a></p>
+<h1>Rollout bestätigen</h1>
+
+<p class="error" role="alert">
+    Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten, Pilotbetrieb
+    erforderlich) -- dieser Rollout stoppt bei der Pilot-Wohnung, bis thermoctl eine
+    Gesundheits-/Außentemperatur-API liefert.
+</p>
+
+<p><strong>{{ service_label }}</strong> &rarr; Version {{ version }}, Digest {{ digest }}</p>
+<p>Wartezeit nach Pilot: {{ stagger_hours }} h. Zeitüberschreitung je Wohnung: {{ timeout_hours }} h.</p>
+
+<ol>
+    {% for apartment_id in ordered_apartment_ids %}
+    <li>{{ apartment_id }}{% if apartment_id in pilot_apartment_ids %} (Pilot){% endif %}</li>
+    {% endfor %}
+</ol>
+
+{% if error %}
+<p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/ui/rollouts/confirm">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="service" value="{{ service }}">
+    <input type="hidden" name="version" value="{{ version }}">
+    <input type="hidden" name="digest" value="{{ digest }}">
+    <input type="hidden" name="stagger_hours" value="{{ stagger_hours }}">
+    <input type="hidden" name="timeout_hours" value="{{ timeout_hours }}">
+    {% for apartment_id in ordered_apartment_ids %}
+    <input type="hidden" name="apartment_ids" value="{{ apartment_id }}">
+    {% endfor %}
+    <label for="reason">Grund (Pflichtfeld)
+        <input type="text" id="reason" name="reason" required>
+    </label>
+    <button type="submit">Rollout starten</button>
+</form>
+{% endblock %}

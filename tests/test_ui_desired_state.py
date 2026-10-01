@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 from fleet.storage import InventoryAuditLogRecord, Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
-from protocol.desired_state import DesiredState
+from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 
 USERNAME = "landlord"
 APARTMENT = "house7-desired-state-ui"
@@ -674,3 +674,82 @@ def test_edit_post_non_numeric_window_temp_is_rejected(
 
     assert response.status_code == 400
     assert storage.get_desired_state(APARTMENT) is None
+
+
+# -- P5.4c cross-review: warning when a rollout already owns this apartment ----
+
+
+def test_edit_and_confirm_pages_warn_about_active_rollout(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """A rollout (P5.4c) that still queues or is reconciling this apartment
+    must be visible on both the edit form and the confirm page, *before*
+    the landlord submits a manual change that would stop it (`fleet.rollout
+    .advance_rollout`'s own "revision drift" guard)."""
+
+    _make_apartment(storage)
+    storage.update_apartment(
+        APARTMENT,
+        label=APARTMENT,
+        floor=None,
+        orientation=None,
+        heating_circuits=1,
+        state="occupied",
+        pilot_mode=True,
+        ui_username="tester",
+        reason="make it a pilot",
+    )
+    storage.create_desired_state_revision(
+        APARTMENT,
+        DesiredState(
+            revision=0,
+            services=Services(
+                thermoctl=ServiceState(image="x", version="1.0", digest=_VALID_DIGEST_A),
+                zigbee2mqtt=ServiceState(image="x", version="1.0", digest=_VALID_DIGEST_A),
+                mosquitto=ServiceState(image="x", version="1.0", digest=_VALID_DIGEST_A),
+                agent=ServiceState(image="x", version="1.0", digest=_VALID_DIGEST_A),
+            ),
+            window=UpdateWindow(from_="09:00", until="16:00", not_below_outdoor_temp_c=-2.0),
+        ),
+        ui_username="tester",
+        reason="initial",
+        now=datetime.now(UTC),
+    )
+    rollout = storage.create_rollout(
+        service="thermoctl",
+        version="1.1",
+        digest=_VALID_DIGEST_B,
+        apartment_ids=[APARTMENT],
+        stagger_hours=48.0,
+        timeout_hours=2.0,
+        ui_username="landlord",
+        reason="rollout",
+        now=datetime.now(UTC),
+    )
+    _login(client, password, totp_secret)
+
+    edit_response = client.get(f"/ui/apartments/{APARTMENT}/desired-state/edit")
+    assert edit_response.status_code == 200
+    assert rollout.id in edit_response.text
+    assert "laufenden Rollouts" in edit_response.text
+
+    csrf_token = _extract_hidden_field(edit_response.text, "csrf_token")
+    confirm_response = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/edit",
+        data={**_valid_form(), "csrf_token": csrf_token},
+    )
+    assert confirm_response.status_code == 200
+    assert rollout.id in confirm_response.text
+    assert "laufenden Rollouts" in confirm_response.text
+
+
+def test_edit_page_shows_no_rollout_warning_when_none_active(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}/desired-state/edit")
+
+    assert response.status_code == 200
+    assert "laufenden Rollouts" not in response.text

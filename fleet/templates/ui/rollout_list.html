@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block title %}Rollouts – thermoctl-fleet{% endblock %}
+
+{% block content %}
+<h1>Rollouts</h1>
+
+<p class="error" role="alert">
+    Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten, Pilotbetrieb
+    erforderlich) -- ein Rollout stoppt daher bei der Pilot-Wohnung, bis thermoctl eine
+    Gesundheits-/Außentemperatur-API liefert.
+</p>
+
+<p><a href="/ui/rollouts/new">Neuer Rollout</a></p>
+
+{% if entries %}
+<table>
+    <thead>
+        <tr>
+            <th>Dienst</th>
+            <th>Version</th>
+            <th>Status</th>
+            <th>Wohnungen</th>
+            <th>Erstellt</th>
+            <th>Von</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for entry in entries %}
+        <tr>
+            <td><a href="/ui/rollouts/{{ entry.rollout_id | urlpath }}">{{ entry.service_label }}</a></td>
+            <td>{{ entry.version }}</td>
+            <td>
+                {{ entry.state_label }}
+                {% if entry.stopped_reason %}<br><small>{{ entry.stopped_reason }}</small>{% endif %}
+            </td>
+            <td>{{ entry.converged_apartments }} / {{ entry.total_apartments }}</td>
+            <td>{{ entry.created_text }}</td>
+            <td>{{ entry.created_by }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p>Noch keine Rollouts angelegt.</p>
+{% endif %}
+{% endblock %}

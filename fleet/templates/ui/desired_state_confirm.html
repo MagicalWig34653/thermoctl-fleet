@@ -17,6 +17,15 @@
     Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten, Pilotbetrieb erforderlich).
 </p>
 
+{% if active_rollout_id %}
+<p class="error" role="alert">
+    Diese Wohnung ist Teil des laufenden Rollouts
+    <a href="/ui/rollouts/{{ active_rollout_id | urlpath }}">{{ active_rollout_id }}</a>.
+    Eine manuelle Änderung hier stoppt diesen Rollout beim nächsten Durchlauf
+    des Rollout-Workers.
+</p>
+{% endif %}
+
 {% if both_thermoctl_and_zigbee_changed %}
 <p class="error" role="alert">
     Warnung: thermoctl und Zigbee2MQTT ändern sich in dieser Revision beide. Der Agent

@@ -56,6 +56,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import uuid
 from collections.abc import Iterator
@@ -110,6 +111,14 @@ from protocol.backups import BackupKind
 from protocol.commands import Command, CommandResult, CommandType
 from protocol.desired_state import DesiredState, DesiredStateOutcomeReport
 from protocol.version import PROTOCOL_VERSION
+
+# P5.4c: the same four names `protocol.desired_state.Services` fixes --
+# duplicated here rather than imported, since `Services`'s fields are not
+# exposed as an iterable set anywhere, and this module already re-derives
+# closed vocabularies from `protocol` field-by-field elsewhere (e.g.
+# `CommandRecord.command_type`'s own docstring).
+_ROLLOUT_SERVICES = frozenset({"thermoctl", "zigbee2mqtt", "mosquitto", "agent"})
+_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class Base(DeclarativeBase):
@@ -689,6 +698,111 @@ class DesiredStateOutcomeRecord(Base):
     reason: Mapped[str] = mapped_column(Text(), nullable=False)
     service: Mapped[str | None] = mapped_column(String(32), nullable=True)
     reported_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class RolloutRecord(Base):
+    """P5.4c (section 13, "Rules for the rollout"): one rollout -- a single
+    target release (`service`/`version`/`digest`) for exactly **one**
+    service family, plus an ordered queue of apartments
+    (`RolloutApartmentRecord`) it is worked through, one at a time.
+
+    **One service per rollout, structurally, not by convention**: `service`
+    is a single string column, never a set/list -- "refuse mixing
+    thermoctl and zigbee2mqtt in one rollout" (P5.4c's own work order) is
+    therefore not a check that can be forgotten, it is simply not
+    representable. `Storage.create_rollout` still validates `service`
+    against the same four names `protocol.desired_state.Services` fixes
+    (CLAUDE.md: the closed command list's own reasoning applied here to a
+    closed *service* list).
+
+    `state` -- `"running"` (the worker advances it), `"stopped"` (the
+    worker halted it at the first apartment that failed or timed out,
+    `stopped_reason` names which and why), `"completed"` (every apartment
+    converged), `"cancelled"` (explicit UI action, CLAUDE.md principle 5 --
+    only `resume_rollout`/`cancel_rollout` below ever set this from
+    `"stopped"`, never the worker itself). A `RolloutRecord` is never
+    deleted -- `"cancelled"`/`"completed"` are terminal, not tombstones.
+
+    `pilot_converged_at` is set once, by the worker
+    (`fleet.rollout.advance_rollout`), the moment the **last** pilot
+    apartment in this rollout's queue converges -- section 13: "the pilot
+    apartment first, then the rest no earlier than 48 hours later". A
+    rollout with more than one pilot apartment (an inventory can carry the
+    flag on several) gates the whole non-pilot tail on the *slowest*
+    pilot, not the fastest -- the strictest reasonable reading of "the
+    pilot phase" as a single gate, not per-pilot fan-out.
+
+    `stagger_hours`/`timeout_hours` are per-rollout, not global constants
+    (CLAUDE.md: "nothing hard-coded" applied to every timing threshold in
+    this codebase) -- `Storage.create_rollout` defaults them to section
+    13's own numbers (48h stagger, this package's own 2h reconciliation
+    timeout) when the caller (the UI route) does not override them.
+    """
+
+    __tablename__ = "rollouts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    service: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[str] = mapped_column(String(128), nullable=False)
+    digest: Mapped[str] = mapped_column(String(128), nullable=False)
+    stagger_hours: Mapped[float] = mapped_column(Float(), nullable=False)
+    timeout_hours: Mapped[float] = mapped_column(Float(), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    stopped_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    pilot_converged_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+
+
+class RolloutApartmentRecord(Base):
+    """P5.4c: one apartment's position and progress within one
+    `RolloutRecord`'s queue -- "a queue worked through, with a stop at the
+    first apartment that does not come back healthy" (section 13).
+
+    `status`: `"queued"` (not yet started), `"in_progress"` (a desired-state
+    revision was created for this apartment, `revision` names it, waiting
+    for the agent's outcome report and a fresh healthy heartbeat
+    afterwards), `"converged"` (both arrived, section 13's own definition
+    of "comes back healthy" -- see `fleet.rollout`'s own docstring for why
+    this reading was chosen, an open point recorded in `docs/STATUS.md`),
+    `"failed"` (the agent reported an unsuccessful outcome for `revision`
+    -- stops the whole rollout), `"timed_out"` (no successful outcome plus
+    healthy heartbeat within `RolloutRecord.timeout_hours` of `started_at`
+    -- also stops the whole rollout), `"skipped"` (the rollout was
+    cancelled while this apartment was still queued).
+
+    `position` is the queue order **after** `Storage.create_rollout` has
+    already moved every pilot apartment to the front (section 13: "the
+    pilot apartment first" is automatic, not something the caller has to
+    get right) -- `is_pilot` is stored redundantly (rather than re-derived
+    from `apartments.pilot_mode` on every read) so a later flip of the
+    inventory flag cannot silently change what an already-created rollout
+    considers its pilot after the fact.
+
+    A `(rollout_id, apartment_id)` pair is unique -- one apartment cannot
+    appear twice in the same rollout's own queue.
+    """
+
+    __tablename__ = "rollout_apartments"
+    __table_args__ = (
+        UniqueConstraint(
+            "rollout_id", "apartment_id", name="uq_rollout_apartments_rollout_apartment"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    rollout_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("rollouts.id"), nullable=False, index=True
+    )
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_pilot: Mapped[bool] = mapped_column(Boolean(), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    converged_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    last_outcome_reason: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
 
 class BackupRecord(Base):
@@ -2534,53 +2648,85 @@ class Storage:
         with self.session() as session:
             if self.engine.dialect.name == "sqlite":
                 session.execute(text("BEGIN IMMEDIATE"))
-            apartment = session.scalar(
-                select(ApartmentRecord).where(ApartmentRecord.id == apartment_id).with_for_update()
-            )
-            if apartment is None:
-                raise ValueError(f"Unknown apartment {apartment_id!r}.")
-            if apartment.state == "retired":
-                raise ValueError(f"Apartment {apartment_id!r} is retired.")
-
-            current_latest = session.scalar(
-                select(func.max(DesiredStateRecord.revision)).where(
-                    DesiredStateRecord.apartment_id == apartment_id
-                )
-            )
-            next_revision = (current_latest or 0) + 1
-
-            stamped = desired_state.model_copy(update={"revision": next_revision})
-            created_at = _naive_utc(now)
-            record = DesiredStateRecord(
-                apartment_id=apartment_id,
-                revision=next_revision,
-                state_json=stamped.model_dump_json(),
-                created_at=created_at,
-                created_by=ui_username,
-                reason=reason.strip(),
-            )
-            session.add(record)
-            self._write_inventory_audit_log(
+            record = self._insert_desired_state_revision(
                 session,
+                apartment_id,
+                desired_state,
                 ui_username=ui_username,
-                entity_type="desired_state",
-                entity_id=apartment_id,
-                action="revision_created",
                 reason=reason.strip(),
-                before=None,
-                after={
-                    "revision": next_revision,
-                    "digests": {
-                        name: getattr(stamped.services, name).digest
-                        for name in ("thermoctl", "zigbee2mqtt", "mosquitto", "agent")
-                    },
-                    "window": stamped.window.model_dump(mode="json"),
-                },
+                now=now,
             )
-            session.flush()
             session.refresh(record)
             session.expunge(record)
             return record
+
+    def _insert_desired_state_revision(
+        self,
+        session: Session,
+        apartment_id: str,
+        desired_state: DesiredState,
+        *,
+        ui_username: str,
+        reason: str,
+        now: datetime,
+    ) -> DesiredStateRecord:
+        """The actual row-insert behind `create_desired_state_revision`,
+        factored out (P5.4c cross-review) so `Storage
+        .start_rollout_apartment_with_new_desired_state` can perform it and
+        its own `RolloutApartmentRecord` update inside **one** transaction
+        instead of two separate `Storage` calls -- see that method's own
+        docstring for the crash-window reasoning this closes. Assumes the
+        caller already opened the right locking scope on this same
+        `session` (`BEGIN IMMEDIATE` on SQLite) before calling this; it
+        does not open its own, and does not commit -- the caller's own
+        `with self.session()` block does both. `reason` is expected
+        already-stripped and already validated non-empty by the caller."""
+
+        apartment = session.scalar(
+            select(ApartmentRecord).where(ApartmentRecord.id == apartment_id).with_for_update()
+        )
+        if apartment is None:
+            raise ValueError(f"Unknown apartment {apartment_id!r}.")
+        if apartment.state == "retired":
+            raise ValueError(f"Apartment {apartment_id!r} is retired.")
+
+        current_latest = session.scalar(
+            select(func.max(DesiredStateRecord.revision)).where(
+                DesiredStateRecord.apartment_id == apartment_id
+            )
+        )
+        next_revision = (current_latest or 0) + 1
+
+        stamped = desired_state.model_copy(update={"revision": next_revision})
+        created_at = _naive_utc(now)
+        record = DesiredStateRecord(
+            apartment_id=apartment_id,
+            revision=next_revision,
+            state_json=stamped.model_dump_json(),
+            created_at=created_at,
+            created_by=ui_username,
+            reason=reason,
+        )
+        session.add(record)
+        self._write_inventory_audit_log(
+            session,
+            ui_username=ui_username,
+            entity_type="desired_state",
+            entity_id=apartment_id,
+            action="revision_created",
+            reason=reason,
+            before=None,
+            after={
+                "revision": next_revision,
+                "digests": {
+                    name: getattr(stamped.services, name).digest
+                    for name in ("thermoctl", "zigbee2mqtt", "mosquitto", "agent")
+                },
+                "window": stamped.window.model_dump(mode="json"),
+            },
+        )
+        session.flush()
+        return record
 
     def get_desired_state(self, apartment_id: str) -> DesiredStateRecord | None:
         """The current (highest-`revision`) desired-state row for
@@ -2667,6 +2813,603 @@ class Storage:
             if record is not None:
                 session.expunge(record)
             return record
+
+    # -- rollouts (P5.4c, section 13, "Rules for the rollout") ----------------------
+
+    def create_rollout(
+        self,
+        *,
+        service: str,
+        version: str,
+        digest: str,
+        apartment_ids: list[str],
+        stagger_hours: float,
+        timeout_hours: float,
+        ui_username: str,
+        reason: str,
+        now: datetime,
+    ) -> RolloutRecord:
+        """Creates one rollout (P5.4c scope item 1) -- a fresh `RolloutRecord`
+        plus one `RolloutApartmentRecord` per (de-duplicated,
+        order-preserving) entry of `apartment_ids`, pilot apartments moved
+        to the front automatically (section 13: "the pilot apartment
+        first").
+
+        Validated, in order, before anything is written (`ValueError` on
+        the first failure, same convention as `create_desired_state_revision`):
+
+        1. `service` is one of the four fixed service names -- structurally
+           the same closed set `protocol.desired_state.Services` fixes;
+           "refuse mixing thermoctl and zigbee2mqtt" (P5.4c's own work
+           order) follows for free from `service` being a single field, not
+           a set.
+        2. `digest` matches `^sha256:[0-9a-f]{64}$` (same pattern
+           `protocol.desired_state.ServiceState.digest` already enforces).
+        3. `version`/`reason` non-empty.
+        4. `apartment_ids` non-empty; every id refers to a known,
+           non-retired apartment.
+        5. Every named apartment already has a current desired state
+           (`Storage.get_desired_state`) -- this package's own worker only
+           ever *changes* the target service on top of an apartment's
+           existing desired state (`fleet.rollout.advance_rollout`), it
+           never invents version/digest values for the other three
+           services; an apartment with no desired state yet cannot safely
+           be sequenced. **Decision to confirm** (recorded in
+           `docs/STATUS.md`, non-security-relevant): the strictest
+           reasonable reading of an open point the specification does not
+           address directly.
+        6. At least one named apartment carries `pilot_mode=True` --
+           without one, "the pilot apartment first, then the rest no
+           earlier than 48 hours later" has nothing to gate on; refused
+           fail-closed rather than silently skipping the pilot phase.
+           Same "decision to confirm" as point 5.
+        7. None of `apartment_ids` is already queued in another rollout
+           whose own `state` is `"running"` or `"stopped"` (i.e. still
+           "touching" it) -- "never two rollouts touching the same
+           apartment concurrently" (P5.4c's own work order).
+
+        Writes exactly one audit row (`entity_type="rollout"`,
+        `action="created"`), in the same transaction.
+
+        **Race (cross-review): "SELECT already-touched, then INSERT" is not
+        atomic on its own** -- two concurrent `create_rollout` calls naming
+        an overlapping apartment can both read "not yet touched" before
+        either has inserted its own `RolloutApartmentRecord` rows, and both
+        succeed, in violation of "never two rollouts touching the same
+        apartment concurrently" (reproduced: 8 threads racing to enroll the
+        same apartment, more than one succeeded before this fix). Fixed the
+        same way `create_desired_state_revision` already fixes the
+        identical shape of race: every named apartment row is locked for
+        the duration of this transaction (`BEGIN IMMEDIATE` on SQLite --
+        this repository's only tested dialect, `with_for_update()`
+        elsewhere) *before* the "already touched" check runs, so a second
+        concurrent caller naming any of the same apartments simply waits
+        for the first transaction to commit or roll back and then sees its
+        result, rather than racing it -- see
+        `tests/test_storage_rollouts.py
+        ::test_create_rollout_serializes_concurrent_callers_for_same_apartment`
+        for a real multi-thread test against a file-backed SQLite database.
+        """
+
+        if service not in _ROLLOUT_SERVICES:
+            raise ValueError(
+                f"Unknown or mixed service {service!r}; must be exactly one of "
+                f"{sorted(_ROLLOUT_SERVICES)}."
+            )
+        if not _DIGEST_PATTERN.fullmatch(digest):
+            raise ValueError(f"Invalid digest {digest!r}.")
+        if not version.strip():
+            raise ValueError("A version is required.")
+        if not reason.strip():
+            raise ValueError("A reason is required for every rollout.")
+        if stagger_hours < 0:
+            raise ValueError("stagger_hours must not be negative.")
+        if timeout_hours <= 0:
+            raise ValueError("timeout_hours must be positive.")
+
+        deduped_ids: list[str] = []
+        seen: set[str] = set()
+        for apartment_id in apartment_ids:
+            if apartment_id not in seen:
+                seen.add(apartment_id)
+                deduped_ids.append(apartment_id)
+        if not deduped_ids:
+            raise ValueError("At least one apartment is required.")
+
+        with self.session() as session:
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+
+            apartments: dict[str, ApartmentRecord] = {}
+            for apartment_id in deduped_ids:
+                apartment = session.scalar(
+                    select(ApartmentRecord)
+                    .where(ApartmentRecord.id == apartment_id)
+                    .with_for_update()
+                )
+                if apartment is None:
+                    raise ValueError(f"Unknown apartment {apartment_id!r}.")
+                if apartment.state == "retired":
+                    raise ValueError(f"Apartment {apartment_id!r} is retired.")
+                if session.scalar(
+                    select(DesiredStateRecord)
+                    .where(DesiredStateRecord.apartment_id == apartment_id)
+                    .limit(1)
+                ) is None:
+                    raise ValueError(
+                        f"Apartment {apartment_id!r} has no current desired state yet."
+                    )
+                apartments[apartment_id] = apartment
+
+            if not any(apartments[a].pilot_mode for a in deduped_ids):
+                raise ValueError(
+                    "At least one apartment in the rollout must carry pilot_mode=True."
+                )
+
+            already_touched = session.scalars(
+                select(RolloutApartmentRecord.apartment_id)
+                .join(RolloutRecord, RolloutRecord.id == RolloutApartmentRecord.rollout_id)
+                .where(
+                    RolloutApartmentRecord.apartment_id.in_(deduped_ids),
+                    RolloutRecord.state.in_(("running", "stopped")),
+                )
+            ).all()
+            if already_touched:
+                raise ValueError(
+                    "Already part of another active rollout: "
+                    f"{sorted(set(already_touched))}."
+                )
+
+            ordered_ids = sorted(
+                deduped_ids, key=lambda a: (not apartments[a].pilot_mode, deduped_ids.index(a))
+            )
+
+            rollout_id = str(uuid.uuid4())
+            created_at = _naive_utc(now)
+            rollout = RolloutRecord(
+                id=rollout_id,
+                service=service,
+                version=version.strip(),
+                digest=digest,
+                stagger_hours=stagger_hours,
+                timeout_hours=timeout_hours,
+                state="running",
+                stopped_reason=None,
+                pilot_converged_at=None,
+                created_at=created_at,
+                created_by=ui_username,
+                reason=reason.strip(),
+            )
+            session.add(rollout)
+
+            for position, apartment_id in enumerate(ordered_ids):
+                session.add(
+                    RolloutApartmentRecord(
+                        rollout_id=rollout_id,
+                        apartment_id=apartment_id,
+                        position=position,
+                        is_pilot=apartments[apartment_id].pilot_mode,
+                        status="queued",
+                        revision=None,
+                        started_at=None,
+                        converged_at=None,
+                        last_outcome_reason=None,
+                    )
+                )
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="rollout",
+                entity_id=rollout_id,
+                action="created",
+                reason=reason.strip(),
+                before=None,
+                after={
+                    "service": service,
+                    "version": version.strip(),
+                    "digest": digest,
+                    "apartment_ids": ordered_ids,
+                    "pilot_apartment_ids": [a for a in ordered_ids if apartments[a].pilot_mode],
+                },
+            )
+            session.flush()
+            session.refresh(rollout)
+            session.expunge(rollout)
+            return rollout
+
+    def get_rollout(self, rollout_id: str) -> RolloutRecord | None:
+        with self.session() as session:
+            record = session.get(RolloutRecord, rollout_id)
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def list_rollouts(self) -> list[RolloutRecord]:
+        """Every rollout ever created, newest first (P5.4c scope item 3,
+        the rollout list view)."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(RolloutRecord).order_by(RolloutRecord.created_at.desc())
+                ).all()
+            )
+            session.expunge_all()
+            return rows
+
+    def list_active_rollout_ids(self) -> list[str]:
+        """Every rollout currently `"running"` -- what `fleet.rollout
+        .advance_all_rollouts` iterates each worker tick."""
+
+        with self.session() as session:
+            return list(
+                session.scalars(
+                    select(RolloutRecord.id).where(RolloutRecord.state == "running")
+                ).all()
+            )
+
+    def rollout_apartments(self, rollout_id: str) -> list[RolloutApartmentRecord]:
+        """One rollout's queue, in position order (P5.4c scope item 3, the
+        rollout detail page's own per-apartment table)."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(RolloutApartmentRecord)
+                    .where(RolloutApartmentRecord.rollout_id == rollout_id)
+                    .order_by(RolloutApartmentRecord.position)
+                ).all()
+            )
+            session.expunge_all()
+            return rows
+
+    def _get_rollout_apartment(
+        self, session: Session, rollout_id: str, apartment_id: str
+    ) -> RolloutApartmentRecord:
+        record = session.scalar(
+            select(RolloutApartmentRecord).where(
+                RolloutApartmentRecord.rollout_id == rollout_id,
+                RolloutApartmentRecord.apartment_id == apartment_id,
+            )
+        )
+        if record is None:
+            raise ValueError(f"{apartment_id!r} is not part of rollout {rollout_id!r}.")
+        return record
+
+    def start_rollout_apartment(
+        self, rollout_id: str, apartment_id: str, revision: int, now: datetime
+    ) -> None:
+        """Moves one apartment from `"queued"` to `"in_progress"`, recording
+        the desired-state `revision` `fleet.rollout.advance_rollout` just
+        created for it. Refuses (`ValueError`) unless the apartment is
+        currently `"queued"` -- the one guard that keeps the worker's own
+        "never more than one apartment in progress per rollout" invariant a
+        database-checked fact, not merely something the caller happens to
+        get right (a restarted worker re-evaluates from scratch every tick,
+        see `fleet.rollout`'s own docstring for why that is safe)."""
+
+        with self.session() as session:
+            record = self._get_rollout_apartment(session, rollout_id, apartment_id)
+            if record.status != "queued":
+                raise ValueError(
+                    f"Apartment {apartment_id!r} in rollout {rollout_id!r} is "
+                    f"{record.status!r}, not queued."
+                )
+            record.status = "in_progress"
+            record.revision = revision
+            record.started_at = _naive_utc(now)
+            record.converged_at = None
+            record.last_outcome_reason = None
+
+    def start_rollout_apartment_with_new_desired_state(
+        self,
+        rollout_id: str,
+        apartment_id: str,
+        desired_state: DesiredState,
+        *,
+        reason: str,
+        now: datetime,
+    ) -> RolloutApartmentRecord:
+        """Atomically creates the next desired-state revision for
+        `apartment_id` **and** marks its `RolloutApartmentRecord`
+        `"in_progress"` with that revision, in one transaction --
+        `fleet.rollout.advance_rollout`'s only way of starting an
+        apartment (P5.4c cross-review, fixing a crash-window bug).
+
+        The original implementation called `create_desired_state_revision`
+        and then `start_rollout_apartment` as two separate `Storage`
+        round-trips. A crash (or a killed worker process) between the two
+        left a `DesiredStateRecord` behind with no `RolloutApartmentRecord`
+        ever pointing at it, still `"queued"` -- and a restarted worker's
+        own idempotent re-read (`advance_rollout` sees `"queued"`, same as
+        before the crash) would create a **second**, higher-numbered
+        revision for the same apartment on retry instead of noticing the
+        first one already exists: an orphaned revision on every such
+        crash, not merely wasted work, since the two revisions can also
+        disagree if a manual edit landed in the gap between them (see
+        `fleet.rollout.advance_rollout`'s own "revision drift" guard for
+        the case where that gap is observed *after* the fact instead).
+        Doing both writes in one transaction removes the gap structurally
+        -- either both happen or neither does, so a retry after a crash
+        always starts from a consistent "still queued, no revision yet"
+        state, tested directly by injecting a failure between the two
+        steps of the *old* two-call sequence
+        (`tests/test_storage_rollouts.py
+        ::test_start_rollout_apartment_atomic_after_injected_failure`).
+
+        Refuses (`ValueError`) unless the apartment is currently
+        `"queued"` -- checked, under the same lock, **before** the
+        desired-state row is ever inserted, so a double call (two racing
+        worker ticks, or a caller retrying a call whose first attempt
+        already committed) can create at most one revision, never two."""
+
+        with self.session() as session:
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+
+            rollout_apartment = self._get_rollout_apartment(session, rollout_id, apartment_id)
+            if rollout_apartment.status != "queued":
+                raise ValueError(
+                    f"Apartment {apartment_id!r} in rollout {rollout_id!r} is "
+                    f"{rollout_apartment.status!r}, not queued."
+                )
+
+            desired_record = self._insert_desired_state_revision(
+                session,
+                apartment_id,
+                desired_state,
+                ui_username="rollout-worker",
+                reason=reason,
+                now=now,
+            )
+
+            rollout_apartment.status = "in_progress"
+            rollout_apartment.revision = desired_record.revision
+            rollout_apartment.started_at = _naive_utc(now)
+            rollout_apartment.converged_at = None
+            rollout_apartment.last_outcome_reason = None
+
+            session.flush()
+            session.refresh(rollout_apartment)
+            session.expunge(rollout_apartment)
+            return rollout_apartment
+
+    def get_active_rollout_for_apartment(self, apartment_id: str) -> RolloutRecord | None:
+        """The `"running"` rollout, if any, that currently still queues or
+        is reconciling `apartment_id` (status `"queued"` or `"in_progress"`)
+        -- P5.4c cross-review: `fleet/ui_routes.py`'s desired-state
+        edit/confirm pages call this to warn the landlord *before* a manual
+        edit interferes with an in-flight rollout (a manual edit changes
+        the apartment's current revision out from under the rollout,
+        which `fleet.rollout.advance_rollout`'s own "revision drift" guard
+        then stops the rollout for on its next tick -- this is only the
+        UI's advance warning, not the enforcement).  An apartment already
+        `"converged"`/`"failed"`/`"timed_out"`/`"skipped"` in every rollout
+        that ever named it is not "active" here even if that rollout's own
+        `state` still shows `"stopped"` pending a resume -- only a
+        genuinely still-sequencing membership warrants the warning."""
+
+        with self.session() as session:
+            rollout = session.scalar(
+                select(RolloutRecord)
+                .join(
+                    RolloutApartmentRecord, RolloutApartmentRecord.rollout_id == RolloutRecord.id
+                )
+                .where(
+                    RolloutApartmentRecord.apartment_id == apartment_id,
+                    RolloutRecord.state == "running",
+                    RolloutApartmentRecord.status.in_(("queued", "in_progress")),
+                )
+                .limit(1)
+            )
+            if rollout is not None:
+                session.expunge(rollout)
+            return rollout
+
+    def mark_rollout_apartment_converged(
+        self, rollout_id: str, apartment_id: str, now: datetime
+    ) -> None:
+        with self.session() as session:
+            record = self._get_rollout_apartment(session, rollout_id, apartment_id)
+            record.status = "converged"
+            record.converged_at = _naive_utc(now)
+
+    def set_rollout_pilot_converged(self, rollout_id: str, now: datetime) -> None:
+        """Records when the **last** pilot apartment of `rollout_id`
+        converged -- idempotent (only ever set once; a later call is a
+        no-op), since several pilots can converge across separate worker
+        ticks but the 48-hour gate (section 13) starts from a single
+        point in time."""
+
+        with self.session() as session:
+            rollout = session.get(RolloutRecord, rollout_id)
+            if rollout is None:
+                raise ValueError(f"Unknown rollout {rollout_id!r}.")
+            if rollout.pilot_converged_at is None:
+                rollout.pilot_converged_at = _naive_utc(now)
+
+    def _stop_rollout(
+        self, session: Session, rollout: RolloutRecord, *, reason: str, now: datetime
+    ) -> None:
+        if rollout.state != "running":
+            return
+        rollout.state = "stopped"
+        rollout.stopped_reason = reason
+        self._write_inventory_audit_log(
+            session,
+            ui_username="system",
+            entity_type="rollout",
+            entity_id=rollout.id,
+            action="stopped",
+            reason=reason,
+            before=None,
+            after={"stopped_reason": reason},
+        )
+
+    def mark_rollout_apartment_failed(
+        self, rollout_id: str, apartment_id: str, *, reason: str, now: datetime
+    ) -> RolloutRecord:
+        """Section 13: "a stop at the first apartment that does not come
+        back healthy" -- marks one apartment `"failed"` and stops the whole
+        rollout (`state="stopped"`) in the same transaction, unless it was
+        already stopped (idempotent under a worker restart racing itself)."""
+
+        with self.session() as session:
+            apartment = self._get_rollout_apartment(session, rollout_id, apartment_id)
+            apartment.status = "failed"
+            apartment.last_outcome_reason = reason
+            rollout = session.get(RolloutRecord, rollout_id)
+            if rollout is None:  # pragma: no cover -- FK guarantees this cannot happen
+                raise ValueError(f"Unknown rollout {rollout_id!r}.")
+            self._stop_rollout(
+                session, rollout, reason=f"Wohnung {apartment_id!r}: {reason}", now=now
+            )
+            session.flush()
+            session.refresh(rollout)
+            session.expunge(rollout)
+            return rollout
+
+    def mark_rollout_apartment_timed_out(
+        self, rollout_id: str, apartment_id: str, now: datetime
+    ) -> RolloutRecord:
+        """Same shape as `mark_rollout_apartment_failed`, for the other
+        stop condition section 13 names: "does not converge within" the
+        configured timeout."""
+
+        with self.session() as session:
+            apartment = self._get_rollout_apartment(session, rollout_id, apartment_id)
+            apartment.status = "timed_out"
+            apartment.last_outcome_reason = "Zeitüberschreitung: keine bestätigte Rückmeldung."
+            rollout = session.get(RolloutRecord, rollout_id)
+            if rollout is None:  # pragma: no cover -- FK guarantees this cannot happen
+                raise ValueError(f"Unknown rollout {rollout_id!r}.")
+            self._stop_rollout(
+                session,
+                rollout,
+                reason=f"Wohnung {apartment_id!r}: Zeitüberschreitung.",
+                now=now,
+            )
+            session.flush()
+            session.refresh(rollout)
+            session.expunge(rollout)
+            return rollout
+
+    def complete_rollout(self, rollout_id: str, now: datetime) -> None:
+        with self.session() as session:
+            rollout = session.get(RolloutRecord, rollout_id)
+            if rollout is None:
+                raise ValueError(f"Unknown rollout {rollout_id!r}.")
+            if rollout.state == "running":
+                rollout.state = "completed"
+
+    def resume_rollout(
+        self, rollout_id: str, *, ui_username: str, reason: str, now: datetime
+    ) -> RolloutRecord:
+        """Explicit UI action (P5.4c scope item 2: "resumed ... only by
+        explicit UI action") -- requires `state == "stopped"`. Resets the
+        apartment that caused the stop (the highest-position
+        `"failed"`/`"timed_out"` row) back to `"queued"` so the next worker
+        tick creates a fresh desired-state revision and retries it --
+        **decision to confirm** (recorded in `docs/STATUS.md`): the
+        specification does not say what "resumed" means operationally for
+        this package; retrying the same apartment is the strictest
+        reasonable reading (it never skips ahead past the apartment that
+        failed)."""
+
+        if not reason.strip():
+            raise ValueError("A reason is required to resume a rollout.")
+
+        with self.session() as session:
+            rollout = session.get(RolloutRecord, rollout_id)
+            if rollout is None:
+                raise ValueError(f"Unknown rollout {rollout_id!r}.")
+            if rollout.state != "stopped":
+                raise ValueError(f"Rollout {rollout_id!r} is {rollout.state!r}, not stopped.")
+
+            blocking = session.scalar(
+                select(RolloutApartmentRecord)
+                .where(
+                    RolloutApartmentRecord.rollout_id == rollout_id,
+                    RolloutApartmentRecord.status.in_(("failed", "timed_out")),
+                )
+                .order_by(RolloutApartmentRecord.position.desc())
+                .limit(1)
+            )
+            if blocking is not None:
+                blocking.status = "queued"
+                blocking.revision = None
+                blocking.started_at = None
+                blocking.converged_at = None
+                blocking.last_outcome_reason = None
+
+            rollout.state = "running"
+            rollout.stopped_reason = None
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="rollout",
+                entity_id=rollout_id,
+                action="resumed",
+                reason=reason.strip(),
+                before=None,
+                after=None,
+            )
+            session.flush()
+            session.refresh(rollout)
+            session.expunge(rollout)
+            return rollout
+
+    def cancel_rollout(
+        self, rollout_id: str, *, ui_username: str, reason: str, now: datetime
+    ) -> RolloutRecord:
+        """Explicit UI action (P5.4c scope item 2) -- allowed from
+        `"running"` or `"stopped"`. Every apartment still `"queued"` or
+        `"in_progress"` becomes `"skipped"` -- an apartment already
+        `"converged"` (a real change already made and confirmed healthy) is
+        left as-is; cancelling a rollout does not roll back a service that
+        already reconciled successfully, it only stops sequencing the rest
+        of the queue."""
+
+        if not reason.strip():
+            raise ValueError("A reason is required to cancel a rollout.")
+
+        with self.session() as session:
+            rollout = session.get(RolloutRecord, rollout_id)
+            if rollout is None:
+                raise ValueError(f"Unknown rollout {rollout_id!r}.")
+            if rollout.state not in ("running", "stopped"):
+                raise ValueError(
+                    f"Rollout {rollout_id!r} is {rollout.state!r}, cannot be cancelled."
+                )
+
+            apartments = session.scalars(
+                select(RolloutApartmentRecord).where(
+                    RolloutApartmentRecord.rollout_id == rollout_id,
+                    RolloutApartmentRecord.status.in_(("queued", "in_progress")),
+                )
+            ).all()
+            for apartment in apartments:
+                apartment.status = "skipped"
+
+            rollout.state = "cancelled"
+            rollout.stopped_reason = None
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="rollout",
+                entity_id=rollout_id,
+                action="cancelled",
+                reason=reason.strip(),
+                before=None,
+                after=None,
+            )
+            session.flush()
+            session.refresh(rollout)
+            session.expunge(rollout)
+            return rollout
 
     # -- fetch_logs uploads (P5.3a, sections 6, 7, 21.5) --------------------------
 
