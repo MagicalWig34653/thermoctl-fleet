@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import agent.loop as loop_module
 from agent.commands_channel import RejectedCommand
 from agent.loop import (
     MAX_EXECUTED_IDS,
@@ -340,6 +341,58 @@ def test_agent_restart_refused_when_proven_missing(tmp_path: Path) -> None:
 
 def test_read_watchdog_state_returns_none_for_a_missing_file(tmp_path: Path) -> None:
     assert _read_watchdog_state(tmp_path / "does-not-exist") is None
+
+
+# --- agent_restart: P5.4d, the shared agent-wide lock -----------------------
+
+
+def test_agent_restart_refused_when_the_lock_cannot_be_acquired_in_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held `ctx.agent_lock` (standing in for an in-flight desired-state
+    swap or a concurrent `backup_now`) makes `agent_restart` fail fast and
+    clearly -- never block the command thread for however long that other
+    operation still has left (up to the 15-minute health deadline)."""
+
+    monkeypatch.setattr(loop_module, "AGENT_RESTART_LOCK_TIMEOUT_S", 0.05)
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    _write_watchdog_state(ctx.watchdog_state_path, desired=_DIGEST_A, proven=_DIGEST_A)
+    command = _command(CommandType.AGENT_RESTART)
+
+    assert ctx.agent_lock.acquire(blocking=False) is True
+    try:
+        outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+    finally:
+        ctx.agent_lock.release()
+
+    assert outcome.result is not None
+    assert outcome.result.successful is False
+    assert "Sperre" in (outcome.result.error_text or "")
+    assert outcome.exit_after_report is False
+
+
+def test_agent_restart_success_holds_the_lock_for_the_rest_of_the_process(
+    tmp_path: Path,
+) -> None:
+    """P5.4d: the success path deliberately never releases `ctx.agent_lock`
+    -- the process is about to exit, and this guarantees nothing else can
+    start a container/backup operation in the window before it actually
+    does."""
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    _write_watchdog_state(ctx.watchdog_state_path, desired=_DIGEST_A, proven=_DIGEST_A)
+    command = _command(CommandType.AGENT_RESTART)
+
+    outcome = execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert outcome.result is not None
+    assert outcome.result.successful is True
+    assert outcome.exit_after_report is True
+    # A non-blocking probe: the lock is still held.
+    assert ctx.agent_lock.acquire(blocking=False) is False
 
 
 def test_read_watchdog_state_returns_none_when_unreadable(tmp_path: Path) -> None:

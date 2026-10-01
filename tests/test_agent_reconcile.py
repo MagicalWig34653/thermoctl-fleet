@@ -715,6 +715,11 @@ def test_reconcile_rolls_back_when_no_health_within_deadline(tmp_path: Path) -> 
 
         assert outcome.successful is False
         assert "rolling back" in outcome.reason
+        # P5.4d: this is the one, structural signal
+        # `_DesiredStateReconciler.attempt`'s own drift re-check uses to
+        # decide a digest is known-bad and must not be retried in a loop --
+        # never a string match on `reason`.
+        assert outcome.rolled_back_unhealthy is True
         assert app.inspect["thermoctl"]["Image"] == f"{REPO_THERMOCTL}@{OLD_THERMOCTL}"
 
     assert not paths["pending"].exists()
@@ -1249,6 +1254,10 @@ def test_reconcile_swap_recreate_fails_rollback_succeeds_is_reported(
         assert outcome.successful is False
         assert "swapping the container failed" in outcome.reason
         assert f"Rolled back to {OLD_THERMOCTL}" in outcome.reason
+        # P5.4d: a swap-*execution* failure (never got to the health wait
+        # at all) is not the "already spent a full health-wait cycle on
+        # this digest" case -- must not be flagged as a known-bad digest.
+        assert outcome.rolled_back_unhealthy is False
     assert not paths["pending"].exists()
 
 
@@ -1284,6 +1293,7 @@ def test_reconcile_swap_recreate_fails_rollback_also_fails_is_reported(
         )
         assert outcome.successful is False
         assert "manual intervention required" in outcome.reason
+        assert outcome.rolled_back_unhealthy is False
 
 
 def test_await_or_rollback_pending_swap_timeout_rollback_also_fails(
@@ -1312,6 +1322,9 @@ def test_await_or_rollback_pending_swap_timeout_rollback_also_fails(
         )
         assert outcome.successful is False
         assert "manual intervention required" in outcome.reason
+        # The health-deadline timeout branch -- still a known-bad digest
+        # even though the rollback attempt itself also failed.
+        assert outcome.rolled_back_unhealthy is True
     assert not paths["pending"].exists()
 
 

@@ -16,16 +16,33 @@ desired-state revision, so `run`'s own existing, already-tested exit path
 from __future__ import annotations
 
 import secrets
+import threading
+import time
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
-from agent.loop import BackupConfig, _load_held_desired_state, _save_held_desired_state, run
+import agent.loop as loop_module
+from agent.loop import (
+    BackupConfig,
+    ReconcileOutcome,
+    _load_held_desired_state,
+    _save_held_desired_state,
+    run,
+)
 from agent.transport import build_client
 from fleet.app import app
-from fleet.storage import Storage, create_storage, get_storage, upgrade
+from fleet.storage import (
+    COMMAND_EXPIRY,
+    CommandRecord,
+    Storage,
+    create_storage,
+    get_storage,
+    upgrade,
+)
 from protocol.commands import CommandType
 from protocol.desired_state import (
     DesiredState,
@@ -197,6 +214,21 @@ def test_run_ignores_a_stale_desired_state_revision(
 def test_run_accepts_a_newer_revision_and_replaces_the_held_state(
     tmp_path: Path, app_storage: Storage
 ) -> None:
+    """P5.4d changed how this has to be tested: `_handle_desired_state
+    _received` no longer runs `reconcile_desired_state` on the command
+    thread (see that function's own docstring) -- it only signals the
+    reconciler's own background thread and returns. An `agent_restart`
+    command delivered in the very same connect-time catch-up batch is
+    therefore no longer guaranteed to be processed *after* the reconciler
+    thread has woken up, acquired `ctx.agent_lock`, and reported the
+    revision-2 outcome -- that race is exactly the point of the fix (a
+    command must not wait for a reconcile to finish). This test instead:
+    starts `run` on its own thread, polls the real storage for the
+    revision-2 outcome to appear (bounded wait), and only *then* creates
+    the `agent_restart` command -- delivered live to the still-open SSE
+    connection -- to stop the loop.
+    """
+
     token = _issue_token(app_storage)
     app_storage.create_desired_state_revision(
         APARTMENT, _desired_state(revision=1), ui_username="landlord", reason="first",
@@ -204,10 +236,6 @@ def test_run_accepts_a_newer_revision_and_replaces_the_held_state(
     )
     app_storage.create_desired_state_revision(
         APARTMENT, _desired_state(revision=2), ui_username="landlord", reason="second",
-        now=datetime.now(UTC),
-    )
-    app_storage.create_command(
-        APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
         now=datetime.now(UTC),
     )
 
@@ -229,11 +257,45 @@ def test_run_accepts_a_newer_revision_and_replaces_the_held_state(
                 client=client,
                 recipients_file=tmp_path / "recipients.txt",
             )
-            _run(client, tmp_path, backup_config=backup_config, held_state_path=held_state_path)
 
-    outcome = app_storage.latest_desired_state_outcome(APARTMENT)
-    assert outcome is not None
-    assert outcome.revision == 2
+            run_thread_errors: list[BaseException] = []
+
+            def _run_in_thread() -> None:
+                try:
+                    _run(
+                        client,
+                        tmp_path,
+                        backup_config=backup_config,
+                        held_state_path=held_state_path,
+                    )
+                except BaseException as error:  # noqa: BLE001 -- surfaced below
+                    run_thread_errors.append(error)
+
+            run_thread = threading.Thread(target=_run_in_thread)
+            run_thread.start()
+            try:
+                deadline = time.monotonic() + 5.0
+                outcome = None
+                while time.monotonic() < deadline:
+                    outcome = app_storage.latest_desired_state_outcome(APARTMENT)
+                    if outcome is not None and outcome.revision == 2:
+                        break
+                    time.sleep(0.02)
+
+                assert outcome is not None
+                assert outcome.revision == 2
+            finally:
+                # Stop the loop regardless of the assertion above -- created
+                # live, delivered to the already-open SSE connection.
+                app_storage.create_command(
+                    APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+                    now=datetime.now(UTC),
+                )
+                run_thread.join(timeout=10.0)
+
+            assert not run_thread.is_alive()
+            assert run_thread_errors == []
+
     held = _load_held_desired_state(held_state_path)
     assert held is not None
     assert held.desired_state.revision == 2
@@ -281,3 +343,140 @@ def test_run_reports_disabled_reconciliation_when_backup_config_missing(
 # proves a *pre-existing* file left over from a previous process is
 # correctly *read* and acted on -- together the same guarantee, without
 # the flakiness.
+
+
+def test_run_executes_an_unrelated_command_while_reconcile_blocks(
+    tmp_path: Path, app_storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P5.4d cross-review, item 2's own acceptance test: the headline claim
+    of the non-blocking immediate trigger (that `_handle_desired_state
+    _received` no longer runs `reconcile_desired_state` on the command
+    thread) proven against the real `run`/SSE channel, not only at the
+    unit level (`tests/test_agent_desired_state_reconciler.py
+    ::test_handle_desired_state_received_never_blocks_on_a_slow_reconcile`
+    already proves the handler itself returns fast; this proves the
+    *consequence* -- another command delivered on the same connection
+    keeps flowing).
+
+    `reconcile_desired_state` is monkeypatched to block on a
+    `threading.Event` until released -- **the one deliberate exception to
+    this module's own "never monkeypatched" docstring**: a real reconcile
+    call that happens to need the full 15-minute health deadline would
+    make this test take 15 minutes too, and the work order itself asks
+    for exactly "a fake, blocking reconcile". `pilot_mode=True` is set on
+    the apartment first, so the delivered `desired_state` event actually
+    reaches `reconcile_desired_state` (a real `pilot_mode=False` would
+    reject before ever calling it, defeating the point of this test).
+
+    The unrelated command (`report_now` -- always a fast, honest failure,
+    no I/O of its own, see `_handle_report_now`) is created with a real,
+    short expiry (~5 seconds from `now`, not `_run`'s usual far-future
+    default) -- this test asserts its result is reported well inside that
+    window while the reconcile is still deliberately blocked, not merely
+    "eventually".
+    """
+
+    entered_reconcile = threading.Event()
+    release_reconcile = threading.Event()
+
+    def _blocking_reconcile(*args: object, **kwargs: object) -> ReconcileOutcome:
+        entered_reconcile.set()
+        release_reconcile.wait(timeout=10.0)
+        return ReconcileOutcome(successful=True, reason="released for the test.")
+
+    monkeypatch.setattr(loop_module, "reconcile_desired_state", _blocking_reconcile)
+
+    token = _issue_token(app_storage)
+    app_storage.update_apartment(
+        APARTMENT,
+        label=APARTMENT,
+        floor=None,
+        orientation=None,
+        heating_circuits=1,
+        state="occupied",
+        pilot_mode=True,
+        ui_username="landlord",
+        reason="pilot, P5.4d cross-review test",
+    )
+    app_storage.create_desired_state_revision(
+        APARTMENT, _desired_state(revision=1), ui_username="landlord", reason="test",
+        now=datetime.now(UTC),
+    )
+    # A real, short expiry (~5s from now), not `_run`'s usual far-future
+    # one -- `Storage.create_command` always computes `expires_at` as
+    # `created_at + COMMAND_EXPIRY` (15 minutes), so backdating `now` by
+    # that same constant minus a few seconds yields an `expires_at` a few
+    # real seconds from the moment this call runs.
+    report_now_command = app_storage.create_command(
+        APARTMENT,
+        CommandType.REPORT_NOW,
+        lines=None,
+        ui_username="landlord",
+        now=datetime.now(UTC) - COMMAND_EXPIRY + timedelta(seconds=8),
+    )
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            backup_config = BackupConfig(
+                apartment_id=APARTMENT,
+                agent_version="0.1.0-test",
+                staging_dir=tmp_path / "staging",
+                thermoctl_db_path=tmp_path / "thermoctl.db",
+                zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+                client=client,
+                recipients_file=tmp_path / "recipients.txt",
+            )
+
+            run_thread_errors: list[BaseException] = []
+
+            def _run_in_thread() -> None:
+                try:
+                    _run(client, tmp_path, backup_config=backup_config)
+                except BaseException as error:  # noqa: BLE001 -- surfaced below
+                    run_thread_errors.append(error)
+
+            run_thread = threading.Thread(target=_run_in_thread)
+            run_thread.start()
+            try:
+                # Confirm the reconcile really is blocking right now (not a
+                # coincidentally-fast real call racing ahead of us).
+                assert entered_reconcile.wait(timeout=5.0)
+
+                deadline = time.monotonic() + 4.0  # comfortably inside the ~8s expiry
+                row: CommandRecord | None = None
+                while time.monotonic() < deadline:
+                    with app_storage.session() as session:
+                        row = session.scalar(
+                            select(CommandRecord).where(
+                                CommandRecord.command_id == report_now_command.id
+                            )
+                        )
+                        if row is not None and row.result_received_at is not None:
+                            break
+                    time.sleep(0.02)
+
+                assert row is not None and row.result_received_at is not None, (
+                    "report_now's result was never reported while the "
+                    "reconcile was still blocking -- the immediate trigger "
+                    "blocked the command thread."
+                )
+                assert row.successful is False  # `_handle_report_now`'s own honest failure
+                # Genuinely still inside the command's own real expiry --
+                # not merely reported "eventually", after it had already
+                # expired.
+                assert datetime.now(UTC).replace(tzinfo=None) < row.expires_at
+                # And the reconcile call is still blocked, proving the
+                # result above was reported *concurrently* with it, not
+                # after it happened to finish first.
+                assert not release_reconcile.is_set()
+            finally:
+                release_reconcile.set()
+                app_storage.create_command(
+                    APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+                    now=datetime.now(UTC),
+                )
+                run_thread.join(timeout=10.0)
+
+            assert not run_thread.is_alive()
+            assert run_thread_errors == []
