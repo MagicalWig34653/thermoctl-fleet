@@ -111,14 +111,19 @@ that gate on someday; it does not touch the gate itself.
   lock is held, and to hold it afterward on success (a non-blocking
   `acquire(blocking=False)` probe fails once the handler returns).
 
-**Verification.** `ruff check .` clean; `mypy .` (135 files) and
-`mypy protocol fleet agent tools` (67 files) clean; pytest: **1728
-passed, 1 skipped**, TOTAL **6525 stmts / 19 missed / 99%** (unchanged
+**Verification (after the cross-review fix-up below, the current,
+final numbers).** `ruff check .` clean; `mypy .` (135 files) and
+`mypy protocol fleet agent tools` (67 files) clean; pytest: **1730
+passed, 1 skipped**, TOTAL **6531 stmts / 19 missed / 99%** (unchanged
 from the P5.4b baseline -- every line this package added is itself 100%
 covered, the 19 remaining misses all predate it, see the P5.4b section
-below for the list); Go: `go vet ./...`/`go test ./...` clean,
+below for the list; `agent/loop.py` itself: 1035 stmts, 4 missed, the
+same pre-existing `collect_heartbeat`/`send_heartbeat`/`fetch_logs`
+lines); Go: `go vet ./...`/`go test ./...` clean,
 `watchdog/check_contract.sh` passing (this package never touches
-`watchdog/`).
+`watchdog/`); the new `run()`-level concurrency test
+(`test_run_executes_an_unrelated_command_while_reconcile_blocks`) also
+run 10 times in a row standalone, no failure.
 
 **Tests** (all in existing files, no new test files): `tests
 /test_agent_desired_state_reconciler.py` gained the bulk of the new
@@ -146,6 +151,70 @@ newer revision -- exactly the point of the fix. The test now runs `run`
 on its own thread, polls the real storage for the revision-2 outcome
 (bounded wait), and only then creates the `agent_restart` command,
 delivered live to the still-open SSE connection, to stop the loop.
+
+### P5.4d cross-review fixes (same worktree, follow-up commit)
+
+Cross-review PASS overall (lock sharing, non-blocking trigger, drift
+re-check and failed-rollback loop prevention all verified, mutations
+caught); three test gaps closed here, one of which uncovered and fixed a
+real production bug:
+
+1. **The known-bad-digest guard had a real gap, found while writing the
+   real-Docker test below.** It only ever ran inside the "just noticed
+   drift after convergence" branch of `attempt()` -- a revision that has
+   **never** converged (the ordinary case immediately after a failed
+   swap: the rollback restores the *previous* digest, so the very next
+   tick's own service selection immediately re-detects the same "drift"
+   toward the still-desired, already-known-bad digest) was never checked
+   against `_FailedRollback` at all before calling `reconcile_desired
+   _state` again -- an unguarded retry loop, every
+   `desired_state_reconcile_interval_s`, of the exact swap/wait/fail/
+   rollback cycle the guard exists to stop. **Fixed structurally**: the
+   guard now runs unconditionally on every `attempt()` call (purely from
+   already-loaded local state, no extra Docker call), not only after the
+   drift branch -- which also let the drift branch's own inline copy of
+   the same check be deleted (one guard, not two).
+2. **`_DesiredStateReconciler` gained explicit, injectable fields** for
+   every local input `reconcile_desired_state` itself already takes as an
+   overridable parameter -- `socket_path`, `health_deadline_s`,
+   `poll_interval_s`, `now`, `sleep` -- each defaulting to the exact
+   production value (`health_deadline_s`/`poll_interval_s` via
+   `default_factory`, since the module-level constants they read are only
+   defined later in the file). `run`'s own construction of this class is
+   unaffected -- it passes none of these, so production behaviour is
+   unchanged; a test can now set a short `health_deadline_s`/fake
+   `socket_path` without `monkeypatch`-ing a module constant.
+3. **Three new/extended tests**, all against real Docker/real `run`, not
+   further mocking: `test_reconciler_attempt_real_docker_no_health
+   _persists_failed_rollback_and_does_not_retry` drives a real swap
+   through `_DesiredStateReconciler.attempt()` itself (not
+   `reconcile_desired_state` directly) against the real fake Docker
+   Engine API -- never healthy, rolls back, `rolled_back_unhealthy=True`
+   is reported, the `_FailedRollback` record is persisted, and a second
+   (then third) `attempt()` for the same revision issues **zero** further
+   container-mutating calls, proving fix 1 above actually closes the
+   loop; `test_run_executes_an_unrelated_command_while_reconcile_blocks`
+   (new, `tests/test_agent_loop_desired_state.py`) is the `run()`-level
+   acceptance test for item 2: a monkeypatched, `threading.Event`-gated
+   `reconcile_desired_state` blocks on the reconciler's own thread
+   (`pilot_mode=True` so it genuinely runs) while a `report_now` command
+   with a real, short (~8s) expiry is delivered concurrently over the
+   real SSE channel -- its result is confirmed reported, and still inside
+   its own expiry, while the reconcile is still deliberately blocked; run
+   10 times in a row with no failure to rule out a timing-dependent
+   flake. `tests/test_agent_reconcile.py`'s existing no-health-within-
+   deadline test gained `assert outcome.rolled_back_unhealthy is True`;
+   the swap-execution-failed rollback test (and its rollback-also-fails
+   sibling) gained `assert outcome.rolled_back_unhealthy is False`; the
+   separate health-deadline-timeout-with-a-failing-rollback test gained
+   `is True` (it is also a genuine health-deadline case, not a swap-
+   execution failure).
+
+**Verification after the fix-up.** `ruff check .` clean; `mypy .` and
+`mypy protocol fleet agent tools` clean; pytest, Go, and
+`watchdog/check_contract.sh` re-run in full -- see the updated numbers
+below (this paragraph is superseded by them, kept only for the narrative
+of what changed).
 
 **Open points:**
 

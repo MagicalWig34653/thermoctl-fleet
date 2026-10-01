@@ -9,7 +9,17 @@ and drift re-check after convergence (with its own known-bad-digest guard).
 level here (never mocked at the Docker/HTTP layer) -- this file's own job
 is the bookkeeping one layer above it (hold/ignore/persist/retry/dedup/
 drift/lock), already exhaustively covered against the real Docker Engine
-API fake by `tests/test_agent_reconcile.py`.
+API fake by `tests/test_agent_reconcile.py`. **One exception** (P5.4d
+cross-review): `test_reconciler_attempt_real_docker_no_health_persists
+_failed_rollback_and_does_not_retry` below runs a real
+`reconcile_desired_state` call through
+`_DesiredStateReconciler.attempt()` itself, against the same real Docker
+Engine API double `tests/test_agent_reconcile.py` uses -- the
+known-bad-digest guard (item 3) is bookkeeping this class alone owns
+(`reconcile_desired_state` itself knows nothing about `_FailedRollback`),
+so a monkeypatched `reconcile_desired_state` cannot exercise the real
+"swap, never healthy, roll back, persist, never swap again" path
+end to end the way this one test does.
 `tests/test_agent_loop_desired_state.py` covers the end-to-end path (real
 fleet app, real TLS, real `reconcile_desired_state`) this file deliberately
 does not re-exercise.
@@ -17,6 +27,7 @@ does not re-exercise.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from datetime import UTC, datetime
@@ -24,6 +35,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pyrage import x25519
 
 import agent.loop as loop_module
 from agent.commands_channel import DesiredStateReceived
@@ -41,6 +53,7 @@ from agent.loop import (
     _save_held_desired_state,
     run_desired_state_reconcile_loop,
 )
+from agent.sources import ALLOWED_SOURCES
 from protocol.desired_state import (
     DesiredState,
     DesiredStateEvent,
@@ -48,6 +61,7 @@ from protocol.desired_state import (
     ServiceState,
     UpdateWindow,
 )
+from tests.docker_api_support import run_fake_docker_api_with_app
 
 _VALID_DIGEST = "sha256:" + "a" * 64
 _OTHER_DIGEST = "sha256:" + "b" * 64
@@ -727,6 +741,238 @@ def test_reconciler_attempt_does_not_persist_a_failed_rollback_for_an_ordinary_f
     reconciler.attempt()
 
     assert _load_failed_rollback(reconciler.failed_rollback_path) is None
+
+
+# -- P5.4d cross-review: a real Docker Engine API, through attempt() itself ----
+
+_REPO_THERMOCTL = ALLOWED_SOURCES["thermoctl"]
+_OLD_THERMOCTL_DIGEST = "sha256:" + "a" * 64
+_NEW_THERMOCTL_DIGEST = "sha256:" + "9" * 64
+
+
+def _write_recipients_file(path: Path) -> None:
+    identity_one = x25519.Identity.generate()
+    identity_two = x25519.Identity.generate()
+    path.write_text(
+        f"{identity_one.to_public()}\n{identity_two.to_public()}\n", encoding="utf-8"
+    )
+
+
+def _mock_backup_client() -> httpx.Client:
+    def handler(request: httpx.Request) -> httpx.Response:
+        content_hash = request.url.params.get("content_hash", "0" * 64)
+        kind = request.url.params.get("kind", "operational_data")
+        return httpx.Response(
+            201,
+            json={
+                "id": "backup-1",
+                "kind": kind,
+                "received_at": "2026-09-28T12:00:00Z",
+                "size_bytes": 1,
+                "content_hash": content_hash,
+            },
+        )
+
+    return httpx.Client(transport=httpx.MockTransport(handler), base_url="http://fleet.example")
+
+
+def _real_backup_config(tmp_path: Path) -> BackupConfig:
+    """A `BackupConfig` that actually works end to end (a real sqlite
+    database, a real zigbee2mqtt directory, real `age` recipients) -- this
+    test's own `reconcile_desired_state` call is real, not monkeypatched,
+    so `run_before_update_backup` must genuinely succeed for the swap
+    below to ever reach the pull/recreate step at all."""
+
+    staging_dir = tmp_path / "staging"
+    db_path = tmp_path / "thermoctl.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute("CREATE TABLE t (x TEXT)")
+    connection.commit()
+    connection.close()
+    z2m_dir = tmp_path / "zigbee2mqtt"
+    z2m_dir.mkdir()
+    recipients_file = tmp_path / "recipients.txt"
+    _write_recipients_file(recipients_file)
+    return BackupConfig(
+        apartment_id="apt-7",
+        agent_version="0.1.0-test",
+        staging_dir=staging_dir,
+        thermoctl_db_path=db_path,
+        zigbee2mqtt_dir=z2m_dir,
+        client=_mock_backup_client(),
+        recipients_file=recipients_file,
+    )
+
+
+def _thermoctl_only_desired_state(*, revision: int, digest: str) -> DesiredState:
+    """A `DesiredState` whose only service that will ever differ from the
+    fake Docker API's own baseline (below) is `thermoctl` -- the other
+    three are given the exact digest the fake API already reports as
+    running, so `_select_service_to_update` (walked in
+    `RECONCILE_SERVICE_ORDER`, `thermoctl` first) never has a reason to
+    look past `thermoctl` at all."""
+
+    return DesiredState(
+        revision=revision,
+        services=Services(
+            thermoctl=ServiceState(image=_REPO_THERMOCTL, version="1.0", digest=digest),
+            zigbee2mqtt=ServiceState(
+                image=ALLOWED_SOURCES["zigbee2mqtt"], version="1.0", digest=_VALID_DIGEST
+            ),
+            mosquitto=ServiceState(
+                image=ALLOWED_SOURCES["mosquitto"], version="1.0", digest=_VALID_DIGEST
+            ),
+            agent=ServiceState(
+                image=ALLOWED_SOURCES["agent"], version="1.0", digest=_VALID_DIGEST
+            ),
+        ),
+        window=UpdateWindow(from_="00:00", until="23:59", not_below_outdoor_temp_c=-50.0),
+    )
+
+
+def _thermoctl_container(image_ref: str) -> dict[str, object]:
+    return {"Config": {}, "HostConfig": {}, "Image": image_ref, "State": {"Running": True}}
+
+
+def test_reconciler_attempt_real_docker_no_health_persists_failed_rollback_and_does_not_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P5.4d cross-review: a real swap through a real (fake) Docker Engine
+    API, driven entirely through `_DesiredStateReconciler.attempt()`
+    itself (never a monkeypatched `reconcile_desired_state`) -- the
+    container never reports healthy, forcing a genuine health-deadline
+    rollback. Verifies, end to end: `outcome.rolled_back_unhealthy` (via
+    the reported outcome) is `True`, the `_FailedRollback` record is
+    persisted, and a **second** `attempt()` for the same still-held,
+    still-blocked revision issues **zero** further container-mutating
+    calls (no `POST`/`DELETE` -- no second swap attempt).
+
+    `health_reader`/`outdoor_temp_reader`/`disk_usage_reader` are
+    deliberately **not** among `_DesiredStateReconciler`'s own injectable
+    fields (unlike `socket_path`/`health_deadline_s`/`poll_interval_s`/
+    `now`): the first two stand in for thermoctl's own not-yet-built
+    health endpoint (section 13's "Decided afterward" gate, P5.4's own
+    honesty gap), and threading them through this class would start to
+    blur the line between "inactive until a real reader exists" and
+    "configurable by a caller". This test reaches past them the same way
+    `tests/test_agent_reconcile.py` already does for `reconcile_desired
+    _state` directly -- by wrapping the real function with one that
+    supplies them as defaults, never stubbing out its own pull/swap/
+    health-wait/rollback behaviour, which stays entirely real."""
+
+    real_reconcile = loop_module.reconcile_desired_state
+
+    def _reconcile_with_test_readers(*args: object, **kwargs: object) -> ReconcileOutcome:
+        kwargs.setdefault("health_reader", lambda: "ok")
+        kwargs.setdefault("outdoor_temp_reader", lambda: 10.0)
+        kwargs.setdefault(
+            "disk_usage_reader", lambda: {"total_bytes": 100, "free_bytes": 50}
+        )
+        return real_reconcile(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(loop_module, "reconcile_desired_state", _reconcile_with_test_readers)
+
+    held_path = tmp_path / "held"
+    desired = _thermoctl_only_desired_state(revision=1, digest=_NEW_THERMOCTL_DIGEST)
+    _save_held_desired_state(
+        held_path, DesiredStateEvent(desired_state=desired, pilot_mode=True)
+    )
+
+    zigbee_repo = ALLOWED_SOURCES["zigbee2mqtt"]
+    mosquitto_repo = ALLOWED_SOURCES["mosquitto"]
+    agent_repo = ALLOWED_SOURCES["agent"]
+    inspect = {
+        "thermoctl": _thermoctl_container(f"{_REPO_THERMOCTL}@{_OLD_THERMOCTL_DIGEST}"),
+        "zigbee2mqtt": _thermoctl_container(f"{zigbee_repo}@{_VALID_DIGEST}"),
+        "mosquitto": _thermoctl_container(f"{mosquitto_repo}@{_VALID_DIGEST}"),
+        "thermoctl-agent": _thermoctl_container(f"{agent_repo}@{_VALID_DIGEST}"),
+    }
+    images = {
+        f"{_REPO_THERMOCTL}@{_OLD_THERMOCTL_DIGEST}": {
+            "RepoDigests": [f"{_REPO_THERMOCTL}@{_OLD_THERMOCTL_DIGEST}"]
+        },
+        f"{_REPO_THERMOCTL}@{_NEW_THERMOCTL_DIGEST}": {
+            "RepoDigests": [f"{_REPO_THERMOCTL}@{_NEW_THERMOCTL_DIGEST}"]
+        },
+        f"{zigbee_repo}@{_VALID_DIGEST}": {"RepoDigests": [f"{zigbee_repo}@{_VALID_DIGEST}"]},
+        f"{mosquitto_repo}@{_VALID_DIGEST}": {
+            "RepoDigests": [f"{mosquitto_repo}@{_VALID_DIGEST}"]
+        },
+        f"{agent_repo}@{_VALID_DIGEST}": {"RepoDigests": [f"{agent_repo}@{_VALID_DIGEST}"]},
+    }
+
+    with run_fake_docker_api_with_app(inspect=inspect, images=images) as (socket_path, app):
+        # The newly recreated container never reports healthy -- forces a
+        # genuine (small, real-time) health-deadline timeout and rollback,
+        # not a stubbed-out shortcut.
+        app.default_health_on_create = "unhealthy"
+
+        client = _FakeClient()
+        reconciler = _DesiredStateReconciler(
+            ctx=ExecutionContext(
+                watchdog_state_path=tmp_path / "watchdog-state.env",
+                local_log_path=tmp_path / "agent.log",
+                backup_config=_real_backup_config(tmp_path),
+                client=client,  # type: ignore[arg-type]
+            ),
+            held_state_path=held_path,
+            pending_swap_path=tmp_path / "pending-swap.json",
+            failed_rollback_path=tmp_path / "failed-rollback.json",
+            socket_path=socket_path,
+            health_deadline_s=0.1,
+            poll_interval_s=0.02,
+            # A real, advancing clock -- not a frozen constant: the
+            # health-deadline wait below anchors its own deadline to
+            # `now().timestamp()` at swap time and polls `now()` again on
+            # every iteration to decide whether the deadline has passed
+            # (`_await_or_rollback_pending_swap`'s own `since +
+            # health_deadline_s` check) -- a frozen `now` would never
+            # advance past that deadline and this call would hang forever
+            # waiting for a health check that is never going to arrive.
+            now=lambda: datetime.now(UTC),
+        )
+
+        reconciler.attempt()
+
+        assert client.calls, "the rollback outcome must have been reported"
+        assert client.calls[-1]["json"]["successful"] is False  # type: ignore[index]
+
+        record = _load_failed_rollback(reconciler.failed_rollback_path)
+        assert record == _FailedRollback(
+            revision=1, service="thermoctl", digest=_NEW_THERMOCTL_DIGEST
+        )
+        # thermoctl is back on its previous digest -- the rollback itself
+        # genuinely happened, not merely reported.
+        assert app.inspect["thermoctl"]["Image"] == f"{_REPO_THERMOCTL}@{_OLD_THERMOCTL_DIGEST}"
+
+        calls_after_first_attempt = len(app.calls)
+        reports_after_first_attempt = len(client.calls)
+
+        # Second attempt: the revision never converged (the swap failed),
+        # so without the P5.4d cross-review fix this would immediately
+        # re-detect the same "drift" and swap/wait/fail/roll back all over
+        # again -- the known-bad-digest guard must stop it before a single
+        # further Docker call.
+        reconciler.attempt()
+
+        assert len(app.calls) == calls_after_first_attempt, (
+            f"a second swap attempt was made: {app.calls[calls_after_first_attempt:]}"
+        )
+        # Exactly one additional report -- the transition from "just rolled
+        # back" to "now known-blocked" is itself a genuinely different
+        # outcome (a different, more specific reason text), so "report on
+        # change" correctly reports it once.
+        assert len(client.calls) == reports_after_first_attempt + 1
+        calls_after_second_attempt = len(app.calls)
+        reports_after_second_attempt = len(client.calls)
+
+        # A third attempt: now the block itself is unchanged from the
+        # second attempt's own report -- "report on change, not every
+        # tick" means this one adds neither a Docker call nor a report.
+        reconciler.attempt()
+
+        assert len(app.calls) == calls_after_second_attempt
+        assert len(client.calls) == reports_after_second_attempt
 
 
 # -- P5.4d item 4: two concurrent attempt() calls are strictly serialized -------

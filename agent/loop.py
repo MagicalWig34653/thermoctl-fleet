@@ -2089,6 +2089,29 @@ class _DesiredStateReconciler:
     # dataclass's own docstring for why this is a separate file from
     # `held_state_path`.
     failed_rollback_path: Path
+    # P5.4d cross-review fix: every local input `reconcile_desired_state`
+    # itself already takes as an explicit, overridable parameter is now
+    # also a field here, with the exact same production default, instead
+    # of this class only ever calling it with the module-level defaults
+    # and forcing a test that wants a fast health deadline or a fake
+    # socket to `monkeypatch` a module constant. Threaded through to both
+    # `reconcile_desired_state` and the drift re-check's own
+    # `_select_service_to_update` call (item 3) -- both need to agree on
+    # the same Docker socket. Nothing here changes production behaviour:
+    # `run`'s own construction of this class passes none of these,
+    # leaving every one at its production default.
+    socket_path: Path = DEFAULT_DOCKER_SOCKET
+    # `RECONCILE_HEALTH_DEADLINE_S`/`RECONCILE_HEALTH_POLL_INTERVAL_S` are
+    # only defined further down in this module (next to
+    # `reconcile_desired_state` itself) -- `default_factory` looks them up
+    # lazily, at instantiation time (by which the whole module is loaded),
+    # rather than at class-body evaluation time, which a plain `= ...`
+    # default would require and which would otherwise raise `NameError` at
+    # import.
+    health_deadline_s: float = field(default_factory=lambda: RECONCILE_HEALTH_DEADLINE_S)
+    poll_interval_s: float = field(default_factory=lambda: RECONCILE_HEALTH_POLL_INTERVAL_S)
+    now: Callable[[], datetime] = field(default=lambda: datetime.now().astimezone())
+    sleep: Callable[[float], None] = time.sleep
     # `(revision, successful, reason, service)` of the last outcome actually
     # reported to the fleet -- `None` until the first attempt ever reports
     # anything. An identical tuple on a later attempt is never re-reported
@@ -2128,16 +2151,29 @@ class _DesiredStateReconciler:
           `reconcile_desired_state` itself uses to pick a service, a
           handful of `GET` Engine API calls, never a mutation -- is run
           directly. No drift (`None`): still converged, no-op, nothing
-          reported again. Drift found: unless this exact
-          `(revision, service, digest)` is the one this agent's own
-          `_await_or_rollback_pending_swap` already rolled back as
-          unhealthy (`_FailedRollback`, checked below) -- in which case
-          the drift is reported once (if it has not been already) and
-          left alone, not retried automatically -- convergence is
-          forgotten for this revision and the normal full-reconcile path
-          below runs, going through `reconcile_desired_state`'s complete
-          fail-closed pre-check exactly as a first attempt at this
-          revision would.
+          reported again. Drift found: convergence is forgotten for this
+          revision and execution falls through to the known-bad-digest
+          guard immediately below, then (unless blocked there) a full
+          reconcile.
+
+        **The known-bad-digest guard runs unconditionally on every
+        `attempt()` call, not only after the drift branch above** (P5.4d
+        cross-review fix -- an earlier version of this method checked it
+        only inside that branch, which left a real gap: a revision that
+        has *never* converged, i.e. the ordinary case immediately after a
+        failed swap, would otherwise call `reconcile_desired_state` again
+        on the very next tick with no guard at all -- and since a rollback
+        restores the *previous* digest, that next call's own service
+        selection would immediately re-detect the exact same "drift"
+        toward the still-desired, already-known-bad digest and repeat the
+        whole swap/wait/fail/rollback cycle forever, every
+        `desired_state_reconcile_interval_s`). The check itself costs
+        nothing extra -- purely local state, the persisted
+        `_FailedRollback` plus the already-loaded held state, no Docker
+        call -- and blocks a full reconcile call only when the currently
+        held desired digest for that exact revision/service still exactly
+        matches the blocked one; the block is reported once (if not
+        already) and left alone until a new revision arrives.
 
         Any outcome whose `rolled_back_unhealthy` is `True` persists a
         fresh `_FailedRollback` for the service/digest that failed --
@@ -2158,31 +2194,48 @@ class _DesiredStateReconciler:
                     # every other path while `pilot_mode` is unset --
                     # tested directly.
                     return
-                drifted_service = _select_service_to_update(held.desired_state)
+                drifted_service = _select_service_to_update(
+                    held.desired_state, socket_path=self.socket_path
+                )
                 if drifted_service is None:
                     return  # still converged, nothing to do
-                service_state = getattr(held.desired_state.services, drifted_service)
-                blocked = _load_failed_rollback(self.failed_rollback_path)
-                if (
-                    blocked is not None
-                    and blocked.revision == revision
-                    and blocked.service == drifted_service
-                    and blocked.digest == service_state.digest
-                ):
+                # Genuinely drifted -- forget convergence and fall through
+                # to the universal known-bad-digest guard immediately
+                # below, then (unless blocked) a full reconcile, fail-
+                # closed pre-check and all.
+                self.last_converged_revision = None
+
+            # **P5.4d cross-review fix**: this guard used to live only
+            # inside the "just noticed drift after convergence" branch
+            # above, which left a real gap -- a revision that has *never*
+            # converged (the ordinary case right after a failed swap: the
+            # rollback restored the *previous* digest, so the very next
+            # tick's own `_select_service_to_update` would immediately
+            # re-detect "drift" toward the same still-desired, already-
+            # known-bad digest and swap-wait-fail-rollback all over again,
+            # forever, every `desired_state_reconcile_interval_s`) was
+            # never checked at all before calling `reconcile_desired_state`
+            # again. Checked here, unconditionally, for **every** attempt
+            # regardless of whether it arrived via the drift branch above
+            # or as a plain, never-converged retry -- purely from local
+            # state (the persisted record plus the already-loaded held
+            # state), no Docker call needed for the check itself.
+            blocked = _load_failed_rollback(self.failed_rollback_path)
+            if blocked is not None and blocked.revision == revision:
+                service_state = getattr(held.desired_state.services, blocked.service, None)
+                if service_state is not None and service_state.digest == blocked.digest:
                     reason = (
-                        f"{drifted_service}: digest {service_state.digest} was "
-                        "already rolled back as unhealthy for this revision -- "
-                        "not retried automatically; a new revision is required."
+                        f"{blocked.service}: digest {blocked.digest} was already "
+                        "rolled back as unhealthy for this revision -- not "
+                        "retried automatically; a new revision is required."
                     )
                     self._report_if_changed(
                         revision,
-                        ReconcileOutcome(successful=False, reason=reason, service=drifted_service),
+                        ReconcileOutcome(
+                            successful=False, reason=reason, service=blocked.service
+                        ),
                     )
                     return
-                # Genuinely drifted, and not a digest already known bad for
-                # this revision -- forget convergence and fall through to a
-                # full reconcile below, fail-closed pre-check and all.
-                self.last_converged_revision = None
 
             if self.ctx.backup_config is None:
                 outcome = ReconcileOutcome(
@@ -2201,6 +2254,11 @@ class _DesiredStateReconciler:
                     watchdog_state_path=self.ctx.watchdog_state_path,
                     pending_swap_path=self.pending_swap_path,
                     local_log_path=self.ctx.local_log_path,
+                    now=self.now,
+                    socket_path=self.socket_path,
+                    health_deadline_s=self.health_deadline_s,
+                    poll_interval_s=self.poll_interval_s,
+                    sleep=self.sleep,
                 )
 
             if outcome.rolled_back_unhealthy and outcome.service is not None:
