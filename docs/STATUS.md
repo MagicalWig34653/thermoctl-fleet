@@ -2,6 +2,19 @@
 
 Last updated: 2026-09-29.
 
+## Merge: P5.5d onto main (main session, 2026-10-01)
+
+Cross-review PASS (round 2, after the HIGH intermediate-symlink finding
+was closed with an `os.Root`-confined `StagingRoot`). Go directive now
+1.24 (toolchain only; `watchdog/go.mod` still has no `require`); the
+watchdog's own root package is byte-identical, its 299 statement lines
+unchanged. Remaining low-severity follow-up: `openEntryNoFollow` does no
+post-open `fstat`/`Nlink == 1` re-check, so an in-root symlink swapped in
+between its `Lstat` and `root.OpenFile` is followed -- judged not
+exploitable (closed allowlist, every staged byte is agent-authored and
+hash-checked, `os.Root` refuses escapes), to be added for consistency
+with `openRegularNoFollow`'s discipline.
+
 ## P5.5d -- restore mover open points (resumable finalize, narrower ReadWritePaths=, `_resolve_prospective` fix)
 
 Closes the three open points left after the P5.5c and P5.5b cross-review
