@@ -238,14 +238,37 @@ def _fault_overdue(fault: OpenFault, now: datetime) -> bool:
     return age > FAULT_OPEN_THRESHOLD
 
 
+def _is_acknowledged(
+    overview: ApartmentOverview,
+    fault: OpenFault,
+    acknowledged_keys: frozenset[tuple[str, str, str, datetime]],
+) -> bool:
+    """`True` if this exact occurrence (P6.3 -- see
+    `fleet.storage.FaultAcknowledgementRecord`'s own docstring for what
+    "occurrence" means) was already acknowledged in the UI. A fault with
+    the same `kind`/`zone` but a *different* `since` (i.e. it cleared and
+    reopened) is a new occurrence and is never matched here, per the
+    2026-10-01 owner decision ("if the same fault recurs, it shows
+    again")."""
+
+    return (
+        overview.apartment_id,
+        str(fault.kind),
+        fault.zone,
+        _naive_utc(fault.since),
+    ) in acknowledged_keys
+
+
 def _overdue_faults(
-    overview: ApartmentOverview, now: datetime
+    overview: ApartmentOverview,
+    now: datetime,
+    acknowledged_keys: frozenset[tuple[str, str, str, datetime]],
 ) -> list[tuple[ApartmentOverview, OpenFault]]:
     assert overview.latest is not None  # _eligible already checked this
     return [
         (overview, fault)
         for fault in overview.latest.heartbeat.open_faults
-        if _fault_overdue(fault, now)
+        if _fault_overdue(fault, now) and not _is_acknowledged(overview, fault, acknowledged_keys)
     ]
 
 
@@ -272,6 +295,7 @@ def build_task_overview(storage: Storage, now: datetime) -> TaskOverview:
     boundaries exactly, without waiting on a real clock."""
 
     eligible = [overview for overview in storage.get_house_overview() if _eligible(overview)]
+    acknowledged_keys = frozenset(storage.list_all_fault_acknowledgement_keys())
 
     battery_rounds = sorted(
         (task for task in (_battery_task(overview, now) for overview in eligible) if task),
@@ -282,7 +306,11 @@ def build_task_overview(storage: Storage, now: datetime) -> TaskOverview:
         key=lambda task: task.apartment_id,
     )
     overdue_faults = sorted(
-        (pair for overview in eligible for pair in _overdue_faults(overview, now)),
+        (
+            pair
+            for overview in eligible
+            for pair in _overdue_faults(overview, now, acknowledged_keys)
+        ),
         # Oldest (longest still open) first -- the same "worst first" reading
         # `fleet/ui_house.py` already applies to open faults on "Das Haus",
         # here read as "longest overdue" rather than "most faults". Sorted

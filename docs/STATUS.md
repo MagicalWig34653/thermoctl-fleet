@@ -1,18 +1,163 @@
 # Status
 
-Last updated: 2026-09-30.
+Last updated: 2026-10-01.
 
-## Owner decisions on section 12 and remaining open points (2026-10-01, main session)
+## P6.3 -- Fault acknowledgement + per-device battery/signal (section 12's "Decided afterward", 2026-10-01)
 
-Recorded in `docs/specification.md` section 12 ("Decided afterward"):
-retention 90/365 days (audit log kept); tenant change = token rotation via
-signed challenge + deletion of the apartment's history (backups stay);
-passkeys as second factor + TOTP secrets encrypted with an environment
-key; fault acknowledgement for the current occurrence only; per-device
-battery/signal as (device id, battery %, signal) without names or measured
-values. Packages P6.1 (retention + tenant change), P6.2 (login), P6.3
-(acknowledgement + per-device values). Still blocked on thermoctl (no
-`/api/v1/health` yet): P2.3 and activating desired-state updates.
+Closes the two open points this package's own predecessors left on
+purpose: P3.4's "no acknowledge/confirm mechanism exists, on purpose --
+open point, not built here" (its own docstring named exactly what a future
+package needs: a new table/column, a CSRF-protected `POST`, and a decision
+on the re-occurrence question) and P3.2's "per-device battery/signal
+values ... are not in the heartbeat wire protocol at all" (noted as
+needing a protocol extension cleared with the project owner first -- done
+2026-10-01, recorded in `docs/specification.md` section 12).
+
+**What "occurrence" means, precisely -- not decided by the specification,
+defined here from the existing fault model, since nothing else pins it
+down.** An open fault is never its own row in this database: it only ever
+exists as one entry of the *latest* stored heartbeat's `open_faults` list
+(`protocol.heartbeat.OpenFault`: `kind`, `zone`, `since`). `since` is the
+moment thermoctl itself considers the fault to have become open, and stays
+identical across every heartbeat for as long as thermoctl keeps reporting
+the same still-open fault -- it only changes when the fault **clears and
+reopens** (thermoctl has no reason to report a new "became open" time for
+what is, from its own perspective, the same continuous problem). The tuple
+`(apartment_id, fault_kind, zone, since)` therefore already *is* the
+occurrence: stable for as long as the fault stays open (one
+acknowledgement covers every later heartbeat still reporting the identical
+`since`), and naturally a *different* occurrence the moment it reopens
+with a new `since` -- exactly "applies to the current occurrence only ...
+shows again" (section 12) without any extra bookkeeping, no separate
+"cleared" signal needed: the fault simply stops appearing in
+`open_faults`, and its acknowledgement row, now orphaned, is never matched
+against anything again. See `fleet/storage.py::FaultAcknowledgementRecord`'s
+own docstring for the full account.
+
+**Storage:** one new table, `fault_acknowledgements`
+(`fleet/migrations/versions/0017_fault_acknowledgements.py`,
+`FaultAcknowledgementRecord`) -- `apartment_id`, `fault_kind`, `zone`,
+`since`, `acknowledged_by`, `acknowledged_at`, `note` (optional, 500
+chars), a unique index on the occurrence tuple. `Storage.acknowledge_fault`
+performs a dialect-native `INSERT ... ON CONFLICT ... DO UPDATE` (same
+reasoning as `raise_alarm`'s own insert-or-ignore) so re-acknowledging the
+identical occurrence (e.g. to fix a typo in the note) updates the one row
+in place instead of racing a second insert -- "one row per acknowledged
+occurrence, not per key forever," per the work package's own instruction.
+`Storage.list_all_fault_acknowledgement_keys` is a single batched query
+across every apartment (mirrors `_get_open_not_reporting_alarms`'s own
+"don't N+1" reasoning), used by `fleet.ui_tasks.build_task_overview` to
+filter the "Aufgaben" unconfirmed-faults group.
+
+**UI:** acknowledged occurrences are **hidden** from "Aufgaben"'s
+"Unbestätigte Störungen" group (not shown separately as quittiert there --
+that view is explicitly "what is still due", per its own module docstring,
+and an acknowledged fault is no longer due). "Eine Wohnung" shows every
+currently open fault including acknowledged ones, each with a "Quittieren"
+form (login + CSRF, mandatory `fault_kind`/`zone`/`since` hidden fields
+carrying the occurrence key, optional note) -- an already-acknowledged
+fault additionally shows who/when/the note and the button relabels to
+"Erneut quittieren". `POST /ui/apartments/{id}/faults/acknowledge`
+(`fleet/ui_routes.py::fault_acknowledge_submit`) re-validates the
+submitted occurrence against the apartment's **current**
+`open_faults` (`Storage.get_latest_heartbeat`) before writing anything --
+a stale or hand-crafted form naming an occurrence that is not actually
+open right now is rejected with 400, never silently accepted.
+
+**Per-device battery/signal (protocol):** `protocol.heartbeat.PerDeviceState`
+(new), `DeviceState.per_device: list[PerDeviceState]` (new, optional,
+`default_factory=list`, bounded by `MAX_PER_DEVICE_ENTRIES` = 128). Exactly
+three fields -- `device_id`, `battery_percent` (0-100 or `None`),
+`signal_quality` (0-100 or `None`) -- `model_config = ConfigDict(extra=
+"forbid")` makes "no other fields" (section 12: "no device names ..., no
+measured values") a structural guarantee, not a convention: a heartbeat
+carrying `{"name": ...}`/`{"room": ...}`/`{"temperature": ...}` on a
+per-device entry is rejected with 422 before any fleet code ever sees the
+extra field. `device_id` is constrained by `Field(pattern=r"^0x[0-9a-f]
+{16}$")` -- a Zigbee IEEE address shape, lowercase, exactly 16 hex digits
+-- refusing anything else (a friendly/room name, upper-case, wrong length,
+missing prefix) so a tenant-chosen or room-derived name can never be
+represented, let alone transmitted. The fleet-wide aggregates
+(`weakest_battery_percent`/`worst_signal_quality`/`silent_devices`/
+`zigbee_bridge`) are unchanged. `PROTOCOL_VERSION` bumped 8 -> 9
+(`protocol/version.py`, "a wholly new model plus an additive field on an
+existing one ... counts as a change to the models too", same literal
+reading every prior bump used) -- **re-chained at merge** if a parallel
+package (P6.1) also bumps it in the same window.
+
+**UI (per-device display):** "Eine Wohnung" gained a "Je Gerät" table next
+to the existing aggregates, from the latest heartbeat's `devices.per_device`
+(`fleet.ui_apartment.PerDeviceDisplay`). **`label` is always `None` in
+this scaffold** -- checked against P4.1's inventory first, per the work
+package's own instruction: the `devices` table (section 20.1) tracks the
+*base station hardware* itself, one row per apartment (serial number,
+model, image/watchdog version, lifecycle state) -- there is no table
+anywhere that maps an individual Zigbee device id to a landlord-chosen
+label. The template therefore falls back to the opaque `device_id` as-is;
+`PerDeviceDisplay.label`'s own docstring documents that the only source it
+may ever be populated from is a future inventory table, never a name read
+from the heartbeat itself (CLAUDE.md: "never take names from the agent").
+A future package wanting friendly per-device labels needs its own new
+inventory table (Zigbee device id -> label), not a field re-purposed from
+`protocol.heartbeat.PerDeviceState` or `fleet.storage.DeviceRecord`. An
+agent that has not been upgraded to send `per_device` yet (P2.3, still
+deferred) simply omits the field -- shown as "Keine Angaben je Gerät
+(der Agent dieser Wohnung sendet diese Liste noch nicht)", not conflated
+with `never_reported`.
+
+**Files:** `protocol/heartbeat.py`, `protocol/version.py`,
+`protocol/__init__.py`, `fleet/storage.py`
+(`FaultAcknowledgementRecord`, `acknowledge_fault`,
+`list_fault_acknowledgements_for_apartment`,
+`list_all_fault_acknowledgement_keys`),
+`fleet/migrations/versions/0017_fault_acknowledgements.py`,
+`fleet/ui_tasks.py`, `fleet/ui_apartment.py`
+(`PerDeviceDisplay`, `OpenFaultDisplay`'s new fields,
+`MAX_FAULT_ACK_NOTE_LENGTH`), `fleet/ui_routes.py`
+(`fault_acknowledge_submit`), `fleet/templates/ui/apartment.html`.
+`agent/` is untouched (P2.3's heartbeat collector is still deferred, per
+the work package's own instruction) -- the model and fleet side are
+complete and ready for whenever the agent can fill the list.
+
+**Tests (new/updated):** `tests/test_protocol.py` (valid per-device entry
+accepted; battery/signal optional; per_device defaults to empty; every
+non-opaque `device_id` shape parametrized and rejected, including a
+literal room name; `name`/`room`/`temperature` extra fields parametrized
+and rejected, both on `PerDeviceState` directly and end-to-end through
+`Heartbeat`; bounds on battery/signal; the list-length bound);
+`tests/test_storage.py` (`acknowledge_fault` creates/updates/is apartment-
+scoped; **recurrence**: a new `since` is a different occurrence, the old
+acknowledgement does not apply; `list_all_fault_acknowledgement_keys`
+spans every apartment; migration 0017 up/down, including the schema-diff
+check `test_migrations_match_the_orm_model_exactly` already covers
+automatically); `tests/test_ui_tasks.py` (an acknowledged fault is hidden;
+a recurring fault with a new `since` shows again despite the old
+acknowledgement); `tests/test_ui_apartment.py` (open fault carries its
+occurrence key and acknowledgement state; a different `since` does not
+inherit a stale acknowledgement; per-device values shown with no
+inventory label; empty when the agent omits the field; `never_reported`
+carries `per_device == []`); `tests/test_ui_faults.py` (new -- every HTTP
+behavior of the acknowledge endpoint: unauthenticated redirect, missing/
+wrong CSRF rejected, unknown apartment 404, happy path creates a row and
+redirects, an occurrence not currently open rejected with 400, unknown
+fault kind rejected, an overlong note rejected, re-acknowledging updates
+the note, and the acknowledged fault disappears from `/ui/tasks`).
+
+**Verification:** `ruff check .`, `mypy .`, `mypy protocol fleet agent
+tools` all clean; `python -m pytest -W ignore::ResourceWarning` --
+**1868 passed, 1 skipped**, coverage **99%** overall
+(`fleet/storage.py`, `fleet/ui_apartment.py`, `fleet/ui_tasks.py`,
+`protocol/heartbeat.py`, and the new migration all at 100%); `go vet
+./...`/`go test ./...` clean (watchdog untouched by this package);
+`watchdog/check_contract.sh` passes; migration 0017 verified both
+directions (`upgrade`, `downgrade` to 0016, re-`upgrade`) via
+`tests/test_storage.py` and a manual round-trip. One pre-existing test
+(`tests/test_protocol_desired_state.py::test_protocol_version_is_8`) was
+pinned to an exact `PROTOCOL_VERSION` value and would have failed on
+every future bump forever after -- loosened to `>= 8` (renamed
+`test_protocol_version_is_at_least_8`), its actual guarantee (P5.4b's own
+bump happened) preserved; flagged for main-session read-back together
+with the rest of this package, not changed silently.
 
 ## P5.4d -- pre-activation points from the P5.4b merge (section 13)
 
@@ -7303,7 +7448,8 @@ its own row exactly as before. Pinned by
 no trailing gap).
 
 **Battery/signal values -- section 9's wording vs. the actual protocol
-(open point, not built, not invented).** Section 9 says "battery and
+(open point, not built, not invented -- closed by P6.3, see this file's own
+P6.3 section at the top).** Section 9 says "battery and
 signal values ... per device"; `protocol.heartbeat.DeviceState` only ever
 carries the fleet-wide aggregates (`weakest_battery_percent`,
 `worst_signal_quality`, `silent_devices`, `zigbee_bridge`) -- there is no
@@ -7574,7 +7720,8 @@ agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
 (728 passed, 99% coverage overall, `fleet/ui_tasks.py` at 100%).
 
 **No acknowledge/confirm mechanism exists, on purpose -- open point, not
-built here.** The work package's own instruction: an "acknowledge" action on
+built here (closed by P6.3, see this file's own P6.3 section at the
+top).** The work package's own instruction: an "acknowledge" action on
 a fault would be a state-changing `POST` (its own CSRF handling, its own
 authorization question, its own persistence -- does acknowledging a fault
 on the fault's *current* occurrence carry forward to a later re-occurrence

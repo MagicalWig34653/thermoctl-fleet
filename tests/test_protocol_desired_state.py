@@ -53,13 +53,20 @@ def test_command_type_is_exactly_the_stage_1_set() -> None:
     }
 
 
-def test_protocol_version_is_8() -> None:
-    """Bumped from 7 (main, P5.5b) for the two wholly new models this
-    package adds (`DesiredStateEvent`, `DesiredStateOutcomeReport`) --
+def test_protocol_version_is_at_least_8() -> None:
+    """P5.4b bumped `PROTOCOL_VERSION` to 8 for the two wholly new models
+    this package adds (`DesiredStateEvent`, `DesiredStateOutcomeReport`) --
     `protocol.version`'s own literal "a wholly new model counts as a
-    change to the models too" reading."""
+    change to the models too" reading. **Not pinned to exactly 8
+    (cross-review, P6.3):** every later package that changes any model in
+    `protocol/` bumps this same module-wide counter again (most recently
+    P6.3, to 9, for `protocol.heartbeat.PerDeviceState`) -- an exact
+    equality assertion here would make this test fail on every single one
+    of those unrelated, correctly-made bumps forever after. The actual
+    guarantee this test protects (P5.4b's own bump happened, is >= 1 higher
+    than the pre-P5.4b value of 7) survives any later, unrelated bump."""
 
-    assert PROTOCOL_VERSION == 8
+    assert PROTOCOL_VERSION >= 8
 
 
 # -- DesiredStateEvent ----------------------------------------------------------
