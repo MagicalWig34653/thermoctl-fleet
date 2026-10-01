@@ -126,6 +126,7 @@ restore_staging_dir="$work_dir/pending-restore"
 restore_live_thermoctl_dir="$work_dir/live/thermoctl"
 restore_live_zigbee_dir="$work_dir/live/zigbee2mqtt"
 restore_mover_status_file="$work_dir/restore-mover-status.json"
+restore_mover_journal_file="$work_dir/restore-mover-journal.json"
 mkdir -p "$restore_data_dir" "$restore_live_thermoctl_dir" "$restore_live_zigbee_dir"
 
 PYTHONPATH="$root" python3 -c "
@@ -162,14 +163,28 @@ echo "7. thermoctl-restore-mover validates and moves the staged restore ..."
     -staging-dir "$restore_staging_dir" \
     -thermoctl-db-file "$restore_live_thermoctl_dir/thermoctl.db" \
     -zigbee2mqtt-dir "$restore_live_zigbee_dir" \
-    -status-file "$restore_mover_status_file"
+    -status-file "$restore_mover_status_file" \
+    -journal-file "$restore_mover_journal_file"
 
 if [ ! -f "$restore_live_thermoctl_dir/thermoctl.db" ]; then
     echo "ERROR: thermoctl.db was not moved into its live destination." >&2
     exit 1
 fi
-if [ -d "$restore_staging_dir" ]; then
-    echo "ERROR: the staging directory should have been removed after a full success." >&2
+# P5.5d: only the staging directory's *contents* are removed on success
+# now, never the directory entry itself (so a narrower ReadWritePaths=
+# suffices for the mover's own systemd unit, see move.go) -- the
+# directory itself must still exist, but empty (no manifest.json left
+# behind, agent/restore.py's own "already staged" check).
+if [ ! -d "$restore_staging_dir" ]; then
+    echo "ERROR: the staging directory itself should still exist after a full success (P5.5d only clears its contents)." >&2
+    exit 1
+fi
+if [ -e "$restore_staging_dir/manifest.json" ]; then
+    echo "ERROR: manifest.json should have been removed from staging after a full success." >&2
+    exit 1
+fi
+if [ -e "$restore_mover_journal_file" ]; then
+    echo "ERROR: the mover's own journal should have been removed after a full success." >&2
     exit 1
 fi
 

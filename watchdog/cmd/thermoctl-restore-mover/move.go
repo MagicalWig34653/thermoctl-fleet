@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	pathpkg "path"
 )
 
 // finalizeResult is what finalizeAll reports back to main.go: how many
@@ -76,14 +77,67 @@ func fsyncDir(dir string, warn func(format string, args ...any)) {
 	}
 }
 
-// removeStagingDir removes the whole staging directory, manifest
-// included -- called only once finalizeResult.complete() is true, so a
-// later restore can stage again
-// (agent/restore.py::_staged_restore_already_pending checks exactly this
-// directory's manifest for its own "already staged" refusal).
-func removeStagingDir(stagingDir string) error {
-	if err := os.RemoveAll(stagingDir); err != nil {
-		return fmt.Errorf("removing staging directory %s: %w", stagingDir, err)
+// removeStagingContents removes exactly the entries this program itself
+// validated and copied out of the staging directory -- the three
+// allowlisted staged files (whichever are present), the fixed
+// "zigbee2mqtt" subdirectory once it is empty, and manifest.json itself --
+// called only once finalizeResult.complete() is true, so a later restore
+// can stage again (agent/restore.py::_staged_restore_already_pending
+// checks exactly this directory's manifest for its own "already staged"
+// refusal, and only the manifest's absence, not the staging directory's
+// own absence).
+//
+// **P5.5d: never removes the staging directory entry itself** (the
+// previous design's `os.RemoveAll(stagingDir)`, cross-review open point --
+// see docs/STATUS.md's P5.5c merge entry) -- removing a directory *entry*
+// requires write permission on its *parent*, which is why the previous
+// design needed `/var/lib/thermoctl-agent` (the staging directory's
+// parent, which also holds the agent's own device token and age identity)
+// in this program's ReadWritePaths=. Removing only the *contents* of an
+// already-writable directory needs write permission on that directory
+// itself only, never on its parent -- so this program's ReadWritePaths=
+// can now name exactly the staging directory
+// (/var/lib/thermoctl-agent/pending-restore), narrowing what a bug in
+// this root-running program could ever reach. agent/restore.py's own
+// `_create_and_verify_safe_dir`/`_assert_staging_layout_is_safe` are
+// unaffected -- an already-existing, empty staging directory is exactly
+// what `mkdir(..., exist_ok=True)` already tolerates.
+//
+// **Routed entirely through the held sr, never a joined path (second
+// P5.5d fix, cross-review of the first): a plain
+// `os.Lstat(filepath.Join(stagingDir, "zigbee2mqtt/database.db"))` looked
+// safe (an Lstat immediately before an Remove) but was not -- Lstat and
+// Remove on a *multi-component* path both resolve every *intermediate*
+// component normally, protecting only the *final* one. If the agent swaps
+// "zigbee2mqtt" itself for a symlink into a live directory between this
+// program's earlier validation pass and this later cleanup pass, both the
+// Lstat check and the Remove call would silently follow it and delete the
+// live file this program had just restored.** `StagingRoot.removeEntry`/
+// `removeZigbeeDirIfPresent`/`removeManifest` (stagingroot.go) close this
+// by resolving "zigbee2mqtt" itself exactly once per run, into its own
+// held sub-root, and only ever performing single-component operations
+// through the top root or that sub-root afterward -- see stagingroot.go's
+// own top docstring for the full reasoning, including why a
+// single-component removal (POSIX `unlink(2)`/`rmdir(2)` never
+// dereferences its own final named component) is safe by construction
+// even without the sub-root, while a *multi*-component one is not.
+func removeStagingContents(sr *StagingRoot, manifest *Manifest) error {
+	needsZigbee := false
+	for _, entry := range manifest.Files {
+		if err := sr.removeEntry(entry.Path); err != nil {
+			return fmt.Errorf("removing staged file %s: %w", entry.Path, err)
+		}
+		if dirPart, _ := pathpkg.Split(entry.Path); dirPart != "" {
+			needsZigbee = true
+		}
+	}
+	if needsZigbee {
+		if err := sr.removeZigbeeDirIfPresent(); err != nil {
+			return fmt.Errorf("removing staging subdirectory %s: %w", zigbeeDirName, err)
+		}
+	}
+	if err := sr.removeManifest(); err != nil {
+		return fmt.Errorf("removing manifest %s: %w", ManifestFilename, err)
 	}
 	return nil
 }

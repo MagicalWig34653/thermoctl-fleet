@@ -307,6 +307,22 @@ def check_restore_mover_units(service_path: Path, path_unit_path: Path) -> None:
     finding (mirrors the watchdog/thermoctl-leds units) and is checked
     again here alongside the newer directives so a regression removing
     any one of them is caught in one place.
+
+    **P5.5d, narrower ReadWritePaths=:** the original grant named
+    `/var/lib/thermoctl-agent` itself (the staging directory's *parent*),
+    which also holds the agent's own device token and age identity --
+    tracked as an open point after P5.5c's own merge. Now that
+    `move.go::removeStagingContents` only ever clears the staging
+    directory's *contents* (never the directory entry itself, see that
+    function's own docstring), the mover only ever needs write access to
+    the staging directory itself
+    (`/var/lib/thermoctl-agent/pending-restore`), so this check now
+    additionally asserts that the broader, no-longer-needed
+    `/var/lib/thermoctl-agent` path is **not** present in
+    `ReadWritePaths=` at all -- checked as a whitespace-delimited token,
+    not a substring, so the still-required
+    `/var/lib/thermoctl-agent/pending-restore` entry itself does not
+    trip this check.
     """
 
     if not service_path.is_file():
@@ -345,10 +361,10 @@ def check_restore_mover_units(service_path: Path, path_unit_path: Path) -> None:
         )
 
     required_paths = [
-        "/var/lib/thermoctl-agent",
+        "/var/lib/thermoctl-agent/pending-restore",
         "/var/lib/thermoctl",
         "/var/lib/zigbee2mqtt",
-        "/run/thermoctl-restore-mover",
+        "/var/lib/thermoctl-restore-mover",
     ]
     read_write_line = next(
         (line for line in service_content.splitlines() if line.startswith("ReadWritePaths=")),
@@ -358,6 +374,21 @@ def check_restore_mover_units(service_path: Path, path_unit_path: Path) -> None:
     if missing_paths:
         raise ImageError(
             f"{service_path}: ReadWritePaths= is missing required path(s) {missing_paths!r}."
+        )
+
+    # P5.5d: the broader, no-longer-needed grant on the staging
+    # directory's *parent* must not reappear -- checked as a
+    # whitespace-delimited token of the ReadWritePaths= value (a
+    # substring check would also match the still-required
+    # ".../pending-restore" entry, which legitimately starts with this
+    # same prefix).
+    listed_paths = read_write_line.removeprefix("ReadWritePaths=").split()
+    if "/var/lib/thermoctl-agent" in listed_paths:
+        raise ImageError(
+            f"{service_path}: ReadWritePaths= still names /var/lib/thermoctl-agent itself "
+            f"(P5.5d) -- that directory also holds the agent's own device token and age "
+            f"identity; this program only ever needs "
+            f"/var/lib/thermoctl-agent/pending-restore."
         )
 
 
@@ -414,12 +445,14 @@ def check_agent_compose_file(path: Path) -> None:
         "- /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro",
         "- /var/lib/thermoctl:/var/lib/thermoctl:ro",
         "- /var/lib/zigbee2mqtt:/var/lib/zigbee2mqtt:ro",
-        # P5.5c: the mover's status file directory -- read-only, and a
-        # directory mount (not a single-file one) for the same
-        # temp-file-plus-rename reasoning as the other two directory
-        # mounts above, even though this mount's *writer* is a different,
-        # bare-system program, not this container.
-        "- /run/thermoctl-restore-mover:/run/thermoctl-restore-mover:ro",
+        # P5.5c/P5.5d: the mover's status file (and, since P5.5d, its own
+        # journal) directory -- read-only, and a directory mount (not a
+        # single-file one) for the same temp-file-plus-rename reasoning as
+        # the other two directory mounts above, even though this mount's
+        # *writer* is a different, bare-system program, not this
+        # container. Persistent (/var/lib), not /run (P5.5d) -- the
+        # journal has to survive the mover's own process exiting.
+        "- /var/lib/thermoctl-restore-mover:/var/lib/thermoctl-restore-mover:ro",
     ]
     missing = [line for line in required if line not in content]
     if missing:
@@ -489,18 +522,22 @@ def check_tmpfiles_entry(path: Path) -> None:
 
 
 def check_restore_mover_tmpfiles_entry(path: Path) -> None:
-    """Checks the tmpfiles.d snippet recreating `/run/thermoctl-restore-mover`
-    on every boot (P5.5c) -- same shape as `check_tmpfiles_entry` above,
-    but expecting `root:root` ownership instead of the agent's own uid/gid:
-    this directory's only writer is `watchdog/cmd/thermoctl-restore-mover`
-    itself, which runs as root (see that program's own `.service` unit for
-    why), not the agent container. The agent container only ever reads it
+    """Checks the tmpfiles.d snippet recreating `/var/lib/thermoctl-restore-mover`
+    on every boot (P5.5c, moved from `/run/thermoctl-restore-mover` to a
+    persistent path by P5.5d -- see that program's own
+    `thermoctl-restore-mover.service` comment for why the journal it holds
+    since P5.5d must survive a reboot) -- same shape as `check_tmpfiles_entry`
+    above, but expecting `root:root` ownership instead of the agent's own
+    uid/gid: this directory's only writer is
+    `watchdog/cmd/thermoctl-restore-mover` itself, which runs as root (see
+    that program's own `.service` unit for why), not the agent container.
+    The agent container only ever reads the status file inside it
     (read-only mount, `image/common/agent-compose.yml`), which mode 0755
     already permits regardless of which uid owns the directory."""
 
     if not path.is_file():
         raise ImageError(
-            f"{path}: tmpfiles.d entry for /run/thermoctl-restore-mover is missing."
+            f"{path}: tmpfiles.d entry for /var/lib/thermoctl-restore-mover is missing."
         )
     lines = [
         line.strip()
@@ -508,22 +545,68 @@ def check_restore_mover_tmpfiles_entry(path: Path) -> None:
         if line.strip() and not line.strip().startswith("#")
     ]
     entries = [
-        line for line in lines if line.split()[1:2] == ["/run/thermoctl-restore-mover"]
+        line for line in lines if line.split()[1:2] == ["/var/lib/thermoctl-restore-mover"]
     ]
     if not entries:
-        raise ImageError(f"{path}: does not define /run/thermoctl-restore-mover.")
+        raise ImageError(f"{path}: does not define /var/lib/thermoctl-restore-mover.")
     fields = entries[0].split()
     if len(fields) < 5:
         raise ImageError(
-            f"{path}: entry for /run/thermoctl-restore-mover has too few fields: "
+            f"{path}: entry for /var/lib/thermoctl-restore-mover has too few fields: "
             f"{entries[0]!r}."
         )
     _entry_type, _entry_path, _mode, uid, gid = fields[:5]
     if uid != "root" or gid != "root":
         raise ImageError(
-            f"{path}: /run/thermoctl-restore-mover is owned by {uid}:{gid}, must be "
+            f"{path}: /var/lib/thermoctl-restore-mover is owned by {uid}:{gid}, must be "
             f"root:root -- its only writer (thermoctl-restore-mover) runs as root, "
             f"not the agent's own uid/gid."
+        )
+
+
+def check_restore_staging_tmpfiles_entry(path: Path) -> None:
+    """Checks the tmpfiles.d entry ensuring `/var/lib/thermoctl-agent/pending-restore`
+    (agent/__main__.py's own `--restore-staging-dir` default) exists, with
+    the agent's own uid/gid, at boot (P5.5d) -- see
+    `image/common/tmpfiles.d/thermoctl-agent.conf`'s own comment for why
+    this is belt and braces rather than strictly required (the directory
+    is also created lazily by `agent.restore._create_and_verify_safe_dir`)
+    and why `watchdog/cmd/thermoctl-restore-mover.service`'s own narrowed
+    `ReadWritePaths=` (P5.5d, `check_restore_mover_units` above) makes its
+    existence at boot worth asserting explicitly here too."""
+
+    if not path.is_file():
+        raise ImageError(
+            f"{path}: tmpfiles.d entry for /var/lib/thermoctl-agent/pending-restore is "
+            f"missing."
+        )
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    entries = [
+        line
+        for line in lines
+        if line.split()[1:2] == ["/var/lib/thermoctl-agent/pending-restore"]
+    ]
+    if not entries:
+        raise ImageError(
+            f"{path}: does not define /var/lib/thermoctl-agent/pending-restore."
+        )
+    fields = entries[0].split()
+    if len(fields) < 5:
+        raise ImageError(
+            f"{path}: entry for /var/lib/thermoctl-agent/pending-restore has too few "
+            f"fields: {entries[0]!r}."
+        )
+    _entry_type, _entry_path, _mode, uid, gid = fields[:5]
+    if uid != _AGENT_UID_GID or gid != _AGENT_UID_GID:
+        raise ImageError(
+            f"{path}: /var/lib/thermoctl-agent/pending-restore is owned by {uid}:{gid}, "
+            f"must be {_AGENT_UID_GID}:{_AGENT_UID_GID} -- this directory holds a "
+            f"landlord's decrypted operational-data backup while it waits for the mover, "
+            f"and is only ever written by the agent container's own uid/gid."
         )
 
 
@@ -554,6 +637,7 @@ def check_all(root: Path = IMAGE_DIR) -> None:
     )
     check_agent_compose_file(common / "agent-compose.yml")
     check_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-agent.conf")
+    check_restore_staging_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-agent.conf")
     check_restore_mover_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-restore-mover.conf")
 
 

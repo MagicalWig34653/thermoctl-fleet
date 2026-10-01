@@ -3,8 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"io"
-	"os"
 	pathpkg "path"
 )
 
@@ -61,41 +59,43 @@ var allowedManifestPaths = map[string]struct{}{
 // closed shape it writes.
 const MaxManifestBytes = 64 * 1024
 
-// parseManifest reads and decodes path -- returns (nil, false, nil) if
-// path does not exist at all (nothing pending, not an error), (nil, true,
-// err) if it exists but cannot be parsed or opened safely, (nil, true,
-// errManifestTooLarge) if it exceeds MaxManifestBytes, or (manifest, true,
-// nil) on success. Opened via openRegularNoFollow (lstat before open,
-// O_NOFOLLOW, regular files only -- the manifest gets exactly the same
-// discipline every staged data file already gets, since it is written by
-// the same untrusted process) rather than a plain os.ReadFile.
-// json.Unmarshal alone is used to decode (no third-party dependency,
-// stdlib only, section 18.3) -- structural validation of the *values* it
-// decodes to (safe paths, non-empty backup_id) is a separate step
-// (validateManifestShape below), not this function's job.
-func parseManifest(path string) (*Manifest, bool, error) {
-	file, _, err := openRegularNoFollow(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, true, err
+// parseManifest reads and decodes manifest.json through sr (P5.5d
+// cross-review fix: routed through the held StagingRoot, not a plain
+// joined path, for the same reason every staged data file now is --
+// stagingroot.go's own top docstring) -- returns (nil, nil, false, nil)
+// if it does not exist at all (nothing pending, not an error), (nil, nil,
+// true, err) if it exists but cannot be parsed or opened safely, (nil, nil,
+// true, errManifestTooLarge) if it exceeds MaxManifestBytes, or (manifest,
+// rawBytes, true, nil) on success. `StagingRoot.readManifestBytes` applies
+// the same lstat-before-open, symlink/non-regular-refusing, size-capped
+// discipline every staged data file already gets, since manifest.json is
+// written by the same untrusted process. json.Unmarshal alone is used to
+// decode (no third-party dependency, stdlib only, section 18.3) --
+// structural validation of the *values* it decodes to (safe paths,
+// non-empty backup_id) is a separate step (validateManifestShape below),
+// not this function's job.
+//
+// **The raw bytes are also returned (P5.5d)**: journal.go's own
+// pre-rename journal records a sha256 of the whole manifest file, keyed
+// against exactly these same bytes -- re-reading the file a second time
+// to hash it would reopen a TOCTOU window this program otherwise avoids
+// everywhere else (the agent could, in principle, rewrite manifest.json
+// between two separate reads); returning the bytes already read here
+// keeps "read once, use everywhere" for this file too.
+func parseManifest(sr *StagingRoot) (*Manifest, []byte, bool, error) {
+	data, present, err := sr.readManifestBytes()
+	if !present {
+		return nil, nil, false, err
 	}
-	defer file.Close()
-
-	data, err := io.ReadAll(io.LimitReader(file, MaxManifestBytes+1))
 	if err != nil {
-		return nil, true, err
-	}
-	if len(data) > MaxManifestBytes {
-		return nil, true, errManifestTooLarge
+		return nil, nil, true, err
 	}
 
 	var manifest Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, true, err
+		return nil, nil, true, err
 	}
-	return &manifest, true, nil
+	return &manifest, data, true, nil
 }
 
 var errManifestTooLarge = errors.New("manifest exceeds the maximum allowed size")

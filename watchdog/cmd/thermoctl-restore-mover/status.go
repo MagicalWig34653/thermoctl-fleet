@@ -2,9 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
 )
 
 // Status is the fixed, small JSON document this program writes for the
@@ -48,34 +45,9 @@ func writeStatusFile(path string, status Status) error {
 	}
 	data = append(data, '\n')
 
-	dir := filepath.Dir(path)
-	temp, err := os.CreateTemp(dir, ".thermoctl-restore-status-*.tmp")
-	if err != nil {
-		return fmt.Errorf("creating temporary status file in %s: %w", dir, err)
-	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath) // no-op once the rename below succeeds
-
-	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		return fmt.Errorf("writing temporary status file: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return fmt.Errorf("fsyncing temporary status file: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("closing temporary status file: %w", err)
-	}
 	// Status files are read by the agent container, not only by this
 	// program's own root user -- world-readable, like
 	// image/common/tmpfiles.d/thermoctl-agent.conf's own 0755 reasoning
 	// for /run/thermoctl-agent applied to a file instead of a directory.
-	if err := os.Chmod(tempPath, 0o644); err != nil {
-		return fmt.Errorf("chmod temporary status file: %w", err)
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("renaming status file into place: %w", err)
-	}
-	return nil
+	return writeFileAtomic(path, data, 0o644)
 }

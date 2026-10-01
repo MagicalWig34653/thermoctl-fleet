@@ -2,6 +2,284 @@
 
 Last updated: 2026-09-29.
 
+## P5.5d -- restore mover open points (resumable finalize, narrower ReadWritePaths=, `_resolve_prospective` fix)
+
+Closes the three open points left after the P5.5c and P5.5b cross-review
+merges (below) -- no new design surface, only the fixes those merges
+already called for.
+
+**1. Resumable finalize after a partial rename (P5.5c open point).**
+Before this package, a rename failure partway through `finalizeAll` left
+the live store non-empty; every later run then refused unconditionally
+(`DetailLiveStoreNotEmpty`), even once the underlying problem (a full
+disk, a permissions glitch) was fixed -- stuck until a manual, undocumented
+intervention. **Fixed with a small, root-owned pre-rename journal**
+(`watchdog/cmd/thermoctl-restore-mover/journal.go`, new): before the
+*first* rename of a run (after `validateAll` has already fully validated
+and copied every entry into its temporary destination-side location),
+`writeJournal` persists -- to this program's own persistent, root-owned
+state directory, never the agent-writable staging directory -- the
+`backup_id`, a sha256 of the *whole* manifest file, and the final
+destination path plus expected sha256 of every file the run is about to
+rename into place. On a later run that finds the live store non-empty,
+`canResumeFinalize` decides, authoritatively, whether that non-emptiness
+is provably this program's own earlier, partial work: a journal must
+exist for exactly this manifest (same `backup_id` **and** the same
+manifest sha256, not `backup_id` alone -- a reused or coincidentally
+identical `backup_id` for a genuinely different staging is refused), every
+live operational file that currently exists must be byte-for-byte
+identical (sha256, re-read from disk, not merely "the journal says so")
+to its journaled entry, and no live operational file may exist that the
+journal never wrote at all. Only if all of that holds does the run
+proceed to re-validate staging from scratch (the same `validateAll` every
+fresh run already goes through) and finish the remaining renames -- a file
+already correctly in place is simply renamed onto again with identical
+bytes, a harmless no-op. The journal is cleared only once every rename in
+a run has completed successfully, mirroring every other
+"only-removed-after-full-success" discipline in this program.
+**Never widens what a compromised agent can do**: the journal is written
+and read only by this root-running program itself, in a directory the
+agent has no write access to; a tampered or symlinked journal is refused
+via the same lstat/`O_NOFOLLOW` discipline (`openRegularNoFollow`) every
+other file this program reads already gets, treated identically to a
+missing journal (fail closed, never a crash, never "trust it anyway").
+
+**2. ReadWritePaths= narrowed off the agent's own token/identity
+directory (P5.5c open point).** The unit previously granted write access
+to all of `/var/lib/thermoctl-agent` (which also holds the agent's own
+device token and age identity) only so `os.RemoveAll` could remove the
+staging directory's own *entry* on success (`rmdir(2)`'s own requirement
+of write access to the *parent*). **Redesigned so the mover only ever
+needs the staging directory itself:**
+`move.go::removeStagingContents` now removes only the staging directory's
+*contents* -- the allowlisted staged files, the fixed `zigbee2mqtt/`
+subdirectory (once empty), and `manifest.json` -- via lstat-checked
+removal (each entry `os.Lstat`ed and type-checked immediately before its
+own `os.Remove`; POSIX `unlink(2)`/`rmdir(2)` never dereference the final
+path component being removed either way, so this is defense in depth on
+an operation that was already symlink-safe for the entry itself), never
+the staging directory entry. `agent/restore.py::_staged_restore_already_pending`
+already only ever checked the manifest's own presence, never the staging
+directory's own presence, so this needed no change on the Python side.
+`thermoctl-restore-mover.service`'s `ReadWritePaths=` now names exactly
+`/var/lib/thermoctl-agent/pending-restore` (the staging directory itself,
+not its parent), `/var/lib/thermoctl`, `/var/lib/zigbee2mqtt`, and this
+program's own state/status directory -- four entries, none of them
+`/var/lib/thermoctl-agent` itself. **The mover's status file and its new
+journal moved from `/run/thermoctl-restore-mover` to
+`/var/lib/thermoctl-restore-mover`** (both `image/common/tmpfiles.d/thermoctl-restore-mover.conf`
+and `image/common/agent-compose.yml`'s read-only mount updated to match):
+the journal has to survive this program's own process exiting, and a
+`tmpfs` directory wiped on every reboot would silently drop the one
+record a later run needs to resume safely -- nothing about the status
+file itself ever needed `tmpfs` semantics in the first place (unlike
+`/run/thermoctl-agent`'s health report, which specifically must not
+survive to cover for a freshly started, not-yet-healthy agent).
+`image/common/tmpfiles.d/thermoctl-agent.conf` gained a second entry for
+`/var/lib/thermoctl-agent/pending-restore` itself (owned by the agent's
+own uid/gid 10002, mode 0700) -- belt and braces, not strictly required
+for correctness (the mover's own `.path` unit can only ever fire once
+`agent/restore.py` has already written `manifest.json` *inside* this
+directory, which already implies the directory exists), but removes any
+doubt about ordering now that the mover's own `ReadWritePaths=` names this
+exact path. **`tools/check_image_config.py::check_restore_mover_units`
+extended** to assert `/var/lib/thermoctl-agent` (the broader path) is
+absent from `ReadWritePaths=` altogether -- checked as a
+whitespace-delimited token of the directive's value, not a substring, so
+the still-required `/var/lib/thermoctl-agent/pending-restore` entry
+itself does not trip the check; a new
+`check_restore_staging_tmpfiles_entry` asserts the new tmpfiles.d entry's
+own ownership.
+
+**3. `agent.restore._resolve_prospective`'s `..`-in-missing-suffix false
+positive (P5.5b open point).** A `..` inside the *not-yet-existing* suffix
+of `--restore-staging-dir` (e.g. `data/foo/../staged` with `foo` missing)
+previously produced an un-collapsed, literal `".."` path component in the
+function's return value, which then never compared equal to what
+`path.mkdir(parents=True)` and the post-`mkdir` `Path.resolve(strict=True)`
+re-check actually produce on disk (both of which the OS resolves `..`
+through normally) -- refusing a genuinely safe path as
+`DETAIL_UNSAFE_STAGING`. Never a bypass (fails closed), but a
+self-inflicted refusal for a legitimate, if unusual, configured path.
+**Fixed** by finding the longest already-existing ancestor exactly as
+before (a real `path.exists()`/`Path.resolve(strict=True)` walk, which
+already correctly follows any symlink *in that existing prefix*,
+including one a `..` passes through), then folding the remaining,
+not-yet-existing suffix components onto that fully-resolved prefix with a
+single `os.path.normpath` call -- safe specifically *because* none of the
+suffix's components can be symlinks (nothing there exists yet), so
+collapsing `..` against an already symlink-free, real prefix is exactly
+what the OS itself would do. **The safety condition this fix must never
+violate, reasoned through and tested both ways:** a `..` that follows an
+*existing* symlink component is still resolved by the real
+`path.exists()`/`Path.resolve(strict=True)` walk (the OS's own symlink
+resolution), never collapsed lexically against the symlink's own literal
+position -- `tests/test_agent_restore.py::test_resolve_prospective_resolves_dotdot_after_an_existing_symlink_via_the_os`
+and its end-to-end counterpart
+`test_apply_pending_restore_refuses_a_dotdot_that_resolves_through_a_symlink_into_a_live_dir`
+both construct exactly this case (a symlink whose target sits inside a
+live directory, `link/../staged`) and confirm it is still refused via the
+real resolved location, not lexically waved through.
+
+**Verification:** `ruff check .` clean; `mypy .` (135 files) and `mypy
+protocol fleet agent tools` (67 files) clean; pytest and Go numbers below
+(this section is filled in by the verification run, see this package's
+own commit for the exact figures); `watchdog/go.mod` still has no
+`require`; `go vet ./...`/`gofmt -l .` clean; `watchdog/check_contract.sh`
+passing (re-verified end to end, including the new
+"staging directory itself still exists, but empty" assertion replacing
+the old "staging directory was removed" one); `python -m
+tools.check_image_config` passing.
+
+**Not changed:** the manifest/live-emptiness validation logic (still the
+same shared contract with `agent/restore.py::_operational_store_is_empty`),
+the copy-then-rename design from the P5.5c cross-review fixes (TOCTOU/
+hard-link/unbounded-manifest-read/unsandboxed-root), the trigger (systemd
+path unit), the status file's own closed detail set (one value added,
+`DetailJournalWriteFailed`, for the one new failure mode this package's
+own journal write can hit), and `PROTOCOL_VERSION` (unaffected, no
+`protocol/` change).
+
+**Files:** `watchdog/cmd/thermoctl-restore-mover/{journal.go (new),
+atomicwrite.go (new), main.go, move.go, manifest.go, validate.go,
+status.go, mover.go, mover_test.go, validate_test.go,
+thermoctl-restore-mover.service}`, `image/common/tmpfiles.d/{thermoctl-agent.conf,
+thermoctl-restore-mover.conf}`, `image/common/agent-compose.yml`,
+`tools/check_image_config.py`, `agent/restore.py`, `agent/__main__.py`,
+`watchdog/check_contract.sh`, `tests/test_image_config.py`,
+`tests/test_agent_restore.py`.
+
+## P5.5d cross-review fix: staging accessed through os.Root, closing an intermediate-symlink gap
+
+Cross-review of the P5.5d commit above found one HIGH-severity finding,
+demonstrated by the reviewer against the code as first committed:
+`removeStagingContents` (and, on the read side, `prepareFile`) built
+plain, multi-component relative paths -- e.g.
+`filepath.Join(stagingDir, "zigbee2mqtt/database.db")` -- and
+Lstat/O_NOFOLLOW/`os.Remove`d them as one joined string. Neither a bare
+`Lstat` nor `O_NOFOLLOW` protects anything but the *final* path
+component: "zigbee2mqtt" itself, an *intermediate* component, was
+silently resolved through if the agent (untrusted, CLAUDE.md security
+principle 5) swapped it for a symlink between an earlier check and a
+later access. Demonstrated two ways: (1) a decoy file elsewhere, with a
+hash crafted to match the manifest, reached through a swapped
+"zigbee2mqtt" symlink, would be read (hashed, copied) as if it were the
+real staged file, without this program ever opening anything actually
+inside the real staging directory; (2) after a successful move, swapping
+"zigbee2mqtt" (or the staging directory's own entry in *its* parent) for
+a symlink into the *live* directory just populated would make this
+root-running program's own cleanup step delete the live file it had just
+restored.
+
+**Fixed structurally: every filesystem access this program makes against
+the staging directory now goes through a single, already-open `os.Root`**
+(new file, `watchdog/cmd/thermoctl-restore-mover/stagingroot.go`,
+`StagingRoot`) -- opened exactly once at the top of `run()` and reused
+for reading the manifest, validating/copying every entry, the resume
+decision's re-validation, and final cleanup, so a swap of any path
+component partway through a run cannot redirect a later step onto a
+different location than an earlier one already resolved.
+`watchdog/go.mod`'s own `go` directive bumped from 1.23 to 1.24 for
+`os.Root` (stdlib, added in Go 1.24) -- a **toolchain-version
+requirement, not a dependency**: `go.mod` still names zero `require`
+lines, and `.github/workflows/go.yml`'s three `go-version: "1.23"`
+entries were bumped to `"1.24"` alongside it.
+
+**os.Root's own documented limit, closed explicitly, never relied on
+implicitly.** Verified empirically (both cross-compiled and against a
+real `golang:1.24-bookworm` container) before committing to this design:
+`os.Root` refuses anything that would resolve *outside* the directory it
+was opened for (an absolute symlink, a `..` escape, a relative symlink
+whose target lies outside) -- but it does **not** refuse a relative
+symlink that stays *inside* the root (`root.Open` on such a symlink
+follows it and returns the *other* file's content), and passing
+`syscall.O_NOFOLLOW` to `Root.OpenFile` does **not** change that (Root
+silently does not honor it). This program refuses ALL symlinks under
+staging, not only ones that would escape it: every entry -- and the
+fixed "zigbee2mqtt" subdirectory itself -- is `Lstat`-ed through the
+appropriate `*os.Root` and refused if it is a symlink, *before* any
+Open/Remove call ever reaches it.
+
+**Why "zigbee2mqtt" gets its own, separately-held sub-root, not just a
+one-time Lstat check.** Root's own path resolution handles a
+multi-component name safely with respect to *escaping* the root on every
+call, but each call independently re-resolves "zigbee2mqtt" from the top
+root's own held directory handle -- an Lstat performed once, followed
+later by a *separate* multi-component Open/Remove call, reopens exactly
+the same window the original bug had, only narrower. `StagingRoot`
+instead opens "zigbee2mqtt" exactly once (immediately after
+Lstat-confirming it is a real, non-symlink directory) as its own
+`os.Root`, and performs every later single-component operation on its
+two children through *that* held sub-root -- "zigbee2mqtt" is never
+looked up by name a second time within the same run. A genuinely
+single-component removal (the "zigbee2mqtt" directory entry itself, or
+`manifest.json`, both through the top root) needed no such sub-root to
+begin with: POSIX `unlink(2)`/`rmdir(2)` never dereference their own
+final named component, so that class of operation was already safe by
+construction, checked here for auditability rather than because it was
+exploitable.
+
+**`parseManifest` also moved onto `StagingRoot`** (`readManifestBytes`) --
+manifest.json is a single top-level component, so it was never part of
+the vulnerable class, but reading it before the staging directory's own
+root existed would have meant a second, separate path resolution of
+`stagingDir` itself; routing it through the same `sr` closes that too and
+keeps "read once, use everywhere" consistent for every file this program
+touches under staging.
+
+**`openStagedFileNoFollow` (the plain-path staged-file primitive this
+fix replaces) removed from `safeopen.go`** -- `openRegularNoFollow`
+(used by `journal.go` for the *live*-side journal/status files, which are
+fixed, non-agent-controlled, single-component paths outside this threat
+model) and `lstatIsDirNoSymlink` (used by `openStagingRoot` itself)
+stay.
+
+**Regression tests** (`watchdog/cmd/thermoctl-restore-mover/stagingroot_test.go`,
+new file), reproducing the reviewer's own demonstrated attacks directly:
+`TestRemoveStagingContentsImmuneToZigbeeSubdirSwapBeforeCleanup` (swap
+"zigbee2mqtt" for a symlink into the live directory between validation
+and cleanup -- cleanup refuses, the live files are untouched, the planted
+symlink itself is left alone); `TestStagingRootOperationsImmuneToStagingDirEntrySwapAfterOpen`
+(rename the staging directory away and symlink its old name into a live
+directory after opening -- every later operation still acts on the
+original, real directory); `TestValidateAllRefusesSymlinkedZigbeeSubdirWithMatchingHashDecoy`
+(a decoy directory with matching size/sha256 behind a symlinked
+"zigbee2mqtt", refused before anything is read, nothing reaches a live
+destination); `TestValidateAllRefusesSymlinkPointingToAnotherStagedFile`
+(a purely in-root, never-escaping symlink from one staged file to another
+-- refused by this program's own explicit check, not by any built-in
+`os.Root` escape protection). Plus full, direct coverage of every
+`StagingRoot` method (`removeEntry`/`removeZigbeeDirIfPresent`/
+`removeManifest`/`openEntryNoFollow`/`zigbeeRoot`/`openStagingRoot`,
+absent/present/symlink/wrong-type/non-empty-directory cases each) and the
+ported originals of the pre-existing `openStagedFileNoFollow` unit tests
+against the new `StagingRoot.openEntryNoFollow`. All of the above verified
+to pass both cross-compiled (`GOOS=linux`) and executed for real inside a
+`golang:1.24-bookworm` container, not only on the development machine's
+own platform.
+
+**Verification:** Go: `cmd/thermoctl-restore-mover` coverage rose from
+78.1% to 80.8% (the new StagingRoot code is thoroughly covered, not just
+exercised incidentally); `go vet ./...`/`gofmt -l .` clean;
+`watchdog/go.mod` still has zero `require` lines; full suite (including
+this package) green both natively and inside a real Linux container.
+Python side unaffected (no Python file touched by this fix) --
+`ruff`/`mypy`/pytest numbers below, from the same verification pass as
+this fix. `watchdog/check_contract.sh` and `python -m
+tools.check_image_config` both re-verified passing.
+
+**Not changed:** the journal/resume design, the narrower `ReadWritePaths=`
+(still exactly the staging directory, the two live dirs, and the mover's
+own state directory -- `removeStagingContents`'s own contract, "clear
+contents, never remove the staging directory entry itself", is unaffected
+by *how* it now resolves paths internally), the `_resolve_prospective`
+fix, and the closed `DETAIL_*` set (no new value needed).
+
+**Files:** `watchdog/cmd/thermoctl-restore-mover/{stagingroot.go (new),
+stagingroot_test.go (new), safeopen.go, manifest.go, validate.go,
+validate_test.go, move.go, main.go, mover.go, mover_test.go}`,
+`watchdog/go.mod`, `.github/workflows/go.yml`.
+
 ## Merge: P5.5c onto main (main session, 2026-09-29)
 
 Cross-review PASS (round 2). Main-session read-back of
@@ -10,19 +288,23 @@ O_NOFOLLOW open with Nlink==1, read+hash+copy from that fd into a
 root-created O_EXCL temp in the destination dir, size/sha256 checked
 before rename, fchown/fchmod on the new fd), the unit's sandboxing
 (`PrivateNetwork=true`, `ProtectSystem=strict`, `NoNewPrivileges=yes`) and
-`watchdog/go.mod` (no `require`). Open points:
+`watchdog/go.mod` (no `require`). Open points (both **resolved by
+P5.5d**, above):
 
-- **Stuck state after a partial finalize (medium):** if a rename fails
+- ~~**Stuck state after a partial finalize (medium):** if a rename fails
   after an earlier file was already renamed into place, the live store is
   no longer empty; every retry is then refused (`DetailLiveStoreNotEmpty`)
   although staging is still intact. Needs manual clearing today. Never
   lets unvalidated data into live dirs. Possible fix: resume when the
-  present live files exactly match this `backup_id`'s manifest.
-- **ReadWritePaths too broad (low):** the unit grants write on all of
+  present live files exactly match this `backup_id`'s manifest.~~ Fixed by
+  P5.5d's own pre-rename journal (`journal.go`).
+- ~~**ReadWritePaths too broad (low):** the unit grants write on all of
   `/var/lib/thermoctl-agent` (holding the device token and age identity)
   only so `os.RemoveAll` can remove the staging dir entry. Narrow by
   clearing staging's contents instead and listing only
-  `/var/lib/thermoctl-agent/pending-restore`.
+  `/var/lib/thermoctl-agent/pending-restore`.~~ Fixed by P5.5d's own
+  `removeStagingContents` (never removes the staging directory entry
+  itself) plus the narrowed `ReadWritePaths=`.
 
 ## Merge: P5.4b onto main (main session, 2026-09-29) -- open points before activation
 
@@ -381,13 +663,17 @@ still never touches `watchdog/`); both migration directions re-verified
   the age ciphertext is submitted, the field is cleared, no fallback) and
   of `Storage.fetch_and_delete_pending_restore` (single guarded
   `DELETE ... RETURNING`; the fallback read only purges expired rows).
-- **Open point (low, fail-safe):** `agent.restore._resolve_prospective`
+- ~~**Open point (low, fail-safe):** `agent.restore._resolve_prospective`
   does not collapse a `..` inside the *not-yet-existing* suffix of
   `--restore-staging-dir` (e.g. `data/foo/../staged` with `foo` missing);
   the post-`mkdir` re-check then refuses a genuinely safe path
   (`DETAIL_UNSAFE_STAGING`). Never a bypass -- a misprediction always
   trips the re-check. Operator-configured path only; fix with `normpath`
-  on the suffix when next touching this module.
+  on the suffix when next touching this module.~~ **Resolved by P5.5d**
+  (above): the missing suffix is now folded onto the already-resolved
+  existing prefix with `os.path.normpath`, while a `..` following an
+  existing (possibly symlinked) component is still resolved by the OS,
+  never lexically.
 - Restore is not usable in production until P5.5c (Go mover) exists --
   **now done, see that section below.**
 

@@ -32,50 +32,12 @@ func TestIsSafeManifestPath(t *testing.T) {
 	}
 }
 
-func TestOpenStagedFileNoFollowRefusesHardLinkedFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "thermoctl.db")
-	writeFile(t, path, []byte("x"))
-	link := filepath.Join(dir, "another-name-for-the-same-inode")
-	if err := os.Link(path, link); err != nil {
-		t.Skipf("hard links not supported on this filesystem: %v", err)
-	}
-
-	_, _, err := openStagedFileNoFollow(path)
-	if err != errHardLinked {
-		t.Fatalf("err = %v, want errHardLinked", err)
-	}
-}
-
-func TestOpenStagedFileNoFollowAcceptsASingleLinkFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "thermoctl.db")
-	writeFile(t, path, []byte("hello"))
-
-	file, size, err := openStagedFileNoFollow(path)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer file.Close()
-	if size != 5 {
-		t.Fatalf("size = %d, want 5", size)
-	}
-}
-
-func TestOpenStagedFileNoFollowRefusesSymlink(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "target.db")
-	writeFile(t, target, []byte("x"))
-	link := filepath.Join(dir, "thermoctl.db")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-
-	_, _, err := openStagedFileNoFollow(link)
-	if err != errNotRegular {
-		t.Fatalf("err = %v, want errNotRegular", err)
-	}
-}
+// StagingRoot.lstatEntryNoFollow/openEntryNoFollow's own equivalents of
+// these three cases (hard link refused, single link accepted, symlink
+// refused) are exercised in stagingroot_test.go instead (P5.5d
+// cross-review fix: the low-level, path-based openStagedFileNoFollow this
+// file used to test no longer exists in production -- every staged-file
+// open now goes through a *StagingRoot).
 
 func TestCreateTempInDirProducesAUniqueNoFollowFile(t *testing.T) {
 	dir := t.TempDir()
@@ -176,7 +138,12 @@ func TestParseManifestUnreadableFile(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores file permission bits")
 	}
-	_, present, err := parseManifest(path)
+	sr, err := openStagingRoot(dir)
+	if err != nil || sr == nil {
+		t.Fatalf("openStagingRoot: sr=%v err=%v", sr, err)
+	}
+	defer sr.Close()
+	_, _, present, err := parseManifest(sr)
 	if !present || err == nil {
 		t.Fatalf("expected present=true, err!=nil for an unreadable manifest, got present=%v err=%v", present, err)
 	}
@@ -190,7 +157,12 @@ func TestParseManifestRefusesASymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	_, present, err := parseManifest(link)
+	sr, err := openStagingRoot(dir)
+	if err != nil || sr == nil {
+		t.Fatalf("openStagingRoot: sr=%v err=%v", sr, err)
+	}
+	defer sr.Close()
+	_, _, present, err := parseManifest(sr)
 	if !present || err == nil {
 		t.Fatalf("expected present=true, err!=nil for a symlinked manifest, got present=%v err=%v", present, err)
 	}

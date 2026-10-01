@@ -71,21 +71,43 @@ PrivateTmp=yes
 ProtectSystem=strict
 # Exactly the four directories this program's own Config (main.go) ever
 # names, nothing more:
-#   - /var/lib/thermoctl-agent: agent/__main__.py's own
-#     --restore-staging-dir default lives here (pending-restore/) -- this
-#     program creates nothing else in this directory, but removing the
-#     staging directory itself (os.RemoveAll, on full success) requires
-#     write access to *its* parent too, not only to the staging directory
-#     itself (rmdir(2)'s own requirement), which is why the parent is
-#     listed rather than only the pending-restore/ subdirectory.
+#   - /var/lib/thermoctl-agent/pending-restore: agent/__main__.py's own
+#     --restore-staging-dir default -- where a staged restore and its
+#     manifest.json wait. **Not /var/lib/thermoctl-agent itself (P5.5d,
+#     narrowed from the original P5.5c grant, cross-review open point)**:
+#     that directory also holds the agent's own device token and age
+#     identity, neither of which this program has any business touching.
+#     The previous, broader grant existed only because the old design
+#     removed the staging directory *entry* on success (os.RemoveAll),
+#     which needs write access to the entry's *parent* (rmdir(2)'s own
+#     requirement) -- move.go's own removeStagingContents now only ever
+#     clears this directory's *contents*, which needs write access to
+#     this directory itself only, never to its parent. This directory is
+#     never created by this program (see
+#     image/common/tmpfiles.d/thermoctl-agent.conf's own
+#     pending-restore entry for why it is guaranteed to already exist by
+#     the time this unit's own trigger, thermoctl-restore-mover.path,
+#     could ever fire).
 #   - /var/lib/thermoctl: thermoctl's live data directory
 #     (--thermoctl-db-file's own parent).
 #   - /var/lib/zigbee2mqtt: Zigbee2MQTT's live data directory
 #     (--zigbee2mqtt-dir).
-#   - /run/thermoctl-restore-mover: this program's own status file
-#     directory (--status-file's own parent,
-#     image/common/tmpfiles.d/thermoctl-restore-mover.conf).
-ReadWritePaths=/var/lib/thermoctl-agent /var/lib/thermoctl /var/lib/zigbee2mqtt /run/thermoctl-restore-mover
+#   - /var/lib/thermoctl-restore-mover: this program's own persistent,
+#     root-owned state/status directory (--status-file's and
+#     --journal-file's own parent,
+#     image/common/tmpfiles.d/thermoctl-restore-mover.conf). **Persistent,
+#     not /run (P5.5d, moved from the original P5.5c location)**: P5.5d's
+#     own pre-rename journal (journal.go) has to survive this program's
+#     own process exiting -- a tmpfs directory wiped on every reboot would
+#     silently drop the one record a later run needs to resume an
+#     interrupted finalize safely. The status file moved alongside it
+#     for the same "one directory, one ReadWritePaths= entry" reasoning;
+#     nothing about it ever needed tmpfs semantics in the first place
+#     (unlike /run/thermoctl-agent's health report, which specifically
+#     must not survive to cover for a freshly started, not-yet-healthy
+#     agent -- no such reasoning applies to this program's own status
+#     report).
+ReadWritePaths=/var/lib/thermoctl-agent/pending-restore /var/lib/thermoctl /var/lib/zigbee2mqtt /var/lib/thermoctl-restore-mover
 
 [Install]
 WantedBy=multi-user.target

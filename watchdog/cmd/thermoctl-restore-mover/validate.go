@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"syscall"
 )
@@ -48,6 +49,11 @@ type preparedFile struct {
 	TempPath  string
 	FinalPath string
 	DestDir   string
+	// SHA256 (P5.5d): the already-verified content hash of this entry --
+	// equal to the manifest's own entry.SHA256 (checked against it in
+	// prepareFile below), carried here too so journal.go::buildJournal
+	// does not need to re-look the value up from the manifest by path.
+	SHA256 string
 }
 
 // validateAll runs every check from this program's own top docstring
@@ -58,27 +64,26 @@ type preparedFile struct {
 // successful entry in this same call is removed before the error is
 // returned (cleanupPrepared below) -- they are root-created, inside
 // root-writable destination directories, safe for this program itself to
-// remove; nothing under stagingDir is ever touched by this cleanup.
-func validateAll(stagingDir string, manifest *Manifest, targets Targets) ([]preparedFile, error) {
+// remove; nothing under staging is ever touched by this cleanup.
+//
+// **Takes the already-open *StagingRoot, not a path (P5.5d cross-review
+// fix)** -- sr is opened exactly once per run() and reused here, for the
+// resume decision's re-validation, and for cleanup afterward; see
+// stagingroot.go's own top docstring for why passing a path here instead
+// (as this function's previous version did) reopened the exact
+// intermediate-symlink gap that redesign closes.
+func validateAll(sr *StagingRoot, manifest *Manifest, targets Targets) ([]preparedFile, error) {
 	if err := validateManifestShape(manifest); err != nil {
 		return nil, err
 	}
 
-	isDir, err := lstatIsDirNoSymlink(stagingDir)
-	if err != nil {
-		return nil, err
-	}
-	if !isDir {
-		return nil, errUnsafe(DetailUnsafeStaging)
-	}
-
-	if err := validateStagingContentsMatchManifest(stagingDir, manifest); err != nil {
+	if err := validateStagingContentsMatchManifest(sr, manifest); err != nil {
 		return nil, err
 	}
 
 	prepared := make([]preparedFile, 0, len(manifest.Files))
 	for _, entry := range manifest.Files {
-		one, err := prepareFile(stagingDir, entry, targets)
+		one, err := prepareFile(sr, entry, targets)
 		if err != nil {
 			cleanupPrepared(prepared)
 			return nil, err
@@ -101,72 +106,63 @@ func cleanupPrepared(prepared []preparedFile) {
 }
 
 // validateStagingContentsMatchManifest walks the staging directory (top
-// level, plus one level into "zigbee2mqtt" if that subdirectory is
-// present) and refuses if it contains a single entry not accounted for by
-// the manifest -- manifest.json itself is the only implicit exception.
-// Without this check, a symlink or an extra, unlisted file planted in
-// staging would simply be ignored by the per-file loop below rather than
-// refused -- silently ignoring an unexpected entry is exactly the kind of
-// thing CLAUDE.md security principle 5 says this program, not the agent,
-// must catch.
-func validateStagingContentsMatchManifest(stagingDir string, manifest *Manifest) error {
+// level, plus one level into "zigbee2mqtt" if the manifest references
+// anything there) through the held sr and refuses if it contains a
+// single entry not accounted for by the manifest -- manifest.json itself
+// is the only implicit exception. Without this check, a symlink or an
+// extra, unlisted file planted in staging would simply be ignored by the
+// per-file loop below rather than refused -- silently ignoring an
+// unexpected entry is exactly the kind of thing CLAUDE.md security
+// principle 5 says this program, not the agent, must catch.
+//
+// **Routed entirely through sr, never a joined path (P5.5d cross-review
+// fix)** -- listing "what actually exists" via sr.topLevelNames/
+// sr.zigbeeNames uses the same already-open root(s) every other check in
+// this file now uses, so this check and the per-file opens that follow
+// it can never observe two different resolutions of "zigbee2mqtt".
+func validateStagingContentsMatchManifest(sr *StagingRoot, manifest *Manifest) error {
 	topLevelAllowed := map[string]struct{}{ManifestFilename: {}}
-	subdirAllowed := map[string]struct{}{}
+	zigbeeAllowed := map[string]struct{}{}
+	needsZigbee := false
 	for _, entry := range manifest.Files {
-		dir, base := filepath.Split(entry.Path)
+		dir, base := pathpkg.Split(entry.Path)
 		if dir == "" {
 			topLevelAllowed[base] = struct{}{}
 			continue
 		}
-		topLevelAllowed[filepath.Clean(dir)] = struct{}{}
-		subdirAllowed[entry.Path] = struct{}{}
+		topLevelAllowed[zigbeeDirName] = struct{}{}
+		zigbeeAllowed[base] = struct{}{}
+		needsZigbee = true
 	}
 
-	if err := checkDirEntriesAllowed(stagingDir, topLevelAllowed); err != nil {
-		return err
-	}
-	for subdir := range subdirAllowedTopDirs(subdirAllowed) {
-		full := filepath.Join(stagingDir, subdir)
-		isDir, err := lstatIsDirNoSymlink(full)
-		if err != nil {
-			return err
-		}
-		if !isDir {
-			// Listed in the manifest (a file lives under it) but not a
-			// real directory in staging -- caught here rather than left
-			// to the per-file open below, so the detail is the more
-			// specific "unexpected entry"/"unsafe staging" rather than a
-			// confusing "file missing".
-			return errUnsafe(DetailUnsafeStaging)
-		}
-		allowedBases := map[string]struct{}{}
-		for rel := range subdirAllowed {
-			if filepath.Dir(rel) == subdir {
-				allowedBases[filepath.Base(rel)] = struct{}{}
-			}
-		}
-		if err := checkDirEntriesAllowed(full, allowedBases); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func subdirAllowedTopDirs(subdirAllowed map[string]struct{}) map[string]struct{} {
-	dirs := map[string]struct{}{}
-	for rel := range subdirAllowed {
-		dirs[filepath.Dir(rel)] = struct{}{}
-	}
-	return dirs
-}
-
-func checkDirEntriesAllowed(dir string, allowed map[string]struct{}) error {
-	entries, err := os.ReadDir(dir)
+	topNames, err := sr.topLevelNames()
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if _, ok := allowed[entry.Name()]; !ok {
+	for _, name := range topNames {
+		if _, ok := topLevelAllowed[name]; !ok {
+			return errUnsafe(DetailUnexpectedEntry)
+		}
+	}
+
+	if !needsZigbee {
+		return nil
+	}
+
+	zigbeeNames, present, err := sr.zigbeeNames()
+	if err != nil {
+		return err
+	}
+	if !present {
+		// Listed in the manifest (a file lives under it) but not a real
+		// directory in staging at all -- caught here rather than left to
+		// the per-file open below, so the detail is the more specific
+		// "unexpected entry"/"unsafe staging" rather than a confusing
+		// "file missing".
+		return errUnsafe(DetailUnsafeStaging)
+	}
+	for _, name := range zigbeeNames {
+		if _, ok := zigbeeAllowed[name]; !ok {
 			return errUnsafe(DetailUnexpectedEntry)
 		}
 	}
@@ -178,20 +174,23 @@ func checkDirEntriesAllowed(dir string, allowed map[string]struct{}) error {
 // its real destination directory -- see preparedFile's own docstring for
 // why this is a copy, not a rename of the staged path.
 //
-// Order: open the staged file safely (openStagedFileNoFollow: lstat, no
-// symlinks, regular file only, exactly one hard link) -> confirm its
-// fstat-reported size matches the manifest -> lstat the destination
-// directory (must be a real directory, not a symlink) -> create a unique
-// temp file there (O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600) -> copy while
-// hashing, capped at MaxStagedFileBytes -> confirm the actual byte count
-// and the resulting sha256 both match the manifest -> fsync the temp file
-// -> chown/chmod it (fd-based, see applyDestinationOwnership below) ->
-// close both descriptors. Every failure path removes the temp file it
-// was in the middle of creating before returning.
-func prepareFile(stagingDir string, entry ManifestFile, targets Targets) (preparedFile, error) {
-	srcPath := filepath.Join(stagingDir, filepath.FromSlash(entry.Path))
-
-	src, size, err := openStagedFileNoFollow(srcPath)
+// Order: open the staged file safely, through the held sr
+// (StagingRoot.openEntryNoFollow: lstat via the correct root, no
+// symlinks, regular file only, exactly one hard link -- see
+// stagingroot.go's own top docstring for why this now goes through sr
+// rather than a joined path) -> confirm its fstat-reported size matches
+// the manifest -> lstat the destination directory (must be a real
+// directory, not a symlink -- this is a *live*, operator-configured
+// path, not agent-controlled staging, so a plain path-based Lstat here
+// remains correct, unaffected by this file's own P5.5d fix) -> create a
+// unique temp file there (O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600) -> copy
+// while hashing, capped at MaxStagedFileBytes -> confirm the actual byte
+// count and the resulting sha256 both match the manifest -> fsync the
+// temp file -> chown/chmod it (fd-based, see applyDestinationOwnership
+// below) -> close both descriptors. Every failure path removes the temp
+// file it was in the middle of creating before returning.
+func prepareFile(sr *StagingRoot, entry ManifestFile, targets Targets) (preparedFile, error) {
+	src, size, err := sr.openEntryNoFollow(entry.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return preparedFile{}, errUnsafe(DetailFileMissing)
@@ -268,7 +267,13 @@ func prepareFile(stagingDir string, entry ManifestFile, targets Targets) (prepar
 		return preparedFile{}, err
 	}
 
-	return preparedFile{RelPath: entry.Path, TempPath: tempPath, FinalPath: dstPath, DestDir: destDir}, nil
+	return preparedFile{
+		RelPath:   entry.Path,
+		TempPath:  tempPath,
+		FinalPath: dstPath,
+		DestDir:   destDir,
+		SHA256:    digest,
+	}, nil
 }
 
 // createTempInDir creates a new, exclusively-owned regular file inside
