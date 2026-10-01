@@ -2,6 +2,18 @@
 
 Last updated: 2026-09-30.
 
+## Owner decisions on section 12 and remaining open points (2026-10-01, main session)
+
+Recorded in `docs/specification.md` section 12 ("Decided afterward"):
+retention 90/365 days (audit log kept); tenant change = token rotation via
+signed challenge + deletion of the apartment's history (backups stay);
+passkeys as second factor + TOTP secrets encrypted with an environment
+key; fault acknowledgement for the current occurrence only; per-device
+battery/signal as (device id, battery %, signal) without names or measured
+values. Packages P6.1 (retention + tenant change), P6.2 (login), P6.3
+(acknowledgement + per-device values). Still blocked on thermoctl (no
+`/api/v1/health` yet): P2.3 and activating desired-state updates.
+
 ## P5.4d -- pre-activation points from the P5.4b merge (section 13)
 
 Closes all four points the P5.4b merge review flagged as required before

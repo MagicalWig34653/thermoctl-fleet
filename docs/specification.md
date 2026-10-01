@@ -298,6 +298,25 @@ protocol code.
   one click is tempting and dangerous. Proposal: stage-2 commands always for one apartment
   only, never "for all".
 
+**Decided afterward (project owner, 2026-10-01):**
+
+- **Retention:** heartbeats 90 days; faults, alarms and events 365 days. Command log
+  excerpts and diagnostic bundles keep their own shorter retention; backups keep section
+  15.2's rhythm; the audit log is not deleted. Deletion runs as a background job, periods
+  configurable.
+- **Tenant change:** an explicit UI action (confirmation, mandatory reason, audited)
+  rotates the apartment's device token -- the agent obtains the new one through a signed
+  challenge with its existing device key, no private key ever leaves the device -- and
+  deletes the apartment's heartbeats, events, faults, alarms and command log excerpts.
+  Encrypted backups stay, under their own retention.
+- **UI login:** passkeys (WebAuthn) are added as a second factor next to TOTP; TOTP secrets
+  are stored encrypted with a key from the environment, never in the database.
+- **Faults can be acknowledged** in the UI; an acknowledgement applies to the current
+  occurrence only -- if the same fault recurs, it shows again.
+- **Battery and signal per device** may be transmitted: a list of device id, battery
+  percent and signal quality only -- no device names (they may contain room names), no
+  measured values. Section 6 stays intact.
+
 ---
 
 ## 13. Docker in the apartment: desired state instead of remote control
