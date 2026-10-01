@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from fleet.rollout import advance_all_rollouts, advance_rollout
+from fleet.rollout import _maybe_start_next, advance_all_rollouts, advance_rollout
 from fleet.storage import RolloutRecord, Storage, create_storage, upgrade
 from protocol.desired_state import (
     DesiredState,
@@ -366,6 +366,189 @@ def test_advance_all_rollouts_advances_every_running_rollout(storage: Storage) -
     apartments_b = storage.rollout_apartments(rollout_b.id)
     assert apartments_a[0].status == "in_progress"
     assert apartments_b[0].status == "in_progress"
+
+
+def test_advance_rollout_stops_on_manual_desired_state_edit_mid_rollout(storage: Storage) -> None:
+    """Cross-review: a manual P5.4b edit while an apartment is in_progress
+    must stop the rollout immediately with a clear reason, not wait out
+    the timeout for an outcome against the wrong revision."""
+
+    _make_apartment(storage, "pilot", pilot_mode=True)
+    rollout = _create_rollout(storage, ["pilot"], timeout_hours=2.0)
+    advance_rollout(storage, rollout.id, T0)
+    revision = next(iter(storage.rollout_apartments(rollout.id))).revision
+    assert revision is not None
+
+    # A landlord edits the desired state directly (P5.4b's own form) while
+    # the rollout still has this apartment "in_progress" against the
+    # earlier revision.
+    storage.create_desired_state_revision(
+        "pilot", _desired_state(), ui_username="landlord", reason="manual edit", now=T0
+    )
+
+    advance_rollout(storage, rollout.id, T0 + timedelta(minutes=1))
+
+    rollout_row = storage.get_rollout(rollout.id)
+    assert rollout_row is not None
+    assert rollout_row.state == "stopped"
+    assert rollout_row.stopped_reason is not None
+    assert "geändert" in rollout_row.stopped_reason
+    apartment = next(iter(storage.rollout_apartments(rollout.id)))
+    assert apartment.status == "failed"
+    assert apartment.last_outcome_reason is not None
+    assert str(revision) in apartment.last_outcome_reason
+
+
+def test_advance_rollout_retired_apartment_mid_rollout_fails_gracefully(storage: Storage) -> None:
+    """The retired-apartment-mid-rollout fallback (`fleet.rollout
+    ._maybe_start_next`'s own `except ValueError` around
+    `start_rollout_apartment_with_new_desired_state`): an apartment
+    retired after joining a rollout but before its own turn is reached
+    must stop the rollout with the retirement reason, not raise or hang."""
+
+    _make_apartment(storage, "pilot", pilot_mode=True)
+    _make_apartment(storage, "other", pilot_mode=False)
+    rollout = _create_rollout(storage, ["other", "pilot"])
+
+    # Converge the pilot immediately so "other" is next in line.
+    advance_rollout(storage, rollout.id, T0)
+    pilot_revision = next(
+        a for a in storage.rollout_apartments(rollout.id) if a.apartment_id == "pilot"
+    ).revision
+    assert pilot_revision is not None
+    outcome_time = T0 + timedelta(minutes=5)
+    _report_outcome(storage, "pilot", pilot_revision, successful=True, now=outcome_time)
+    storage.save_heartbeat(
+        "pilot",
+        _heartbeat("pilot", outcome_time + timedelta(minutes=1)),
+        outcome_time + timedelta(minutes=1),
+    )
+    advance_rollout(storage, rollout.id, outcome_time + timedelta(minutes=2))
+    rollout_row = storage.get_rollout(rollout.id)
+    assert rollout_row is not None
+    assert rollout_row.pilot_converged_at is not None
+
+    # Retire "other" before its own turn comes up, then pass the gate.
+    storage.update_apartment(
+        "other",
+        label="other",
+        floor=None,
+        orientation=None,
+        heating_circuits=1,
+        state="retired",
+        pilot_mode=False,
+        ui_username="landlord",
+        reason="tenant moved out",
+    )
+    gate_passed = rollout_row.pilot_converged_at + timedelta(hours=48, minutes=1)
+    advance_rollout(storage, rollout.id, gate_passed)
+
+    final_rollout = storage.get_rollout(rollout.id)
+    assert final_rollout is not None
+    assert final_rollout.state == "stopped"
+    other_apartment = next(
+        a for a in storage.rollout_apartments(rollout.id) if a.apartment_id == "other"
+    )
+    assert other_apartment.status == "failed"
+    assert other_apartment.last_outcome_reason is not None
+    assert "retired" in other_apartment.last_outcome_reason
+
+
+def test_advance_rollout_other_services_stay_identical(storage: Storage) -> None:
+    """The worker only ever changes the rollout's own target service --
+    the other three services' image/version/digest must be byte-identical
+    to what the apartment already had."""
+
+    _make_apartment(storage, "pilot", pilot_mode=True)
+    before = storage.get_desired_state("pilot")
+    assert before is not None
+    before_state = DesiredState.model_validate_json(before.state_json)
+
+    rollout = _create_rollout(storage, ["pilot"], service="thermoctl")
+    advance_rollout(storage, rollout.id, T0)
+
+    after = storage.get_desired_state("pilot")
+    assert after is not None
+    after_state = DesiredState.model_validate_json(after.state_json)
+
+    assert after_state.services.thermoctl.digest == TARGET_DIGEST
+    assert after_state.services.zigbee2mqtt == before_state.services.zigbee2mqtt
+    assert after_state.services.mosquitto == before_state.services.mosquitto
+    assert after_state.services.agent == before_state.services.agent
+    assert after_state.window == before_state.window
+
+
+def test_maybe_start_next_noop_when_rollout_not_running(storage: Storage) -> None:
+    """`_maybe_start_next`'s own defensive re-check of `rollout.state` --
+    see its docstring for why this is a genuine (if today unreachable from
+    `advance_rollout`'s own call sequence) TOCTOU guard, exercised here
+    directly rather than faked through `advance_rollout`."""
+
+    _make_apartment(storage, "pilot", pilot_mode=True)
+    rollout = _create_rollout(storage, ["pilot"])
+    storage.cancel_rollout(rollout.id, ui_username="u", reason="stop", now=T0)
+
+    _maybe_start_next(storage, rollout.id, T0.replace(tzinfo=None))
+
+    apartment = next(iter(storage.rollout_apartments(rollout.id)))
+    assert apartment.status == "skipped"  # untouched by _maybe_start_next itself
+
+
+def test_maybe_start_next_noop_when_unknown_rollout(storage: Storage) -> None:
+    _maybe_start_next(storage, "does-not-exist", T0.replace(tzinfo=None))  # must not raise
+
+
+def test_maybe_start_next_noop_when_apartment_already_in_progress(storage: Storage) -> None:
+    """The "never more than one apartment in progress" safety net."""
+
+    _make_apartment(storage, "pilot", pilot_mode=True)
+    _make_apartment(storage, "other", pilot_mode=True)
+    rollout = _create_rollout(storage, ["pilot", "other"])
+    advance_rollout(storage, rollout.id, T0)  # starts "pilot"
+
+    _maybe_start_next(storage, rollout.id, (T0 + timedelta(minutes=1)).replace(tzinfo=None))
+
+    apartments = storage.rollout_apartments(rollout.id)
+    assert sum(1 for a in apartments if a.status == "in_progress") == 1
+    other = next(a for a in apartments if a.apartment_id == "other")
+    assert other.status == "queued"
+
+
+def test_maybe_start_next_self_heals_missing_pilot_converged_at(storage: Storage) -> None:
+    """Simulates a crash between `mark_rollout_apartment_converged` and
+    `set_rollout_pilot_converged` in an earlier tick: the pilot already
+    shows "converged" but `pilot_converged_at` was never persisted.
+    `_maybe_start_next` must set it now rather than stall forever."""
+
+    _make_apartment(storage, "pilot", pilot_mode=True)
+    _make_apartment(storage, "other", pilot_mode=False)
+    rollout = _create_rollout(storage, ["other", "pilot"], stagger_hours=48.0)
+    advance_rollout(storage, rollout.id, T0)  # starts "pilot"
+
+    # Mark the pilot converged directly, bypassing `_maybe_set_pilot_converged`
+    # -- reproduces the crash window without needing to actually crash.
+    storage.mark_rollout_apartment_converged(rollout.id, "pilot", now=T0 + timedelta(minutes=5))
+    rollout_before = storage.get_rollout(rollout.id)
+    assert rollout_before is not None
+    assert rollout_before.pilot_converged_at is None
+
+    heal_time = (T0 + timedelta(minutes=10)).replace(tzinfo=None)
+    _maybe_start_next(storage, rollout.id, heal_time)
+
+    healed = storage.get_rollout(rollout.id)
+    assert healed is not None
+    assert healed.pilot_converged_at == heal_time
+    # The gate has not yet passed (measured from the self-healed time), so
+    # "other" is not started on this same call.
+    other = next(a for a in storage.rollout_apartments(rollout.id) if a.apartment_id == "other")
+    assert other.status == "queued"
+
+    gate_passed = heal_time + timedelta(hours=48, minutes=1)
+    advance_rollout(storage, rollout.id, gate_passed)
+    other_after = next(
+        a for a in storage.rollout_apartments(rollout.id) if a.apartment_id == "other"
+    )
+    assert other_after.status == "in_progress"
 
 
 def test_advance_all_rollouts_one_failure_does_not_stop_others(

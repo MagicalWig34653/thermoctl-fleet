@@ -37,13 +37,31 @@ already applies to the pre-check).
 
 **Idempotent across worker restarts:** every mutation this module performs
 goes through a `Storage` method that first re-reads the current row inside
-its own transaction (`start_rollout_apartment` refuses unless the
-apartment is still `"queued"`, `mark_rollout_apartment_*` methods are
-plain overwrites of already-terminal state) -- calling `advance_rollout`
-again for the same rollout, from a freshly started process with no memory
-of the previous run, reproduces exactly the same next step from what is
-already stored, never a duplicate desired-state revision or a double
-stop.
+its own transaction (`start_rollout_apartment_with_new_desired_state`
+refuses unless the apartment is still `"queued"`, and creates the next
+desired-state revision plus the `"in_progress"` transition in one
+transaction -- see that method's own docstring for the crash-window bug
+this closes; `mark_rollout_apartment_*` methods are plain overwrites of
+already-terminal state) -- calling `advance_rollout` again for the same
+rollout, from a freshly started process with no memory of the previous
+run, reproduces exactly the same next step from what is already stored,
+never a duplicate desired-state revision or a double stop.
+
+**A manually edited desired state stops the rollout (P5.4c cross-review):**
+`fleet/ui_routes.py`'s own desired-state edit/confirm form
+(`Storage.create_desired_state_revision`, P5.4b) is not disabled while an
+apartment is mid-rollout -- it only shows a warning
+(`Storage.get_active_rollout_for_apartment`). If a landlord edits it
+anyway while this package has an apartment `"in_progress"`, the agent
+that eventually reports back reports against a revision this rollout
+never created, and the rollout would otherwise wait for an outcome that
+can never arrive for *its own* revision -- silently, until the timeout
+finally fires with a misleading "no outcome reported" reason. `advance_rollout`
+therefore checks, before anything else, whether the apartment's *current*
+desired-state revision still matches the one this rollout's own
+`RolloutApartmentRecord.revision` recorded; a mismatch stops the rollout
+immediately with an explicit "changed outside the rollout" reason instead
+of waiting out the timeout for the wrong thing.
 
 **Never more than one apartment in progress per rollout**: enforced
 structurally by `advance_rollout` itself -- it returns immediately once it
@@ -116,6 +134,28 @@ def advance_rollout(storage: Storage, rollout_id: str, now: datetime) -> None:
 
     in_progress = next((a for a in apartments if a.status == "in_progress"), None)
     if in_progress is not None:
+        current_state = storage.get_desired_state(in_progress.apartment_id)
+        current_revision = current_state.revision if current_state is not None else None
+        if current_revision != in_progress.revision:
+            # See the module docstring, "A manually edited desired state
+            # stops the rollout": someone changed the apartment's desired
+            # state outside this rollout (P5.4b's own edit/confirm form)
+            # while this rollout still had it "in_progress" -- the agent
+            # will report against a revision this rollout never expects,
+            # so waiting for that outcome would just run out the timeout
+            # with a misleading reason. Stop immediately instead.
+            storage.mark_rollout_apartment_failed(
+                rollout_id,
+                in_progress.apartment_id,
+                reason=(
+                    "Sollzustand wurde außerhalb des Rollouts geändert "
+                    f"(aktuelle Revision {current_revision!r}, Rollout erwartete "
+                    f"Revision {in_progress.revision!r})."
+                ),
+                now=now_naive,
+            )
+            return
+
         outcome = storage.latest_desired_state_outcome(in_progress.apartment_id)
         has_matching_outcome = (
             outcome is not None
@@ -168,13 +208,26 @@ def _maybe_set_pilot_converged(storage: Storage, rollout_id: str, now_naive: dat
 
 
 def _maybe_start_next(storage: Storage, rollout_id: str, now_naive: datetime) -> None:
+    """Starts the next eligible apartment, if any. `advance_rollout` only
+    ever calls this once it has already confirmed no apartment is
+    `"in_progress"` and the rollout is still `"running"` -- the two guards
+    at the top of this function are a second, independent read of the same
+    two facts (this function does its own fresh `Storage` round-trip
+    rather than being handed the caller's already-loaded objects), kept as
+    a defensive check against the two calls racing a concurrent write in
+    between (the fleet UI's own cancel/resume routes run on ordinary
+    request handlers, not on this background worker's thread) -- not
+    reachable from `advance_rollout`'s own single-threaded call sequence
+    today, which is why both are exercised directly in
+    `tests/test_rollout_worker.py` instead of through `advance_rollout`."""
+
     rollout = storage.get_rollout(rollout_id)
     if rollout is None or rollout.state != "running":
         return
 
     apartments = storage.rollout_apartments(rollout_id)
     if any(a.status == "in_progress" for a in apartments):
-        return  # Safety net -- should already have returned above.
+        return
 
     remaining = [a for a in apartments if a.status == "queued"]
     if not remaining:
@@ -186,10 +239,45 @@ def _maybe_start_next(storage: Storage, rollout_id: str, now_naive: datetime) ->
     next_apartment = remaining[0]
     if not next_apartment.is_pilot:
         pilots = [a for a in apartments if a.is_pilot]
-        if not all(p.status == "converged" for p in pilots):
+        if not all(
+            p.status == "converged" for p in pilots
+        ):  # pragma: no cover -- see below, kept as a documented invariant guard
+            # `Storage.create_rollout` always positions every pilot ahead
+            # of every non-pilot (`ordered_ids` there is sorted on
+            # `not is_pilot` first); `remaining` above preserves that same
+            # position order. A non-pilot can therefore only ever be
+            # `remaining[0]` once every pilot has left `"queued"` status --
+            # and while this rollout is still `"running"`, a pilot that
+            # left `"queued"` can only be `"converged"` (an `"in_progress"`
+            # pilot is caught by the guard just above this function;
+            # `"failed"`/`"timed_out"` always stop the whole rollout in the
+            # same transaction, so `"running"` could not observe one;
+            # `resume_rollout` puts a blocking apartment straight back to
+            # `"queued"`, not to some other state). Reaching this branch
+            # would need `RolloutApartmentRecord.position` itself violating
+            # that ordering -- not producible through any public `Storage`
+            # method, only by writing to the row directly, which is
+            # exactly the "artificial construction" CLAUDE.md's own testing
+            # rule says to mark rather than fake a test around.
             return
         if rollout.pilot_converged_at is None:
-            return
+            # Self-heals a crash between `mark_rollout_apartment_converged`
+            # and `set_rollout_pilot_converged` in an earlier tick (two
+            # separate `Storage` calls in `advance_rollout`, the same class
+            # of crash window `start_rollout_apartment_with_new_desired_state`'s
+            # own docstring closes for revision creation) -- every pilot
+            # already shows `"converged"` here, so it is safe to set the
+            # gate now rather than wait forever for an event (a pilot
+            # transitioning *into* `"converged"`) that cannot fire again
+            # for an already-terminal apartment. Best-effort: the gate then
+            # measures from *this* tick, not from the pilot's true
+            # convergence moment, so a rollout that hits this path waits a
+            # little longer than 48h -- bounded and disclosed, unlike an
+            # indefinite stall.
+            storage.set_rollout_pilot_converged(rollout_id, now=now_naive)
+            rollout = storage.get_rollout(rollout_id)
+            assert rollout is not None  # this rollout id existed a line above
+            assert rollout.pilot_converged_at is not None  # just set, unconditionally
         gate = rollout.pilot_converged_at + timedelta(hours=rollout.stagger_hours)
         if now_naive < gate:
             return
@@ -214,10 +302,10 @@ def _maybe_start_next(storage: Storage, rollout_id: str, now_naive: datetime) ->
     new_state = DesiredState(revision=0, services=Services(**services), window=base.window)
 
     try:
-        record = storage.create_desired_state_revision(
+        storage.start_rollout_apartment_with_new_desired_state(
+            rollout_id,
             next_apartment.apartment_id,
             new_state,
-            ui_username="rollout-worker",
             reason=(
                 f"Rollout {rollout_id} ({rollout.service} -> {rollout.version}): "
                 f"{rollout.reason}"
@@ -225,14 +313,15 @@ def _maybe_start_next(storage: Storage, rollout_id: str, now_naive: datetime) ->
             now=now_naive,
         )
     except ValueError as error:
+        # Reached e.g. when the apartment was retired (`update_apartment`)
+        # after joining this rollout but before its own turn came up --
+        # `Storage.create_rollout` only checks "not retired" at creation
+        # time, section 13 gives no reconciliation path for a since-retired
+        # apartment, so the rollout stops here instead of retrying forever.
         storage.mark_rollout_apartment_failed(
             rollout_id, next_apartment.apartment_id, reason=str(error), now=now_naive
         )
         return
-
-    storage.start_rollout_apartment(
-        rollout_id, next_apartment.apartment_id, record.revision, now=now_naive
-    )
 
 
 def advance_all_rollouts(storage: Storage, now: datetime) -> None:

@@ -1456,6 +1456,7 @@ def _desired_state_edit_response(
     window_from: str,
     window_until: str,
     window_temp: str,
+    active_rollout_id: str | None,
     error: str | None,
     status_code: int = 200,
 ) -> HTMLResponse:
@@ -1473,6 +1474,7 @@ def _desired_state_edit_response(
             "window_until": window_until,
             "window_temp": window_temp,
             "max_version_length": MAX_VERSION_LENGTH,
+            "active_rollout_id": active_rollout_id,
             "error": error,
         },
         status_code=status_code,
@@ -1517,6 +1519,8 @@ def desired_state_edit_form(
         window_until = "16:00"
         window_temp = "-2"
 
+    active_rollout = storage.get_active_rollout_for_apartment(apartment_id)
+
     return _desired_state_edit_response(
         request,
         authenticated,
@@ -1527,6 +1531,7 @@ def desired_state_edit_form(
         window_from=window_from,
         window_until=window_until,
         window_temp=window_temp,
+        active_rollout_id=active_rollout.id if active_rollout is not None else None,
         error=None,
     )
 
@@ -1580,6 +1585,8 @@ def desired_state_edit_submit(
         )
         for name in DESIRED_STATE_SERVICE_ORDER
     ]
+    active_rollout = storage.get_active_rollout_for_apartment(apartment_id)
+    active_rollout_id = active_rollout.id if active_rollout is not None else None
 
     def _error(message: str) -> HTMLResponse:
         return _desired_state_edit_response(
@@ -1592,6 +1599,7 @@ def desired_state_edit_submit(
             window_from=window_from,
             window_until=window_until,
             window_temp=window_temp,
+            active_rollout_id=active_rollout_id,
             error=message,
             status_code=400,
         )
@@ -1648,6 +1656,7 @@ def desired_state_edit_submit(
             "window_until": desired.window.until.strftime("%H:%M"),
             "window_temp": str(desired.window.not_below_outdoor_temp_c),
             "both_thermoctl_and_zigbee_changed": both_changed,
+            "active_rollout_id": active_rollout_id,
             "error": None,
         },
     )

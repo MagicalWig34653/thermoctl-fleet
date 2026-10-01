@@ -134,7 +134,7 @@ def _make_apartment(
         )
 
 
-def _new_form(apartment_ids: list[str]) -> dict[str, object]:
+def _new_form(apartment_ids: list[str]) -> dict[str, str | list[str]]:
     return {
         "service": "thermoctl",
         "version": "1.1",
@@ -206,6 +206,38 @@ def test_resume_and_cancel_require_login(client: TestClient) -> None:
 
 
 # -- two-step flow ----------------------------------------------------------------
+
+
+def test_new_form_get_renders_apartments(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _make_apartment(storage, OTHER_APARTMENT, pilot_mode=False, with_desired_state=False)
+    retired_apartment = "house7-rollout-retired"
+    _make_apartment(storage, retired_apartment, pilot_mode=False)
+    storage.update_apartment(
+        retired_apartment,
+        label=retired_apartment,
+        floor=None,
+        orientation=None,
+        heating_circuits=1,
+        state="retired",
+        pilot_mode=False,
+        ui_username="tester",
+        reason="retire it",
+    )
+    _login(client, password, totp_secret)
+
+    response = client.get("/ui/rollouts/new")
+
+    assert response.status_code == 200
+    assert PILOT_APARTMENT in response.text
+    assert OTHER_APARTMENT in response.text
+    # An apartment with no current desired state is still listed, but
+    # called out -- `Storage.create_rollout` would refuse to enroll it.
+    assert "kein Sollzustand" in response.text
+    # A retired apartment is not offered at all.
+    assert retired_apartment not in response.text
 
 
 def test_full_flow_creates_rollout_with_audit_row(
@@ -293,6 +325,120 @@ def test_new_step_refuses_unknown_service(
     assert response.status_code == 400
 
 
+def test_new_step_refuses_version_too_long(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    form = _new_form([PILOT_APARTMENT])
+    form["version"] = "x" * 100
+    response = client.post("/ui/rollouts/new", data={**form, "csrf_token": csrf})
+    assert response.status_code == 400
+
+
+def test_new_step_refuses_empty_version(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    form = _new_form([PILOT_APARTMENT])
+    form["version"] = "   "
+    response = client.post("/ui/rollouts/new", data={**form, "csrf_token": csrf})
+    assert response.status_code == 400
+
+
+def test_new_step_refuses_non_numeric_stagger_or_timeout(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    form = _new_form([PILOT_APARTMENT])
+    form["stagger_hours"] = "not-a-number"
+    response = client.post("/ui/rollouts/new", data={**form, "csrf_token": csrf})
+    assert response.status_code == 400
+
+
+def test_new_step_refuses_negative_stagger_hours(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    form = _new_form([PILOT_APARTMENT])
+    form["stagger_hours"] = "-1"
+    response = client.post("/ui/rollouts/new", data={**form, "csrf_token": csrf})
+    assert response.status_code == 400
+
+
+def test_new_step_refuses_non_positive_timeout_hours(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    form = _new_form([PILOT_APARTMENT])
+    form["timeout_hours"] = "0"
+    response = client.post("/ui/rollouts/new", data={**form, "csrf_token": csrf})
+    assert response.status_code == 400
+
+
+def test_new_step_refuses_no_apartments_selected(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    form = _new_form([])
+    response = client.post("/ui/rollouts/new", data={**form, "csrf_token": csrf})
+    assert response.status_code == 400
+
+
+def test_confirm_step_refuses_non_numeric_stagger_or_timeout(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """Re-validation on the confirm step's own submit, same "never trust
+    the hidden fields blindly" rule `desired_state_confirm_submit` already
+    applies -- reached by posting directly to `/confirm` with a numeric
+    field tampered with, bypassing the `/new` step that would normally
+    have caught it first."""
+
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    form = _new_form([PILOT_APARTMENT])
+    form["stagger_hours"] = "not-a-number"
+    response = client.post(
+        "/ui/rollouts/confirm", data={**form, "csrf_token": csrf, "reason": "test"}
+    )
+    assert response.status_code == 400
+    assert storage.list_rollouts() == []
+
+
+def test_confirm_step_refuses_reason_too_long(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    response = client.post(
+        "/ui/rollouts/confirm",
+        data={**_new_form([PILOT_APARTMENT]), "csrf_token": csrf, "reason": "x" * 1000},
+    )
+    assert response.status_code == 400
+    assert storage.list_rollouts() == []
+
+
 def test_confirm_step_revalidates_and_refuses_empty_reason(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:
@@ -304,6 +450,28 @@ def test_confirm_step_revalidates_and_refuses_empty_reason(
         "/ui/rollouts/confirm",
         data={**_new_form([PILOT_APARTMENT]), "csrf_token": csrf, "reason": "   "},
     )
+    assert response.status_code == 400
+    assert storage.list_rollouts() == []
+
+
+def test_confirm_step_storage_refusal_becomes_400(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """`rollout_confirm_submit` does not re-check everything `/new` already
+    did (no pilot presence check of its own, for one) -- `Storage
+    .create_rollout`'s own `ValueError` must still surface as a clean
+    `400` when reached directly, e.g. by posting to `/confirm` for an
+    apartment with no `pilot_mode`, bypassing `/new` entirely."""
+
+    _make_apartment(storage, OTHER_APARTMENT, pilot_mode=False)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    response = client.post(
+        "/ui/rollouts/confirm",
+        data={**_new_form([OTHER_APARTMENT]), "csrf_token": csrf, "reason": "test"},
+    )
+
     assert response.status_code == 400
     assert storage.list_rollouts() == []
 
@@ -389,6 +557,143 @@ def test_resume_requires_reason_and_cancel_writes_audit(
         data={"csrf_token": csrf, "reason": "try again"},
     )
     assert resume_response.status_code == 400
+
+
+def test_resume_post_wrong_csrf_is_403(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    rollout = storage.create_rollout(
+        service="thermoctl",
+        version="1.1",
+        digest=_TARGET_DIGEST,
+        apartment_ids=[PILOT_APARTMENT],
+        stagger_hours=48.0,
+        timeout_hours=2.0,
+        ui_username="tester",
+        reason="test",
+        now=datetime.now(UTC),
+    )
+    storage.cancel_rollout(rollout.id, ui_username="tester", reason="pause", now=datetime.now(UTC))
+    _login(client, password, totp_secret)
+
+    response = client.post(
+        f"/ui/rollouts/{rollout.id}/resume",
+        data={"csrf_token": "not-the-real-token", "reason": "try again"},
+    )
+    assert response.status_code == 403
+
+
+def test_cancel_post_wrong_csrf_is_403(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    rollout = storage.create_rollout(
+        service="thermoctl",
+        version="1.1",
+        digest=_TARGET_DIGEST,
+        apartment_ids=[PILOT_APARTMENT],
+        stagger_hours=48.0,
+        timeout_hours=2.0,
+        ui_username="tester",
+        reason="test",
+        now=datetime.now(UTC),
+    )
+    _login(client, password, totp_secret)
+
+    response = client.post(
+        f"/ui/rollouts/{rollout.id}/cancel",
+        data={"csrf_token": "not-the-real-token", "reason": "abort"},
+    )
+    assert response.status_code == 403
+
+
+def test_cancel_route_storage_refusal_becomes_400(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """`Storage.cancel_rollout`'s own `ValueError` (a terminal rollout
+    cannot be cancelled again) must surface as a clean `400` through the
+    route, not an unhandled `500` -- reached by cancelling an
+    already-cancelled rollout."""
+
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    rollout = storage.create_rollout(
+        service="thermoctl",
+        version="1.1",
+        digest=_TARGET_DIGEST,
+        apartment_ids=[PILOT_APARTMENT],
+        stagger_hours=48.0,
+        timeout_hours=2.0,
+        ui_username="tester",
+        reason="test",
+        now=datetime.now(UTC),
+    )
+    storage.cancel_rollout(rollout.id, ui_username="tester", reason="first", now=datetime.now(UTC))
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    response = client.post(
+        f"/ui/rollouts/{rollout.id}/cancel",
+        data={"csrf_token": csrf, "reason": "second attempt"},
+    )
+
+    assert response.status_code == 400
+
+
+def test_resume_empty_reason_is_refused_and_successful_resume_through_ui(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """P5.4c scope item 2: "resumed ... only by explicit UI action" --
+    exercises the `/resume` route's own empty-reason guard, then a real,
+    successful resume end to end through the UI (CSRF, reason, redirect,
+    storage state, audit row)."""
+
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    rollout = storage.create_rollout(
+        service="thermoctl",
+        version="1.1",
+        digest=_TARGET_DIGEST,
+        apartment_ids=[PILOT_APARTMENT],
+        stagger_hours=48.0,
+        timeout_hours=2.0,
+        ui_username="tester",
+        reason="test",
+        now=datetime.now(UTC),
+    )
+    storage.start_rollout_apartment(rollout.id, PILOT_APARTMENT, revision=1, now=datetime.now(UTC))
+    storage.mark_rollout_apartment_failed(
+        rollout.id, PILOT_APARTMENT, reason="agent rejected", now=datetime.now(UTC)
+    )
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    empty_reason_response = client.post(
+        f"/ui/rollouts/{rollout.id}/resume", data={"csrf_token": csrf, "reason": "   "}
+    )
+    assert empty_reason_response.status_code == 400
+    assert storage.get_rollout(rollout.id).state == "stopped"  # type: ignore[union-attr]
+
+    resume_response = client.post(
+        f"/ui/rollouts/{rollout.id}/resume",
+        data={"csrf_token": csrf, "reason": "retry after fixing the pilot flag"},
+        follow_redirects=False,
+    )
+    assert resume_response.status_code == 303
+    assert resume_response.headers["location"] == f"/ui/rollouts/{rollout.id}"
+
+    rollout_row = storage.get_rollout(rollout.id)
+    assert rollout_row is not None
+    assert rollout_row.state == "running"
+    apartment = next(iter(storage.rollout_apartments(rollout.id)))
+    assert apartment.status == "queued"
+
+    with storage.session() as session:
+        rows = list(
+            session.query(InventoryAuditLogRecord).filter_by(
+                entity_type="rollout", entity_id=rollout.id, action="resumed"
+            )
+        )
+    assert len(rows) == 1
 
 
 def test_rollout_list_view_renders(

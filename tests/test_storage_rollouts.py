@@ -13,8 +13,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy.orm import Session
 
-from fleet.storage import RolloutRecord, Storage, create_storage, upgrade
+from fleet.storage import DesiredStateRecord, RolloutRecord, Storage, create_storage, upgrade
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 
 VALID_DIGEST = "sha256:" + "a" * 64
@@ -358,3 +359,304 @@ def test_complete_rollout_only_from_running(storage: Storage) -> None:
     rollout_row = storage.get_rollout(rollout.id)
     assert rollout_row is not None
     assert rollout_row.state == "cancelled"
+
+
+# -- cross-review: concurrency and crash-window fixes --------------------------
+
+
+def test_create_rollout_serializes_concurrent_callers_for_same_apartment(
+    tmp_path: object,
+) -> None:
+    """Cross-review, HIGH: `create_rollout`'s own "already touched" check
+    used to be an unlocked read -- 8 threads racing to enroll the same
+    apartment into 8 separate rollouts reproducibly let more than one
+    succeed (6/8 and 8/8 observed), violating "never two rollouts touching
+    the same apartment concurrently". Fixed the same way
+    `create_desired_state_revision` already fixes the identical shape of
+    race: the named apartment rows are locked (`BEGIN IMMEDIATE` on
+    SQLite) before the "already touched" check runs. A real multi-thread
+    test against a file-backed SQLite database (not `:memory:`), each
+    thread opening its own `Storage` bound to the same URL -- mirrors how
+    separate fleet worker connections would actually contend, not several
+    threads sharing one already-open connection."""
+
+    import secrets
+    import threading
+
+    from fleet.storage import create_storage
+
+    url = f"sqlite:///{tmp_path}/rollout-race-test.db"
+    upgrade(url)
+    bootstrap = create_storage(url)
+    prop = bootstrap.create_property("Property", "Address 1")
+    bootstrap.create_apartment(
+        "a1",
+        property_id=prop.id,
+        label="a1",
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=True,
+    )
+    bootstrap.create_desired_state_revision(
+        "a1", _desired_state(), ui_username="tester", reason="initial", now=NOW
+    )
+
+    successes: list[str] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def _create(i: int) -> None:
+        try:
+            store = create_storage(url)
+            rollout = store.create_rollout(
+                service="thermoctl",
+                version=f"1.{i}",
+                digest=OTHER_DIGEST,
+                apartment_ids=["a1"],
+                stagger_hours=48.0,
+                timeout_hours=2.0,
+                ui_username="landlord",
+                reason=f"race-{i}-{secrets.token_urlsafe(4)}",
+                now=NOW,
+            )
+            with lock:
+                successes.append(rollout.id)
+        except ValueError as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=_create, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Exactly one caller succeeded; every other one was refused with the
+    # "already part of another active rollout" ValueError, never an
+    # uncaught IntegrityError and never more than one winner.
+    assert len(successes) == 1
+    assert len(errors) == 7
+    assert bootstrap.list_rollouts()[0].id == successes[0]
+
+
+def test_start_rollout_apartment_atomic_after_injected_failure(
+    storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-review: a crash between creating the desired-state revision
+    and marking the apartment `in_progress` used to leave an orphaned
+    revision behind with no `RolloutApartmentRecord` ever pointing at it.
+    `start_rollout_apartment_with_new_desired_state` now does both in one
+    transaction -- simulated here by injecting a failure right after the
+    revision insert but before the transaction commits; the whole
+    transaction must roll back, not leave a half-done state behind."""
+
+    _make_apartment(storage, "a1", pilot_mode=True)
+    rollout = _create_rollout(storage, ["a1"])
+    before_history = storage.desired_state_history("a1")
+    assert len(before_history) == 1  # only the apartment's own initial revision
+
+    real_insert = Storage._insert_desired_state_revision
+
+    def _insert_then_crash(
+        self: Storage,
+        session: Session,
+        apartment_id: str,
+        desired_state: DesiredState,
+        *,
+        ui_username: str,
+        reason: str,
+        now: datetime,
+    ) -> DesiredStateRecord:
+        real_insert(
+            self,
+            session,
+            apartment_id,
+            desired_state,
+            ui_username=ui_username,
+            reason=reason,
+            now=now,
+        )
+        raise RuntimeError("simulated crash between the two steps")
+
+    monkeypatch.setattr(Storage, "_insert_desired_state_revision", _insert_then_crash)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        storage.start_rollout_apartment_with_new_desired_state(
+            rollout.id,
+            "a1",
+            _desired_state(digest=OTHER_DIGEST),
+            reason="rollout attempt",
+            now=NOW,
+        )
+
+    # The whole transaction rolled back: no orphaned revision, apartment
+    # still "queued" with no revision recorded, ready for a clean retry.
+    after_history = storage.desired_state_history("a1")
+    assert len(after_history) == 1
+    apartment = next(iter(storage.rollout_apartments(rollout.id)))
+    assert apartment.status == "queued"
+    assert apartment.revision is None
+
+    monkeypatch.undo()
+    started = storage.start_rollout_apartment_with_new_desired_state(
+        rollout.id,
+        "a1",
+        _desired_state(digest=OTHER_DIGEST),
+        reason="rollout attempt",
+        now=NOW,
+    )
+    assert started.status == "in_progress"
+    assert started.revision == 2
+    assert len(storage.desired_state_history("a1")) == 2
+
+
+# -- cross-review: remaining validation branches --------------------------------
+
+
+def test_create_rollout_refuses_empty_version(storage: Storage) -> None:
+    _make_apartment(storage, "a1", pilot_mode=True)
+    with pytest.raises(ValueError, match="version"):
+        storage.create_rollout(
+            service="thermoctl",
+            version="   ",
+            digest=OTHER_DIGEST,
+            apartment_ids=["a1"],
+            stagger_hours=48.0,
+            timeout_hours=2.0,
+            ui_username="landlord",
+            reason="test",
+            now=NOW,
+        )
+
+
+def test_create_rollout_refuses_negative_stagger_hours(storage: Storage) -> None:
+    _make_apartment(storage, "a1", pilot_mode=True)
+    with pytest.raises(ValueError, match="stagger_hours"):
+        storage.create_rollout(
+            service="thermoctl",
+            version="1.0",
+            digest=OTHER_DIGEST,
+            apartment_ids=["a1"],
+            stagger_hours=-1.0,
+            timeout_hours=2.0,
+            ui_username="landlord",
+            reason="test",
+            now=NOW,
+        )
+
+
+def test_create_rollout_refuses_non_positive_timeout_hours(storage: Storage) -> None:
+    _make_apartment(storage, "a1", pilot_mode=True)
+    with pytest.raises(ValueError, match="timeout_hours"):
+        storage.create_rollout(
+            service="thermoctl",
+            version="1.0",
+            digest=OTHER_DIGEST,
+            apartment_ids=["a1"],
+            stagger_hours=48.0,
+            timeout_hours=0.0,
+            ui_username="landlord",
+            reason="test",
+            now=NOW,
+        )
+
+
+def test_start_rollout_apartment_refuses_apartment_not_in_rollout(storage: Storage) -> None:
+    _make_apartment(storage, "a1", pilot_mode=True)
+    rollout = _create_rollout(storage, ["a1"])
+    with pytest.raises(ValueError, match="is not part of rollout"):
+        storage.start_rollout_apartment(rollout.id, "unknown-apartment", revision=1, now=NOW)
+
+
+def test_set_rollout_pilot_converged_refuses_unknown_rollout(storage: Storage) -> None:
+    with pytest.raises(ValueError, match="Unknown rollout"):
+        storage.set_rollout_pilot_converged("does-not-exist", now=NOW)
+
+
+def test_complete_rollout_refuses_unknown_rollout(storage: Storage) -> None:
+    with pytest.raises(ValueError, match="Unknown rollout"):
+        storage.complete_rollout("does-not-exist", now=NOW)
+
+
+def test_resume_rollout_refuses_unknown_rollout(storage: Storage) -> None:
+    with pytest.raises(ValueError, match="Unknown rollout"):
+        storage.resume_rollout("does-not-exist", ui_username="u", reason="retry", now=NOW)
+
+
+def test_cancel_rollout_refuses_unknown_rollout(storage: Storage) -> None:
+    with pytest.raises(ValueError, match="Unknown rollout"):
+        storage.cancel_rollout("does-not-exist", ui_username="u", reason="abort", now=NOW)
+
+
+def test_get_active_rollout_for_apartment(storage: Storage) -> None:
+    _make_apartment(storage, "a1", pilot_mode=True)
+    assert storage.get_active_rollout_for_apartment("a1") is None
+
+    rollout = _create_rollout(storage, ["a1"])
+    active = storage.get_active_rollout_for_apartment("a1")
+    assert active is not None
+    assert active.id == rollout.id
+
+    storage.cancel_rollout(rollout.id, ui_username="u", reason="abort", now=NOW)
+    assert storage.get_active_rollout_for_apartment("a1") is None
+
+
+def test_cancel_rollout_requires_reason(storage: Storage) -> None:
+    _make_apartment(storage, "a1", pilot_mode=True)
+    rollout = _create_rollout(storage, ["a1"])
+    with pytest.raises(ValueError, match="reason"):
+        storage.cancel_rollout(rollout.id, ui_username="u", reason="   ", now=NOW)
+
+
+def test_start_rollout_apartment_with_new_desired_state_requires_queued(storage: Storage) -> None:
+    _make_apartment(storage, "a1", pilot_mode=True)
+    rollout = _create_rollout(storage, ["a1"])
+    storage.start_rollout_apartment_with_new_desired_state(
+        rollout.id, "a1", _desired_state(digest=OTHER_DIGEST), reason="first attempt", now=NOW
+    )
+
+    with pytest.raises(ValueError, match="not queued"):
+        storage.start_rollout_apartment_with_new_desired_state(
+            rollout.id,
+            "a1",
+            _desired_state(digest=OTHER_DIGEST),
+            reason="second attempt",
+            now=NOW,
+        )
+
+
+def test_mark_rollout_apartment_failed_twice_is_idempotent(storage: Storage) -> None:
+    """`_stop_rollout`'s own "already stopped" guard: a second stop call
+    for the same (already-stopped) rollout -- e.g. two racing worker
+    ticks each observing a failure for the same apartment -- must not
+    overwrite the first `stopped_reason` or write a second audit row."""
+
+    _make_apartment(storage, "a1", pilot_mode=True)
+    rollout = _create_rollout(storage, ["a1"])
+    storage.start_rollout_apartment(rollout.id, "a1", revision=1, now=NOW)
+
+    first = storage.mark_rollout_apartment_failed(
+        rollout.id, "a1", reason="first failure", now=NOW
+    )
+    assert first.stopped_reason is not None
+    assert "first failure" in first.stopped_reason
+
+    second = storage.mark_rollout_apartment_failed(
+        rollout.id, "a1", reason="second failure", now=NOW
+    )
+    assert second.state == "stopped"
+    # The original stop reason is preserved -- the second call's own
+    # `_stop_rollout` no-ops once the rollout is already stopped.
+    assert second.stopped_reason == first.stopped_reason
+
+    with storage.session() as session:
+        from fleet.storage import InventoryAuditLogRecord
+
+        rows = list(
+            session.query(InventoryAuditLogRecord).filter_by(
+                entity_type="rollout", entity_id=rollout.id, action="stopped"
+            )
+        )
+    assert len(rows) == 1
