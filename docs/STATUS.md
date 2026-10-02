@@ -135,6 +135,29 @@ age_is_deleted`); the two pre-existing boundary/scoping tests that used an
 uncleared alarm were updated to clear it first, since they specifically
 mean to test the age boundary, not the new "closed" gate.
 
+**A reading, not yet confirmed by the project owner (recorded here per
+cross-review, 2026-10-02):** section 12's "faults" in "the 365-day limit
+applies only to cleared/closed alarms, faults and events" is read as
+meaning the fault `EventRecord` rows themselves (section 6/18.1's
+single, instantaneous reports, 365-day retention, kept while "open"
+*where that is applicable* -- which, as the paragraph above explains, this
+schema currently has no column to express for an `EventRecord` at all, so
+in practice every `EventRecord` is deleted once older than 365 days,
+regardless). The **current status of a long-open fault is read as staying
+accurate through the latest heartbeat's own `open_faults` snapshot**
+(`protocol.heartbeat.Heartbeat.open_faults`) instead -- that snapshot is
+display/transport data, not an audit trail, and therefore follows the
+90-day *heartbeat* retention (`Storage.delete_heartbeats_older_than`), not
+the 365-day fault-event one: a fault still open today is still visible
+via any heartbeat from the last 90 days, independent of whether the
+`EventRecord` that originally reported it has since aged out past 365
+days. **This reading has not been put to the project owner explicitly**
+-- if it is wrong (e.g. if "faults" was meant to require a genuine
+"still open" column on `EventRecord` itself, which would need its own
+schema change, likely alongside P6.3's fault-acknowledgement work), this
+paragraph and `delete_events_older_than`'s own docstring are the two
+places to revisit.
+
 **Owner decision (2026-10-02), tenant change refined: "additionally
 deletes the apartment's diagnostic bundles (DB rows and blob files, scoped
 to that apartment only); backups stay."** `Storage.rotate_apartment_token_

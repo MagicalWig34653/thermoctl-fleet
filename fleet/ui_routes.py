@@ -2328,7 +2328,23 @@ def tenant_change_confirm_submit(
     blob path afterward (filesystem writes are not transactional with the
     database, same "row first, then blob" ordering
     `apartment_diagnostic_bundle_download`'s own sibling retention job
-    already uses)."""
+    already uses).
+
+    **The blob-deletion loop never fails the request (cross-review fix,
+    2026-10-02).** The tenant change itself -- the security-relevant part
+    (token rotation, history deletion, the audit entry) -- has already
+    committed by the time this loop runs; a single `OSError` deleting one
+    blob file (a permissions problem, the file already gone, a transient
+    disk error) must not turn an already-successful tenant change into a
+    `500` or orphan every blob *after* the one that failed. Each delete is
+    therefore wrapped individually: a failure is logged (the storage
+    *path* only, never any blob content -- nothing sensitive to begin
+    with, since this fleet never holds the decryption key) and the loop
+    continues; the redirect always happens. If anything failed, a short,
+    one-line notice is carried to the apartment page via a query
+    parameter (`apartment_detail` reads it) -- a landlord who wants the
+    file gone still learns it is not, rather than silently believing
+    everything was cleaned up."""
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
@@ -2356,12 +2372,23 @@ def tenant_change_confirm_submit(
     outcome = storage.rotate_apartment_token_for_tenant_change(
         apartment_id, reason.strip(), authenticated.user.username, datetime.now(UTC)
     )
+    bundle_cleanup_failed = False
     for storage_path in outcome.diagnostic_bundle_storage_paths:
-        bundle_storage.delete(storage_path)
+        try:
+            bundle_storage.delete(storage_path)
+        except OSError:
+            logger.warning(
+                "Tenant change for %r: could not delete diagnostic bundle blob %r "
+                "(continuing with the remaining ones).",
+                apartment_id,
+                storage_path,
+            )
+            bundle_cleanup_failed = True
 
-    return RedirectResponse(
-        url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
-    )
+    redirect_url = f"/ui/apartments/{quote(apartment_id, safe='')}"
+    if bundle_cleanup_failed:
+        redirect_url += "?bundle_cleanup_failed=1"
+    return RedirectResponse(url=redirect_url, status_code=303)
 
 
 # P3.2 review: any future `/ui/apartments/...` sub-route (a fixed suffix,
@@ -2414,6 +2441,16 @@ def apartment_detail(
     """
 
     detail = build_apartment_detail(storage, apartment_id, datetime.now(UTC), days)
+    # Cross-review fix (2026-10-02): a one-shot notice carried via a query
+    # parameter from `tenant_change_confirm_submit`'s own redirect -- the
+    # tenant change itself always succeeds by the time that redirect
+    # happens; this only ever says "some diagnostic bundle blob files
+    # could not be removed", never anything about the rotation/deletion
+    # itself. Deliberately just a presence check (`"1"` or anything else),
+    # not parsed as a count or a list of paths -- the exact failure is
+    # only ever in the server log, never echoed back into a URL a browser
+    # history/referrer could carry.
+    bundle_cleanup_failed = request.query_params.get("bundle_cleanup_failed") is not None
     response = templates.TemplateResponse(
         request,
         "apartment.html",
@@ -2422,6 +2459,7 @@ def apartment_detail(
             "csrf_token": authenticated.session.csrf_token,
             "apartment_id": apartment_id,
             "detail": detail,
+            "bundle_cleanup_failed": bundle_cleanup_failed,
         },
         status_code=200 if detail is not None else 404,
     )

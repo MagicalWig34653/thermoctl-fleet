@@ -273,6 +273,102 @@ def test_successful_submit_deletes_diagnostic_bundle_rows_and_blob_files(
     assert not blob_path.exists()
 
 
+def test_successful_submit_continues_after_one_blob_delete_fails_and_shows_a_notice(
+    client: TestClient,
+    storage: Storage,
+    bundle_storage: DiagnosticBundleBlobStorage,
+    password: str,
+    totp_secret: str,
+    user_id: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cross-review fix (2026-10-02): the blob-deletion loop must not fail
+    the whole request when one delete raises -- the remaining blob is
+    still deleted, the tenant change itself (already committed) is never
+    undone or turned into a `500`, the redirect always happens, and a
+    one-line notice is carried to the apartment page. The failure is
+    logged (the storage path only)."""
+
+    import logging
+
+    _make_apartment(storage)
+    with storage.session() as session:
+        from fleet.storage import ApartmentRecord
+
+        apartment = session.get(ApartmentRecord, APARTMENT)
+        assert apartment is not None
+        apartment.token_hash = "a" * 64
+    now = datetime.now(UTC)
+    ok_command = storage.create_command(
+        APARTMENT, CommandType.DIAGNOSTIC_BUNDLE, lines=None, ui_username=USERNAME, now=now
+    )
+    failing_command = storage.create_command(
+        APARTMENT, CommandType.DIAGNOSTIC_BUNDLE, lines=None, ui_username=USERNAME, now=now
+    )
+
+    ok_storage_path = f"{APARTMENT}/ok.age"
+    ok_blob_path = bundle_storage.root / ok_storage_path
+    ok_blob_path.parent.mkdir(parents=True, exist_ok=True)
+    ok_blob_path.write_bytes(b"age-encryption.org/v1\nfine")
+
+    # A *directory* at the "blob" path -- `Path.unlink` raises
+    # `IsADirectoryError` (an `OSError` subclass) for it, exactly the kind
+    # of real, reproducible failure this fix must survive.
+    failing_storage_path = f"{APARTMENT}/this-is-a-directory.age"
+    failing_blob_path = bundle_storage.root / failing_storage_path
+    failing_blob_path.mkdir(parents=True, exist_ok=True)
+
+    ok_outcome, _ = storage.store_diagnostic_bundle(
+        APARTMENT, ok_command.id, size_bytes=ok_blob_path.stat().st_size, content_hash="0" * 64,
+        storage_path=ok_storage_path, now=now,
+    )
+    failing_outcome, _ = storage.store_diagnostic_bundle(
+        APARTMENT, failing_command.id, size_bytes=0, content_hash="1" * 64,
+        storage_path=failing_storage_path, now=now,
+    )
+    assert ok_outcome.name == "STORED"
+    assert failing_outcome.name == "STORED"
+
+    _login(client, password, totp_secret)
+    csrf_token = _extract_hidden_field(
+        client.get(f"/ui/apartments/{APARTMENT}/tenant-change/confirm").text, "csrf_token"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        response = client.post(
+            f"/ui/apartments/{APARTMENT}/tenant-change/confirm",
+            data={"reason": "Mieterwechsel", "csrf_token": csrf_token},
+            follow_redirects=False,
+        )
+
+    # The request itself never fails -- it is a redirect, not a 500.
+    assert response.status_code == 303
+    assert "bundle_cleanup_failed=1" in response.headers["location"]
+    # The tenant change itself is unaffected by the blob failure.
+    assert storage.get_apartment_token_hash(APARTMENT) is None
+    assert storage.apartment_reauth_pending(APARTMENT) is True
+    # The one blob that *could* be deleted still was -- the failure did
+    # not stop the loop or orphan the remaining one.
+    assert not ok_blob_path.exists()
+    # The directory causing the failure is left exactly as it was --
+    # neither silently removed nor crashing the request.
+    assert failing_blob_path.is_dir()
+    # Both metadata rows are gone regardless (the database deletion
+    # already committed before the blob loop ever runs).
+    assert storage.get_diagnostic_bundle_for_apartment_command(APARTMENT, ok_command.id) is None
+    assert (
+        storage.get_diagnostic_bundle_for_apartment_command(APARTMENT, failing_command.id)
+        is None
+    )
+    # Logged, with the specific path -- no blob content anywhere in it.
+    assert any(
+        failing_storage_path in record.message for record in caplog.records
+    )
+
+    notice_page = client.get(response.headers["location"])
+    assert "konnte nicht gelöscht werden" in notice_page.text
+
+
 def test_unknown_apartment_post_is_404(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:

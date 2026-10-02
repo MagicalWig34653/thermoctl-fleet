@@ -21,12 +21,31 @@ not only within a single process's own lifetime. Exponential: starts at
 `MAX_BACKOFF_S` (3600s, 1h); reset to `MIN_BACKOFF_S` the moment a
 re-authentication actually succeeds.
 
-**Fails safe, not closed** -- mirrors `agent.commands_channel
-._read_last_event_id`'s own reasoning exactly: this is scheduling data, not
-an execution-safety mechanism. A missing, symlinked, or otherwise unsafe
-state file degrades to "no backoff currently pending" (`load_backoff_state`
-returns `None`) rather than ever crashing the agent or blocking it
-indefinitely.
+**Fails safe, not closed, for a genuinely *absent* state** -- mirrors
+`agent.commands_channel._read_last_event_id`'s own reasoning exactly: a
+missing, symlinked, or otherwise unreadable/unsafe state file degrades to
+"no backoff currently pending" (`load_backoff_state` returns `None`)
+rather than ever crashing the agent or blocking it indefinitely.
+
+**A *present but absurd* state file is treated differently (cross-review
+fix, 2026-10-02): clamped to the maximum backoff, not discarded.** A file
+that parses but carries a `next_attempt_at` more than `MAX_BACKOFF_S` in
+the future, or an `interval_s` outside `[0, MAX_BACKOFF_S]` (corruption,
+or a tampered value -- a year-9999 timestamp was the case found in
+cross-review, which would otherwise make `time.sleep` either hang for
+millennia or raise `OverflowError` uncaught, crash-looping the very
+process this module exists to protect), is deliberately **not** read as
+"nothing pending": a corrupt-but-*present* file already represents some
+prior failure, and treating it as absent would hand an attacker who can
+write this file (or a bug that corrupts it) a trivial way to force an
+immediate, unthrottled retry -- exactly what this module exists to
+prevent. `load_backoff_state` therefore substitutes
+`BackoffState(next_attempt_at=now + MAX_BACKOFF_S, interval_s=MAX_BACKOFF
+_S)` for such a file instead of `None` -- the safer of the two readings,
+not the more lenient one. `wait_if_needed` additionally clamps the
+computed sleep duration itself into `[0, MAX_BACKOFF_S]` right before
+calling `sleep` -- defense in depth against the file changing between the
+read and this point, not merely trusting the read-time check alone.
 """
 
 from __future__ import annotations
@@ -41,6 +60,15 @@ from agent.safe_io import UnsafeStateFileError, read_text_safe
 
 MIN_BACKOFF_S = 60.0
 MAX_BACKOFF_S = 3600.0
+
+# `timedelta` form of `MAX_BACKOFF_S`, computed once -- `load_backoff_
+# state`'s own "more than MAX_BACKOFF_S in the future counts as corrupt"
+# check compares a `timedelta` (the difference of two `datetime`s) against
+# this, not a raw float against `.total_seconds()`, so it never needs to
+# worry about a `timedelta` overflow of its own for a sufficiently
+# pathological stored timestamp (e.g. year 9999) the way computing
+# `.total_seconds()` first and comparing floats could in principle.
+_MAX_BACKOFF_FALLBACK_STATE_DELTA = timedelta(seconds=MAX_BACKOFF_S)
 
 
 @dataclass(frozen=True)
@@ -59,11 +87,18 @@ def _atomic_write_text(path: Path, text: str) -> None:
     temp.replace(path)
 
 
-def load_backoff_state(path: Path) -> BackoffState | None:
-    """Returns the persisted backoff state, or `None` if there is none yet
-    (first run ever, the state was already cleared by a success, or the
-    file is unreadable/unsafe -- see module docstring for why that last
-    case fails *safe*, not closed)."""
+def load_backoff_state(path: Path, now: datetime) -> BackoffState | None:
+    """Returns the persisted backoff state, or `None` if there is none at
+    all (first run ever, the state was already cleared by a success, or
+    the file is unreadable/unsafe -- see module docstring for why that
+    case fails *safe*, not closed).
+
+    `now` is required (not read internally) so a *present but absurd*
+    state -- `next_attempt_at` more than `MAX_BACKOFF_S` out, or
+    `interval_s` outside `[0, MAX_BACKOFF_S]` -- can be detected and
+    substituted with the maximum backoff from `now`, rather than ever
+    being used as-is (see module docstring for why this is the safer of
+    the two readings, not merely the more cautious-sounding one)."""
 
     try:
         raw = read_text_safe(path)
@@ -81,6 +116,16 @@ def load_backoff_state(path: Path) -> BackoffState | None:
         interval_s = float(fields["interval_s"])
     except (KeyError, ValueError):
         return None
+
+    max_backoff = _MAX_BACKOFF_FALLBACK_STATE_DELTA
+    if (
+        not (0.0 <= interval_s <= MAX_BACKOFF_S)
+        or (next_attempt_at - now) > max_backoff
+    ):
+        # A corrupt-but-*present* file still represents some prior
+        # failure -- substitute the safe maximum rather than discarding it
+        # as "nothing pending" (module docstring).
+        return BackoffState(next_attempt_at=now + max_backoff, interval_s=MAX_BACKOFF_S)
     return BackoffState(next_attempt_at=next_attempt_at, interval_s=interval_s)
 
 
@@ -89,7 +134,7 @@ def record_failure(path: Path, now: datetime) -> BackoffState:
     was pending), capped at `MAX_BACKOFF_S`, and persists the next allowed
     attempt time. Returns the new state, mainly for tests/logging."""
 
-    previous = load_backoff_state(path)
+    previous = load_backoff_state(path, now)
     interval_s = (
         MIN_BACKOFF_S if previous is None else min(previous.interval_s * 2, MAX_BACKOFF_S)
     )
@@ -118,12 +163,21 @@ def wait_if_needed(
     own `sleep=` parameter already establishes) -- production callers
     leave it at `time.sleep`."""
 
-    state = load_backoff_state(path)
+    state = load_backoff_state(path, now)
     if state is None:
         return
     remaining = (state.next_attempt_at - now).total_seconds()
-    if remaining > 0:
-        sleep(remaining)
+    # Defense in depth (cross-review, 2026-10-02): `load_backoff_state`
+    # already refuses to hand back an absurd `next_attempt_at`, but the
+    # sleep duration passed to `sleep` is clamped into `[0, MAX_BACKOFF_S]`
+    # here too, one last time, right before the call -- never trusting a
+    # single earlier check alone to be the only thing standing between a
+    # corrupted value and an unbounded `time.sleep` (which can itself raise
+    # `OverflowError` for a sufficiently large argument, uncaught by any
+    # caller of this function).
+    clamped_remaining = min(max(remaining, 0.0), MAX_BACKOFF_S)
+    if clamped_remaining > 0:
+        sleep(clamped_remaining)
 
 
 __all__ = [
