@@ -397,7 +397,7 @@ skip: no `age` CLI binary on this machine, pre-existing and unrelated),
 coverage **99%** overall (7354 statements, 20 missed) -- every file this
 package touched (`fleet/app.py`, `fleet/auth.py`, `fleet/storage.py`,
 `fleet/data_retention.py`, `fleet/ui_routes.py`,
-`fleet/migrations/versions/0017_retention_and_tenant_change.py`,
+`fleet/migrations/versions/0018_retention_and_tenant_change.py`,
 `agent/token_rotation.py`, `agent/__main__.py`) at **100%**; the remaining
 20 misses are all pre-existing and unrelated (`agent/loop.py`'s own
 still-open placeholders, `agent/commands_channel.py`'s one pre-existing
@@ -407,20 +407,315 @@ CLI-entry-point gaps). `watchdog/`: `go vet ./...` clean, `go test
 ./...` -- all four packages `ok`, `bash watchdog/check_contract.sh` --
 "Contract test passed" (`protocol/` itself unchanged by this package, run
 anyway per instruction since `fleet/`/`agent/` both changed
-substantially). Migration `0017` verified both directions
-(`upgrade`/`downgrade`/`upgrade` again on a throwaway sqlite file).
+substantially). Migration `0017` (renumbered to `0018` at the main-merge
+below, after P6.3's own `0017_fault_acknowledgements.py`) verified both
+directions (`upgrade`/`downgrade`/`upgrade` again on a throwaway sqlite
+file).
 
-## Owner decisions on section 12 and remaining open points (2026-10-01, main session)
+## Open point from the flaky-test investigation (main session, 2026-10-02)
 
-Recorded in `docs/specification.md` section 12 ("Decided afterward"):
-retention 90/365 days (audit log kept); tenant change = token rotation via
-signed challenge + deletion of the apartment's history (backups stay);
-passkeys as second factor + TOTP secrets encrypted with an environment
-key; fault acknowledgement for the current occurrence only; per-device
-battery/signal as (device id, battery %, signal) without names or measured
-values. Packages P6.1 (retention + tenant change), P6.2 (login), P6.3
-(acknowledgement + per-device values). Still blocked on thermoctl (no
-`/api/v1/health` yet): P2.3 and activating desired-state updates.
+The agent's background threads (restore poll, backup scheduler, desired-state
+reconciler) and the main command loop share one `httpx.Client`. The
+investigation observed a `500` on one request tearing down the connection
+under a *different*, concurrent request on the same client (the
+`agent_restart` result POST failing with "Server disconnected"). In tests the
+`500` came from a missing test configuration; in production any fleet-side
+`500` could do the same and lose or delay a command result. To be examined:
+one client per thread, or making result reporting robust against a
+connection torn down by a concurrent request.
+
+## Flaky test fixes (test-only, 2026-10-02)
+
+Three tests in the P5.4d/P5.5b end-to-end area restructured; no production
+code touched. Two root causes, same "command batch races the reconciler/
+poll thread" family the P5.4d merge already hit once
+(`test_run_accepts_a_newer_revision_and_replaces_the_held_state`):
+
+1. **`tests/test_agent_loop_desired_state.py
+   ::test_run_reports_pilot_mode_rejection_for_a_delivered_desired_state`**
+   and **`::test_run_reports_disabled_reconciliation_when_backup_config_
+   missing`** (the latter found by searching the rest of the file for the
+   same shape, not in the original report): both delivered `agent_restart`
+   in the same connect-time batch as a desired-state revision and then
+   checked the outcome synchronously after `run` returned -- since P5.4d
+   the outcome is reported by the reconciler's own background thread, so
+   the restart can stop the loop before it reports. Restructured exactly
+   like the already-fixed sibling: `run` on its own thread, bounded poll
+   of real storage for the outcome, `agent_restart` delivered live only
+   afterward. `test_run_ignores_a_stale_desired_state_revision` was
+   checked too and left alone -- a stale revision is ignored synchronously
+   (`_handle_desired_state_received` never sets the trigger event for it),
+   so there is nothing there for `agent_restart` to race.
+2. **`tests/test_agent_loop_run.py
+   ::test_run_starts_and_stops_the_restore_poll_thread_when_configured`**:
+   a different race, found while investigating a report of this test
+   failing once under full-suite load (passing alone). Two contributing
+   issues, confirmed independently: (a) the test never configured
+   `FLEET_BACKUP_STORAGE_DIR` -- unlike a real deployment -- so the
+   restore-poll thread's own `GET /v1/restore` hit `fleet.backup_storage
+   .get_backup_storage`'s fail-closed `RuntimeError` every tick (a `500`,
+   not the `200`/`404` it gets in production); with the deliberately tight
+   `restore_poll_interval_s=0.05` and one `httpx.Client` shared between
+   that thread and the main loop's own result-reporting POST, an
+   occasional `500` was enough to tear down the connection out from under
+   the concurrent `agent_restart` result-report, which then failed
+   outright ("Server disconnected without sending a response") and never
+   reached storage at all -- reproduced locally at a high rate without the
+   fix, zero failures across repeated runs with `FLEET_BACKUP_STORAGE_DIR`
+   configured like a real deployment has it; (b) separately, `run` signals
+   its background threads to stop in its own `finally` but never joins
+   them (daemon threads, so a stuck one can't block process exit) -- left
+   running past the test's own teardown, a later exception in one can be
+   misattributed by pytest's thread-exception hook to whatever test is
+   running by the time it surfaces. Fixed by configuring
+   `FLEET_BACKUP_STORAGE_DIR` for the test and explicitly joining the
+   restore-poll thread (only that one -- the desired-state reconcile
+   thread, always started regardless of this test's configuration, can
+   legitimately take up to its own 600s default interval to notice a stop
+   signal, since nothing sets its `trigger_event`; not this test's
+   concern) before the `with` blocks holding the client/server close. Not
+   a production bug: in production `exit_fn` is `sys.exit`, so a daemon
+   thread taking a while to notice `stop_event` is moot -- the whole
+   process ends with it. Worth a note for whoever next touches
+   `fleet/app.py`'s `BaseHTTPMiddleware` stack, though: an unrelated
+   concurrent request's `500` visibly disrupting a *different* request on
+   the same client is a fragility this package did not go looking for and
+   did not fix, only worked around in the one test it was hitting.
+
+**Verification.** Each of the three restructured tests run 30x in
+isolation: **30/30 passed**, all three. Full suite run 3x: **1871 passed,
+1 skipped**, all three runs identical (no new tests added, restructurings
+only). `ruff check .` clean; `mypy .` (143 files) and `mypy protocol fleet
+agent tools` (71 files) clean.
+
+## P6.3 -- Fault acknowledgement + per-device battery/signal (section 12's "Decided afterward", 2026-10-01)
+
+Closes the two open points this package's own predecessors left on
+purpose: P3.4's "no acknowledge/confirm mechanism exists, on purpose --
+open point, not built here" (its own docstring named exactly what a future
+package needs: a new table/column, a CSRF-protected `POST`, and a decision
+on the re-occurrence question) and P3.2's "per-device battery/signal
+values ... are not in the heartbeat wire protocol at all" (noted as
+needing a protocol extension cleared with the project owner first -- done
+2026-10-01, recorded in `docs/specification.md` section 12).
+
+**What "occurrence" means, precisely -- not decided by the specification,
+defined here from the existing fault model, since nothing else pins it
+down.** An open fault is never its own row in this database: it only ever
+exists as one entry of the *latest* stored heartbeat's `open_faults` list
+(`protocol.heartbeat.OpenFault`: `kind`, `zone`, `since`). `since` is the
+moment thermoctl itself considers the fault to have become open, and stays
+identical across every heartbeat for as long as thermoctl keeps reporting
+the same still-open fault -- it only changes when the fault **clears and
+reopens** (thermoctl has no reason to report a new "became open" time for
+what is, from its own perspective, the same continuous problem). The tuple
+`(apartment_id, fault_kind, zone, since)` therefore already *is* the
+occurrence: stable for as long as the fault stays open (one
+acknowledgement covers every later heartbeat still reporting the identical
+`since`), and naturally a *different* occurrence the moment it reopens
+with a new `since` -- exactly "applies to the current occurrence only ...
+shows again" (section 12) without any extra bookkeeping, no separate
+"cleared" signal needed: the fault simply stops appearing in
+`open_faults`, and its acknowledgement row, now orphaned, is never matched
+against anything again. See `fleet/storage.py::FaultAcknowledgementRecord`'s
+own docstring for the full account.
+
+**Storage:** one new table, `fault_acknowledgements`
+(`fleet/migrations/versions/0017_fault_acknowledgements.py`,
+`FaultAcknowledgementRecord`) -- `apartment_id`, `fault_kind`, `zone`,
+`since`, `acknowledged_by`, `acknowledged_at`, `note` (optional, 500
+chars), a unique index on the occurrence tuple. `Storage.acknowledge_fault`
+performs a dialect-native `INSERT ... ON CONFLICT ... DO UPDATE` (same
+reasoning as `raise_alarm`'s own insert-or-ignore) so re-acknowledging the
+identical occurrence (e.g. to fix a typo in the note) updates the one row
+in place instead of racing a second insert -- "one row per acknowledged
+occurrence, not per key forever," per the work package's own instruction.
+`Storage.list_all_fault_acknowledgement_keys` is a single batched query
+across every apartment (mirrors `_get_open_not_reporting_alarms`'s own
+"don't N+1" reasoning), used by `fleet.ui_tasks.build_task_overview` to
+filter the "Aufgaben" unconfirmed-faults group.
+
+**UI:** acknowledged occurrences are **hidden** from "Aufgaben"'s
+"Unbestätigte Störungen" group (not shown separately as quittiert there --
+that view is explicitly "what is still due", per its own module docstring,
+and an acknowledged fault is no longer due). "Eine Wohnung" shows every
+currently open fault including acknowledged ones, each with a "Quittieren"
+form (login + CSRF, mandatory `fault_kind`/`zone`/`since` hidden fields
+carrying the occurrence key, optional note) -- an already-acknowledged
+fault additionally shows who/when/the note and the button relabels to
+"Erneut quittieren". `POST /ui/apartments/{id}/faults/acknowledge`
+(`fleet/ui_routes.py::fault_acknowledge_submit`) re-validates the
+submitted occurrence against the apartment's **current**
+`open_faults` (`Storage.get_latest_heartbeat`) before writing anything --
+a stale or hand-crafted form naming an occurrence that is not actually
+open right now is rejected with 400, never silently accepted.
+
+**Per-device battery/signal (protocol):** `protocol.heartbeat.PerDeviceState`
+(new), `DeviceState.per_device: list[PerDeviceState]` (new, optional,
+`default_factory=list`, bounded by `MAX_PER_DEVICE_ENTRIES` = 128). Exactly
+three fields -- `device_id`, `battery_percent` (0-100 or `None`),
+`signal_quality` (0-100 or `None`) -- `model_config = ConfigDict(extra=
+"forbid")` makes "no other fields" (section 12: "no device names ..., no
+measured values") a structural guarantee, not a convention: a heartbeat
+carrying `{"name": ...}`/`{"room": ...}`/`{"temperature": ...}` on a
+per-device entry is rejected with 422 before any fleet code ever sees the
+extra field. `device_id` is constrained by `Field(pattern=r"^0x[0-9a-f]
+{16}$")` -- a Zigbee IEEE address shape, lowercase, exactly 16 hex digits
+-- refusing anything else (a friendly/room name, upper-case, wrong length,
+missing prefix) so a tenant-chosen or room-derived name can never be
+represented, let alone transmitted. The fleet-wide aggregates
+(`weakest_battery_percent`/`worst_signal_quality`/`silent_devices`/
+`zigbee_bridge`) are unchanged. `PROTOCOL_VERSION` bumped 8 -> 9
+(`protocol/version.py`, "a wholly new model plus an additive field on an
+existing one ... counts as a change to the models too", same literal
+reading every prior bump used) -- **re-chained at merge** if a parallel
+package (P6.1) also bumps it in the same window. **A tripwire test,
+`tests/test_protocol.py::test_protocol_version_is_exactly_9`, pins this
+exact value and must be edited together with `protocol/version.py` on
+every future bump** -- it is the one test in this repository deliberately
+allowed to assert exact equality on `PROTOCOL_VERSION`, replacing the role
+a pre-existing, mis-scoped exact-equality assertion in
+`tests/test_protocol_desired_state.py` used to serve (that one was pinned
+to P5.4b's own historical bump value and would have failed on every later,
+unrelated bump forever after -- loosened to `>= 8` and renamed
+`test_protocol_version_is_at_least_8`, its actual, narrower guarantee kept).
+
+**Precision (cross-review, 2026-10-02): `extra="forbid"` is scoped to
+`PerDeviceState` only, not to `Heartbeat`/`DeviceState` or any other
+heartbeat model.** Those deliberately keep Pydantic's default
+`extra="ignore"` (section 18.2: "the fleet service accepts an older
+version as long as it understands its fields", the forward-compatibility
+guarantee `tests/test_fleet.py
+::test_heartbeat_higher_version_with_an_unknown_extra_field_is_204` already
+pins for the top-level heartbeat) -- an unknown top-level field from a
+*newer* agent is silently dropped during validation, never stored (only
+the validated model is persisted, see `fleet/storage.py`'s own module
+docstring) and never rendered. `PerDeviceState` is the one place in this
+protocol where "unknown field" and "a name/room/measured value sneaking
+in disguised as a new field" are the same risk, which is why it alone
+trades that forward-compatibility leniency for a hard 422 instead.
+
+**UI (per-device display):** "Eine Wohnung" gained a "Je Gerät" table next
+to the existing aggregates, from the latest heartbeat's `devices.per_device`
+(`fleet.ui_apartment.PerDeviceDisplay`). **`label` is always `None` in
+this scaffold** -- checked against P4.1's inventory first, per the work
+package's own instruction: the `devices` table (section 20.1) tracks the
+*base station hardware* itself, one row per apartment (serial number,
+model, image/watchdog version, lifecycle state) -- there is no table
+anywhere that maps an individual Zigbee device id to a landlord-chosen
+label. The template therefore falls back to the opaque `device_id` as-is;
+`PerDeviceDisplay.label`'s own docstring documents that the only source it
+may ever be populated from is a future inventory table, never a name read
+from the heartbeat itself (CLAUDE.md: "never take names from the agent").
+A future package wanting friendly per-device labels needs its own new
+inventory table (Zigbee device id -> label), not a field re-purposed from
+`protocol.heartbeat.PerDeviceState` or `fleet.storage.DeviceRecord`. An
+agent that has not been upgraded to send `per_device` yet (P2.3, still
+deferred) simply omits the field -- shown as "Keine Angaben je Gerät
+(der Agent dieser Wohnung sendet diese Liste noch nicht)", not conflated
+with `never_reported`.
+
+**Precision (cross-review, 2026-10-02): per-device values are not a
+separate, latest-only store -- they are part of each heartbeat row and
+therefore follow the 90-day heartbeat retention from section 12, not some
+shorter or longer lifetime of their own.** `HeartbeatRecord.payload_json`
+already persists the whole validated `Heartbeat` verbatim (`fleet/storage
+.py`'s own module docstring: "not split into columns per field"), and
+`per_device` is just one more field inside that same JSON blob -- storing
+it needed no new column and no new retention rule, it rides along with
+whatever retention/deletion the heartbeats table already has (P6.1's
+retention job, developed in parallel). **"Latest only" is a read-time,
+UI-only choice**, not a storage one: `fleet.ui_apartment.build_apartment_
+detail` reads `devices.per_device` off `Storage.get_latest_heartbeat`'s
+single most-recent row -- the same read path the fleet-wide aggregates
+and every other per-heartbeat value on "Eine Wohnung" already use -- it
+simply never queries `list_heartbeats`/`get_heartbeat_history` for this
+field. A future package wanting a per-device *history* (not just the
+latest reading) already has the raw data available in every stored
+heartbeat row; it is not re-derivable only going forward from here.
+
+**Files:** `protocol/heartbeat.py`, `protocol/version.py`,
+`protocol/__init__.py`, `fleet/storage.py`
+(`FaultAcknowledgementRecord`, `acknowledge_fault`,
+`list_fault_acknowledgements_for_apartment`,
+`list_all_fault_acknowledgement_keys`),
+`fleet/migrations/versions/0017_fault_acknowledgements.py`,
+`fleet/ui_tasks.py`, `fleet/ui_apartment.py`
+(`PerDeviceDisplay`, `OpenFaultDisplay`'s new fields,
+`MAX_FAULT_ACK_NOTE_LENGTH`), `fleet/ui_routes.py`
+(`fault_acknowledge_submit`), `fleet/templates/ui/apartment.html`.
+`agent/` is untouched (P2.3's heartbeat collector is still deferred, per
+the work package's own instruction) -- the model and fleet side are
+complete and ready for whenever the agent can fill the list.
+
+**Tests (new/updated):** `tests/test_protocol.py` (valid per-device entry
+accepted; battery/signal optional; per_device defaults to empty; every
+non-opaque `device_id` shape parametrized and rejected, including a
+literal room name; `name`/`room`/`temperature` extra fields parametrized
+and rejected, both on `PerDeviceState` directly and end-to-end through
+`Heartbeat`; bounds on battery/signal; the list-length bound; **the
+`PROTOCOL_VERSION` tripwire**, `test_protocol_version_is_exactly_9` --
+pins the exact current value, by design the one test allowed to do so,
+meant to be edited together with `protocol/version.py` on every future
+bump); `tests/test_storage.py` (`acknowledge_fault` creates/updates/is
+apartment-scoped; **recurrence**: a new `since` is a different occurrence,
+the old acknowledgement does not apply; **audit**:
+`test_acknowledge_fault_writes_an_audit_row_every_call` -- landlord A
+acknowledges, landlord B corrects -> two `inventory_audit_log` rows, both
+identities present (the `fault_acknowledgements` row itself only ever
+shows B, the current acknowledger); `list_all_fault_acknowledgement_keys`
+spans every apartment; migration 0017 up/down, including the schema-diff
+check `test_migrations_match_the_orm_model_exactly` already covers
+automatically); `tests/test_ui_tasks.py` (an acknowledged fault is hidden;
+a recurring fault with a new `since` shows again despite the old
+acknowledgement); `tests/test_ui_apartment.py` (open fault carries its
+occurrence key and acknowledgement state; a different `since` does not
+inherit a stale acknowledgement; per-device values shown with no
+inventory label; empty when the agent omits the field; `never_reported`
+carries `per_device == []`); `tests/test_ui_faults.py` (new -- every HTTP
+behavior of the acknowledge endpoint: unauthenticated redirect, missing/
+wrong CSRF rejected, unknown apartment 404, happy path creates a row and
+redirects, an occurrence not currently open rejected with 400, unknown
+fault kind rejected, an overlong note rejected, re-acknowledging updates
+the note, the acknowledged fault disappears from `/ui/tasks`, and **an
+XSS regression**, `test_acknowledgement_note_with_a_script_tag_renders_
+escaped` -- a note containing `<script>alert('xss')</script>` is stored
+verbatim but renders HTML-escaped on "Eine Wohnung", Jinja2's default
+autoescaping, not a hand-rolled sanitizer).
+
+**Cross-review (2026-10-02): four items closed in the same commit, no
+behavior change beyond the audit write** -- (1) `Storage.acknowledge_fault`
+now writes an `InventoryAuditLogRecord` in the same transaction on every
+call, including a re-acknowledgement that only updates the existing
+`fault_acknowledgements` row, so an earlier acknowledger stays traceable
+even after someone else corrects the note; (2) the `PROTOCOL_VERSION`
+tripwire above, restoring the "fails on a forgotten bump" guarantee the
+loosened `test_protocol_version_is_at_least_8` deliberately gave up, in a
+test scoped to not fight future bumps; (3) the XSS regression above; (4)
+the two precision notes above (`extra="forbid"` is `PerDeviceState`-only,
+`Heartbeat`/`DeviceState` keep the existing forward-compatible
+`extra="ignore"`; per-device values live inside the heartbeat row and
+follow its 90-day retention, "latest only" is a read-time UI choice, not a
+storage one).
+
+**Verification:** `ruff check .`, `mypy .`, `mypy protocol fleet agent
+tools` all clean; `python -m pytest -W ignore::ResourceWarning` --
+**1871 passed, 1 skipped**, coverage **99%** overall
+(`fleet/storage.py`, `fleet/ui_apartment.py`, `fleet/ui_tasks.py`,
+`protocol/heartbeat.py`, and the new migration all at 100%); `go vet
+./...`/`go test ./...` clean (watchdog untouched by this package);
+`watchdog/check_contract.sh` passes; migration 0017 verified both
+directions (`upgrade`, `downgrade` to 0016, re-`upgrade`) via
+`tests/test_storage.py` and a manual round-trip. One pre-existing test
+(`tests/test_protocol_desired_state.py::test_protocol_version_is_8`) was
+pinned to an exact `PROTOCOL_VERSION` value and would have failed on
+every future bump forever after -- loosened to `>= 8` (renamed
+`test_protocol_version_is_at_least_8`), its actual guarantee (P5.4b's own
+bump happened) preserved, with a new, narrowly-scoped exact-equality
+tripwire added elsewhere (`test_protocol_version_is_exactly_9`, see
+above) to keep the "forgotten bump" guarantee the loosening gave up;
+flagged for main-session read-back together with the rest of this
+package, not changed silently.
 
 ## P5.4d -- pre-activation points from the P5.4b merge (section 13)
 
@@ -7711,7 +8006,8 @@ its own row exactly as before. Pinned by
 no trailing gap).
 
 **Battery/signal values -- section 9's wording vs. the actual protocol
-(open point, not built, not invented).** Section 9 says "battery and
+(open point, not built, not invented -- closed by P6.3, see this file's own
+P6.3 section at the top).** Section 9 says "battery and
 signal values ... per device"; `protocol.heartbeat.DeviceState` only ever
 carries the fleet-wide aggregates (`weakest_battery_percent`,
 `worst_signal_quality`, `silent_devices`, `zigbee_bridge`) -- there is no
@@ -7982,7 +8278,8 @@ agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
 (728 passed, 99% coverage overall, `fleet/ui_tasks.py` at 100%).
 
 **No acknowledge/confirm mechanism exists, on purpose -- open point, not
-built here.** The work package's own instruction: an "acknowledge" action on
+built here (closed by P6.3, see this file's own P6.3 section at the
+top).** The work package's own instruction: an "acknowledge" action on
 a fault would be a state-changing `POST` (its own CSRF handling, its own
 authorization question, its own persistence -- does acknowledging a fault
 on the fault's *current* occurrence carry forward to a later re-occurrence

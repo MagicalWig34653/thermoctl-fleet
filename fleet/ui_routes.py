@@ -40,6 +40,7 @@ from fleet.ui_apartment import (
     DEFAULT_FETCH_LOGS_LINES,
     DESIRED_STATE_SERVICE_LABELS,
     DESIRED_STATE_SERVICE_ORDER,
+    MAX_FAULT_ACK_NOTE_LENGTH,
     MAX_FETCH_LOGS_LINES,
     MIN_FETCH_LOGS_LINES,
     DesiredStateServiceDisplay,
@@ -86,6 +87,7 @@ from fleet.ui_rollout import (
 from fleet.ui_tasks import build_task_overview
 from protocol.commands import CommandType
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
+from protocol.heartbeat import FaultKind
 from protocol.inventory import ApartmentState
 from protocol.registration import AgentRegistrationFile
 
@@ -2389,6 +2391,89 @@ def tenant_change_confirm_submit(
     if bundle_cleanup_failed:
         redirect_url += "?bundle_cleanup_failed=1"
     return RedirectResponse(url=redirect_url, status_code=303)
+
+
+# Fault acknowledgement (P6.3, section 12's "Decided afterward", 2026-10-01).
+# Registered here, above `apartment_detail`'s own `{apartment_id:path}` route
+# below -- same route-ordering rule as the command-confirmation/desired-state
+# routes' own comments already state.
+@router.post("/apartments/{apartment_id:path}/faults/acknowledge")
+def fault_acknowledge_submit(
+    apartment_id: str,
+    fault_kind: str = Form(...),
+    zone: str = Form(...),
+    since: str = Form(...),
+    note: str = Form(""),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Acknowledges one fault occurrence on "Eine Wohnung" (P6.3). Only ever
+    called from that page's own "Quittieren" form -- `fault_kind`/`zone`/
+    `since` are its hidden fields, carrying exactly the occurrence key
+    `fleet.storage.FaultAcknowledgementRecord`'s docstring defines.
+
+    **Re-validated against the apartment's *current* `open_faults`
+    (`Storage.get_latest_heartbeat`), not trusted from the form alone** --
+    an unknown `fault_kind` value, or a `(fault_kind, zone, since)` triple
+    that does not match any fault the apartment's latest heartbeat actually
+    reports as open right now, is rejected with 400 before
+    `Storage.acknowledge_fault` is ever called. This is what keeps a
+    stale or hand-crafted form from creating an acknowledgement row for an
+    occurrence that was never genuinely open -- the same "the agent/cloud
+    is not trusted to self-report what's valid" reasoning this package's
+    other state-changing routes already apply to their own inputs.
+    """
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    try:
+        parsed_kind = FaultKind(fault_kind)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Unbekannte Störungsart.") from exc
+
+    try:
+        parsed_since = datetime.fromisoformat(since)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Ungültiger Zeitpunkt.") from exc
+
+    stripped_note = note.strip() or None
+    if stripped_note is not None:
+        length_error = _first_length_error(("Hinweis", stripped_note, MAX_FAULT_ACK_NOTE_LENGTH))
+        if length_error is not None:
+            raise HTTPException(status_code=400, detail=length_error)
+
+    latest = storage.get_latest_heartbeat(apartment_id)
+    currently_open = latest is not None and any(
+        fault.kind == parsed_kind
+        and fault.zone == zone
+        and fault.since.replace(tzinfo=None) == parsed_since.replace(tzinfo=None)
+        for fault in latest.heartbeat.open_faults
+    )
+    if not currently_open:
+        raise HTTPException(
+            status_code=400,
+            detail="Diese Störung ist derzeit nicht offen.",
+        )
+
+    storage.acknowledge_fault(
+        apartment_id,
+        parsed_kind.value,
+        zone,
+        parsed_since,
+        acknowledged_by=authenticated.user.username,
+        note=stripped_note,
+        now=datetime.now(UTC),
+    )
+
+    return RedirectResponse(
+        url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+    )
 
 
 # P3.2 review: any future `/ui/apartments/...` sub-route (a fixed suffix,

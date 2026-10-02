@@ -967,6 +967,228 @@ def test_migration_0004_alarms_downgrade_removes_the_table(tmp_path: object) -> 
 
 
 # -----------------------------------------------------------------------------
+# P6.3: fault acknowledgement (section 12's "Decided afterward", 2026-10-01).
+# -----------------------------------------------------------------------------
+
+_ACK_APARTMENT = "house7-a03"
+_ACK_SINCE = datetime(2026, 9, 21, 6, 12, 0, tzinfo=UTC)
+
+
+def test_acknowledge_fault_creates_a_row(storage: Storage) -> None:
+    now = datetime(2026, 9, 22, 8, 0, 0, tzinfo=UTC)
+
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord",
+        note="Techniker informiert",
+        now=now,
+    )
+
+    rows = storage.list_fault_acknowledgements_for_apartment(_ACK_APARTMENT)
+    assert len(rows) == 1
+    assert rows[0].fault_kind == FaultKind.SENSOR_FAULT.value
+    assert rows[0].zone == "bathroom"
+    assert rows[0].since == _ACK_SINCE.replace(tzinfo=None)
+    assert rows[0].acknowledged_by == "landlord"
+    assert rows[0].note == "Techniker informiert"
+    assert rows[0].acknowledged_at == now.replace(tzinfo=None)
+
+
+def test_acknowledge_fault_is_scoped_to_the_apartment(storage: Storage) -> None:
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord",
+        note=None,
+        now=datetime(2026, 9, 22, tzinfo=UTC),
+    )
+
+    assert storage.list_fault_acknowledgements_for_apartment("house9-b01") == []
+
+
+def test_acknowledging_the_same_occurrence_twice_updates_the_one_row(storage: Storage) -> None:
+    """Re-acknowledging the identical occurrence (same apartment/kind/zone/
+    `since`) updates the existing row in place -- "one row per acknowledged
+    occurrence, not per key forever" (`FaultAcknowledgementRecord`'s own
+    docstring)."""
+
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord",
+        note="erster Hinweis",
+        now=datetime(2026, 9, 22, 8, 0, 0, tzinfo=UTC),
+    )
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="other-user",
+        note="korrigierter Hinweis",
+        now=datetime(2026, 9, 22, 9, 0, 0, tzinfo=UTC),
+    )
+
+    rows = storage.list_fault_acknowledgements_for_apartment(_ACK_APARTMENT)
+    assert len(rows) == 1
+    assert rows[0].acknowledged_by == "other-user"
+    assert rows[0].note == "korrigierter Hinweis"
+
+
+def test_acknowledge_fault_writes_an_audit_row_every_call(storage: Storage) -> None:
+    """Cross-review (2026-10-02): the upsert on `fault_acknowledgements`
+    only ever keeps the *current* acknowledger -- an earlier one, overwritten
+    by a later re-acknowledgement, must stay traceable through
+    `inventory_audit_log`. A acknowledges, B corrects -> two audit rows,
+    both identities present (not just the final row's own `acknowledged_by`,
+    which only ever shows B)."""
+
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord-a",
+        note="erster Hinweis",
+        now=datetime(2026, 9, 22, 8, 0, 0, tzinfo=UTC),
+    )
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord-b",
+        note="korrigierter Hinweis",
+        now=datetime(2026, 9, 22, 9, 0, 0, tzinfo=UTC),
+    )
+
+    with storage.session() as session:
+        audit_rows = session.scalars(
+            select(InventoryAuditLogRecord)
+            .where(InventoryAuditLogRecord.entity_type == "fault_acknowledgement")
+            .order_by(InventoryAuditLogRecord.id)
+        ).all()
+
+    assert len(audit_rows) == 2
+    assert audit_rows[0].ui_username == "landlord-a"
+    assert audit_rows[0].before_json is None
+    assert "erster Hinweis" in (audit_rows[0].after_json or "")
+    assert audit_rows[1].ui_username == "landlord-b"
+    assert "landlord-a" in (audit_rows[1].before_json or "")
+    assert "korrigierter Hinweis" in (audit_rows[1].after_json or "")
+    # The current `fault_acknowledgements` row alone only shows the final
+    # acknowledger -- the point of this test is that the audit log still
+    # carries both.
+    rows = storage.list_fault_acknowledgements_for_apartment(_ACK_APARTMENT)
+    assert rows[0].acknowledged_by == "landlord-b"
+
+
+def test_a_recurrence_with_a_new_since_is_a_different_occurrence(storage: Storage) -> None:
+    """The actual "recurrence" guarantee: acknowledging the fault when it
+    was first open, then it clears and reopens with a new `since`, must
+    produce a *second*, independent acknowledgement row -- the fleet never
+    conflates the two occurrences (section 12: "if the same fault recurs,
+    it shows again")."""
+
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord",
+        note=None,
+        now=datetime(2026, 9, 22, 8, 0, 0, tzinfo=UTC),
+    )
+    new_since = datetime(2026, 9, 25, 6, 0, 0, tzinfo=UTC)
+
+    keys_before = storage.list_all_fault_acknowledgement_keys()
+    assert (_ACK_APARTMENT, FaultKind.SENSOR_FAULT.value, "bathroom", new_since.replace(
+        tzinfo=None
+    )) not in keys_before
+
+    rows = storage.list_fault_acknowledgements_for_apartment(_ACK_APARTMENT)
+    assert len(rows) == 1  # the new occurrence was never acknowledged
+
+
+def test_list_all_fault_acknowledgement_keys_spans_every_apartment(storage: Storage) -> None:
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord",
+        note=None,
+        now=datetime(2026, 9, 22, tzinfo=UTC),
+    )
+    storage.acknowledge_fault(
+        "house9-b01",
+        FaultKind.BRIDGE_FAULT.value,
+        "kitchen",
+        _ACK_SINCE,
+        acknowledged_by="landlord",
+        note=None,
+        now=datetime(2026, 9, 22, tzinfo=UTC),
+    )
+
+    keys = storage.list_all_fault_acknowledgement_keys()
+
+    assert (
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE.replace(tzinfo=None),
+    ) in keys
+    assert (
+        "house9-b01",
+        FaultKind.BRIDGE_FAULT.value,
+        "kitchen",
+        _ACK_SINCE.replace(tzinfo=None),
+    ) in keys
+    assert len(keys) == 2
+
+
+def test_migration_0017_upgrade_creates_the_table(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+
+    upgrade(url)
+
+    engine = create_storage(url).engine
+    assert "fault_acknowledgements" in set(inspect(engine).get_table_names())
+    columns = {col["name"] for col in inspect(engine).get_columns("fault_acknowledgements")}
+    assert columns == {
+        "id",
+        "apartment_id",
+        "fault_kind",
+        "zone",
+        "since",
+        "acknowledged_by",
+        "acknowledged_at",
+        "note",
+    }
+
+
+def test_migration_0017_downgrade_removes_the_table(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+
+    downgrade(url, "0016")
+
+    engine = create_storage(url).engine
+    assert "fault_acknowledgements" not in set(inspect(engine).get_table_names())
+
+    # And back up again -- the round trip other migration tests exercise too.
+    upgrade(url)
+    assert "fault_acknowledgements" in set(inspect(create_storage(url).engine).get_table_names())
+
+
+# -----------------------------------------------------------------------------
 # P4.1: inventory foundation -- properties, apartments extended, devices,
 # assignments, inventory_audit_log (migration 0006_inventory.py).
 # -----------------------------------------------------------------------------

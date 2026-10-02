@@ -1043,11 +1043,14 @@ they must also stay conceptually separate, not just separately scheduled.
 
 ---
 
-## Step 6 -- Owner decisions on section 12's open points (2026-10-01)
+## Step 6 -- Section 12's owner decisions (2026-10-01)
 
-Follow-up packages for the three open points the project owner decided in
-`docs/specification.md` section 12's "Decided afterward" paragraph and
-`docs/STATUS.md`'s own "Owner decisions on section 12" entry.
+Three packages closing the "Decided afterward" paragraphs the project
+owner added to section 12 in the main session: P6.1 (retention + tenant
+change), P6.2 (login hardening -- passkeys + encrypted TOTP secrets), P6.3
+(fault acknowledgement + per-device battery/signal). Developed in
+parallel worktrees; `PROTOCOL_VERSION` and `fleet/migrations/versions/`
+are re-chained at merge if more than one bumps/adds at once.
 
 ### P6.1 -- Retention and tenant change (section 12) **SR**
 - **Goal:** a background job deleting heartbeats older than 90 days and
@@ -1061,7 +1064,7 @@ Follow-up packages for the three open points the project owner decided in
 - **Files:** `fleet/data_retention.py` (new), `fleet/storage.py`,
   `fleet/auth.py`, `fleet/app.py`, `fleet/ui_routes.py`,
   `fleet/templates/ui/tenant_change_confirm.html` (new),
-  `fleet/migrations/versions/0017_retention_and_tenant_change.py` (new),
+  `fleet/migrations/versions/0018_retention_and_tenant_change.py` (new),
   `agent/token_rotation.py` (new), `agent/commands_channel.py`,
   `agent/__main__.py`.
 - **Section:** 12.
@@ -1085,9 +1088,11 @@ Follow-up packages for the three open points the project owner decided in
   signal (`WWW-Authenticate: Bearer error="reauth_required"`) is how the
   agent learns to run the recovery flow, surfaced to it as
   `agent.commands_channel.CommandStreamReauthRequired`, retried at most
-  once by `agent.__main__._run_agent`. Migration `0017`, chained onto
-  main's `0016`. `ruff`/`mypy`/`pytest` all clean, coverage 99% overall,
-  every new line in this package's own files at 100%.
+  once by `agent.__main__._run_agent`. Migration `0017` (renumbered to
+  `0018` at the main-merge below, after P6.3's own parallel
+  `0017_fault_acknowledgements.py`). `ruff`/`mypy`/`pytest` all clean,
+  coverage 99% overall, every new line in this package's own files at
+  100%.
 - [x] **cross-review fix** (2026-10-02, see `docs/STATUS.md`'s own entry
   for the full account): both token-rotation endpoints now also require
   the OLD token as Bearer (`fleet.auth.require_apartment_reauth_old_
@@ -1102,6 +1107,51 @@ Follow-up packages for the three open points the project owner decided in
   retention limit now applies only to cleared/closed alarms (an open one
   survives regardless of age); tenant change additionally deletes the
   apartment's diagnostic bundles (row and blob, scoped to that apartment).
+
+### P6.3 -- Fault acknowledgement + per-device battery/signal **SR**
+- [x] done -- see `docs/STATUS.md`'s own P6.3 section for the full design
+  and verification output.
+- **Goal:** close P3.2's "per-device battery/signal values are not in the
+  heartbeat wire protocol" open point and P3.4's "no acknowledge/confirm
+  mechanism" open point, both per section 12's 2026-10-01 "Decided
+  afterward" paragraphs: an acknowledgement applies to the fault's current
+  occurrence only (it shows again if the identical kind/zone fault clears
+  and reopens with a new `since`); a per-device heartbeat list of
+  `(device_id, battery_percent, signal_quality)` only, `device_id` a
+  structurally-enforced opaque Zigbee IEEE address, no name/room/measured
+  value ever representable.
+- **Files:** `protocol/heartbeat.py` (`PerDeviceState`,
+  `DeviceState.per_device`, `MAX_PER_DEVICE_ENTRIES`),
+  `protocol/version.py` (`PROTOCOL_VERSION` 8 -> 9), `fleet/storage.py`
+  (`FaultAcknowledgementRecord`, `acknowledge_fault`,
+  `list_fault_acknowledgements_for_apartment`,
+  `list_all_fault_acknowledgement_keys`),
+  `fleet/migrations/versions/0017_fault_acknowledgements.py`,
+  `fleet/ui_tasks.py` (acknowledged occurrences filtered out of
+  "Aufgaben"), `fleet/ui_apartment.py` (`PerDeviceDisplay`,
+  `OpenFaultDisplay`'s new acknowledgement fields), `fleet/ui_routes.py`
+  (`POST /ui/apartments/{id}/faults/acknowledge`),
+  `fleet/templates/ui/apartment.html`.
+- **Section:** 9, 12.
+- **Acceptance:** an acknowledged occurrence (exact `apartment_id`/
+  `fault_kind`/`zone`/`since` match) is hidden from "Aufgaben" and shown as
+  quittiert on "Eine Wohnung"; the identical kind/zone fault reopening with
+  a new `since` is unaffected by the old acknowledgement and shows again;
+  acknowledgement requires login + CSRF, is re-validated against the
+  apartment's *currently* open faults (never trusted from the form alone),
+  and is audited (who/when/optional note); a heartbeat with a name-like
+  `device_id` or an extra field (`name`/`room`/`temperature`) on a
+  per-device entry is rejected with 422; the list is bounded; the
+  fleet-wide aggregates are unchanged. `fleet/ui_apartment.py::PerDeviceDisplay
+  .label` is always `None` in this scaffold -- the P4.1 inventory has no
+  table mapping a Zigbee device id to a landlord-chosen label (its
+  `Device` table tracks the base station hardware, not individual Zigbee
+  devices), left as an open point for a future package, not invented here.
+- **Depends on:** P3.2/P3.4a (the views this closes open points in), P1.3
+  (storage layer).
+- **Read back by:** main session (a new optional heartbeat field is a
+  protocol change, CLAUDE.md's "not a data collector"/"a field may only
+  ever be added" principle).
 
 ---
 

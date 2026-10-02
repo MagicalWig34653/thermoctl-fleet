@@ -245,6 +245,80 @@ class EventRecord(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
 
+class FaultAcknowledgementRecord(Base):
+    """P6.3 (section 12's "Decided afterward", 2026-10-01: "Faults can be
+    acknowledged in the UI; an acknowledgement applies to the current
+    occurrence only -- if the same fault recurs, it shows again.").
+
+    **What "occurrence" means, precisely (not decided by the specification,
+    defined here from the existing fault model since nothing else pins it
+    down):** an open fault is never its own row in this database -- it only
+    ever exists as one entry of the *latest* stored heartbeat's
+    `Heartbeat.open_faults` list (`protocol.heartbeat.OpenFault`: `kind`,
+    `zone`, `since`). `since` is the moment thermoctl itself considers the
+    fault to have become open; it stays the same across every heartbeat for
+    as long as thermoctl keeps reporting the same still-open fault, and
+    only ever changes when the fault **clears and reopens** (thermoctl
+    would not otherwise have a reason to report a new "became open" time
+    for what is, from its perspective, the same continuous problem). The
+    tuple `(apartment_id, fault_kind, zone, since)` therefore already
+    *is* the occurrence: stable for as long as the fault stays open
+    (acknowledging once covers every later heartbeat that still reports the
+    identical `since`), and naturally different the moment it reopens with
+    a new `since` -- exactly "applies to the current occurrence only ...
+    shows again" without any extra bookkeeping (no separate "cleared"
+    signal is needed or available: the fault simply stops appearing in
+    `open_faults`, and its acknowledgement row, now orphaned, is never
+    matched against anything again).
+
+    One row per acknowledged occurrence (not per key forever) -- re-
+    acknowledging the *same* occurrence (e.g. to add or correct a note)
+    updates this row in place rather than creating a second one, enforced
+    by the unique index below via `Storage.acknowledge_fault`'s
+    `INSERT ... ON CONFLICT ... DO UPDATE` (mirroring `AlarmRecord`'s own
+    conflict-handling reasoning, see `Storage.raise_alarm`). **This row
+    therefore only ever shows the *current* acknowledger** -- an earlier
+    one, overwritten by a later re-acknowledgement, stays traceable only
+    through `inventory_audit_log` (`Storage.acknowledge_fault` writes one
+    audit row per call, including re-acknowledgements, in the same
+    transaction -- see that method's own docstring).
+    """
+
+    __tablename__ = "fault_acknowledgements"
+    __table_args__ = (
+        Index(
+            "ux_fault_ack_occurrence",
+            "apartment_id",
+            "fault_kind",
+            "zone",
+            "since",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    apartment_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # `protocol.heartbeat.FaultKind` value, plain string -- same reasoning
+    # as `EventRecord.fault_kind`/`AlarmRecord.kind` (avoid a circular
+    # import with `protocol`, and keep the closed vocabulary owned by the
+    # protocol module, not re-declared as a second enum here).
+    fault_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    zone: Mapped[str] = mapped_column(String(255), nullable=False)
+    since: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    # Mandatory login + CSRF is enforced by `fleet/ui_routes.py`, not here --
+    # this column only ever records the already-authenticated username, the
+    # same "who" convention as `CommandRecord.created_by`/
+    # `InventoryAuditLogRecord.ui_username`.
+    acknowledged_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    acknowledged_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    # Optional, short -- "an optional short note" per the work package.
+    # Free text, but never a place section 6 data could leak from: a note
+    # about *acknowledging* a fault has no structural reason to ever need a
+    # room temperature, a setpoint, or a tenant's name, and nothing in this
+    # package ever reads one back into anything but this same page.
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+
 class AlarmRecord(Base):
     __tablename__ = "alarms"
     __table_args__ = (
@@ -4143,6 +4217,159 @@ class Storage:
             result = list(rows)
             session.expunge_all()
             return result
+
+    # -- fault acknowledgements (P6.3, section 12's "Decided afterward") --------
+
+    _MAX_ACKNOWLEDGEMENT_NOTE_LENGTH = 500
+
+    def acknowledge_fault(
+        self,
+        apartment_id: str,
+        fault_kind: str,
+        zone: str,
+        since: datetime,
+        *,
+        acknowledged_by: str,
+        note: str | None,
+        now: datetime,
+    ) -> None:
+        """Acknowledges one fault occurrence (`FaultAcknowledgementRecord`'s
+        own docstring defines what "occurrence" means precisely).
+
+        `INSERT ... ON CONFLICT (apartment_id, fault_kind, zone, since) DO
+        UPDATE ...` -- the same dialect-native upsert reasoning as
+        `raise_alarm` above, so re-acknowledging the identical occurrence
+        (e.g. to fix a typo in the note) updates the one existing row
+        rather than racing a second insert against the unique index under
+        concurrent requests.
+
+        **Cross-review (2026-10-02): every call -- including a re-
+        acknowledgement that only updates the existing row -- also writes an
+        `InventoryAuditLogRecord`, in the same transaction, same as every
+        other landlord action (section 20.3: "every change ... is logged:
+        who, when, why").** The upsert keeps only the *current*
+        `acknowledged_by`/`note` on the `fault_acknowledgements` row itself
+        -- without this, an earlier acknowledger would become untraceable
+        the moment someone else re-acknowledges the same occurrence (e.g.
+        to correct a typo). `before` (the row's state prior to this call,
+        `None` for a first-time acknowledgement) plus `after` (this call's
+        own values) together keep every acknowledger of a given occurrence
+        visible in `inventory_audit_log`, not just the most recent one.
+        `entity_id` is the occurrence key itself (`apartment_id` is already
+        `entity_type`-scoped elsewhere via its own column, but the
+        occurrence has no numeric row id a caller could stably reference
+        before the first insert, hence a composed string here, unlike
+        `entity_id`s elsewhere that reuse an existing natural/surrogate
+        key).
+        """
+
+        since_naive = _naive_utc(since)
+        values: dict[str, object] = {
+            "apartment_id": apartment_id,
+            "fault_kind": fault_kind,
+            "zone": zone,
+            "since": since_naive,
+            "acknowledged_by": acknowledged_by,
+            "acknowledged_at": _naive_utc(now),
+            "note": note,
+        }
+        with self.session() as session:
+            existing = session.scalar(
+                select(FaultAcknowledgementRecord).where(
+                    FaultAcknowledgementRecord.apartment_id == apartment_id,
+                    FaultAcknowledgementRecord.fault_kind == fault_kind,
+                    FaultAcknowledgementRecord.zone == zone,
+                    FaultAcknowledgementRecord.since == since_naive,
+                )
+            )
+            before: dict[str, object] | None = (
+                {
+                    "acknowledged_by": existing.acknowledged_by,
+                    "acknowledged_at": existing.acknowledged_at.isoformat(),
+                    "note": existing.note,
+                }
+                if existing is not None
+                else None
+            )
+
+            dialect = session.get_bind().dialect.name
+            # See `_insert_heartbeats_ignoring_conflicts`/`raise_alarm` above
+            # for why this branches on dialect name and why
+            # `postgresql`/`else` are excluded from coverage.
+            statement: Any
+            if dialect == "sqlite":
+                statement = _sqlite_dialect.insert(FaultAcknowledgementRecord).values(**values)
+            elif dialect == "postgresql":  # pragma: no cover -- see above
+                statement = _postgresql_dialect.insert(FaultAcknowledgementRecord).values(
+                    **values
+                )
+            else:  # pragma: no cover -- see above
+                raise NotImplementedError(
+                    f"Upsert for fault acknowledgements is not implemented for "
+                    f"the {dialect!r} SQLAlchemy dialect."
+                )
+            statement = statement.on_conflict_do_update(
+                index_elements=["apartment_id", "fault_kind", "zone", "since"],
+                set_={
+                    "acknowledged_by": acknowledged_by,
+                    "acknowledged_at": _naive_utc(now),
+                    "note": note,
+                },
+            )
+            session.execute(statement)
+
+            entity_id = f"{apartment_id}:{fault_kind}:{zone}:{since_naive.isoformat()}"
+            self._write_inventory_audit_log(
+                session,
+                ui_username=acknowledged_by,
+                entity_type="fault_acknowledgement",
+                entity_id=entity_id,
+                action="acknowledged",
+                reason=note,
+                before=before,
+                after={
+                    "acknowledged_by": acknowledged_by,
+                    "acknowledged_at": _naive_utc(now).isoformat(),
+                    "note": note,
+                },
+            )
+
+    def list_fault_acknowledgements_for_apartment(
+        self, apartment_id: str
+    ) -> list[FaultAcknowledgementRecord]:
+        """Every acknowledged occurrence ever recorded for `apartment_id`
+        (cleared or still open) -- `fleet.ui_apartment` matches these
+        against the apartment's *current* `open_faults` by occurrence key to
+        decide which open fault shows a "quittiert" badge."""
+
+        with self.session() as session:
+            rows = session.scalars(
+                select(FaultAcknowledgementRecord).where(
+                    FaultAcknowledgementRecord.apartment_id == apartment_id
+                )
+            ).all()
+            result = list(rows)
+            session.expunge_all()
+            return result
+
+    def list_all_fault_acknowledgement_keys(self) -> set[tuple[str, str, str, datetime]]:
+        """Every `(apartment_id, fault_kind, zone, since)` occurrence key
+        acknowledged anywhere in the fleet, in one batched query -- used by
+        `fleet.ui_tasks.build_task_overview` to filter "Aufgaben"'s
+        unconfirmed-faults group without one query per apartment (the same
+        "batch it, don't N+1" reasoning as `_get_open_not_reporting_alarms`
+        above)."""
+
+        with self.session() as session:
+            rows = session.execute(
+                select(
+                    FaultAcknowledgementRecord.apartment_id,
+                    FaultAcknowledgementRecord.fault_kind,
+                    FaultAcknowledgementRecord.zone,
+                    FaultAcknowledgementRecord.since,
+                )
+            ).all()
+            return {(row[0], row[1], row[2], row[3]) for row in rows}
 
     # -- inventory (P4.1, section 20) --------------------------------------------
     #

@@ -28,9 +28,14 @@ overwrites these same columns -- the old, still-unused nonce silently
 stops working, the same "single-use applied at the row level" reasoning
 `DeviceRegistrationRecord`'s own nonce column docstring already states).
 
-Revision ID: 0017
-Revises: 0016
+Revision ID: 0018
+Revises: 0017
 Create Date: 2026-10-01
+
+Re-chained at merge (2026-10-02): originally "0017"/"Revises: 0016",
+renumbered to "0018"/"Revises: 0017" onto P6.3's own, separately merged
+`0017_fault_acknowledgements.py` (both packages branched from main's
+`0016_rollouts.py` independently).
 """
 
 from __future__ import annotations
@@ -40,8 +45,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0017"
-down_revision: str | Sequence[str] | None = "0016"
+revision: str = "0018"
+down_revision: str | Sequence[str] | None = "0017"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

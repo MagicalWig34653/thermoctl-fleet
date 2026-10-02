@@ -39,11 +39,13 @@ from protocol.events import (
     fault_kind_from_key,
 )
 from protocol.heartbeat import (
+    MAX_PER_DEVICE_ENTRIES,
     ControlState,
     DeviceState,
     FaultKind,
     Heartbeat,
     OpenFault,
+    PerDeviceState,
     SystemState,
     ThermoctlState,
 )
@@ -72,6 +74,7 @@ __all__ = [
     "AGE_HEADER_MAGIC",
     "MAX_BACKUP_UPLOAD_BYTES",
     "MAX_DIAGNOSTIC_BUNDLE_UPLOAD_BYTES",
+    "MAX_PER_DEVICE_ENTRIES",
     "PROTOCOL_VERSION",
     "AgeRecipientReport",
     "AgentRegistrationFile",
@@ -98,6 +101,7 @@ __all__ = [
     "LogExcerpt",
     "OpenFault",
     "PendingRestore",
+    "PerDeviceState",
     "Property",
     "RegistrationAccepted",
     "RegistrationConfirmation",
