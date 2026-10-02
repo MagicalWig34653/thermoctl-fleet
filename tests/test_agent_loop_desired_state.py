@@ -141,15 +141,23 @@ def test_run_reports_pilot_mode_rejection_for_a_delivered_desired_state(
     default (`_issue_token`'s own apartment) -- the agent must reject,
     end to end over the real SSE channel, exactly as section 13's "Decided
     afterward" gate requires, and report that rejection back to the fleet.
+
+    P5.4d changed how this has to be tested, for the same reason as
+    `test_run_accepts_a_newer_revision_and_replaces_the_held_state` below:
+    `_handle_desired_state_received` no longer runs the reconcile attempt
+    itself -- it only signals the reconciler's own background thread and
+    returns. An `agent_restart` delivered in the same connect-time catch-up
+    batch is therefore no longer guaranteed to be processed *after* the
+    reconciler thread has woken up, acquired `ctx.agent_lock`, and reported
+    the rejection outcome. This test instead starts `run` on its own
+    thread, polls the real storage for the rejection outcome to appear
+    (bounded wait), and only *then* creates the `agent_restart` command --
+    delivered live to the still-open SSE connection -- to stop the loop.
     """
 
     token = _issue_token(app_storage)
     app_storage.create_desired_state_revision(
         APARTMENT, _desired_state(), ui_username="landlord", reason="test",
-        now=datetime.now(UTC),
-    )
-    app_storage.create_command(
-        APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
         now=datetime.now(UTC),
     )
 
@@ -166,12 +174,45 @@ def test_run_reports_pilot_mode_rejection_for_a_delivered_desired_state(
                 client=client,
                 recipients_file=tmp_path / "recipients.txt",
             )
-            _run(client, tmp_path, backup_config=backup_config, held_state_path=held_state_path)
 
-    outcome = app_storage.latest_desired_state_outcome(APARTMENT)
-    assert outcome is not None
-    assert outcome.successful is False
-    assert "pilot_mode" in outcome.reason
+            run_thread_errors: list[BaseException] = []
+
+            def _run_in_thread() -> None:
+                try:
+                    _run(
+                        client,
+                        tmp_path,
+                        backup_config=backup_config,
+                        held_state_path=held_state_path,
+                    )
+                except BaseException as error:  # noqa: BLE001 -- surfaced below
+                    run_thread_errors.append(error)
+
+            run_thread = threading.Thread(target=_run_in_thread)
+            run_thread.start()
+            try:
+                deadline = time.monotonic() + 5.0
+                outcome = None
+                while time.monotonic() < deadline:
+                    outcome = app_storage.latest_desired_state_outcome(APARTMENT)
+                    if outcome is not None:
+                        break
+                    time.sleep(0.02)
+
+                assert outcome is not None
+                assert outcome.successful is False
+                assert "pilot_mode" in outcome.reason
+            finally:
+                # Stop the loop regardless of the assertion above -- created
+                # live, delivered to the already-open SSE connection.
+                app_storage.create_command(
+                    APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+                    now=datetime.now(UTC),
+                )
+                run_thread.join(timeout=10.0)
+
+            assert not run_thread.is_alive()
+            assert run_thread_errors == []
 
     held = _load_held_desired_state(held_state_path)
     assert held is not None
@@ -306,27 +347,60 @@ def test_run_reports_disabled_reconciliation_when_backup_config_missing(
 ) -> None:
     """`backup_config=None` (the default, e.g. no `--apartment-id` given to
     `python -m agent run`) must not crash the loop -- an honest failed
-    outcome is reported instead."""
+    outcome is reported instead.
+
+    Same P5.4d restructuring as the two tests above, for the identical
+    reason: the outcome is reported by the reconciler's own background
+    thread, not synchronously on the command thread that delivers the
+    desired-state revision, so an `agent_restart` in the same connect-time
+    batch is not guaranteed to be processed after it. Runs `run` on its own
+    thread, polls the real storage for the outcome (bounded wait), then
+    delivers `agent_restart` live to stop the loop.
+    """
 
     token = _issue_token(app_storage)
     app_storage.create_desired_state_revision(
         APARTMENT, _desired_state(), ui_username="landlord", reason="test",
         now=datetime.now(UTC),
     )
-    app_storage.create_command(
-        APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
-        now=datetime.now(UTC),
-    )
 
     with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
         with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
             client.headers["Authorization"] = f"Bearer {token}"
-            _run(client, tmp_path)
 
-    outcome = app_storage.latest_desired_state_outcome(APARTMENT)
-    assert outcome is not None
-    assert outcome.successful is False
-    assert "backup_config" in outcome.reason
+            run_thread_errors: list[BaseException] = []
+
+            def _run_in_thread() -> None:
+                try:
+                    _run(client, tmp_path)
+                except BaseException as error:  # noqa: BLE001 -- surfaced below
+                    run_thread_errors.append(error)
+
+            run_thread = threading.Thread(target=_run_in_thread)
+            run_thread.start()
+            try:
+                deadline = time.monotonic() + 5.0
+                outcome = None
+                while time.monotonic() < deadline:
+                    outcome = app_storage.latest_desired_state_outcome(APARTMENT)
+                    if outcome is not None:
+                        break
+                    time.sleep(0.02)
+
+                assert outcome is not None
+                assert outcome.successful is False
+                assert "backup_config" in outcome.reason
+            finally:
+                # Stop the loop regardless of the assertion above -- created
+                # live, delivered to the already-open SSE connection.
+                app_storage.create_command(
+                    APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+                    now=datetime.now(UTC),
+                )
+                run_thread.join(timeout=10.0)
+
+            assert not run_thread.is_alive()
+            assert run_thread_errors == []
 
 
 # "Restart keeps the held state" is covered deterministically at the unit
