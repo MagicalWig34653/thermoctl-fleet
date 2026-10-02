@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from fleet.storage import InventoryAuditLogRecord, Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
+from tests.conftest import store_encrypted_totp_secret
 
 USERNAME = "landlord"
 APARTMENT = "house7-desired-state-ui"
@@ -52,9 +53,10 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
     record = storage.create_ui_user(
         username=USERNAME,
         password_hash=hash_password(password),
-        totp_secret=totp_secret,
+        totp_secret="",
         created_at=datetime.now(UTC),
     )
+    store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id
 
 

@@ -367,3 +367,167 @@ def test_rotate_epoch_missing_database_url_exits_with_an_error(
         admin_module.main(["rotate-epoch"])
 
     assert excinfo.value.code == 2
+
+
+# -- P6.2: TOTP secrets encrypted at rest ----------------------------------------
+
+
+def test_create_user_stores_an_encrypted_totp_secret(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fleet.totp_crypto import decrypt_totp_secret, load_totp_key
+
+    _patch_password(monkeypatch, secrets.token_urlsafe(16))
+
+    exit_code = admin_module.main(["create-user", "landlord"])
+    assert exit_code == 0
+
+    storage = create_storage(database_url)
+    user = storage.get_ui_user_by_username("landlord")
+    assert user is not None
+    # Stored value is not a plausible plaintext base32 TOTP secret -- it is
+    # ciphertext, and it decrypts correctly under the configured key.
+    key = load_totp_key(__import__("os").environ["FLEET_TOTP_KEY"])
+    plaintext = decrypt_totp_secret(user.totp_secret, user.id, key)
+    assert plaintext != user.totp_secret
+    assert len(plaintext) >= 16  # pyotp.random_base32()'s default length
+
+
+def test_create_user_fails_loudly_without_a_totp_key(
+    database_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("FLEET_TOTP_KEY", raising=False)
+    _patch_password(monkeypatch, secrets.token_urlsafe(16))
+
+    with pytest.raises(SystemExit) as excinfo:
+        admin_module.main(["create-user", "landlord"])
+
+    assert excinfo.value.code == 2
+    assert "FLEET_TOTP_KEY" in capsys.readouterr().err
+    # Nothing was created -- the key check runs before any password prompt.
+    assert create_storage(database_url).get_ui_user_by_username("landlord") is None
+
+
+def test_reset_totp_stores_a_newly_encrypted_secret(database_url: str) -> None:
+    from fleet.totp_crypto import decrypt_totp_secret, load_totp_key
+
+    storage = create_storage(database_url)
+    user = storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password(secrets.token_urlsafe(16)),
+        totp_secret="placeholder",
+        created_at=datetime.now(UTC),
+    )
+
+    exit_code = admin_module.main(["reset-totp", "landlord"])
+    assert exit_code == 0
+
+    refreshed = create_storage(database_url).get_ui_user_by_username("landlord")
+    assert refreshed is not None
+    assert refreshed.totp_secret != "placeholder"
+    key = load_totp_key(__import__("os").environ["FLEET_TOTP_KEY"])
+    # Decrypts cleanly, bound to this user's id.
+    decrypt_totp_secret(refreshed.totp_secret, user.id, key)
+
+
+def test_reset_totp_fails_loudly_without_a_totp_key(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = create_storage(database_url)
+    storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password(secrets.token_urlsafe(16)),
+        totp_secret="placeholder",
+        created_at=datetime.now(UTC),
+    )
+    monkeypatch.delenv("FLEET_TOTP_KEY", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        admin_module.main(["reset-totp", "landlord"])
+
+    assert excinfo.value.code == 2
+    # Untouched -- the key check happens before the secret is replaced.
+    untouched_user = create_storage(database_url).get_ui_user_by_username("landlord")
+    assert untouched_user is not None
+    assert untouched_user.totp_secret == "placeholder"
+
+
+def test_rotate_totp_key_reencrypts_every_user(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import base64
+    import os as os_module
+
+    from fleet.totp_crypto import (
+        TotpDecryptionError,
+        decrypt_totp_secret,
+        encrypt_totp_secret,
+        load_totp_key,
+    )
+
+    old_key = load_totp_key(os_module.environ["FLEET_TOTP_KEY"])
+    storage = create_storage(database_url)
+    secrets_by_user: dict[int, str] = {}
+    for name in ("landlord-a", "landlord-b"):
+        record = storage.create_ui_user(
+            username=name,
+            password_hash=hash_password(secrets.token_urlsafe(16)),
+            totp_secret="",
+            created_at=datetime.now(UTC),
+        )
+        plaintext_secret = secrets.token_hex(10)
+        storage.set_ui_user_totp_secret(
+            record.id, encrypt_totp_secret(plaintext_secret, record.id, old_key)
+        )
+        secrets_by_user[record.id] = plaintext_secret
+
+    new_key_raw = os_module.urandom(32)
+    new_key_b64 = base64.urlsafe_b64encode(new_key_raw).decode()
+    monkeypatch.setenv("FLEET_TOTP_KEY_NEW", new_key_b64)
+
+    exit_code = admin_module.main(["rotate-totp-key"])
+    assert exit_code == 0
+
+    storage_after = create_storage(database_url)
+    for user_id, plaintext_secret in secrets_by_user.items():
+        user = storage_after.get_ui_user_by_id(user_id)
+        assert user is not None
+        # No longer decryptable with the old key...
+        with pytest.raises(TotpDecryptionError):
+            decrypt_totp_secret(user.totp_secret, user_id, old_key)
+        # ...but correctly decrypts with the new one, unchanged content.
+        assert decrypt_totp_secret(user.totp_secret, user_id, new_key_raw) == plaintext_secret
+
+
+def test_rotate_totp_key_stops_at_the_first_undecryptable_row_and_reports_it(
+    database_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import base64
+    import os as os_module
+
+    storage = create_storage(database_url)
+    storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password(secrets.token_urlsafe(16)),
+        totp_secret="not-valid-ciphertext-for-any-key",
+        created_at=datetime.now(UTC),
+    )
+    monkeypatch.setenv(
+        "FLEET_TOTP_KEY_NEW", base64.urlsafe_b64encode(os_module.urandom(32)).decode()
+    )
+
+    exit_code = admin_module.main(["rotate-totp-key"])
+
+    assert exit_code == 1
+    assert "landlord" in capsys.readouterr().err
+
+
+def test_rotate_totp_key_requires_both_keys(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("FLEET_TOTP_KEY_NEW", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        admin_module.main(["rotate-totp-key"])
+
+    assert excinfo.value.code == 2

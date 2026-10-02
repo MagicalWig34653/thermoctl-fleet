@@ -29,6 +29,7 @@ from fleet.ui_inventory import (
     APARTMENT_ID_PATTERN,
     build_inventory_view,
 )
+from tests.conftest import store_encrypted_totp_secret
 
 USERNAME = "landlord"
 
@@ -248,9 +249,10 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
     record = storage.create_ui_user(
         username=USERNAME,
         password_hash=hash_password(password),
-        totp_secret=totp_secret,
+        totp_secret="",
         created_at=datetime.now(UTC),
     )
+    store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id
 
 

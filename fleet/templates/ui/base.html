@@ -31,6 +31,8 @@
         <a href="/ui/inventory">Inventar</a>
         {# P5.4c: the rollout queue list/detail view. #}
         <a href="/ui/rollouts">Rollouts</a>
+        {# P6.2: passkey (WebAuthn) management for the logged-in account. #}
+        <a href="/ui/account/webauthn">Konto</a>
         <form method="post" action="/ui/logout">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button type="submit">Abmelden</button>

@@ -1,12 +1,25 @@
-"""Login for the fleet UI (P3.0), completely separate from agent auth.
+"""Login for the fleet UI (P3.0/P6.2), completely separate from agent auth.
 
 **Decisions by the project owner, 2026-09-24 (see CLAUDE.md, not renegotiated
 here):** own user accounts in the fleet database, password hashed with
 Argon2 (`argon2-cffi`), plus TOTP as a mandatory second factor (`pyotp`),
 server-side sessions via a cookie. The first account is created via a CLI
 command (`python -m fleet.admin create-user`), never via the web. No
-external identity provider. Passkeys/WebAuthn are a possible later
-extension, not part of this package.
+external identity provider.
+
+**P6.2 (`docs/specification.md` section 12 "Decided afterward", 2026-10-01):
+passkeys (WebAuthn) are added as a second factor *next to* TOTP, not instead
+of it** -- every account still has a TOTP secret (unchanged: `fleet.admin
+create-user` always generates one), and a login's second factor is either a
+TOTP code or a verified WebAuthn assertion, modeled below as
+`TotpSecondFactor`/`WebauthnSecondFactor`, both accepted by `authenticate`.
+**TOTP secrets are now stored encrypted** (`fleet.totp_crypto`,
+AES-256-GCM, key from `FLEET_TOTP_KEY`) -- `authenticate` decrypts
+transiently, for the duration of one check, never persisting the plaintext
+anywhere. See `fleet/webauthn_auth.py` for the WebAuthn ceremonies
+themselves (registration/authentication); this module only wires their
+*outcome* into the same lockout/throttle/generic-failure machinery the TOTP
+path already uses.
 
 **Why this is a separate module from `fleet/auth.py` (CLAUDE.md: "the agent
 API is untouched and not reachable with a UI session; UI routes are not
@@ -92,8 +105,16 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, VerifyMismatchError
 from fastapi import BackgroundTasks, Cookie, Depends, HTTPException, Request
 
+from fleet import webauthn_auth
 from fleet.alarms import Notifier, notify_ui_account_locked
 from fleet.storage import Storage, UiSessionRecord, UiUserRecord, get_storage, hash_token
+from fleet.totp_crypto import (
+    TOTP_KEY_ENV,
+    TotpDecryptionError,
+    TotpKeyError,
+    decrypt_totp_secret,
+    load_totp_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +343,16 @@ def _verify_password(password_hash: str, password: str) -> bool:
     return True
 
 
+def totp_key() -> bytes:
+    """Loads and validates `FLEET_TOTP_KEY` (P6.2). Raises `TotpKeyError` if
+    missing or the wrong shape -- read fresh on every call (not cached),
+    same reasoning as every other env-driven function in this module: a
+    test must be able to change the environment and see the effect
+    immediately."""
+
+    return load_totp_key(os.environ.get(TOTP_KEY_ENV))
+
+
 def generate_totp_secret() -> str:
     return pyotp.random_base32()
 
@@ -373,12 +404,29 @@ def authenticate(
     now: datetime,
     notifiers: Sequence[Notifier] | None = None,
     background_tasks: BackgroundTasks | None = None,
+    *,
+    webauthn_assertion: str | None = None,
+    webauthn_challenge_id: int | None = None,
+    webauthn_pre_csrf: str | None = None,
 ) -> UiUserRecord | None:
-    """The single entry point for a login attempt (P3.0). Returns the
-    authenticated `UiUserRecord` on success, `None` on **any** failure --
-    unknown user, wrong password, wrong/replayed TOTP code, and a locked
-    account are all indistinguishable from the caller's point of view, by
-    design (see the module docstring).
+    """The single entry point for a login attempt (P3.0, extended by P6.2).
+    Returns the authenticated `UiUserRecord` on success, `None` on **any**
+    failure -- unknown user, wrong password, wrong/replayed TOTP code, a
+    rejected/clone-suspected passkey assertion, and a locked account are all
+    indistinguishable from the caller's point of view, by design (see the
+    module docstring).
+
+    **Second factor, P6.2:** when `webauthn_assertion` is given (non-`None`,
+    together with `webauthn_challenge_id` and `webauthn_pre_csrf` --
+    `fleet/ui_routes.py` always passes all three together or none), the
+    second factor is a WebAuthn assertion, verified via
+    `fleet.webauthn_auth.verify_login_assertion`, instead of `totp_code`
+    (which is then ignored entirely -- a request cannot present both).
+    Every other rule in this function -- unconditional Argon2 verify, the
+    lockout/notification bookkeeping, the generic `None` return on any
+    failure -- applies identically to both second-factor kinds, per the
+    task requirement "throttling/lockout from P3.0 must apply equally to
+    passkey attempts."
 
     **The Argon2 verify always runs, unconditionally, before any decision
     is made** -- including for a locked account (cross-review: an earlier
@@ -440,16 +488,58 @@ def authenticate(
     password_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
     password_ok = _verify_password(password_hash, password)
 
-    matched_step: int | None = None
-    if user is not None and password_ok and not locked:
-        matched_step = verify_totp(user.totp_secret, totp_code, now, user.last_totp_step)
+    using_webauthn = webauthn_assertion is not None
+    second_factor_ok = False
+    matched_totp_step: int | None = None
+    webauthn_outcome: webauthn_auth.LoginAssertionOutcome | None = None
 
-    if user is None or not password_ok or locked or matched_step is None:
+    if user is not None and password_ok and not locked:
+        if using_webauthn:
+            assert (
+                webauthn_assertion is not None
+                and webauthn_challenge_id is not None
+                and webauthn_pre_csrf is not None
+            )
+            webauthn_outcome = webauthn_auth.verify_login_assertion(
+                storage, user.id, webauthn_pre_csrf, webauthn_challenge_id, webauthn_assertion, now
+            )
+            second_factor_ok = webauthn_outcome.ok
+            if webauthn_outcome.clone_suspected:
+                logger.warning(
+                    "WebAuthn sign-count regression for user %r, credential %r -- "
+                    "possible cloned authenticator, login refused.",
+                    user.username,
+                    webauthn_outcome.credential.id if webauthn_outcome.credential else None,
+                )
+        else:
+            try:
+                totp_secret = decrypt_totp_secret(user.totp_secret, user.id, totp_key())
+            except (TotpKeyError, TotpDecryptionError):
+                logger.exception(
+                    "Could not decrypt TOTP secret for user %r -- treating as a failed login.",
+                    user.username,
+                )
+                totp_secret = None
+            if totp_secret is not None:
+                matched_totp_step = verify_totp(totp_secret, totp_code, now, user.last_totp_step)
+                second_factor_ok = matched_totp_step is not None
+
+    if user is None or not password_ok or locked or not second_factor_ok:
         if user is not None:
             _record_failure_and_maybe_notify(storage, user, now, notifiers, background_tasks)
         return None
 
-    if not storage.record_ui_login_success(user.id, matched_step):
+    if using_webauthn:
+        assert webauthn_outcome is not None and webauthn_outcome.credential is not None
+        assert webauthn_outcome.new_sign_count is not None
+        storage.update_webauthn_sign_count(
+            webauthn_outcome.credential.id, webauthn_outcome.new_sign_count, now
+        )
+        storage.record_ui_login_success_webauthn(user.id)
+        return user
+
+    assert matched_totp_step is not None
+    if not storage.record_ui_login_success(user.id, matched_totp_step):
         # Lost the replay race to a concurrent request presenting the same
         # code -- same outcome as any other failure, including being
         # counted toward the lockout threshold.
@@ -611,6 +701,7 @@ __all__ = [
     "resolve_client_ip",
     "session_absolute_lifetime_s",
     "session_idle_timeout_s",
+    "totp_key",
     "totp_provisioning_uri",
     "verify_totp",
 ]

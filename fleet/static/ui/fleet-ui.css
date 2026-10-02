@@ -371,3 +371,11 @@ ul.backup-list li {
     overflow-y: auto;
     margin: 0.35rem 0 0;
 }
+
+/* P6.2: the "remove this passkey" form sits inline next to its label in
+   the credential list, not stacked as its own block -- kept here rather
+   than an inline style= attribute (CSP has no 'unsafe-inline' for styles
+   either, see this file's own header comment). */
+.inline-form {
+    display: inline;
+}

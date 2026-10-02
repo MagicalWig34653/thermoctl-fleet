@@ -34,6 +34,7 @@ from fleet.ui_auth import (
     resolve_client_ip,
 )
 from fleet.ui_routes import get_ui_notifiers
+from tests.conftest import store_encrypted_totp_secret
 
 USERNAME = "landlord"
 
@@ -60,9 +61,10 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
     record = storage.create_ui_user(
         username=USERNAME,
         password_hash=hash_password(password),
-        totp_secret=totp_secret,
+        totp_secret="",
         created_at=datetime.now(UTC),
     )
+    store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id
 
 
@@ -627,6 +629,8 @@ def test_login_submit_schedules_the_notification_via_background_tasks(
         username=USERNAME,
         password="wrong",
         totp_code="000000",
+        webauthn_assertion=None,
+        webauthn_challenge_id=None,
         pre_csrf=csrf,
         pre_csrf_cookie=csrf,
         storage=storage,

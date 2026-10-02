@@ -288,11 +288,15 @@ class UiUserRecord(Base):
     # Argon2 encoded hash (`argon2.PasswordHasher().hash(...)`) -- carries its
     # own salt and parameters, nothing else is stored alongside it.
     password_hash: Mapped[str] = mapped_column(Text(), nullable=False)
-    # Base32 TOTP secret (`pyotp.random_base32()`). Stored in plain text --
-    # a known, documented open point (see docs/STATUS.md): a database leak
-    # exposes it. Passkeys/WebAuthn (avoiding a stored shared secret
-    # entirely) are a possible later extension, out of scope for P3.0.
-    totp_secret: Mapped[str] = mapped_column(String(64), nullable=False)
+    # **P6.2: encrypted at rest**, not plain text (`docs/specification.md`
+    # section 12 "Decided afterward"; `0017_totp_encryption_and_webauthn.py`
+    # widens this column from `String(64)` and encrypts every existing row
+    # in place). Holds `fleet.totp_crypto.encrypt_totp_secret`'s base64
+    # output (nonce || AES-256-GCM ciphertext+tag, bound to this row's user
+    # id as associated data), never the raw base32 secret -- decrypted only
+    # transiently, in `fleet.ui_auth`, for the duration of a single TOTP
+    # check.
+    totp_secret: Mapped[str] = mapped_column(Text(), nullable=False)
     # Replay protection (P3.0): the last TOTP time step accepted for this
     # user. A presented code resolving to a step at or before this one is
     # rejected even if otherwise correct -- see `fleet/ui_auth.py::verify_totp`.
@@ -350,6 +354,64 @@ class UiSessionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class WebauthnCredentialRecord(Base):
+    __tablename__ = "webauthn_credentials"
+
+    # One row per registered passkey (P6.2, second factor alternative to
+    # TOTP next to it -- see `docs/specification.md` section 12 "Decided
+    # afterward"). `id` is the credential id the authenticator itself
+    # generates (`PublicKeyCredential.id`, base64url in the browser API,
+    # stored here as the raw bytes `py_webauthn` works with) -- a natural
+    # key, not a surrogate one: the whole point of the authentication
+    # ceremony is "the browser hands back a credential id, the server looks
+    # up which user and public key that id belongs to", never the reverse.
+    id: Mapped[bytes] = mapped_column(LargeBinary(), primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # COSE-encoded public key (`py_webauthn`'s own
+    # `credential_public_key` bytes) -- never a private key (CLAUDE.md
+    # security principle 3's spirit extends here too: only the
+    # authenticator itself ever holds the private half).
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(), nullable=False)
+    # Clone detection (task requirement): the authenticator's own signature
+    # counter, as last observed. A future assertion presenting a counter
+    # that is not strictly greater (and non-zero) indicates either a
+    # replayed assertion or a cloned authenticator -- see
+    # `fleet.webauthn_auth.verify_login_assertion`.
+    sign_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    transports: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    # A landlord-chosen label ("YubiKey Büro", "iPhone") so multiple
+    # credentials are distinguishable in the "list/remove" UI (task
+    # requirement) -- never derived from anything the authenticator itself
+    # reports (no AAGUID-to-model lookup, which would need an external,
+    # regularly updated metadata service this package deliberately does not
+    # depend on).
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
+
+class WebauthnChallengeRecord(Base):
+    __tablename__ = "webauthn_challenges"
+
+    # A pending WebAuthn ceremony's server-chosen challenge (P6.2).
+    # Single-use (`consumed`), bounded lifetime (`expires_at`), and bound to
+    # the caller's session/pre-session identity (`binding` -- the
+    # authenticated session's token hash for a *registration* ceremony, or
+    # the pre-session CSRF cookie's value for a login *authentication*
+    # ceremony, since no session exists yet at that point in the flow; see
+    # `fleet.webauthn_auth` for which one each purpose uses). Task
+    # requirement: "challenges single-use, bounded lifetime, bound to the
+    # session."
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    challenge: Mapped[bytes] = mapped_column(LargeBinary(), nullable=False)
+    binding: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    consumed: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
 
 
 class PropertyRecord(Base):
@@ -5922,6 +5984,20 @@ class Storage:
                 session.expunge(record)
             return record
 
+    def list_ui_users(self) -> list[UiUserRecord]:
+        """Every UI account, ordered by id -- used by `fleet.admin
+        rotate-totp-key` (P6.2) to re-encrypt each row's TOTP secret in
+        turn. Not used by any request-handling path (there is no "list
+        accounts" UI page -- a single-landlord deployment has no need for
+        one, and CLAUDE.md's "no secrets in the repo" reasoning extends to
+        not building a browsable account list for data this sensitive)."""
+
+        with self.session() as session:
+            records = list(session.scalars(select(UiUserRecord).order_by(UiUserRecord.id)))
+            for record in records:
+                session.expunge(record)
+            return records
+
     def record_ui_login_failure(
         self,
         user_id: int,
@@ -6359,6 +6435,177 @@ class Storage:
 
         with self.session() as session:
             session.execute(delete(UiSessionRecord).where(UiSessionRecord.token_hash == token_hash))
+
+    def record_ui_login_success_webauthn(self, user_id: int) -> None:
+        """The WebAuthn-second-factor equivalent of `record_ui_login_success`
+        above: resets the account-level failure counter and any lock. No
+        `last_totp_step`-style CAS is needed here -- replay protection for a
+        passkey login comes from the challenge itself being single-use
+        (`consume_webauthn_challenge`), not from a counter on this row."""
+
+        with self.session() as session:
+            session.execute(
+                update(UiUserRecord)
+                .where(UiUserRecord.id == user_id)
+                .values(failed_attempts=0, locked_until=None, failure_window_started_at=None)
+            )
+
+    # -- webauthn credentials / challenges (P6.2) ----------------------------------
+
+    def create_webauthn_credential(
+        self,
+        credential_id: bytes,
+        user_id: int,
+        public_key: bytes,
+        sign_count: int,
+        transports: str | None,
+        label: str,
+        created_at: datetime,
+    ) -> WebauthnCredentialRecord:
+        with self.session() as session:
+            record = WebauthnCredentialRecord(
+                id=credential_id,
+                user_id=user_id,
+                public_key=public_key,
+                sign_count=sign_count,
+                transports=transports,
+                label=label,
+                created_at=_naive_utc(created_at),
+                last_used_at=None,
+            )
+            session.add(record)
+            session.flush()
+            session.expunge(record)
+            return record
+
+    def get_webauthn_credential(self, credential_id: bytes) -> WebauthnCredentialRecord | None:
+        with self.session() as session:
+            record = session.get(WebauthnCredentialRecord, credential_id)
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def list_webauthn_credentials(self, user_id: int) -> list[WebauthnCredentialRecord]:
+        with self.session() as session:
+            records = list(
+                session.scalars(
+                    select(WebauthnCredentialRecord)
+                    .where(WebauthnCredentialRecord.user_id == user_id)
+                    .order_by(WebauthnCredentialRecord.created_at)
+                )
+            )
+            for record in records:
+                session.expunge(record)
+            return records
+
+    def update_webauthn_sign_count(
+        self, credential_id: bytes, new_sign_count: int, now: datetime
+    ) -> None:
+        with self.session() as session:
+            session.execute(
+                update(WebauthnCredentialRecord)
+                .where(WebauthnCredentialRecord.id == credential_id)
+                .values(sign_count=new_sign_count, last_used_at=_naive_utc(now))
+            )
+
+    def write_webauthn_credential_audit_log(
+        self, ui_username: str, action: str, credential_id: bytes, label: str
+    ) -> None:
+        """Audit entry for registering/removing a passkey (task requirement:
+        "listable and removable in the UI (audited)") -- reuses
+        `inventory_audit_log` (already a generic "who/when/what changed"
+        table for several unrelated entity kinds, see
+        `_write_inventory_audit_log`'s own docstring) with `entity_type=
+        "webauthn_credential"` rather than adding a dedicated table for one
+        more audited action."""
+
+        with self.session() as session:
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="webauthn_credential",
+                entity_id=credential_id.hex(),
+                action=action,
+                reason=None,
+                before=None,
+                after={"label": label},
+            )
+
+    def delete_webauthn_credential(self, credential_id: bytes, user_id: int) -> bool:
+        """Removes a credential (task requirement: "listable and removable
+        in the UI") -- scoped to `user_id` so one account can never delete
+        another's credential by guessing/observing its id. Returns whether a
+        row was actually deleted (the caller audit-logs only a real
+        removal)."""
+
+        with self.session() as session:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(WebauthnCredentialRecord).where(
+                        WebauthnCredentialRecord.id == credential_id,
+                        WebauthnCredentialRecord.user_id == user_id,
+                    )
+                ),
+            )
+            return bool(result.rowcount and result.rowcount > 0)
+
+    def create_webauthn_challenge(
+        self,
+        purpose: str,
+        user_id: int | None,
+        challenge: bytes,
+        binding: str,
+        now: datetime,
+        lifetime_s: float,
+    ) -> int:
+        with self.session() as session:
+            record = WebauthnChallengeRecord(
+                purpose=purpose,
+                user_id=user_id,
+                challenge=challenge,
+                binding=binding,
+                created_at=_naive_utc(now),
+                expires_at=_naive_utc(now) + timedelta(seconds=lifetime_s),
+                consumed=False,
+            )
+            session.add(record)
+            session.flush()
+            challenge_id = record.id
+            session.expunge(record)
+            return challenge_id
+
+    def consume_webauthn_challenge(
+        self, challenge_id: int, purpose: str, binding: str, now: datetime
+    ) -> bytes | None:
+        """Atomically marks a pending challenge consumed and returns its
+        raw bytes -- or `None` if it does not exist, is for a different
+        purpose/binding, has already been consumed, or has expired. The
+        `UPDATE ... WHERE consumed = false ... RETURNING` shape (mirroring
+        `record_ui_login_success`'s own atomic-CAS pattern elsewhere in this
+        module) is what makes this single-use under concurrency: two
+        requests racing to consume the same challenge can never both
+        succeed, since only one `UPDATE` can ever match the still-unconsumed
+        row."""
+
+        normalized_now = _naive_utc(now)
+        with self.session() as session:
+            statement = (
+                update(WebauthnChallengeRecord)
+                .where(
+                    WebauthnChallengeRecord.id == challenge_id,
+                    WebauthnChallengeRecord.purpose == purpose,
+                    WebauthnChallengeRecord.binding == binding,
+                    WebauthnChallengeRecord.consumed.is_(False),
+                    WebauthnChallengeRecord.expires_at > normalized_now,
+                )
+                .values(consumed=True)
+                .returning(WebauthnChallengeRecord.challenge)
+            )
+            row = session.execute(statement).first()
+            if row is None:
+                return None
+            return row[0]
 
 
 def create_engine_from_url(url: str) -> Engine:

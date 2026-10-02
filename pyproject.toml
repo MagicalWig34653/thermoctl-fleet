@@ -28,6 +28,15 @@ fleet = [
     # server-rendered templates, and form parsing for FastAPI.
     "argon2-cffi>=23.1",
     "pyotp>=2.9",
+    # Passkeys / WebAuthn as a second factor alternative to TOTP (P6.2,
+    # `docs/specification.md` section 12 "Decided afterward") -- a
+    # maintained library (`py_webauthn`, PyPI name `webauthn`) does the
+    # actual registration/authentication ceremony verification (CBOR
+    # attestation/assertion parsing, COSE key handling, signature
+    # checking); see `fleet/webauthn_auth.py`. Never used to generate or
+    # hold a private key in the cloud (CLAUDE.md security principle 3) --
+    # the private half of every passkey stays on the authenticator.
+    "webauthn>=3.0.1,<4",
     "jinja2>=3.1",
     "python-multipart>=0.0.9",
     # Device registration (P4.2b, sections 4/14/15.3): validating a device's
@@ -83,6 +92,13 @@ dev = [
     # Local SMTP server for testing the SMTP notifier (P2.2) against a real
     # receiver -- no mocks, per CLAUDE.md's testing method.
     "aiosmtpd>=1.4",
+    # P6.2 tests build a real, minimal software WebAuthn authenticator
+    # (`tests/webauthn_fixtures.py`) to exercise `py_webauthn`'s actual
+    # verification code end to end ("no mocking of verification") --
+    # `cbor2` is what encodes its CBOR `attestationObject`. Already an
+    # installed transitive dependency of `webauthn` itself; pinned here
+    # explicitly so the test suite does not rely on that remaining true.
+    "cbor2>=5.6",
     # P3.0's packaging test (tests/test_packaging.py) builds a real wheel
     # with `pip wheel --no-build-isolation` to prove the UI templates are
     # actually included -- that needs the build backend itself present in

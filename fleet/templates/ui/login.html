@@ -7,8 +7,10 @@
 {% if error %}
 <p class="error" role="alert">{{ error }}</p>
 {% endif %}
-<form method="post" action="/ui/login">
+<form method="post" action="/ui/login" id="login-form">
     <input type="hidden" name="pre_csrf" value="{{ pre_csrf }}">
+    <input type="hidden" name="webauthn_assertion" id="webauthn-assertion" value="">
+    <input type="hidden" name="webauthn_challenge_id" id="webauthn-challenge-id" value="">
     <label for="username">Benutzername
         <input type="text" id="username" name="username" autocomplete="username" required autofocus>
     </label>
@@ -16,8 +18,21 @@
         <input type="password" id="password" name="password" autocomplete="current-password" required>
     </label>
     <label for="totp_code">Bestätigungscode (Authenticator-App)
-        <input type="text" id="totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code" required>
+        <input type="text" id="totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code">
     </label>
     <button type="submit">Anmelden</button>
+    {% if webauthn_enabled %}
+    {# P6.2: a passkey is an alternative to the TOTP code above, not an
+       extra field -- `webauthn.js` fills the two hidden fields above and
+       submits this same form, leaving `totp_code` empty. #}
+    <button type="button" id="webauthn-login-button">Mit Passkey anmelden</button>
+    <p id="webauthn-error" class="error" role="alert"></p>
+    {% endif %}
 </form>
+{% endblock %}
+
+{% block scripts %}
+{% if webauthn_enabled %}
+<script src="/ui/static/webauthn.js"></script>
+{% endif %}
 {% endblock %}

@@ -1,13 +1,20 @@
-"""Fleet UI account management CLI (P3.0).
+"""Fleet UI account management CLI (P3.0, extended by P6.2).
 
 `python -m fleet.admin <command> ...` -- the **only** way a UI account is
 ever created ("the first account is created via a CLI command, never via
 the web", project owner decision 2026-09-24; there is deliberately no
-`POST /ui/register` or similar endpoint anywhere in this package).
+`POST /ui/register` or similar endpoint anywhere in this package). Passkey
+(WebAuthn) credentials are added differently: a logged-in user registers
+one through the UI itself (`fleet/ui_routes.py`, re-authenticating with
+their current second factor first) -- there is no CLI command for that,
+since it needs a real browser/authenticator ceremony a terminal cannot
+perform.
 
 Uses `FLEET_DATABASE_URL`, exactly like the rest of the fleet service
 (`fleet/storage.py::get_storage`) -- no separate configuration for this
-tool.
+tool. `create-user`/`reset-totp`/`rotate-totp-key` additionally require
+`FLEET_TOTP_KEY` (P6.2, `fleet/totp_crypto.py`) to encrypt the TOTP secret
+they generate/store.
 
 The password is **always** read interactively via `getpass.getpass`, typed
 twice, never accepted from `sys.argv` or an environment variable: a
@@ -28,6 +35,14 @@ from datetime import UTC, datetime
 from sqlalchemy.exc import IntegrityError
 
 from fleet.storage import create_storage
+from fleet.totp_crypto import (
+    TOTP_KEY_ENV,
+    TotpDecryptionError,
+    TotpKeyError,
+    decrypt_totp_secret,
+    encrypt_totp_secret,
+    load_totp_key,
+)
 from fleet.ui_auth import (
     MIN_PASSWORD_LENGTH,
     generate_totp_secret,
@@ -37,6 +52,15 @@ from fleet.ui_auth import (
 )
 
 _DATABASE_URL_ENV = "FLEET_DATABASE_URL"
+_TOTP_KEY_NEW_ENV = "FLEET_TOTP_KEY_NEW"
+
+
+def _require_totp_key(env_var: str) -> bytes:
+    try:
+        return load_totp_key(os.environ.get(env_var))
+    except TotpKeyError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from None
 
 
 def _require_database_url() -> str:
@@ -93,22 +117,32 @@ def create_user(username: str) -> int:
         print(f"User {username!r} already exists.", file=sys.stderr)
         return 1
 
+    # Fetched before any Argon2/password prompting, per CLAUDE.md "startup
+    # fails loudly": there is no point asking the operator to type a
+    # password twice only to then discover the TOTP secret cannot be
+    # encrypted (P6.2).
+    key = _require_totp_key(TOTP_KEY_ENV)
+
     password = _read_new_password()
     totp_secret = generate_totp_secret()
     try:
-        storage.create_ui_user(
+        record = storage.create_ui_user(
             username=normalized_username,
+            # A placeholder -- the real, user-id-bound ciphertext is written
+            # right after, once the row (and therefore its id, the
+            # associated data) exists. See the `set_ui_user_totp_secret`
+            # call below.
             password_hash=hash_password(password),
-            totp_secret=totp_secret,
+            totp_secret="",
             created_at=datetime.now(UTC),
         )
     except IntegrityError:
         print(f"User {username!r} already exists.", file=sys.stderr)
         return 1
+    storage.set_ui_user_totp_secret(record.id, encrypt_totp_secret(totp_secret, record.id, key))
     # Printed exactly once, here, and never stored anywhere else -- the
-    # operator scans this into an authenticator app now or it is gone; the
-    # secret itself stays in the database (see docs/STATUS.md's open point
-    # on that), not repeated in any log.
+    # operator scans this into an authenticator app now or it is gone; only
+    # the encrypted form is ever persisted (P6.2).
     print(f"User {username!r} created.")
     print("Add this account to an authenticator app (shown once):")
     print(totp_provisioning_uri(normalized_username, totp_secret))
@@ -122,11 +156,55 @@ def reset_totp(username: str) -> int:
         print(f"User {username!r} not found.", file=sys.stderr)
         return 1
 
+    key = _require_totp_key(TOTP_KEY_ENV)
     totp_secret = generate_totp_secret()
-    storage.set_ui_user_totp_secret(user.id, totp_secret)
+    storage.set_ui_user_totp_secret(user.id, encrypt_totp_secret(totp_secret, user.id, key))
     print(f"TOTP secret for {username!r} reset.")
     print("Add this account to an authenticator app (shown once):")
     print(totp_provisioning_uri(user.username, totp_secret))
+    return 0
+
+
+def rotate_totp_key() -> int:
+    """`rotate-totp-key` (P6.2 key rotation procedure, see
+    `fleet/totp_crypto.py`'s module docstring): decrypts every `ui_users`
+    row with `FLEET_TOTP_KEY` (the *old* key) and re-encrypts it with
+    `FLEET_TOTP_KEY_NEW` (the new one), one row at a time.
+
+    **Fails loudly and stops on the first row it cannot decrypt** -- a
+    wrong old key would otherwise silently corrupt every subsequent
+    account's login. Each row's re-encryption is written immediately (not
+    batched into one implicit transaction across *all* rows) so a failure
+    partway through leaves every already-processed row correctly on the
+    *new* key and reports exactly which username it stopped at -- re-running
+    the command with `FLEET_TOTP_KEY` set to the new key (now correct for
+    the already-rotated rows) and `FLEET_TOTP_KEY_NEW` unchanged resumes
+    from there; it is not all-or-nothing the way the one-time migration
+    (`0017_totp_encryption_and_webauthn.py`) is, because unlike that
+    migration this is an operator-driven, re-runnable maintenance command,
+    not a single irreversible schema transition.
+    """
+
+    old_key = _require_totp_key(TOTP_KEY_ENV)
+    new_key = _require_totp_key(_TOTP_KEY_NEW_ENV)
+    storage = create_storage(_require_database_url())
+    rotated = 0
+    for user in storage.list_ui_users():
+        try:
+            plaintext = decrypt_totp_secret(user.totp_secret, user.id, old_key)
+        except TotpDecryptionError as exc:
+            print(
+                f"Could not decrypt TOTP secret for user {user.username!r} with "
+                f"{TOTP_KEY_ENV}: {exc} Rotated {rotated} user(s) before this failure; "
+                f"{TOTP_KEY_ENV} already covers those -- fix the key and re-run to "
+                "resume from here.",
+                file=sys.stderr,
+            )
+            return 1
+        storage.set_ui_user_totp_secret(user.id, encrypt_totp_secret(plaintext, user.id, new_key))
+        rotated += 1
+    print(f"Rotated {rotated} user(s) to the new TOTP key.")
+    print(f"Now set {TOTP_KEY_ENV} to the value of {_TOTP_KEY_NEW_ENV} and restart the service.")
     return 0
 
 
@@ -219,6 +297,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    subparsers.add_parser(
+        "rotate-totp-key",
+        help=(
+            "Re-encrypt every account's TOTP secret from FLEET_TOTP_KEY (old) to "
+            "FLEET_TOTP_KEY_NEW (new) -- P6.2 key rotation. Set both environment "
+            "variables before running; FLEET_TOTP_KEY must then be updated to the "
+            "new value and the service restarted."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "create-user":
@@ -231,6 +319,8 @@ def main(argv: list[str] | None = None) -> int:
         return delete_user(args.username)
     if args.command == "rotate-epoch":
         return rotate_epoch()
+    if args.command == "rotate-totp-key":
+        return rotate_totp_key()
     raise AssertionError(f"unreachable: unknown command {args.command!r}")  # pragma: no cover
 
 

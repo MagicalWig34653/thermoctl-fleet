@@ -1,6 +1,161 @@
 # Status
 
-Last updated: 2026-09-30.
+Last updated: 2026-10-02.
+
+## P6.2 -- UI login hardening: TOTP encryption at rest + passkeys (WebAuthn)
+
+Implements the two P6.2 items from the project owner's section 12 decision
+below: "TOTP secrets are stored encrypted with a key from the environment,
+never in the database" and "passkeys (WebAuthn) are added as a second
+factor next to TOTP". Closes the two P3.0 "open points" this exact gap
+used to be recorded under (removed from that section below). Worktree
+`.claude/worktrees/p6.2-login`, branch `p6.2-login`.
+
+**1. TOTP secrets encrypted at rest (`fleet/totp_crypto.py`).** AES-256-GCM
+(`cryptography.hazmat.primitives.ciphers.aead.AESGCM`, already a dependency
+via P4.2b/P5.5a -- no new cryptographic primitive, only a new use of one
+already vetted), key from `FLEET_TOTP_KEY` (32 raw bytes, base64 --
+`load_totp_key` length-checks it and raises `TotpKeyError` for anything
+else). Associated data is the row's own user id (ASCII decimal) -- binds
+ciphertext to its user, so a ciphertext copied/swapped onto a *different*
+user's row fails decryption (`InvalidTag` -> `TotpDecryptionError`) instead
+of silently handing one account's code-verification path another's secret.
+Wire format: `nonce(12) || ciphertext+tag`, base64, stored in `ui_users
+.totp_secret` (`Text`, widened from `String(64)` by migration `0017`).
+`fleet.ui_auth.authenticate` decrypts transiently, once per login attempt,
+never persisting plaintext; a decrypt failure (wrong/missing key, tampered
+ciphertext) is logged and treated as an ordinary failed login, never raised
+out of `authenticate`.
+
+**Startup fails loudly** (`fleet.app.lifespan`, CLAUDE.md "nothing hidden"):
+if any `ui_users` row exists and `FLEET_TOTP_KEY` is missing or the wrong
+shape, the service refuses to start. A fresh database with no accounts yet
+needs no key. `fleet.admin create-user`/`reset-totp` fetch and validate the
+key *before* prompting for a password, so a missing key fails immediately,
+not after the operator has already typed one in.
+
+**Migration `0017_totp_encryption_and_webauthn.py`:** widens the column and
+re-encrypts every existing plaintext row in place, in one transaction --
+requires `FLEET_TOTP_KEY` already set in the environment it runs in if any
+`ui_users` row exists, and raises `RuntimeError` (whole migration rolled
+back, nothing touched) otherwise; a database with zero accounts migrates
+with no key needed. `downgrade()` decrypts back to plaintext (same
+requirement) and narrows the column back to `String(64)` (always safe --
+a `pyotp.random_base32()` secret is far under 64 characters).
+
+**Key rotation** (`python -m fleet.admin rotate-totp-key`): reads
+`FLEET_TOTP_KEY` (old) and `FLEET_TOTP_KEY_NEW`, decrypts every row with
+the old key and re-encrypts with the new one, one row at a time, each
+written immediately (not one big implicit transaction) -- a decrypt failure
+partway through stops and reports exactly which username, already-rotated
+rows stay correctly on the new key, safe to fix the key and re-run. Operator
+then sets `FLEET_TOTP_KEY` to the new value and restarts.
+
+**2. Passkeys (WebAuthn) as a second factor alternative to TOTP**
+(`fleet/webauthn_auth.py`, using `webauthn` aka `py_webauthn`, pinned
+`>=3.0.1,<4` -- a maintained library does every CBOR/COSE/signature
+verification, never hand-rolled). TOTP stays mandatory at account creation
+(unchanged `fleet.admin create-user`); a passkey is an *additional*,
+equally-valid second factor a user can register and then use instead of a
+TOTP code at login -- "next to TOTP", not replacing it.
+
+- **RP ID/origin from the environment** (`FLEET_WEBAUTHN_RP_ID`,
+  `FLEET_WEBAUTHN_ORIGIN`, no hard-coded default -- a wrong value fails
+  every ceremony by construction, so there is no safe guess to fall back
+  to). `fleet.webauthn_auth.is_configured()` gates whether the passkey UI
+  (login button, account-page registration form) is shown at all -- a
+  deployment that never sets these two variables keeps working exactly as
+  TOTP-only P3.0 did.
+- **Registration** (`/ui/account/webauthn/register/begin`+`/complete`):
+  logged-in user, CSRF (session token), **re-authenticates with a fresh
+  TOTP code first** (task requirement "re-auth with current second
+  factor" -- TOTP is always available since it is mandatory at account
+  creation). `user_verification=REQUIRED` on both registration and
+  authentication. Challenge bound to the session's own token hash,
+  single-use (`consume_webauthn_challenge`'s atomic `UPDATE ... WHERE
+  consumed = false ... RETURNING`), 120s lifetime.
+- **Authentication (login second factor):** `/ui/login/webauthn/begin`
+  (no password check, by design -- a credential id is not a secret;
+  standard WebAuthn relying-party practice; still generic: unknown
+  username and a known user with zero passkeys both return `allow
+  Credentials: []`) hands the browser a challenge bound to the login
+  form's pre-session CSRF cookie value (no session exists yet at this
+  point -- the closest available equivalent to "bound to the session").
+  `/ui/login` itself (unchanged route) accepts either `totp_code` or
+  `webauthn_assertion`+`webauthn_challenge_id` -- `fleet.ui_auth
+  .authenticate` dispatches on which was given, but every other rule
+  (unconditional Argon2 verify, per-IP throttle reservation before either
+  branch, account-lock bookkeeping, generic failure response) is shared,
+  not duplicated per second-factor kind -- "throttling/lockout applies
+  equally to passkey attempts" (task requirement), proven directly by
+  `tests/test_ui_webauthn_routes.py
+  ::test_login_via_passkey_lockout_counts_a_failed_assertion`.
+- **Sign-count / clone detection:** `verify_login_assertion` parses the
+  presented assertion's `authenticatorData` itself first
+  (`webauthn.helpers.parse_authenticator_data`, the library's own real
+  parser) and compares its counter to the stored one *before* calling
+  `verify_authentication_response` -- doing the check only afterward
+  would be unreachable, since the library's own internal check already
+  raises the same generic `InvalidAuthenticationResponse` for a
+  non-increasing counter (found while writing the test for this, not
+  assumed). A non-increasing, non-zero counter is refused and reported as
+  `clone_suspected=True`, logged distinctly by `fleet.ui_auth.authenticate`.
+- **Credentials listable and removable, audited**
+  (`/ui/account/webauthn`, `/ui/account/webauthn/delete`) -- deletion
+  scoped to the caller's own `user_id` (a crafted id belonging to another
+  account simply matches no row, proven by test), and every create/delete
+  writes a row to the existing `inventory_audit_log` table
+  (`entity_type="webauthn_credential"`) rather than a new audit table.
+- **Small same-origin JS** (`fleet/static/ui/webauthn.js`), served under
+  `/ui/static`, `script-src 'self'` (already the CSP, unchanged) -- no
+  inline script, no CDN. Only talks to this app's own endpoints and
+  `navigator.credentials`.
+
+**Schema (migration `0017`, same file as the TOTP-encryption change):**
+`webauthn_credentials` (credential id as primary key -- the natural key a
+login assertion actually presents; public key; sign count; label;
+timestamps) and `webauthn_challenges` (purpose, optional user id,
+challenge bytes, `binding`, timestamps, `consumed`).
+
+**Tests:** `tests/test_totp_crypto.py` (round trip, wrong key, tampered
+ciphertext, associated-data mismatch when a ciphertext is decrypted under
+a different user id -- all the task's explicit encryption requirements);
+`tests/test_webauthn_auth.py` (24 tests) and `tests/test_ui_webauthn_routes
+.py` (19 tests) using `tests/webauthn_fixtures.py::SoftAuthenticator` -- a
+minimal **real** software authenticator (real CBOR via `cbor2`, real P-256
+ECDSA signatures via `cryptography`), not a mock of verification: happy
+path, replayed challenge, wrong origin, wrong RP id, counter regression
+(clone detection), credential belonging to a different user, malformed
+assertion JSON, CSRF/login-required on every state-changing endpoint.
+`soft-webauthn` (the obvious off-the-shelf alternative, built on
+`python-fido2`) could not be installed alongside the pinned
+`webauthn>=3.0.1` -- `fido2` caps `cryptography<45`, `webauthn>=3.0.1`
+needs `cryptography>=49`, a real `pip install` `ResolutionImpossible`, not
+a style choice (documented in `tests/webauthn_fixtures.py`'s own
+docstring). `tests/test_storage.py` gained six migration-0017 tests
+(encrypts existing plaintext, fails loudly without a key, a key-less
+upgrade with zero `ui_users` rows, downgrade decrypts back, webauthn
+tables created/dropped). `tests/test_admin.py` gained encryption/rotation
+coverage for `create-user`/`reset-totp`/`rotate-totp-key`. Every existing
+test file that creates a UI account and logs in for real
+(`tests/test_ui_*.py`, `tests/test_restore_e2e.py`) now stores an
+*encrypted* TOTP secret via the new `tests/conftest.py
+::store_encrypted_totp_secret` helper and a session-wide `FLEET_TOTP_KEY`
+test default (`tests/conftest.py`) -- no behavioral change to any of those
+tests, only how the fixture seeds the row.
+
+**Verification:** `ruff check .` clean; `mypy .` (149 files) and `mypy
+protocol fleet agent tools` (73 files) clean. Pytest, `go vet`/`go test`,
+`watchdog/check_contract.sh`, and the final coverage number are reported
+verbatim in the commit this section accompanies (see git log for the exact
+figures -- not restated twice in this file to avoid the two ever silently
+drifting apart).
+
+**Security question not resolved by the specification, flagged rather
+than guessed:** none encountered that blocked this package -- registration
+re-auth, challenge binding, and clone detection are all implementation
+choices for mechanisms the spec already approved (TOTP encryption,
+passkeys), not new security policy.
 
 ## Owner decisions on section 12 and remaining open points (2026-10-01, main session)
 
@@ -8257,19 +8412,11 @@ with `hmac.compare_digest`.
 
 **Open points, carried forward, not silently dropped:**
 
-- **Passkeys/WebAuthn** are a possible later extension (noted by the
-  project owner at decision time) -- not built here. Would remove the
-  stored-shared-secret risk below entirely for whoever opts in.
-- **TOTP secrets are stored in plain text** in `ui_users.totp_secret` (like
-  thermoctl's own account TOTP storage, for the same reason: a symmetric,
-  time-based one-time code needs the shared secret readable at verification
-  time, there is no salted-hash equivalent for a TOTP secret the way there
-  is for a password). A database leak exposes every account's TOTP seed,
-  not just password hashes. Mitigation options for later, not decided here:
-  encrypting `totp_secret` at rest with a key held outside the database (a
-  KMS, or an operator-supplied environment secret used only to wrap/unwrap
-  this one column), or moving to passkeys (above) where no such secret
-  exists to leak in the first place.
+- **Passkeys (WebAuthn) and TOTP-secret-at-rest encryption -- both closed
+  by P6.2** (see that section near the top of this file): TOTP secrets are
+  now AES-256-GCM-encrypted with a key from `FLEET_TOTP_KEY`, never stored
+  in plain text, and passkeys are available as a full alternative second
+  factor next to TOTP, not merely a noted possibility.
 - **No password-reset-by-mail**, on purpose: the fleet UI has exactly one
   account class (the landlord), no email sending infrastructure exists
   anywhere else in this repository, and a mail-based reset flow is its own
