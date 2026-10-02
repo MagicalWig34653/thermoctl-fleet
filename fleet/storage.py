@@ -6500,13 +6500,53 @@ class Storage:
 
     def update_webauthn_sign_count(
         self, credential_id: bytes, new_sign_count: int, now: datetime
-    ) -> None:
-        with self.session() as session:
-            session.execute(
-                update(WebauthnCredentialRecord)
-                .where(WebauthnCredentialRecord.id == credential_id)
-                .values(sign_count=new_sign_count, last_used_at=_naive_utc(now))
+    ) -> bool:
+        """Atomic compare-and-swap, not a plain write (P6.2, cross-review:
+        closes a TOCTOU between `fleet.webauthn_auth.verify_login_assertion`
+        reading `sign_count` to decide "is this presented counter an
+        increase" and this method writing the new value back). Two
+        concurrent requests racing to present an assertion for the *same*
+        stolen/duplicated authenticator state can both read the same
+        pre-update `sign_count` and both independently compute "yes, this
+        is an increase" in `verify_login_assertion` -- only one of their
+        writes may actually win here; the loser's `UPDATE` matches no row
+        (the `WHERE sign_count < :new_sign_count` guard, evaluated against
+        the row's *current*, possibly-already-advanced value, not the
+        stale one the caller read) and this returns `False`.
+
+        **`new_sign_count == 0` is exempt from the CAS guard** (always
+        succeeds, by `id` alone) -- some real authenticators never
+        increment their counter at all (a legitimate, documented case in
+        the WebAuthn spec, not a clone signal on its own); `0 < 0` would
+        otherwise make every one of their logins after the first fail this
+        CAS for no good reason. `fleet.ui_auth.authenticate`'s own clone
+        check already treats "both counters zero" as "nothing to compare,"
+        consistently.
+
+        **Caller contract: a `False` return must be treated as a failed
+        login, not a successful one with a skipped side effect** -- the
+        caller (`fleet.ui_auth.authenticate`) does exactly that, counting
+        it toward the lockout the same as any other clone-suspected
+        rejection.
+        """
+
+        if new_sign_count == 0:
+            condition = WebauthnCredentialRecord.id == credential_id
+        else:
+            condition = and_(
+                WebauthnCredentialRecord.id == credential_id,
+                WebauthnCredentialRecord.sign_count < new_sign_count,
             )
+        with self.session() as session:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(WebauthnCredentialRecord)
+                    .where(condition)
+                    .values(sign_count=new_sign_count, last_used_at=_naive_utc(now))
+                ),
+            )
+            return bool(result.rowcount and result.rowcount > 0)
 
     def write_webauthn_credential_audit_log(
         self, ui_username: str, action: str, credential_id: bytes, label: str

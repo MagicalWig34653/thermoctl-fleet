@@ -70,11 +70,21 @@ class SoftAuthenticator:
     _credentials: dict[bytes, SoftAuthenticatorCredential] = field(default_factory=dict)
 
     def create_credential(
-        self, rp_id: str, challenge: bytes, origin: str, credential_id: bytes
+        self,
+        rp_id: str,
+        challenge: bytes,
+        origin: str,
+        credential_id: bytes,
+        *,
+        user_verified: bool = True,
     ) -> str:
         """Builds a `RegistrationCredential`-shaped JSON string (what
         `navigator.credentials.create()` resolves to, serialized), using a
-        freshly generated P-256 key pair stored under `credential_id`."""
+        freshly generated P-256 key pair stored under `credential_id`.
+        `user_verified=False` clears the UV flag (bit 0x04) in `authData`
+        -- used to prove `require_user_verification=True` is actually
+        enforced by `fleet.webauthn_auth.complete_registration`, not just
+        requested and silently ignored."""
 
         private_key = ec.generate_private_key(ec.SECP256R1())
         self._credentials[credential_id] = SoftAuthenticatorCredential(
@@ -93,7 +103,9 @@ class SoftAuthenticator:
             }
         )
 
-        flags = _FLAG_USER_PRESENT | _FLAG_USER_VERIFIED | _FLAG_ATTESTED_CREDENTIAL_DATA
+        flags = _FLAG_USER_PRESENT | _FLAG_ATTESTED_CREDENTIAL_DATA
+        if user_verified:
+            flags |= _FLAG_USER_VERIFIED
         auth_data = (
             hashlib.sha256(rp_id.encode("utf-8")).digest()
             + bytes([flags])

@@ -275,6 +275,52 @@ def test_register_begin_requires_csrf(
     assert response.status_code == 403
 
 
+def test_register_begin_returns_404_when_not_configured(
+    client: TestClient,
+    password: str,
+    totp_secret: str,
+    user_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _login_with_totp(client, password, totp_secret)
+    account_page = client.get("/ui/account/webauthn")
+    csrf_token = _extract_hidden_field(account_page.text, "csrf_token")
+
+    monkeypatch.delenv(RP_ID_ENV, raising=False)
+    response = client.post(
+        "/ui/account/webauthn/register/begin",
+        data={"csrf_token": csrf_token, "totp_code": _totp_now(totp_secret, datetime.now(UTC))},
+    )
+    assert response.status_code == 404
+
+
+def test_register_complete_requires_csrf(
+    client: TestClient, password: str, totp_secret: str, user_id: int, storage: Storage
+) -> None:
+    _login_with_totp(client, password, totp_secret)
+    account_page = client.get("/ui/account/webauthn")
+    csrf_token = _extract_hidden_field(account_page.text, "csrf_token")
+
+    _reset_totp_replay_watermark(storage, USERNAME)
+    begin_response = client.post(
+        "/ui/account/webauthn/register/begin",
+        data={"csrf_token": csrf_token, "totp_code": _totp_now(totp_secret, datetime.now(UTC))},
+    )
+    assert begin_response.status_code == 200
+    options = begin_response.json()
+
+    response = client.post(
+        "/ui/account/webauthn/register/complete",
+        data={
+            "csrf_token": "wrong",
+            "challenge_id": str(options["fleetChallengeId"]),
+            "credential_json": "{}",
+            "label": "x",
+        },
+    )
+    assert response.status_code == 403
+
+
 def test_register_begin_requires_login(client: TestClient) -> None:
     response = client.post(
         "/ui/account/webauthn/register/begin",
@@ -577,3 +623,88 @@ def test_delete_credential_rejects_non_hex_credential_id(
         data={"csrf_token": csrf_token, "credential_id": "not-hex!!"},
     )
     assert response.status_code == 400
+
+
+# -- user-verification enforcement, through the real routes (cross-review) ----------
+
+
+def test_register_complete_rejects_a_credential_with_user_not_verified(
+    client: TestClient, password: str, totp_secret: str, user_id: int, storage: Storage
+) -> None:
+    _login_with_totp(client, password, totp_secret)
+    account_page = client.get("/ui/account/webauthn")
+    csrf_token = _extract_hidden_field(account_page.text, "csrf_token")
+
+    _reset_totp_replay_watermark(storage, USERNAME)
+    begin_response = client.post(
+        "/ui/account/webauthn/register/begin",
+        data={"csrf_token": csrf_token, "totp_code": _totp_now(totp_secret, datetime.now(UTC))},
+    )
+    assert begin_response.status_code == 200
+    options = begin_response.json()
+
+    authenticator = SoftAuthenticator()
+    credential_id = b"not-verified-cred"
+    credential_json = authenticator.create_credential(
+        rp_id(),
+        base64url_to_bytes(options["challenge"]),
+        ORIGIN,
+        credential_id,
+        user_verified=False,
+    )
+
+    response = client.post(
+        "/ui/account/webauthn/register/complete",
+        data={
+            "csrf_token": csrf_token,
+            "challenge_id": str(options["fleetChallengeId"]),
+            "credential_json": credential_json,
+            "label": "Unverified",
+        },
+    )
+    assert response.status_code == 400
+    assert storage.get_webauthn_credential(credential_id) is None
+
+
+def test_login_via_passkey_rejects_an_assertion_with_user_not_verified(
+    client: TestClient, password: str, totp_secret: str, user_id: int, storage: Storage
+) -> None:
+    credential_id, authenticator, _csrf = _register_passkey_via_http(
+        client, password, totp_secret, storage
+    )
+    client.post(
+        "/ui/logout",
+        data={
+            "csrf_token": _extract_hidden_field(
+                client.get("/ui/account/webauthn").text, "csrf_token"
+            )
+        },
+        follow_redirects=False,
+    )
+
+    pre_csrf, _ = _get_login_form(client)
+    begin = client.post(
+        "/ui/login/webauthn/begin", data={"username": USERNAME, "pre_csrf": pre_csrf}
+    )
+    options = begin.json()
+    assertion_json = authenticator.get_assertion(
+        rp_id(),
+        base64url_to_bytes(options["challenge"]),
+        ORIGIN,
+        credential_id,
+        user_verified=False,
+    )
+
+    response = client.post(
+        "/ui/login",
+        data={
+            "username": USERNAME,
+            "password": password,
+            "pre_csrf": pre_csrf,
+            "webauthn_assertion": assertion_json,
+            "webauthn_challenge_id": str(options["fleetChallengeId"]),
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 401
+    assert client.cookies.get("fleet_ui_session") is None

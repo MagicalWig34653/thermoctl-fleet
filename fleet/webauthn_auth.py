@@ -63,7 +63,11 @@ from webauthn import (
     verify_registration_response,
 )
 from webauthn.helpers import base64url_to_bytes, parse_authenticator_data
-from webauthn.helpers.exceptions import InvalidAuthenticationResponse, InvalidRegistrationResponse
+from webauthn.helpers.exceptions import (
+    InvalidAuthenticationResponse,
+    InvalidRegistrationResponse,
+    WebAuthnException,
+)
 from webauthn.helpers.structs import (
     AuthenticatorSelectionCriteria,
     PublicKeyCredentialDescriptor,
@@ -321,7 +325,16 @@ def verify_login_assertion(
         presented_sign_count = parse_authenticator_data(
             base64url_to_bytes(json.loads(assertion_json)["response"]["authenticatorData"])
         ).sign_count
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, WebAuthnException):
+        # `WebAuthnException` (e.g. `InvalidAuthenticatorDataStructure`,
+        # raised by `parse_authenticator_data` itself for a too-short/
+        # malformed byte string) is **not** a `ValueError` subclass --
+        # confirmed while adding `tests/test_webauthn_auth.py
+        # ::test_verify_login_assertion_rejects_malformed_authenticator
+        # _data`, which reproduced this clause letting it through
+        # uncaught (a 500 out of `fleet.ui_auth.authenticate`, not a
+        # clean login failure) before this except clause named it
+        # explicitly.
         return LoginAssertionOutcome(ok=False)
 
     if (

@@ -8,23 +8,40 @@ existing row's plaintext base32 secret is re-written in place as
 `fleet.totp_crypto.encrypt_totp_secret`'s ciphertext**, bound to that row's
 own `id` as associated data. This migration **requires `FLEET_TOTP_KEY` to
 already be set in the environment it runs in** -- reads it with
-`fleet.totp_crypto.load_totp_key` and fails loudly (`RuntimeError`, the
-whole migration transaction rolled back, nothing touched) if it is missing
-or the wrong shape **and at least one `ui_users` row exists** -- a fresh
-database with no accounts yet needs no key to migrate (there is nothing to
-encrypt), exactly mirroring `fleet.app.lifespan`'s own startup check (see
-that module) so the two "does this deployment have a usable key" checks
-agree. There is deliberately no partial/mixed-state outcome: either every
-row is re-encrypted inside this one transaction, or (on any error, for any
-row) the whole migration raises and SQLAlchemy/Alembic rolls the
-transaction back -- never some rows encrypted and others still plaintext.
+`fleet.totp_crypto.load_totp_key` and fails loudly (`RuntimeError`) if it is
+missing or the wrong shape **and at least one `ui_users` row exists** -- a
+fresh database with no accounts yet needs no key to migrate (there is
+nothing to encrypt), exactly mirroring `fleet.app.lifespan`'s own startup
+check (see that module) so the two "does this deployment have a usable
+key" checks agree. **No row is ever partially encrypted**: the key is
+loaded and validated *before* the per-row loop even starts, so either every
+row's plaintext secret is read and re-written as ciphertext, or (key
+missing/wrong) none is touched at all -- the column having already been
+widened to `Text` at that point is harmless either way (a wider column
+still holds the exact same plaintext value unchanged; see `downgrade()`
+below for the one case in this file where step ordering is *not* merely
+harmless and is instead the actual safety property).
 
-**`downgrade()` decrypts back to plaintext** (also requires the same key,
-same loud failure if missing/wrong/any row fails to decrypt -- a corrupt or
-mismatched key must never produce a silently-wrong plaintext secret that
-then fails every subsequent login) and narrows the column back to
-`String(64)` -- safe: a `pyotp.random_base32()` secret is always well under
-64 characters, so no real value is ever truncated by the narrowing.
+**`downgrade()` decrypts back to plaintext first, before touching anything
+else** (also requires the same key, same loud failure if missing/wrong/any
+row fails to decrypt -- a corrupt or mismatched key must never produce a
+silently-wrong plaintext secret that then fails every subsequent login),
+**then** drops the `webauthn_*` tables and narrows the column back to
+`String(64)`. The ordering is deliberate, not incidental: an earlier draft
+dropped the `webauthn_*` tables first and decrypted after, which meant a
+missing/wrong key still destroyed every registered passkey before the
+`RuntimeError` was ever raised -- caught by
+`tests/test_storage.py::test_migration_0017_downgrade_fails_loudly_without
+_a_totp_key` actually asserting the tables are *still there* after a failed
+downgrade, not merely that an exception was raised. (A plain Python
+exception inside an Alembic migration does **not** reliably roll back DDL
+already executed against SQLite within the same run -- `DROP TABLE` stuck
+even though the surrounding `command.upgrade`/`downgrade` call raised --
+so "put the one step that can fail *before* anything irreversible" is the
+actual guarantee here, not "the whole thing is one rolled-back
+transaction.") Narrowing the column back to `String(64)` is always safe --
+a `pyotp.random_base32()` secret is well under 64 characters, so no real
+value is ever truncated by it.
 
 **Key rotation** is a separate, idempotent operation (`fleet.admin
 rotate-totp-key`, see `fleet/totp_crypto.py`'s module docstring), not part
@@ -136,12 +153,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_webauthn_challenges_binding", table_name="webauthn_challenges")
-    op.drop_index("ix_webauthn_challenges_user_id", table_name="webauthn_challenges")
-    op.drop_table("webauthn_challenges")
-    op.drop_index("ix_webauthn_credentials_user_id", table_name="webauthn_credentials")
-    op.drop_table("webauthn_credentials")
-
+    # **The one step that can fail (decrypting every secret back to
+    # plaintext) runs first, before anything irreversible** -- dropping the
+    # `webauthn_*` tables below. See the module docstring: a plain
+    # exception here does not reliably undo DDL SQLite has already
+    # executed within this same `downgrade()` call, so correctness comes
+    # from ordering, not from an assumed transaction rollback.
     ui_users = sa.table(
         "ui_users",
         sa.column("id", sa.Integer()),
@@ -173,3 +190,9 @@ def downgrade() -> None:
         batch_op.alter_column(
             "totp_secret", existing_type=sa.Text(), type_=sa.String(length=64), nullable=False
         )
+
+    op.drop_index("ix_webauthn_challenges_binding", table_name="webauthn_challenges")
+    op.drop_index("ix_webauthn_challenges_user_id", table_name="webauthn_challenges")
+    op.drop_table("webauthn_challenges")
+    op.drop_index("ix_webauthn_credentials_user_id", table_name="webauthn_credentials")
+    op.drop_table("webauthn_credentials")

@@ -3661,6 +3661,81 @@ def test_migration_0017_downgrade_decrypts_back_to_plaintext(tmp_path: object) -
     assert secret_after == plaintext_secret
 
 
+def test_migration_0017_downgrade_fails_loudly_without_a_totp_key(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `test_migration_0017_upgrade_fails_loudly_without_a_totp_key`
+    for the opposite direction: `downgrade()` must decrypt every row back
+    to plaintext, so it needs the key just as much as `upgrade()` does --
+    and must fail loudly, leaving the schema and data untouched, if it is
+    missing."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    from fleet.totp_crypto import encrypt_totp_secret, load_totp_key
+    from fleet.ui_auth import hash_password
+
+    key = load_totp_key(os.environ["FLEET_TOTP_KEY"])
+    record = storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password("unused-here"),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+    )
+    ciphertext = encrypt_totp_secret("JBSWY3DPEHPK3PXP", record.id, key)
+    storage.set_ui_user_totp_secret(record.id, ciphertext)
+
+    monkeypatch.delenv("FLEET_TOTP_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="FLEET_TOTP_KEY"):
+        downgrade(url, "0016")
+
+    # Nothing was left half-migrated: still at 0017's schema, still the
+    # same ciphertext.
+    engine = create_storage(url).engine
+    assert "webauthn_credentials" in set(inspect(engine).get_table_names())
+    untouched = create_storage(url).get_ui_user_by_username("landlord")
+    assert untouched is not None
+    assert untouched.totp_secret == ciphertext
+
+
+def test_migration_0017_downgrade_fails_loudly_with_the_wrong_totp_key(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as above, but for a *present, well-shaped, wrong* key -- the
+    AEAD tag check must still refuse decryption rather than silently
+    writing a garbage "plaintext" secret back to the narrowed column."""
+
+    import base64
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    from fleet.totp_crypto import encrypt_totp_secret, load_totp_key
+    from fleet.ui_auth import hash_password
+
+    key = load_totp_key(os.environ["FLEET_TOTP_KEY"])
+    record = storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password("unused-here"),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+    )
+    ciphertext = encrypt_totp_secret("JBSWY3DPEHPK3PXP", record.id, key)
+    storage.set_ui_user_totp_secret(record.id, ciphertext)
+
+    wrong_key_b64 = base64.urlsafe_b64encode(os.urandom(32)).decode()
+    monkeypatch.setenv("FLEET_TOTP_KEY", wrong_key_b64)
+    with pytest.raises(RuntimeError, match=f"ui_users.id={record.id}"):
+        downgrade(url, "0016")
+
+    engine = create_storage(url).engine
+    assert "webauthn_credentials" in set(inspect(engine).get_table_names())
+    untouched = create_storage(url).get_ui_user_by_username("landlord")
+    assert untouched is not None
+    assert untouched.totp_secret == ciphertext
+
+
 def test_migration_0017_downgrade_drops_webauthn_tables(tmp_path: object) -> None:
     url = _database_url(tmp_path)
     upgrade(url)

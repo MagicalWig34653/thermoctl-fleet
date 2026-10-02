@@ -532,9 +532,24 @@ def authenticate(
     if using_webauthn:
         assert webauthn_outcome is not None and webauthn_outcome.credential is not None
         assert webauthn_outcome.new_sign_count is not None
-        storage.update_webauthn_sign_count(
+        # Atomic compare-and-swap (`Storage.update_webauthn_sign_count`'s own
+        # docstring) -- closes the TOCTOU between `verify_login_assertion`'s
+        # read of `sign_count` and this write: a concurrent request that
+        # already advanced the counter for this credential makes this CAS
+        # lose, and a lost CAS is treated exactly like a clone-suspected
+        # rejection (counted toward the lockout), never as "login succeeded,
+        # side effect skipped."
+        if not storage.update_webauthn_sign_count(
             webauthn_outcome.credential.id, webauthn_outcome.new_sign_count, now
-        )
+        ):
+            logger.warning(
+                "WebAuthn sign-count update lost a concurrency race for user %r, "
+                "credential %r -- treating as clone-suspected, login refused.",
+                user.username,
+                webauthn_outcome.credential.id,
+            )
+            _record_failure_and_maybe_notify(storage, user, now, notifiers, background_tasks)
+            return None
         storage.record_ui_login_success_webauthn(user.id)
         return user
 
