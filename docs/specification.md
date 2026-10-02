@@ -321,6 +321,16 @@ protocol code.
   percent and signal quality only -- no device names (they may contain room names), no
   measured values. Section 6 stays intact.
 
+**Decided afterward (project owner, 2026-10-02):**
+
+- **Retention, refined:** the 365-day limit for faults, alarms and events applies only to
+  *cleared/closed* ones -- anything still open is kept with its real start time regardless
+  of age (an alarm open for more than a year is a sign something needs attention, not a
+  row to silently discard).
+- **Tenant change, refined:** also deletes the apartment's diagnostic bundles (both the
+  database row and the stored blob file), scoped to that apartment only. Encrypted
+  backups still stay, under their own retention, unchanged by this addition.
+
 ---
 
 ## 13. Docker in the apartment: desired state instead of remote control

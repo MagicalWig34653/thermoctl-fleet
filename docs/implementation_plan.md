@@ -1092,10 +1092,65 @@ they must also stay conceptually separate, not just separately scheduled.
 Three packages closing the "Decided afterward" paragraphs the project
 owner added to section 12 in the main session: P6.1 (retention + tenant
 change), P6.2 (login hardening -- passkeys + encrypted TOTP secrets), P6.3
-(this package -- fault acknowledgement + per-device battery/signal).
-Developed in parallel worktrees; `PROTOCOL_VERSION` and
-`fleet/migrations/versions/` are re-chained at merge if more than one
-bumps/adds at once.
+(fault acknowledgement + per-device battery/signal). Developed in
+parallel worktrees; `PROTOCOL_VERSION` and `fleet/migrations/versions/`
+are re-chained at merge if more than one bumps/adds at once.
+
+### P6.1 -- Retention and tenant change (section 12) **SR**
+- **Goal:** a background job deleting heartbeats older than 90 days and
+  faults/alarms/events older than 365 days (both periods configurable),
+  never the audit log; and an explicit UI action, per apartment, that
+  rotates the apartment's device token (old token stops working
+  immediately, the agent recovers it via a signed challenge with its
+  existing Ed25519 device key -- no private key ever leaves the device)
+  and deletes that apartment's heartbeats, events, faults, alarms, and
+  command log excerpts (not backups, not the audit log, not inventory).
+- **Files:** `fleet/data_retention.py` (new), `fleet/storage.py`,
+  `fleet/auth.py`, `fleet/app.py`, `fleet/ui_routes.py`,
+  `fleet/templates/ui/tenant_change_confirm.html` (new),
+  `fleet/migrations/versions/0018_retention_and_tenant_change.py` (new),
+  `agent/token_rotation.py` (new), `agent/commands_channel.py`,
+  `agent/__main__.py`.
+- **Section:** 12.
+- **Acceptance:** retention boundaries exact (a row exactly at the cutoff
+  kept, one microsecond older deleted) with an injected clock; unrelated
+  tables (backups, audit log, command log excerpts, diagnostic bundles)
+  never touched by the retention job; old token 403 after rotation for an
+  unrelated caller, 401 "re-authenticate" for the device that actually held
+  it; replay/wrong-key/expired-challenge all refused; deletion scope exact
+  (another apartment's history untouched); CSRF/login/mandatory-reason
+  enforced on the UI action; agent recovers once, end to end, over a real
+  TLS harness, never loops.
+- **Depends on:** P4.2b (the signed-challenge design this package reuses),
+  P5.5a (the backup-retention pattern this package's own retention job
+  mirrors).
+- [x] done -- see `docs/STATUS.md`'s own P6.1 section for the full design:
+  no new protocol model (the token-rotation challenge/token pair reuses
+  P4.2b's `TokenChallenge`/`TokenRequest`/`TokenIssued` under a distinct
+  domain-separated message, `thermoctl-fleet/token-rotation/v1`), so
+  `PROTOCOL_VERSION` is unchanged. `fleet.auth`'s new 401 "re-authenticate"
+  signal (`WWW-Authenticate: Bearer error="reauth_required"`) is how the
+  agent learns to run the recovery flow, surfaced to it as
+  `agent.commands_channel.CommandStreamReauthRequired`, retried at most
+  once by `agent.__main__._run_agent`. Migration `0017` (renumbered to
+  `0018` at the main-merge below, after P6.3's own parallel
+  `0017_fault_acknowledgements.py`). `ruff`/`mypy`/`pytest` all clean,
+  coverage 99% overall, every new line in this package's own files at
+  100%.
+- [x] **cross-review fix** (2026-10-02, see `docs/STATUS.md`'s own entry
+  for the full account): both token-rotation endpoints now also require
+  the OLD token as Bearer (`fleet.auth.require_apartment_reauth_old_
+  token`) -- closes a found-and-reproduced gap where anyone who merely
+  knew a rotated apartment's (non-secret) id could overwrite the real
+  device's single active nonce and permanently lock it out. Rotation-
+  pending state is now also cleared by `confirm_device`/`issue_device_
+  token`/`remove_device`, not only by completing the rotation. A new
+  `agent/reauth_backoff.py` persists an exponential backoff across process
+  restarts so a persistently failing re-authentication cannot crash-loop a
+  supervised process. Two further owner decisions folded in: the 365-day
+  retention limit now applies only to cleared/closed alarms (an open one
+  survives regardless of age); tenant change additionally deletes the
+  apartment's diagnostic bundles (row and blob, scoped to that apartment).
 
 ### P6.3 -- Fault acknowledgement + per-device battery/signal **SR**
 - [x] done -- see `docs/STATUS.md`'s own P6.3 section for the full design

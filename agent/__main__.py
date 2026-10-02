@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pydantic
 
-from agent import loop
-from agent.commands_channel import CommandStreamAuthError
+from agent import loop, reauth_backoff
+from agent.commands_channel import CommandStreamAuthError, CommandStreamReauthRequired
 from agent.encryption import DEFAULT_RECIPIENTS_FILE
 from agent.registration import (
     DEFAULT_DATA_DIR,
@@ -22,8 +23,14 @@ from agent.registration import (
 )
 from agent.restore import DEFAULT_RESTORE_POLL_INTERVAL_S, RestoreTargets
 from agent.safe_io import UnsafeStateFileError
+from agent.token_rotation import TokenRotationError, reauthenticate
 from agent.transport import build_client
 from protocol.registration import AgentRegistrationFile
+
+# P6.1 cross-review fix (2026-10-02): the persisted re-authentication
+# backoff's own state file, next to the other data-dir state this CLI
+# already owns (the token, the private key, the registration status).
+_REAUTH_BACKOFF_FILENAME = "reauth_backoff"  # noqa: S105 -- a filename, not a secret
 
 # `python -m agent --version`/`agent_version` in the device-config backup
 # (P5.5a, `agent.loop._build_device_config_snapshot`) -- this scaffold has
@@ -78,6 +85,7 @@ def _run_agent(args: argparse.Namespace) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         data_dir = Path(args.data_dir)
+        backoff_path = data_dir / _REAUTH_BACKOFF_FILENAME
         token = load_token(data_dir)
         if not token:
             print(
@@ -125,25 +133,92 @@ def _run_agent(args: argparse.Namespace) -> int:
                 staging_dir=Path(args.restore_staging_dir),
                 mover_status_path=Path(args.restore_mover_status_file),
             )
-            loop.run(
-                client,
-                last_event_id_path=data_dir / loop.DEFAULT_LAST_EVENT_ID_FILE,
-                outbox_path=data_dir / loop.DEFAULT_COMMAND_OUTBOX_FILE,
-                executed_ids_path=data_dir / loop.DEFAULT_EXECUTED_IDS_FILE,
-                local_log_path=data_dir / loop.DEFAULT_LOCAL_LOG_FILE,
-                watchdog_state_path=Path(args.watchdog_state_file),
-                led_status_path=Path(args.led_status_file),
-                backup_config=backup_config,
-                restore_targets=restore_targets,
-                restore_poll_interval_s=args.restore_poll_interval_s,
-                pending_swap_path=data_dir / loop.DEFAULT_PENDING_SWAP_FILE,
-                desired_state_held_state_path=(
-                    data_dir / loop.DEFAULT_DESIRED_STATE_HELD_STATE_FILE
-                ),
-                desired_state_failed_rollback_path=(
-                    data_dir / loop.DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE
-                ),
-            )
+            # P6.1 (section 12's "Decided afterward" 2026-10-01): a tenant
+            # change rotates this apartment's agent token server-side. The
+            # SSE command channel (`agent.commands_channel.receive_commands`,
+            # called from inside `loop.run`) is where this agent actually
+            # notices -- the fleet answers its very next call with a 401
+            # carrying `error="reauth_required"`, surfaced here as
+            # `CommandStreamReauthRequired`. **Retried at most once per
+            # process**: a `reauthenticated` flag, not a loop with no exit,
+            # is what keeps this from hammering the fleet service if the
+            # rotation flow itself keeps failing (e.g. no rotation actually
+            # pending, a wrong key, a transport error) -- the second
+            # occurrence (`reauthenticated` already `True`) is never caught
+            # here and propagates to the `except CommandStreamReauthRequired`/
+            # `CommandStreamAuthError` clauses below instead, ending the
+            # process with a clear message rather than retrying forever.
+            #
+            # **Cross-review fix (2026-10-02): a persisted backoff on top,
+            # across process restarts, not only within this one.** Bounding
+            # retries to one *per process* only prevents a tight loop
+            # *inside* a single run -- under a `Restart=always`/`restart:
+            # always` policy, a process that keeps exiting with this error
+            # would otherwise be restarted instantly, forever, by whatever
+            # supervises it. `reauth_backoff.wait_if_needed` sleeps out any
+            # pending backoff (persisted to `backoff_path`, surviving
+            # exactly this kind of restart) before even attempting the
+            # rotation flow; a failure doubles it (`record_failure`, capped
+            # at `reauth_backoff.MAX_BACKOFF_S`), a success clears it
+            # (`record_success`) so the next, unrelated failure streak (if
+            # any) starts fresh.
+            reauthenticated = False
+            while True:
+                try:
+                    loop.run(
+                        client,
+                        last_event_id_path=data_dir / loop.DEFAULT_LAST_EVENT_ID_FILE,
+                        outbox_path=data_dir / loop.DEFAULT_COMMAND_OUTBOX_FILE,
+                        executed_ids_path=data_dir / loop.DEFAULT_EXECUTED_IDS_FILE,
+                        local_log_path=data_dir / loop.DEFAULT_LOCAL_LOG_FILE,
+                        watchdog_state_path=Path(args.watchdog_state_file),
+                        led_status_path=Path(args.led_status_file),
+                        backup_config=backup_config,
+                        restore_targets=restore_targets,
+                        restore_poll_interval_s=args.restore_poll_interval_s,
+                        pending_swap_path=data_dir / loop.DEFAULT_PENDING_SWAP_FILE,
+                        desired_state_held_state_path=(
+                            data_dir / loop.DEFAULT_DESIRED_STATE_HELD_STATE_FILE
+                        ),
+                        desired_state_failed_rollback_path=(
+                            data_dir / loop.DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE
+                        ),
+                    )
+                    break
+                except CommandStreamReauthRequired:
+                    if reauthenticated or not args.apartment_id:
+                        if reauthenticated:
+                            # The rotation flow itself appeared to succeed
+                            # (a new token was obtained and set), yet the
+                            # fleet still answered the retried `loop.run`
+                            # with the same reauth signal -- genuinely
+                            # unresolved, counts as a failure for backoff
+                            # purposes. Missing `--apartment-id` is a
+                            # configuration problem, not a transient one --
+                            # nothing to back off from, so left alone.
+                            reauth_backoff.record_failure(backoff_path, datetime.now(UTC))
+                        raise
+                    reauthenticated = True
+                    reauth_backoff.wait_if_needed(backoff_path, datetime.now(UTC))
+                    try:
+                        outcome = reauthenticate(args.apartment_id, data_dir, client, token)
+                    except TokenRotationError:
+                        reauth_backoff.record_failure(backoff_path, datetime.now(UTC))
+                        raise
+                    reauth_backoff.record_success(backoff_path)
+                    token = outcome.token
+                    client.headers["Authorization"] = f"Bearer {outcome.token}"
+    except CommandStreamReauthRequired:
+        print(
+            "thermoctl-agent: token re-authentication already attempted once; "
+            "refusing to retry again. Check --apartment-id and that a tenant "
+            "change is actually pending for this apartment.",
+            file=sys.stderr,
+        )
+        return 1
+    except TokenRotationError as error:
+        print(f"thermoctl-agent: token re-authentication failed: {error}", file=sys.stderr)
+        return 1
     except CommandStreamAuthError:
         print(
             "thermoctl-agent: command authorization refused; token revoked or invalid.",

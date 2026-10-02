@@ -188,6 +188,19 @@
     {% endif %}
 </section>
 
+<section aria-labelledby="tenant-change-heading">
+    <h2 id="tenant-change-heading">Mieterwechsel</h2>
+    {% if bundle_cleanup_failed %}
+    {# Cross-review fix (2026-10-02): the tenant change itself (token
+       rotation, history deletion) already succeeded by the time this
+       notice can appear -- it only ever means some diagnostic bundle
+       blob file could not be removed from disk; see the server log for
+       which one. #}
+    <p class="error" role="alert">Mieterwechsel durchgeführt. Mindestens eine Diagnose-Sicherung konnte nicht gelöscht werden -- siehe Server-Log.</p>
+    {% endif %}
+    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">Mieterwechsel durchführen</a></p>
+</section>
+
 <section aria-labelledby="commands-heading">
     <h2 id="commands-heading">Befehle</h2>
     {% if detail.retired %}

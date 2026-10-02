@@ -1214,6 +1214,13 @@ def test_migration_0006_upgrade_creates_the_new_tables(tmp_path: object) -> None
         "state",
         "heating_circuits",
         "pilot_mode",
+        # P6.1, `0017_retention_and_tenant_change.py` -- `upgrade(url)`
+        # above runs the full chain to head, not only to 0006, so these
+        # four later columns are present here too.
+        "reauth_old_token_hash",
+        "rotation_nonce_hash",
+        "rotation_nonce_expires_at",
+        "rotation_nonce_consumed_at",
     }
 
 
@@ -1301,9 +1308,22 @@ def test_migration_0006_downgrade_refuses_when_an_apartment_has_no_token(
     # Schema and data both still intact at 0006 -- nothing was touched.
     assert "properties" in tables
     assert "devices" in tables
-    apartment = storage.get_apartment("house7-a03")
-    assert apartment is not None
-    assert apartment.label == "A"
+    # Raw SQL, not `storage.get_apartment` (P6.1, `0017_retention_and_tenant
+    # _change.py`): the chain already walked all the way down from head to
+    # this point, which includes *that* migration's own downgrade -- the
+    # live schema here is genuinely revision 0006's own shape (no
+    # `reauth_old_token_hash`/`rotation_nonce_*` columns, added only by
+    # 0017, well after 0006), but `ApartmentRecord`'s ORM mapping always
+    # reflects *head*, so a `SELECT *` through the ORM at this
+    # intentionally-partial schema would itself raise "no such column" --
+    # a mismatch this test must not be confused with the `RuntimeError`
+    # it actually means to prove.
+    with engine.connect() as connection:
+        row = connection.exec_driver_sql(
+            "SELECT label FROM apartments WHERE id = ?", ("house7-a03",)
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "A"
 
 
 def test_migration_0006_backfills_a_legacy_apartment_row(tmp_path: object) -> None:
@@ -1330,15 +1350,28 @@ def test_migration_0006_backfills_a_legacy_apartment_row(tmp_path: object) -> No
 
     command.upgrade(config, "0006")
 
-    storage = create_storage(url)
-    apartment = storage.get_apartment("house7-a03")
-    assert apartment is not None
-    assert apartment.token_hash == "abc123"
-    assert apartment.property_id is None
-    assert apartment.label == "house7-a03"
-    assert apartment.state == "occupied"
-    assert apartment.heating_circuits == 0
-    assert apartment.pilot_mode is False
+    # Raw SQL, not `Storage.get_apartment` (P6.1, `0017_retention_and_tenant
+    # _change.py`): stopping the migration chain deliberately at revision
+    # 0006 means the live schema here genuinely has none of 0017's later
+    # columns yet -- `ApartmentRecord`'s ORM mapping always reflects
+    # *head*, so a `SELECT *` through the ORM against this
+    # intentionally-partial schema would itself raise "no such column",
+    # unrelated to what this test actually checks (0006's own backfill).
+    connection = sqlite3.connect(path)
+    row = connection.execute(
+        "SELECT token_hash, property_id, label, state, heating_circuits, pilot_mode "
+        "FROM apartments WHERE id = ?",
+        ("house7-a03",),
+    ).fetchone()
+    connection.close()
+    assert row is not None
+    token_hash, property_id, label, state, heating_circuits, pilot_mode = row
+    assert token_hash == "abc123"
+    assert property_id is None
+    assert label == "house7-a03"
+    assert state == "occupied"
+    assert heating_circuits == 0
+    assert pilot_mode == 0
 
 
 def test_token_hash_column_is_nullable(storage: Storage) -> None:

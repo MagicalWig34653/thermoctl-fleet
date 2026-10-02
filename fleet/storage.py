@@ -175,6 +175,25 @@ class ApartmentRecord(Base):
     # logged with a mandatory reason, see `Storage.set_apartment_pilot_mode`.
     pilot_mode: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
 
+    # -- tenant change (P6.1, section 12's "Decided afterward" 2026-10-01) --
+    # `0017_retention_and_tenant_change.py`. See that migration's own
+    # docstring for the full reasoning: `reauth_old_token_hash` is the hash
+    # of the token that was valid immediately before a tenant-change
+    # rotation (kept only so `fleet.auth` can recognise that specific,
+    # still-presenting device and answer with a 401 "re-authenticate"
+    # signal instead of the generic 403); its presence *is* "reauthentication
+    # pending" (`Storage.apartment_reauth_pending`), no separate boolean.
+    # `rotation_nonce_*` mirror `DeviceRegistrationRecord.token_nonce_*`
+    # exactly, one active challenge per apartment.
+    reauth_old_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    rotation_nonce_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    rotation_nonce_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(), nullable=True
+    )
+    rotation_nonce_consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(), nullable=True
+    )
+
 
 class HeartbeatRecord(Base):
     __tablename__ = "heartbeats"
@@ -1385,6 +1404,27 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class TenantChangeOutcome:
+    """Returned by `Storage.rotate_apartment_token_for_tenant_change`
+    (P6.1; `diagnostic_bundle_storage_paths` added for the owner decision
+    2026-10-02: tenant change also deletes the apartment's diagnostic
+    bundles). `ok` is `False` only for an unknown apartment id (nothing
+    touched, `diagnostic_bundle_storage_paths` always empty in that case).
+
+    `diagnostic_bundle_storage_paths` are the **already-deleted** rows'
+    `storage_path`s -- the metadata rows are gone the moment this method
+    returns (same transaction as everything else it does), but the actual
+    blob files on disk are not: mirrors `Storage.delete_expired_diagnostic_
+    bundles`'s own "row first, then blob, outside this transaction"
+    ordering (see that method's own docstring for why) -- the caller
+    (`fleet.ui_routes`) deletes each blob via `fleet.bundle_storage
+    .DiagnosticBundleBlobStorage.delete` after this call returns."""
+
+    ok: bool
+    diagnostic_bundle_storage_paths: list[str]
+
+
 class Storage:
     """Thin wrapper around one SQLAlchemy engine -- write/read-back functions
     for apartments (token hash), heartbeats, and events (P1.3).
@@ -1458,6 +1498,21 @@ class Storage:
             record = session.get(ApartmentRecord, apartment_id)
             return record.token_hash if record is not None else None
 
+    def get_apartment_reauth_old_token_hash(self, apartment_id: str) -> str | None:
+        """P6.1 cross-review fix -- the apartment-scoped counterpart of
+        `get_apartment_token_hash`, against `reauth_old_token_hash`
+        instead: used by `fleet.auth.require_apartment_reauth_old_token`
+        to verify the token-rotation recovery endpoints' caller actually
+        holds the OLD token for *this specific* apartment (never a lookup
+        by hash across all apartments, which would only prove "some
+        apartment was rotated", not "this one") -- `None` for an unknown
+        apartment or one with no rotation pending, exactly `get_apartment_
+        token_hash`'s own "unknown apartment" convention."""
+
+        with self.session() as session:
+            record = session.get(ApartmentRecord, apartment_id)
+            return record.reauth_old_token_hash if record is not None else None
+
     def get_apartment_label(self, apartment_id: str) -> str | None:
         """The apartment's `label`, or `None` if the apartment does not
         exist (P4.1). `label` is `NOT NULL` for every row that exists (see
@@ -1488,6 +1543,23 @@ class Storage:
         with self.session() as session:
             record = session.scalar(
                 select(ApartmentRecord).where(ApartmentRecord.token_hash == token_hash)
+            )
+            return record.id if record is not None else None
+
+    def get_apartment_id_by_reauth_old_token_hash(self, token_hash: str) -> str | None:
+        """P6.1 -- which apartment's *just-rotated-away* token hash is this,
+        or `None`. Used **only** by `fleet.auth` to decide whether a token
+        that no longer matches `token_hash` at all is a complete stranger
+        (the ordinary, generic 403) or the apartment's own agent, still
+        presenting the token a tenant-change rotation just revoked (401,
+        "re-authenticate") -- see `0017_retention_and_tenant_change.py` and
+        `fleet.auth`'s own module docstring for the full reasoning. Exactly
+        mirrors `get_apartment_id_by_token_hash` above, against the sibling
+        column instead."""
+
+        with self.session() as session:
+            record = session.scalar(
+                select(ApartmentRecord).where(ApartmentRecord.reauth_old_token_hash == token_hash)
             )
             return record.id if record is not None else None
 
@@ -3639,6 +3711,92 @@ class Storage:
             )
             return result.rowcount
 
+    # -- data retention (P6.1, section 12's "Decided afterward" 2026-10-01,
+    # owner decision 2026-10-02) ------------------------------------------------
+    # "heartbeats 90 days; faults, alarms and events 365 days ... deletion
+    # runs as a background job, periods configurable" -- `fleet.data_retention
+    # .run_data_retention` is the thin, clock-injected I/O wrapper that calls
+    # these three; each one mirrors `delete_expired_log_excerpts`'s own exact
+    # shape (a single `DELETE ... WHERE <timestamp> < cutoff`, `rowcount`
+    # returned for the caller's own logging). Deliberately three separate
+    # methods, not one generic "delete older than" helper parameterized by
+    # table -- each table's own cutoff column (and, for alarms, its own
+    # extra "closed" gate, see below) differs, and a generic helper would
+    # only hide that difference, not remove it. **Never touches the audit
+    # log, command log excerpts, diagnostic bundles, or backups** -- section
+    # 12's own explicit exclusions, enforced here by simply never naming
+    # those tables, not by a runtime check.
+    #
+    # **Owner decision, 2026-10-02 (docs/specification.md section 12's
+    # dated addendum): "the 365-day limit applies only to cleared/closed
+    # alarms, faults and events; anything still open is kept with its real
+    # start time regardless of age."** Applied to `AlarmRecord` below via
+    # an explicit `cleared_at IS NOT NULL` gate alongside the age cutoff --
+    # a still-open alarm (`cleared_at IS NULL`) is never deleted, no matter
+    # how old `raised_at` is. `EventRecord` (the "faults and events" half of
+    # that sentence) has **no "open"/"closed" state of its own in this
+    # schema at all** -- a fault event is a single, instantaneous report
+    # (section 6/18.1), never an ongoing condition this codebase tracks as
+    # "still open" the way `AlarmRecord.cleared_at` tracks an alarm; there
+    # is therefore no column here for this decision to gate on, and
+    # `delete_events_older_than` is unchanged (every event strictly older
+    # than the cutoff is deleted, as it already was).
+
+    def delete_heartbeats_older_than(self, cutoff: datetime) -> int:
+        """Deletes every `HeartbeatRecord` with `received_at` strictly
+        before `cutoff` -- a heartbeat exactly at the cutoff is kept, not
+        deleted (section 12: "90 days", read as "older than", not "at
+        least")."""
+
+        normalized_cutoff = _naive_utc(cutoff)
+        with self.session() as session:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(HeartbeatRecord).where(HeartbeatRecord.received_at < normalized_cutoff)
+                ),
+            )
+            return result.rowcount
+
+    def delete_events_older_than(self, cutoff: datetime) -> int:
+        """Deletes every `EventRecord` (section 6/18.1's fault reports) with
+        `received_at` strictly before `cutoff` -- see
+        `delete_heartbeats_older_than` for the exact boundary semantics."""
+
+        normalized_cutoff = _naive_utc(cutoff)
+        with self.session() as session:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(EventRecord).where(EventRecord.received_at < normalized_cutoff)
+                ),
+            )
+            return result.rowcount
+
+    def delete_alarms_older_than(self, cutoff: datetime) -> int:
+        """Deletes every **cleared** `AlarmRecord` with `raised_at`
+        strictly before `cutoff` -- owner decision, 2026-10-02: "the
+        365-day limit applies only to cleared/closed alarms ... anything
+        still open is kept with its real start time regardless of age."
+        A still-open alarm (`cleared_at IS NULL`) is therefore never
+        deleted here, no matter how old it is -- the age cutoff and the
+        "closed" gate are both part of the same `WHERE` clause, not a
+        separate check. See `delete_heartbeats_older_than` for the exact
+        boundary semantics of the age cutoff itself."""
+
+        normalized_cutoff = _naive_utc(cutoff)
+        with self.session() as session:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(AlarmRecord).where(
+                        AlarmRecord.raised_at < normalized_cutoff,
+                        AlarmRecord.cleared_at.is_not(None),
+                    )
+                ),
+            )
+            return result.rowcount
+
     # -- diagnostic bundles (P5.3b, sections 15.1, 21.5) --------------------------
 
     def store_diagnostic_bundle(
@@ -4285,6 +4443,51 @@ class Storage:
                 before_json=json.dumps(before) if before is not None else None,
                 after_json=json.dumps(after) if after is not None else None,
             )
+        )
+
+    def _clear_reauth_rotation_state(
+        self,
+        session: Session,
+        apartment: ApartmentRecord,
+        *,
+        ui_username: str,
+        reason: str | None,
+        action: str,
+    ) -> None:
+        """Clears a stale tenant-change rotation state (P6.1,
+        `reauth_old_token_hash`/`rotation_nonce_*`) for `apartment` --
+        cross-review fix: an ordinary, independent lifecycle event for the
+        same apartment (a fresh device confirmation, an ordinary
+        (non-rotation) token issuance, or a device removal) used to leave
+        this state untouched, so a tenant change's leftover
+        `reauth_old_token_hash` could keep answering a very old,
+        already-superseded token with the 401 "re-authenticate" signal
+        indefinitely, long after the apartment's real token had already
+        moved on through a completely different path. Called from
+        `confirm_device`, `issue_device_token`, and `remove_device`, each
+        in the same transaction as their own write, using the caller's
+        already-open `session` -- mirrors `_write_inventory_audit_log`'s
+        own "same transaction as the change" discipline.
+
+        A no-op, and never audit-logged, if nothing was actually pending
+        (the overwhelmingly common case -- most apartments never go
+        through a tenant change at all)."""
+
+        if apartment.reauth_old_token_hash is None and apartment.rotation_nonce_hash is None:
+            return
+        apartment.reauth_old_token_hash = None
+        apartment.rotation_nonce_hash = None
+        apartment.rotation_nonce_expires_at = None
+        apartment.rotation_nonce_consumed_at = None
+        self._write_inventory_audit_log(
+            session,
+            ui_username=ui_username,
+            entity_type="apartment",
+            entity_id=apartment.id,
+            action=action,
+            reason=reason,
+            before={"reauth_pending": True},
+            after={"reauth_pending": False},
         )
 
     def create_property(
@@ -5113,6 +5316,17 @@ class Storage:
                     f"Wohnung {apartment_id!r} ist stillgelegt."
                 )
 
+            # Cross-review fix (P6.1): a device freshly confirmed for this
+            # apartment makes any outstanding tenant-change rotation moot
+            # -- see `_clear_reauth_rotation_state`'s own docstring.
+            self._clear_reauth_rotation_state(
+                session,
+                apartment,
+                ui_username=ui_user,
+                reason=reason,
+                action="tenant_change_rotation_superseded",
+            )
+
             previous_assignment = session.scalar(
                 select(AssignmentRecord).where(
                     AssignmentRecord.apartment_id == apartment_id,
@@ -5808,7 +6022,23 @@ class Storage:
                 session.execute(
                     update(ApartmentRecord)
                     .where(ApartmentRecord.id == apartment_id, ApartmentRecord.state != "retired")
-                    .values(token_hash=token_hash)
+                    .values(
+                        token_hash=token_hash,
+                        # Cross-review fix (P6.1): this ordinary (non-
+                        # rotation) token issuance makes any outstanding
+                        # tenant-change rotation state stale -- a fresh
+                        # token now exists through a completely different
+                        # path, so a leftover `reauth_old_token_hash` must
+                        # not keep answering some very old token with the
+                        # 401 "re-authenticate" signal forever. Cleared
+                        # unconditionally in this same `UPDATE` (harmless,
+                        # idempotent, even when nothing was pending) rather
+                        # than a separate read-then-clear step.
+                        reauth_old_token_hash=None,
+                        rotation_nonce_hash=None,
+                        rotation_nonce_expires_at=None,
+                        rotation_nonce_consumed_at=None,
+                    )
                 ),
             )
             if not token_result.rowcount:
@@ -5832,6 +6062,300 @@ class Storage:
                 reason=None,
                 before={"token_issued_at": None},
                 after={"token_issued_at": normalized_now.isoformat()},
+            )
+
+        return raw_token
+
+    # -- tenant change (P6.1, section 12's "Decided afterward" 2026-10-01) ------
+    #
+    # "An explicit UI action (confirmation, mandatory reason, audited)
+    # rotates the apartment's device token -- the agent obtains the new one
+    # through a signed challenge with its existing device key, no private
+    # key ever leaves the device -- and deletes the apartment's heartbeats,
+    # events, faults, alarms and command log excerpts. Encrypted backups
+    # stay, under their own retention."
+    #
+    # Deliberately reuses `protocol.registration`'s own `TokenChallenge`/
+    # `TokenRequest`/`TokenIssued` models and the identical signed-challenge
+    # shape P4.2b already established (`fleet.app.request_token_challenge`/
+    # `request_device_token`) -- a different *domain prefix*
+    # (`thermoctl-fleet/token-rotation/v1\0`, `fleet.app
+    # .request_token_rotation_token`) and a different subject
+    # (`apartment_id`, not a `registration_id`) are the only things that
+    # differ; no new protocol model is needed, so `PROTOCOL_VERSION` is not
+    # bumped for this package.
+
+    def apartment_reauth_pending(self, apartment_id: str) -> bool:
+        """`True` iff `apartment_id` has a tenant-change rotation awaiting
+        the device's signed re-authentication (`reauth_old_token_hash IS NOT
+        NULL`) -- see `0017_retention_and_tenant_change.py` for why this
+        column's mere presence *is* the state, with no separate boolean.
+        Used by `fleet.app`'s two rotation-challenge endpoints to refuse a
+        request for an apartment that is not actually mid-rotation, the
+        same uniform-404 reasoning `Storage.issue_token_challenge` already
+        applies to an unrelated `registration_id`."""
+
+        with self.session() as session:
+            record = session.get(ApartmentRecord, apartment_id)
+            return record is not None and record.reauth_old_token_hash is not None
+
+    def get_current_device_public_key_for_apartment(self, apartment_id: str) -> str | None:
+        """The Ed25519 public key of the device **currently** assigned to
+        `apartment_id` (an open `AssignmentRecord`), taken from the most
+        recently confirmed, token-issuing `DeviceRegistrationRecord` for
+        that exact `(device, apartment)` pair -- the same row
+        `issue_device_token` itself wrote `token_issued_at` onto. Returns
+        `None` if there is no open assignment, or no such registration row
+        (a device that was assigned without ever completing P4.2b's own
+        token exchange cannot be the target of a rotation challenge --
+        there is no key on file to verify a signature against)."""
+
+        with self.session() as session:
+            assignment = session.scalar(
+                select(AssignmentRecord).where(
+                    AssignmentRecord.apartment_id == apartment_id,
+                    AssignmentRecord.ended_at.is_(None),
+                )
+            )
+            if assignment is None:
+                return None
+            registration = session.scalar(
+                select(DeviceRegistrationRecord)
+                .where(
+                    DeviceRegistrationRecord.device_id == assignment.device_id,
+                    DeviceRegistrationRecord.apartment_id == apartment_id,
+                    DeviceRegistrationRecord.confirmed_at.is_not(None),
+                    DeviceRegistrationRecord.token_issued_at.is_not(None),
+                    DeviceRegistrationRecord.public_key.is_not(None),
+                )
+                .order_by(DeviceRegistrationRecord.confirmed_at.desc())
+                .limit(1)
+            )
+            return registration.public_key if registration is not None else None
+
+    def rotate_apartment_token_for_tenant_change(
+        self, apartment_id: str, reason: str, ui_username: str, now: datetime
+    ) -> TenantChangeOutcome:
+        """The UI action's one entry point (`fleet.ui_routes`) -- in a
+        single transaction:
+
+        1. **Stops the old token immediately**: `token_hash` is cleared, its
+           previous value moved to `reauth_old_token_hash` (so the device
+           still presenting it gets `fleet.auth`'s distinguishable
+           "re-authenticate" 401, not merely the same 403 a stranger would
+           get) -- `None` if the apartment never had a token yet (nothing to
+           preserve, nothing to rotate).
+        2. **Deletes this apartment's heartbeats, events, alarms, command
+           log excerpts, and diagnostic bundle metadata rows** -- section
+           12's list plus the owner's 2026-10-02 addendum ("tenant change
+           additionally deletes the apartment's diagnostic bundles").
+           Backups, the audit log, and every inventory row
+           (`ApartmentRecord` itself, `AssignmentRecord`, `DeviceRecord`)
+           are deliberately **not** touched here: the apartment keeps
+           existing, keeps its device assignment, keeps its backups under
+           their own retention (`fleet.backup_retention`) -- only the
+           *operational history* belonging to the outgoing tenancy is
+           erased. The diagnostic bundles' own **blob files** are not
+           deleted in this transaction (filesystem writes are not
+           transactional with the database) -- see `TenantChangeOutcome`'s
+           own docstring for the "row first, then blob, by the caller"
+           ordering this mirrors from `delete_expired_diagnostic_bundles`.
+        3. **Writes one audit log entry**, mandatory reason included,
+           committed in the same transaction as everything above (section
+           20.3's "every change ... is logged", the same discipline
+           `_write_inventory_audit_log`'s own docstring states).
+
+        Returns `TenantChangeOutcome(ok=False, ...)` for an unknown
+        `apartment_id` (nothing is touched); `ok=True` otherwise, regardless
+        of whether a token existed to rotate -- a tenant change on an
+        apartment whose device has not yet completed registration still
+        deletes any stray history and is still audited.
+        """
+
+        del now  # accepted for signature consistency with every other
+        # clock-injected `Storage` method; unused here -- this action has no
+        # time-based arithmetic of its own (`_write_inventory_audit_log`
+        # always timestamps with the real clock, like every other audited
+        # change in this module).
+        with self.session() as session:
+            apartment = session.get(ApartmentRecord, apartment_id)
+            if apartment is None:
+                return TenantChangeOutcome(ok=False, diagnostic_bundle_storage_paths=[])
+
+            old_token_hash = apartment.token_hash
+            apartment.token_hash = None
+            apartment.reauth_old_token_hash = old_token_hash
+            # A tenant change always starts a fresh rotation window -- any
+            # earlier, still-unconsumed rotation nonce for this apartment
+            # (an interrupted previous tenant change) is discarded, the
+            # same "single current nonce" reasoning `issue_token_challenge`
+            # already applies to `DeviceRegistrationRecord`.
+            apartment.rotation_nonce_hash = None
+            apartment.rotation_nonce_expires_at = None
+            apartment.rotation_nonce_consumed_at = None
+
+            deleted_heartbeats = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(HeartbeatRecord).where(HeartbeatRecord.apartment_id == apartment_id)
+                ),
+            ).rowcount
+            deleted_events = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(EventRecord).where(EventRecord.apartment_id == apartment_id)
+                ),
+            ).rowcount
+            deleted_alarms = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(AlarmRecord).where(AlarmRecord.apartment_id == apartment_id)
+                ),
+            ).rowcount
+            deleted_log_excerpts = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(CommandLogExcerptRecord).where(
+                        CommandLogExcerptRecord.apartment_id == apartment_id
+                    )
+                ),
+            ).rowcount
+
+            # Owner decision, 2026-10-02: tenant change also deletes the
+            # apartment's diagnostic bundles -- metadata rows here (read
+            # first, for their `storage_path`s, same "row first, then
+            # blob" ordering `delete_expired_diagnostic_bundles` already
+            # establishes); the caller deletes the actual blob files
+            # afterward, see `TenantChangeOutcome`'s own docstring.
+            diagnostic_bundle_rows = list(
+                session.scalars(
+                    select(DiagnosticBundleRecord).where(
+                        DiagnosticBundleRecord.apartment_id == apartment_id
+                    )
+                ).all()
+            )
+            diagnostic_bundle_storage_paths = [row.storage_path for row in diagnostic_bundle_rows]
+            deleted_diagnostic_bundles = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(DiagnosticBundleRecord).where(
+                        DiagnosticBundleRecord.apartment_id == apartment_id
+                    )
+                ),
+            ).rowcount
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username=ui_username,
+                entity_type="apartment",
+                entity_id=apartment_id,
+                action="tenant_change",
+                reason=reason,
+                before={"token_hash": "set" if old_token_hash is not None else None},
+                after={
+                    "token_hash": None,
+                    "reauth_pending": old_token_hash is not None,
+                    "deleted_heartbeats": deleted_heartbeats,
+                    "deleted_events": deleted_events,
+                    "deleted_alarms": deleted_alarms,
+                    "deleted_command_log_excerpts": deleted_log_excerpts,
+                    "deleted_diagnostic_bundles": deleted_diagnostic_bundles,
+                },
+            )
+            return TenantChangeOutcome(
+                ok=True, diagnostic_bundle_storage_paths=diagnostic_bundle_storage_paths
+            )
+
+    def issue_token_rotation_challenge(
+        self, apartment_id: str, nonce_hash: str, now: datetime
+    ) -> datetime | None:
+        """`POST /v1/apartments/{apartment}/token-rotation/challenge` --
+        issues a fresh, single-use nonce for an apartment that actually has
+        a rotation pending (`reauth_old_token_hash IS NOT NULL`), exactly
+        mirroring `issue_token_challenge`'s own guarded-`UPDATE` shape
+        (guard and write in one statement, so two concurrent requests
+        cannot leave an inconsistent nonce/expiry pair). Returns `None` for
+        an unknown apartment or one with no rotation pending."""
+
+        normalized_now = _naive_utc(now)
+        new_expires_at = normalized_now + timedelta(minutes=self._TOKEN_NONCE_VALID_MINUTES)
+        with self.session() as session:
+            statement = (
+                update(ApartmentRecord)
+                .where(
+                    ApartmentRecord.id == apartment_id,
+                    ApartmentRecord.reauth_old_token_hash.is_not(None),
+                )
+                .values(
+                    rotation_nonce_hash=nonce_hash,
+                    rotation_nonce_expires_at=new_expires_at,
+                    rotation_nonce_consumed_at=None,
+                )
+                .returning(ApartmentRecord.id)
+            )
+            row = session.execute(statement).first()
+            if row is None:
+                return None
+            return new_expires_at
+
+    def complete_token_rotation(self, apartment_id: str, nonce: str, now: datetime) -> str | None:
+        """`POST /v1/apartments/{apartment}/token-rotation/token` -- the
+        caller (`fleet.app.request_token_rotation_token`) has **already
+        verified the Ed25519 signature** against `Storage
+        .get_current_device_public_key_for_apartment`'s own return value;
+        this method only ever handles the *storage* side: nonce unexpired
+        and unused, a rotation genuinely pending, and -- all in the one
+        guarded `UPDATE` below -- generating the new token, writing it, and
+        clearing the rotation state so a second call with the same
+        (by-then-stale) nonce fails exactly like `issue_device_token`'s own
+        "exactly one token per registration" guarantee.
+
+        Returns the raw new token on success (nowhere stored in plain text
+        beyond this return value), or `None` for any refusal -- unknown
+        apartment, no rotation pending, wrong/expired/already-consumed
+        nonce. Every one of these is deliberately indistinguishable to the
+        caller, mirroring `issue_device_token`'s own "every failure looks
+        the same" reasoning.
+        """
+
+        normalized_now = _naive_utc(now)
+        nonce_hash = hash_token(nonce)
+        raw_token = f"agent_{apartment_id}_{secrets.token_urlsafe(32)}"
+        token_hash = hash_token(raw_token)
+
+        with self.session() as session:
+            statement = (
+                update(ApartmentRecord)
+                .where(
+                    ApartmentRecord.id == apartment_id,
+                    ApartmentRecord.reauth_old_token_hash.is_not(None),
+                    ApartmentRecord.rotation_nonce_hash == nonce_hash,
+                    ApartmentRecord.rotation_nonce_consumed_at.is_(None),
+                    ApartmentRecord.rotation_nonce_expires_at.is_not(None),
+                    ApartmentRecord.rotation_nonce_expires_at > normalized_now,
+                )
+                .values(
+                    token_hash=token_hash,
+                    reauth_old_token_hash=None,
+                    rotation_nonce_hash=None,
+                    rotation_nonce_expires_at=None,
+                    rotation_nonce_consumed_at=normalized_now,
+                )
+                .returning(ApartmentRecord.id)
+            )
+            row = session.execute(statement).first()
+            if row is None:
+                return None
+
+            self._write_inventory_audit_log(
+                session,
+                ui_username="agent:token-rotation",
+                entity_type="apartment",
+                entity_id=apartment_id,
+                action="token_rotated",
+                reason=None,
+                before={"reauth_pending": True},
+                after={"reauth_pending": False},
             )
 
         return raw_token
@@ -6098,6 +6622,18 @@ class Storage:
             # out. Mirrors `confirm_device`'s own `had_token` computation.
             had_token = apartment.token_hash is not None
             apartment.token_hash = None
+            # Cross-review fix (P6.1): removing the device ends any
+            # outstanding tenant-change rotation -- nothing will ever
+            # complete it now, so the stale state must not keep answering
+            # a very old token with the 401 "re-authenticate" signal
+            # forever (see `_clear_reauth_rotation_state`'s own docstring).
+            self._clear_reauth_rotation_state(
+                session,
+                apartment,
+                ui_username=ui_username,
+                reason=reason,
+                action="tenant_change_rotation_superseded",
+            )
 
             self._write_inventory_audit_log(
                 session,

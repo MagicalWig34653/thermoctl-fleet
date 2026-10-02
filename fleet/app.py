@@ -30,17 +30,22 @@ from typing import Annotated
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from fleet.age_key_block import AgeRecipientError, validate_age_recipient
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
-from fleet.auth import require_apartment_token, require_apartment_token_by_hash
+from fleet.auth import (
+    require_apartment_reauth_old_token,
+    require_apartment_token,
+    require_apartment_token_by_hash,
+)
 from fleet.backup_retention import run_backup_retention
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
+from fleet.data_retention import FAULT_RETENTION_DAYS, HEARTBEAT_RETENTION_DAYS, run_data_retention
 from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
 from fleet.rollout import advance_all_rollouts
 from fleet.storage import (
@@ -143,6 +148,15 @@ _EVENT_ID_PATTERN = re.compile(r"([0-9a-f]{32})\.([0-9]{1,20})")
 _BACKUP_RETENTION_INTERVAL_ENV = "FLEET_BACKUP_RETENTION_INTERVAL_S"
 _DEFAULT_BACKUP_RETENTION_INTERVAL_S = 3600.0
 
+# P6.1, section 12's "Decided afterward" (2026-10-01): heartbeats/events/
+# alarms retention -- same "once an hour is plenty" reasoning as the backup
+# retention interval just above (the retention windows themselves are
+# measured in *days*, section 12's own 90/365).
+_DATA_RETENTION_INTERVAL_ENV = "FLEET_RETENTION_INTERVAL_S"
+_DEFAULT_DATA_RETENTION_INTERVAL_S = 3600.0
+_DATA_RETENTION_HEARTBEAT_DAYS_ENV = "FLEET_RETENTION_HEARTBEAT_DAYS"
+_DATA_RETENTION_FAULT_DAYS_ENV = "FLEET_RETENTION_FAULT_DAYS"
+
 # P5.3a, project owner condition 4: "a retention period for fetched logs in
 # the cloud (main-session default: 14 days, env-configurable, enforced by a
 # periodic cleanup like the alarm loop)" -- otherwise `fetch_logs` uploads
@@ -226,6 +240,41 @@ async def _backup_retention_loop(interval_s: float) -> None:  # pragma: no cover
             )
         except Exception:
             logger.exception("Backup retention cleanup failed")
+        await asyncio.sleep(interval_s)
+
+
+async def _data_retention_loop(
+    interval_s: float, heartbeat_retention_days: int, fault_retention_days: int
+) -> None:  # pragma: no cover
+    """Periodically deletes heartbeats/events/alarms older than their own
+    configured retention (P6.1, section 12's "Decided afterward" 2026-10-01)
+    -- the same thin scheduling wrapper as `_backup_retention_loop` above,
+    deliberately untested here for the identical reason (an infinite loop
+    around a real `asyncio.sleep`); the logic it calls,
+    `fleet.data_retention.run_data_retention`, is fully covered with an
+    injected clock in `tests/test_data_retention.py`. Runs via
+    `asyncio.to_thread` for the same "do not freeze every other request"
+    reason `_alarm_check_loop` already documents for itself -- blocking
+    database I/O, none of it `async`."""
+
+    while True:
+        try:
+            result = await asyncio.to_thread(
+                run_data_retention,
+                get_storage(),
+                datetime.now(UTC),
+                heartbeat_retention_days=heartbeat_retention_days,
+                fault_retention_days=fault_retention_days,
+            )
+            if result.total_deleted:
+                logger.info(
+                    "Data retention deleted %d heartbeat(s), %d event(s), %d alarm(s).",
+                    result.heartbeats_deleted,
+                    result.events_deleted,
+                    result.alarms_deleted,
+                )
+        except Exception:
+            logger.exception("Data retention cleanup failed")
         await asyncio.sleep(interval_s)
 
 
@@ -447,6 +496,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _backup_retention_loop(backup_retention_interval_s)
     )
 
+    data_retention_interval_s = float(
+        os.environ.get(_DATA_RETENTION_INTERVAL_ENV, _DEFAULT_DATA_RETENTION_INTERVAL_S)
+    )
+    data_retention_heartbeat_days = int(
+        os.environ.get(_DATA_RETENTION_HEARTBEAT_DAYS_ENV, HEARTBEAT_RETENTION_DAYS)
+    )
+    data_retention_fault_days = int(
+        os.environ.get(_DATA_RETENTION_FAULT_DAYS_ENV, FAULT_RETENTION_DAYS)
+    )
+    data_retention_task = asyncio.create_task(
+        _data_retention_loop(
+            data_retention_interval_s, data_retention_heartbeat_days, data_retention_fault_days
+        )
+    )
+
     log_retention_interval_s = float(
         os.environ.get(
             _LOG_RETENTION_CHECK_INTERVAL_ENV, _DEFAULT_LOG_RETENTION_CHECK_INTERVAL_S
@@ -490,6 +554,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         task.cancel()
         backup_retention_task.cancel()
+        data_retention_task.cancel()
         log_retention_task.cancel()
         restore_purge_task.cancel()
         diagnostic_bundle_retention_task.cancel()
@@ -498,6 +563,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await task
         with contextlib.suppress(asyncio.CancelledError):
             await backup_retention_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await data_retention_task
         with contextlib.suppress(asyncio.CancelledError):
             await log_retention_task
         with contextlib.suppress(asyncio.CancelledError):
@@ -1651,6 +1718,11 @@ _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 _THROTTLE_PURPOSE_REGISTER = "register"
 _THROTTLE_PURPOSE_CHALLENGE = "challenge"
 _THROTTLE_PURPOSE_TOKEN = "token"  # noqa: S105 -- a throttle "purpose" tag, not a secret
+# P6.1's token-rotation challenge/token pair reuses this same per-IP
+# throttle table (`DeviceRegistrationThrottleRecord`, keyed by
+# `(ip, purpose)`) under its own purpose tag -- an actual signature/nonce
+# guess, so kept at the same tight default as `_THROTTLE_PURPOSE_TOKEN`.
+_THROTTLE_PURPOSE_TOKEN_ROTATION = "token_rotation"  # noqa: S105
 
 # `POST /v1/registration`: an actual registration-code guess. Kept at the
 # same order of magnitude as the UI login throttle's own default
@@ -1697,6 +1769,18 @@ _DEFAULT_TOKEN_THROTTLE_WINDOW_S = 15 * 60.0
 _TOKEN_THROTTLE_DURATION_S_ENV = "FLEET_REGISTRATION_TOKEN_THROTTLE_DURATION_S"  # noqa: S105
 _DEFAULT_TOKEN_THROTTLE_DURATION_S = 15 * 60.0
 
+# P6.1's token-rotation challenge/token pair -- its own, independently
+# configured budget (not shared with `_THROTTLE_PURPOSE_TOKEN` above, same
+# "each purpose needs its own budget" reasoning `0008_device_registration
+# _tokens.py` already states), same tight defaults as ordinary token
+# issuance.
+_TOKEN_ROTATION_THROTTLE_THRESHOLD_ENV = "FLEET_TOKEN_ROTATION_THROTTLE_THRESHOLD"  # noqa: S105
+_DEFAULT_TOKEN_ROTATION_THROTTLE_THRESHOLD = 10
+_TOKEN_ROTATION_THROTTLE_WINDOW_S_ENV = "FLEET_TOKEN_ROTATION_THROTTLE_WINDOW_S"  # noqa: S105
+_DEFAULT_TOKEN_ROTATION_THROTTLE_WINDOW_S = 15 * 60.0
+_TOKEN_ROTATION_THROTTLE_DURATION_S_ENV = "FLEET_TOKEN_ROTATION_THROTTLE_DURATION_S"  # noqa: S105
+_DEFAULT_TOKEN_ROTATION_THROTTLE_DURATION_S = 15 * 60.0
+
 
 def _registration_throttle_config(purpose: str) -> tuple[int, float, float]:
     """`(threshold, window_s, duration_s)` for one throttle `purpose`,
@@ -1727,6 +1811,27 @@ def _registration_throttle_config(purpose: str) -> tuple[int, float, float]:
             float(os.environ.get(_TOKEN_THROTTLE_WINDOW_S_ENV, _DEFAULT_TOKEN_THROTTLE_WINDOW_S)),
             float(
                 os.environ.get(_TOKEN_THROTTLE_DURATION_S_ENV, _DEFAULT_TOKEN_THROTTLE_DURATION_S)
+            ),
+        )
+    if purpose == _THROTTLE_PURPOSE_TOKEN_ROTATION:
+        return (
+            int(
+                os.environ.get(
+                    _TOKEN_ROTATION_THROTTLE_THRESHOLD_ENV,
+                    _DEFAULT_TOKEN_ROTATION_THROTTLE_THRESHOLD,
+                )
+            ),
+            float(
+                os.environ.get(
+                    _TOKEN_ROTATION_THROTTLE_WINDOW_S_ENV,
+                    _DEFAULT_TOKEN_ROTATION_THROTTLE_WINDOW_S,
+                )
+            ),
+            float(
+                os.environ.get(
+                    _TOKEN_ROTATION_THROTTLE_DURATION_S_ENV,
+                    _DEFAULT_TOKEN_ROTATION_THROTTLE_DURATION_S,
+                )
             ),
         )
     return (
@@ -2066,6 +2171,160 @@ def request_device_token(
         raise _uniform_registration_lookup_failure()
 
     storage.release_registration_throttle(ip, _THROTTLE_PURPOSE_TOKEN, now)
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder(TokenIssued(token=token)),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+def _uniform_rotation_failure() -> HTTPException:
+    """The token-rotation equivalent of `_uniform_registration_lookup_
+    failure` (P6.1): an apartment with no rotation pending, an unknown
+    apartment, a wrong/malformed/low-order signature, and a wrong/expired/
+    already-consumed nonce are all the same `404`-style response -- an
+    attacker probing an apartment id (guessable, unlike a `registration_id`)
+    learns nothing about whether a rotation is even in progress for it."""
+
+    return HTTPException(
+        status_code=404,
+        detail="Unknown apartment, or no token rotation pending.",
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@app.post(
+    "/v1/apartments/{apartment}/token-rotation/challenge",
+    response_model=None,
+)
+def request_token_rotation_challenge(
+    apartment: str,
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """P6.1, section 12's "Decided afterward" (2026-10-01): the first half
+    of how a device recovers after a tenant-change rotation. The fleet UI's
+    tenant-change action (`fleet.ui_routes`) already cleared this
+    apartment's `token_hash` and moved the old value to `reauth_old_token_
+    hash` (`Storage.rotate_apartment_token_for_tenant_change`) -- the
+    device's very next authenticated call gets `fleet.auth`'s 401
+    "re-authenticate" signal instead of a generic 403, which is what
+    triggers this call.
+
+    **Requires the OLD token as Bearer** (`fleet.auth.require_apartment_
+    reauth_old_token`, cross-review fix, 2026-10-02): an apartment id is
+    not a secret, so without this gate, anyone who merely knows a rotated
+    apartment's id could call this endpoint and overwrite the single
+    active rotation nonce, permanently locking the real device out of ever
+    completing its own recovery (reproduced in cross-review -- "rotation
+    pending" has no expiry of its own). Checked *after* the per-IP
+    throttle, so throttling still happens before any token lookup.
+
+    Otherwise exactly mirrors `request_token_challenge` above (P4.2b),
+    substituting `apartment` for `registration_id` as the subject and a
+    dedicated throttle purpose/budget. **No `202`/pending branch here** --
+    unlike a fresh device registration, which waits for a human to confirm
+    it in the UI, a rotation challenge either is pending (the UI action
+    already ran) or is not; there is nothing to poll for.
+    """
+
+    ip = resolve_client_ip(request)
+    now = datetime.now(UTC)
+    _enforce_registration_throttle(storage, ip, _THROTTLE_PURPOSE_TOKEN_ROTATION, now)
+    require_apartment_reauth_old_token(apartment, authorization, storage)
+
+    raw_nonce = secrets.token_bytes(MIN_NONCE_BYTES)
+    encoded_nonce = encode_bytes(raw_nonce)
+    nonce_hash = hash_token(encoded_nonce)
+    expires_at = storage.issue_token_rotation_challenge(apartment, nonce_hash, now)
+    if expires_at is None:
+        # Lost a narrow race against `complete_token_rotation` between the
+        # status read above and this write -- same reasoning as
+        # `request_token_challenge`'s own identical, deliberately
+        # unreachable-in-practice branch.
+        raise _uniform_rotation_failure()  # pragma: no cover
+
+    storage.release_registration_throttle(ip, _THROTTLE_PURPOSE_TOKEN_ROTATION, now)
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder(TokenChallenge(nonce=encoded_nonce, expires_at=expires_at)),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@app.post(
+    "/v1/apartments/{apartment}/token-rotation/token",
+    response_model=None,
+)
+def request_token_rotation_token(
+    apartment: str,
+    payload: TokenRequest,
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> JSONResponse:
+    """P6.1 -- proof of private-key possession for a tenant-change
+    rotation, exactly mirroring `request_device_token` above (P4.2b):
+    `payload.signature` must verify, under the **stored** public key of the
+    device currently assigned to `apartment` (`Storage
+    .get_current_device_public_key_for_apartment` -- never a key the
+    request itself supplies), over the domain-separated message
+    `b"thermoctl-fleet/token-rotation/v1\\0" + apartment + b"\\0" + nonce`.
+    The distinct domain prefix (vs. `request_device_token`'s
+    `b"thermoctl-fleet/token/v1\\0"`) means a signature produced for one
+    flow can never be replayed against the other, even though both sign
+    over a nonce of the same shape.
+
+    **Also requires the OLD token as Bearer** (`fleet.auth.require_
+    apartment_reauth_old_token`, cross-review fix, 2026-10-02 -- see
+    `request_token_rotation_challenge`'s own docstring for the gap this
+    closes): two independent factors, the old token *and* a signature from
+    the device's current Ed25519 key, neither sufficient alone.
+
+    Every failure past that gate is the same uniform response
+    (`_uniform_rotation_failure`): no device currently assigned (so no key
+    to verify against at all), a wrong, malformed, or low-order public
+    key/signature half, and a wrong/expired/already-consumed nonce -- none
+    distinguished any further, mirroring `request_device_token`'s own
+    identical reasoning. A wrong/missing old token, or no rotation pending
+    at all, is instead the generic 403 from the auth gate itself, identical
+    to an apartment that was never rotated.
+    """
+
+    ip = resolve_client_ip(request)
+    now = datetime.now(UTC)
+    _enforce_registration_throttle(storage, ip, _THROTTLE_PURPOSE_TOKEN_ROTATION, now)
+    require_apartment_reauth_old_token(apartment, authorization, storage)
+
+    public_key = storage.get_current_device_public_key_for_apartment(apartment)
+    if public_key is None:
+        raise _uniform_rotation_failure()
+
+    try:
+        raw_public_key = decode_bytes(public_key)
+        raw_signature = decode_bytes(payload.signature)
+        reject_low_order_public_key(raw_public_key)
+        reject_malleable_signature(raw_signature)
+    except ValueError as error:
+        raise _uniform_rotation_failure() from error
+
+    message = (
+        b"thermoctl-fleet/token-rotation/v1\0"
+        + apartment.encode("utf-8")
+        + b"\0"
+        + payload.nonce.encode("utf-8")
+    )
+    try:
+        Ed25519PublicKey.from_public_bytes(raw_public_key).verify(raw_signature, message)
+    except (InvalidSignature, ValueError) as error:
+        raise _uniform_rotation_failure() from error
+
+    token = storage.complete_token_rotation(apartment, payload.nonce, now)
+    if token is None:
+        raise _uniform_rotation_failure()
+
+    storage.release_registration_throttle(ip, _THROTTLE_PURPOSE_TOKEN_ROTATION, now)
     return JSONResponse(
         status_code=200,
         content=jsonable_encoder(TokenIssued(token=token)),

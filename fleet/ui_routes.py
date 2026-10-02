@@ -2275,6 +2275,154 @@ def apartment_diagnostic_bundle_download(
     )
 
 
+# -----------------------------------------------------------------------------
+# Tenant change (P6.1, section 12's "Decided afterward" 2026-10-01): "an
+# explicit UI action (confirmation, mandatory reason, audited) rotates the
+# apartment's device token ... and deletes the apartment's heartbeats,
+# events, faults, alarms and command log excerpts." Same two-step,
+# GET-renders/POST-confirms shape as `command_confirm_form`/
+# `command_confirm_submit` above -- `Storage.rotate_apartment_token_for_
+# tenant_change` is the only place this actually happens, called only from
+# the POST below, never the GET.
+#
+# Registered here, above `apartment_detail`'s own `{apartment_id:path}`
+# route below -- the same route-ordering rule that route's own comment
+# already states.
+# -----------------------------------------------------------------------------
+
+
+def _tenant_change_confirm_response(
+    request: Request,
+    authenticated: AuthenticatedUiSession,
+    *,
+    apartment_id: str,
+    apartment_label: str,
+    error: str | None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "tenant_change_confirm.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "apartment_id": apartment_id,
+            "apartment_label": apartment_label,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/apartments/{apartment_id}/tenant-change/confirm", response_class=HTMLResponse)
+def tenant_change_confirm_form(
+    request: Request,
+    apartment_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """Step one of two: names the apartment and spells out, in words, what
+    the action does (rotates the token, deletes the apartment's history),
+    and asks for a mandatory reason. Never calls `Storage.rotate_apartment
+    _token_for_tenant_change` itself -- only the POST below does."""
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    return _tenant_change_confirm_response(
+        request,
+        authenticated,
+        apartment_id=apartment_id,
+        apartment_label=apartment.label,
+        error=None,
+    )
+
+
+@router.post("/apartments/{apartment_id}/tenant-change/confirm")
+def tenant_change_confirm_submit(
+    request: Request,
+    apartment_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    bundle_storage: DiagnosticBundleBlobStorage = Depends(get_bundle_storage),  # noqa: B008
+) -> Response:
+    """Validates the confirmation and performs the tenant change -- token
+    rotation plus history deletion plus the audit entry, all in
+    `Storage.rotate_apartment_token_for_tenant_change`'s one transaction
+    (see that method's own docstring). Owner decision, 2026-10-02: also
+    deletes the apartment's diagnostic bundles -- the metadata rows are
+    gone by the time that call returns; this route deletes each returned
+    blob path afterward (filesystem writes are not transactional with the
+    database, same "row first, then blob" ordering
+    `apartment_diagnostic_bundle_download`'s own sibling retention job
+    already uses).
+
+    **The blob-deletion loop never fails the request (cross-review fix,
+    2026-10-02).** The tenant change itself -- the security-relevant part
+    (token rotation, history deletion, the audit entry) -- has already
+    committed by the time this loop runs; a single `OSError` deleting one
+    blob file (a permissions problem, the file already gone, a transient
+    disk error) must not turn an already-successful tenant change into a
+    `500` or orphan every blob *after* the one that failed. Each delete is
+    therefore wrapped individually: a failure is logged (the storage
+    *path* only, never any blob content -- nothing sensitive to begin
+    with, since this fleet never holds the decryption key) and the loop
+    continues; the redirect always happens. If anything failed, a short,
+    one-line notice is carried to the apartment page via a query
+    parameter (`apartment_detail` reads it) -- a landlord who wants the
+    file gone still learns it is not, rather than silently believing
+    everything was cleaned up."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    def _error(message: str) -> HTMLResponse:
+        return _tenant_change_confirm_response(
+            request,
+            authenticated,
+            apartment_id=apartment_id,
+            apartment_label=apartment.label,
+            error=message,
+            status_code=400,
+        )
+
+    if not reason.strip():
+        return _error("Ein Grund ist erforderlich.")
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        return _error(length_error)
+
+    outcome = storage.rotate_apartment_token_for_tenant_change(
+        apartment_id, reason.strip(), authenticated.user.username, datetime.now(UTC)
+    )
+    bundle_cleanup_failed = False
+    for storage_path in outcome.diagnostic_bundle_storage_paths:
+        try:
+            bundle_storage.delete(storage_path)
+        except OSError:
+            logger.warning(
+                "Tenant change for %r: could not delete diagnostic bundle blob %r "
+                "(continuing with the remaining ones).",
+                apartment_id,
+                storage_path,
+            )
+            bundle_cleanup_failed = True
+
+    redirect_url = f"/ui/apartments/{quote(apartment_id, safe='')}"
+    if bundle_cleanup_failed:
+        redirect_url += "?bundle_cleanup_failed=1"
+    return RedirectResponse(url=redirect_url, status_code=303)
+
+
 # Fault acknowledgement (P6.3, section 12's "Decided afterward", 2026-10-01).
 # Registered here, above `apartment_detail`'s own `{apartment_id:path}` route
 # below -- same route-ordering rule as the command-confirmation/desired-state
@@ -2408,6 +2556,16 @@ def apartment_detail(
     """
 
     detail = build_apartment_detail(storage, apartment_id, datetime.now(UTC), days)
+    # Cross-review fix (2026-10-02): a one-shot notice carried via a query
+    # parameter from `tenant_change_confirm_submit`'s own redirect -- the
+    # tenant change itself always succeeds by the time that redirect
+    # happens; this only ever says "some diagnostic bundle blob files
+    # could not be removed", never anything about the rotation/deletion
+    # itself. Deliberately just a presence check (`"1"` or anything else),
+    # not parsed as a count or a list of paths -- the exact failure is
+    # only ever in the server log, never echoed back into a URL a browser
+    # history/referrer could carry.
+    bundle_cleanup_failed = request.query_params.get("bundle_cleanup_failed") is not None
     response = templates.TemplateResponse(
         request,
         "apartment.html",
@@ -2416,6 +2574,7 @@ def apartment_detail(
             "csrf_token": authenticated.session.csrf_token,
             "apartment_id": apartment_id,
             "detail": detail,
+            "bundle_cleanup_failed": bundle_cleanup_failed,
         },
         status_code=200 if detail is not None else 404,
     )
