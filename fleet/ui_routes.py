@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import os
 import re
@@ -23,10 +24,11 @@ from urllib.parse import quote
 
 import pydantic
 from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from fleet import webauthn_auth
 from fleet.age_key_block import AgeKeyBlockError, validate_single_x25519_stanza
 from fleet.alarms import Notifier, NotifierConfigError, load_notifiers_from_env
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
@@ -35,6 +37,7 @@ from fleet.desired_state_sources import DISPLAY_SOURCES
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
 from fleet.rollout import DEFAULT_STAGGER_HOURS, DEFAULT_TIMEOUT_HOURS
 from fleet.storage import Storage, get_storage
+from fleet.totp_crypto import TotpDecryptionError, TotpKeyError, decrypt_totp_secret
 from fleet.ui_apartment import (
     COMMAND_TYPE_LABELS,
     DEFAULT_FETCH_LOGS_LINES,
@@ -57,9 +60,12 @@ from fleet.ui_auth import (
     ip_throttle_duration_s,
     ip_throttle_threshold,
     ip_throttle_window_s,
+    normalize_username,
     require_ui_user,
     resolve_client_ip,
     session_absolute_lifetime_s,
+    totp_key,
+    verify_totp,
 )
 from fleet.ui_house import build_house_overview
 from fleet.ui_inventory import (
@@ -199,7 +205,9 @@ def login_form(request: Request) -> HTMLResponse:
 
     pre_csrf = secrets.token_urlsafe(32)
     response = templates.TemplateResponse(
-        request, "login.html", {"pre_csrf": pre_csrf, "error": None}
+        request,
+        "login.html",
+        {"pre_csrf": pre_csrf, "error": None, "webauthn_enabled": webauthn_auth.is_configured()},
     )
     _set_pre_csrf_cookie(response, pre_csrf)
     return response
@@ -216,11 +224,55 @@ def _generic_login_failure_response(request: Request) -> Response:
     response: Response = templates.TemplateResponse(
         request,
         "login.html",
-        {"pre_csrf": new_pre_csrf, "error": _GENERIC_LOGIN_ERROR},
+        {
+            "pre_csrf": new_pre_csrf,
+            "error": _GENERIC_LOGIN_ERROR,
+            "webauthn_enabled": webauthn_auth.is_configured(),
+        },
         status_code=401,
     )
     _set_pre_csrf_cookie(response, new_pre_csrf)
     return response
+
+
+@router.post("/login/webauthn/begin")
+def login_webauthn_begin(
+    request: Request,
+    username: str = Form(...),
+    pre_csrf: str = Form(...),
+    pre_csrf_cookie: str | None = Cookie(default=None, alias=PRE_SESSION_CSRF_COOKIE_NAME),
+    storage: Storage = Depends(get_storage),  # noqa: B008
+) -> Response:
+    """Starts a passkey authentication ceremony for the login form's
+    "sign in with a passkey" button (P6.2) -- called by `fleet/static/ui
+    /webauthn.js` before `navigator.credentials.get()`, so the browser can
+    be offered exactly this username's own registered credentials (an
+    authenticator/browser filters its UI by `allowCredentials`).
+
+    **Deliberately does not check the password, and does not touch the
+    per-IP throttle or the account lock** -- unlike `login_submit`, which
+    performs the actual, throttled, lockout-relevant authentication
+    decision. A WebAuthn credential id is not a secret (it identifies a
+    public key; standard practice, mirrored by every major WebAuthn relying
+    party, is to resolve `allowCredentials` from the username alone). What
+    *is* kept generic here is exactly what the task and P3.0 both already
+    require of a login-adjacent endpoint: an unknown username and a known
+    username with zero registered passkeys produce the identical response
+    shape (`allowCredentials: []`), so this endpoint cannot be used to test
+    "does this username exist" any more precisely than it could already be
+    tested by how a submitted TOTP code behaves.
+    """
+
+    if not pre_csrf_cookie or not check_csrf(pre_csrf_cookie, pre_csrf):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+    if not webauthn_auth.is_configured():
+        raise HTTPException(status_code=404, detail="WebAuthn is not configured.")
+
+    del request
+    now = datetime.now(UTC)
+    user = storage.get_ui_user_by_username(normalize_username(username))
+    options_json = webauthn_auth.begin_login_authentication(storage, user, pre_csrf, now)
+    return JSONResponse(content=json.loads(options_json))
 
 
 @router.post("/login")
@@ -229,8 +281,10 @@ def login_submit(
     background_tasks: BackgroundTasks,
     username: str = Form(...),
     password: str = Form(...),
-    totp_code: str = Form(...),
     pre_csrf: str = Form(...),
+    totp_code: str = Form(default=""),
+    webauthn_assertion: str | None = Form(default=None),
+    webauthn_challenge_id: str | None = Form(default=None),
     pre_csrf_cookie: str | None = Cookie(default=None, alias=PRE_SESSION_CSRF_COOKIE_NAME),
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
     notifiers: list[Notifier] = Depends(get_ui_notifiers),  # noqa: B008
@@ -251,7 +305,9 @@ def login_submit(
     # work and reports whether this specific request is still within the
     # limit -- over the limit means the same generic failure, no Argon2,
     # no account-counter credit, exactly as round 3 intended but now
-    # actually race-free.
+    # actually race-free. Applies identically to a passkey attempt (P6.2
+    # task requirement) -- this check runs before either second-factor
+    # branch, not duplicated per branch.
     if not storage.reserve_ip_login_attempt(
         client_ip,
         now,
@@ -261,7 +317,36 @@ def login_submit(
     ):
         return _generic_login_failure_response(request)
 
-    user = authenticate(storage, username, password, totp_code, now, notifiers, background_tasks)
+    # P6.2: a non-empty `webauthn_assertion` selects the passkey second
+    # factor instead of `totp_code` -- never both (a malformed/missing
+    # `webauthn_challenge_id` alongside a present assertion is treated as
+    # "no valid passkey attempt" -- the generic failure response, same as
+    # any other malformed input, not a 400/422 that would distinguish this
+    # failure mode from any other).
+    parsed_challenge_id: int | None = None
+    if webauthn_assertion:
+        try:
+            parsed_challenge_id = int(webauthn_challenge_id) if webauthn_challenge_id else None
+        except ValueError:
+            parsed_challenge_id = None
+        if parsed_challenge_id is None:
+            return _generic_login_failure_response(request)
+        user = authenticate(
+            storage,
+            username,
+            password,
+            "",
+            now,
+            notifiers,
+            background_tasks,
+            webauthn_assertion=webauthn_assertion,
+            webauthn_challenge_id=parsed_challenge_id,
+            webauthn_pre_csrf=pre_csrf,
+        )
+    else:
+        user = authenticate(
+            storage, username, password, totp_code, now, notifiers, background_tasks
+        )
 
     if user is None:
         return _generic_login_failure_response(request)
@@ -298,6 +383,151 @@ def logout(
     response = RedirectResponse(url="/ui/login", status_code=303)
     _clear_session_cookie(response)
     return response
+
+
+# -- passkeys / WebAuthn account management (P6.2) -----------------------------------
+
+
+@router.get("/account/webauthn", response_class=HTMLResponse)
+def webauthn_account_page(
+    request: Request,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008
+) -> HTMLResponse:
+    """Lists the logged-in user's registered passkeys and offers the
+    "register a new one" / "remove" actions (task requirement: "credentials
+    listable and removable in the UI")."""
+
+    credentials = storage.list_webauthn_credentials(authenticated.user.id)
+    response = templates.TemplateResponse(
+        request,
+        "webauthn_account.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "credentials": credentials,
+            "webauthn_enabled": webauthn_auth.is_configured(),
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/account/webauthn/register/begin")
+def webauthn_register_begin(
+    request: Request,
+    csrf_token: str = Form(...),
+    totp_code: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008
+) -> Response:
+    """Starts a passkey registration ceremony -- task requirement:
+    "registration (logged-in user, CSRF, re-auth with current second
+    factor)". Every account always has a TOTP secret (P6.2 keeps TOTP
+    mandatory, passkeys are an *additional* option -- see
+    `fleet/ui_auth.py`'s module docstring), so a fresh TOTP code is always
+    available as the re-auth channel regardless of whether this is the
+    user's first passkey or a later one.
+
+    **Re-auth failure uses a generic 403**, deliberately not distinguishing
+    "wrong code" from "WebAuthn not configured" or any other reason, for
+    the same "do not hand an attacker a more precise oracle" reasoning as
+    the login form's own generic failure (this is a *second* factor check,
+    exactly as security-sensitive as the login one)."""
+
+    del request
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+    if not webauthn_auth.is_configured():
+        raise HTTPException(status_code=404, detail="WebAuthn is not configured.")
+
+    now = datetime.now(UTC)
+    user = authenticated.user
+    try:
+        totp_secret = decrypt_totp_secret(user.totp_secret, user.id, totp_key())
+    except (TotpKeyError, TotpDecryptionError):
+        logger.exception("Could not decrypt TOTP secret for user %r during re-auth.", user.username)
+        raise HTTPException(status_code=403, detail="Re-authentication failed.") from None
+
+    matched_step = verify_totp(totp_secret, totp_code, now, user.last_totp_step)
+    if matched_step is None or not storage.record_ui_login_success(user.id, matched_step):
+        raise HTTPException(status_code=403, detail="Re-authentication failed.")
+
+    options_json = webauthn_auth.begin_registration(
+        storage, user, authenticated.session.token_hash, now
+    )
+    return JSONResponse(content=json.loads(options_json))
+
+
+@router.post("/account/webauthn/register/complete")
+def webauthn_register_complete(
+    request: Request,
+    csrf_token: str = Form(...),
+    challenge_id: str = Form(...),
+    credential_json: str = Form(...),
+    label: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008
+) -> Response:
+    del request
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+    if not webauthn_auth.is_configured():
+        raise HTTPException(status_code=404, detail="WebAuthn is not configured.")
+
+    stripped_label = label.strip()[:255] or "Passkey"
+    try:
+        parsed_challenge_id = int(challenge_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid challenge id.") from None
+
+    now = datetime.now(UTC)
+    outcome = webauthn_auth.complete_registration(
+        storage,
+        authenticated.user,
+        authenticated.session.token_hash,
+        parsed_challenge_id,
+        credential_json,
+        stripped_label,
+        now,
+    )
+    if not outcome.ok or outcome.credential_id is None:
+        raise HTTPException(status_code=400, detail="Could not register this passkey.")
+
+    storage.write_webauthn_credential_audit_log(
+        authenticated.user.username, "created", outcome.credential_id, stripped_label
+    )
+    return RedirectResponse(url="/ui/account/webauthn", status_code=303)
+
+
+@router.post("/account/webauthn/delete")
+def webauthn_delete_credential(
+    request: Request,
+    csrf_token: str = Form(...),
+    credential_id: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008
+) -> Response:
+    """Removes one of the logged-in user's own passkeys (task requirement:
+    "removable in the UI"). Scoped to `authenticated.user.id` by
+    `Storage.delete_webauthn_credential` itself -- a crafted `credential_id`
+    belonging to a different account simply matches no row."""
+
+    del request
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    try:
+        raw_credential_id = bytes.fromhex(credential_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid credential id.") from None
+
+    deleted = storage.delete_webauthn_credential(raw_credential_id, authenticated.user.id)
+    if deleted:
+        storage.write_webauthn_credential_audit_log(
+            authenticated.user.username, "deleted", raw_credential_id, ""
+        )
+    return RedirectResponse(url="/ui/account/webauthn", status_code=303)
 
 
 @router.get("/", response_class=HTMLResponse)

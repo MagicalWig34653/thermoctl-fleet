@@ -51,6 +51,7 @@ from fleet.ui_auth import (
     totp_provisioning_uri,
     verify_totp,
 )
+from tests.conftest import store_encrypted_totp_secret
 
 USERNAME = "landlord"
 
@@ -77,9 +78,10 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
     record = storage.create_ui_user(
         username=USERNAME,
         password_hash=hash_password(password),
-        totp_secret=totp_secret,
+        totp_secret="",
         created_at=datetime.now(UTC),
     )
+    store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id
 
 
@@ -1149,3 +1151,316 @@ def test_ui_session_cookie_cannot_access_the_agent_api(
     # so the agent endpoint must reject this the same as any other
     # unauthenticated request, not accept the cookie as a substitute token.
     assert response.status_code == 401
+
+
+# -- P6.2: WebAuthn as a second factor, through fleet.ui_auth.authenticate ------
+
+
+def test_authenticate_succeeds_with_a_verified_webauthn_assertion(
+    storage: Storage, user_id: int, password: str
+) -> None:
+    import json as _json
+
+    import pytest as _pytest
+
+    from fleet.webauthn_auth import begin_login_authentication, rp_id
+    from tests.webauthn_fixtures import SoftAuthenticator
+
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setenv("FLEET_WEBAUTHN_RP_ID", "example.org")
+        mp.setenv("FLEET_WEBAUTHN_ORIGIN", "https://example.org")
+
+        user = storage.get_ui_user_by_id(user_id)
+        assert user is not None
+        authenticator = SoftAuthenticator()
+        now = datetime.now(UTC)
+
+        # Register a credential directly via storage (registration ceremony
+        # itself is tested in tests/test_webauthn_auth.py).
+        from webauthn.helpers import base64url_to_bytes
+
+        from fleet.webauthn_auth import begin_registration, complete_registration
+
+        reg_options = _json.loads(begin_registration(storage, user, "session-a", now))
+        credential_id = b"login-flow-credential"
+        reg_json = authenticator.create_credential(
+            rp_id(),
+            base64url_to_bytes(reg_options["challenge"]),
+            "https://example.org",
+            credential_id,
+        )
+        reg_outcome = complete_registration(
+            storage, user, "session-a", reg_options["fleetChallengeId"], reg_json, "Key", now
+        )
+        assert reg_outcome.ok
+
+        # Now authenticate through the real `authenticate()` entry point.
+        login_options = _json.loads(begin_login_authentication(storage, user, "pre-csrf-x", now))
+        assertion_json = authenticator.get_assertion(
+            rp_id(),
+            base64url_to_bytes(login_options["challenge"]),
+            "https://example.org",
+            credential_id,
+        )
+
+        result = authenticate(
+            storage,
+            USERNAME,
+            password,
+            "",
+            now,
+            webauthn_assertion=assertion_json,
+            webauthn_challenge_id=login_options["fleetChallengeId"],
+            webauthn_pre_csrf="pre-csrf-x",
+        )
+
+    assert result is not None
+    assert result.id == user_id
+    stored = storage.get_webauthn_credential(credential_id)
+    assert stored is not None
+    assert stored.sign_count == 1
+    assert stored.last_used_at is not None
+
+
+def test_authenticate_rejects_webauthn_with_wrong_password(
+    storage: Storage, user_id: int
+) -> None:
+    now = datetime.now(UTC)
+    result = authenticate(
+        storage,
+        USERNAME,
+        "definitely-wrong-password",
+        "",
+        now,
+        webauthn_assertion="{}",
+        webauthn_challenge_id=1,
+        webauthn_pre_csrf="pre-csrf-x",
+    )
+    assert result is None
+
+
+def test_authenticate_rejects_a_malformed_webauthn_assertion(
+    storage: Storage, user_id: int, password: str
+) -> None:
+    now = datetime.now(UTC)
+    result = authenticate(
+        storage,
+        USERNAME,
+        password,
+        "",
+        now,
+        webauthn_assertion="not valid json",
+        webauthn_challenge_id=999,
+        webauthn_pre_csrf="pre-csrf-x",
+    )
+    assert result is None
+    # Counts as an ordinary failed login, same as a wrong TOTP code.
+    user = storage.get_ui_user_by_username(USERNAME)
+    assert user is not None
+    assert user.failed_attempts == 1
+
+
+def test_authenticate_with_undecryptable_totp_secret_fails_cleanly(
+    storage: Storage, user_id: int, password: str, totp_secret: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `FLEET_TOTP_KEY` that no longer matches what a secret was
+    encrypted with (e.g. misconfigured after a rotation) must fail the
+    login cleanly -- never raise out of `authenticate`, and never treat the
+    account as if the code were simply wrong in a way that silently retries
+    with plaintext."""
+
+    import base64
+    import os as os_module
+
+    monkeypatch.setenv(
+        "FLEET_TOTP_KEY", base64.urlsafe_b64encode(os_module.urandom(32)).decode()
+    )
+    now = datetime.now(UTC)
+
+    result = authenticate(storage, USERNAME, password, _totp_now(totp_secret, now), now)
+
+    assert result is None
+
+
+def test_authenticate_logs_and_refuses_a_clone_suspected_webauthn_login(
+    storage: Storage, user_id: int, password: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Full `authenticate()` integration path for clone detection (task
+    requirement) -- not just `fleet.webauthn_auth.verify_login_assertion`
+    in isolation: a real passkey login whose sign count does not advance
+    must come back `None` from `authenticate` itself, with the distinct
+    "possible cloned authenticator" warning actually logged (not merely a
+    generic failure indistinguishable from a wrong code in the log, which
+    would make this undiagnosable operationally)."""
+
+    import json
+    import logging as _logging
+
+    from webauthn.helpers import base64url_to_bytes
+
+    from fleet.webauthn_auth import (
+        begin_login_authentication,
+        begin_registration,
+        complete_registration,
+        rp_id,
+    )
+    from tests.webauthn_fixtures import SoftAuthenticator
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("FLEET_WEBAUTHN_RP_ID", "example.org")
+        mp.setenv("FLEET_WEBAUTHN_ORIGIN", "https://example.org")
+
+        user = storage.get_ui_user_by_id(user_id)
+        assert user is not None
+        authenticator = SoftAuthenticator()
+        now = datetime.now(UTC)
+
+        reg_options = json.loads(begin_registration(storage, user, "session-a", now))
+        credential_id = b"clone-detection-credential"
+        reg_json = authenticator.create_credential(
+            rp_id(),
+            base64url_to_bytes(reg_options["challenge"]),
+            "https://example.org",
+            credential_id,
+        )
+        reg_outcome = complete_registration(
+            storage, user, "session-a", reg_options["fleetChallengeId"], reg_json, "Key", now
+        )
+        assert reg_outcome.ok
+
+        # A first, legitimate login advances the stored sign count.
+        login_options_1 = json.loads(
+            begin_login_authentication(storage, user, "pre-csrf-1", now)
+        )
+        assertion_1 = authenticator.get_assertion(
+            rp_id(),
+            base64url_to_bytes(login_options_1["challenge"]),
+            "https://example.org",
+            credential_id,
+            sign_count_override=5,
+        )
+        first_result = authenticate(
+            storage,
+            USERNAME,
+            password,
+            "",
+            now,
+            webauthn_assertion=assertion_1,
+            webauthn_challenge_id=login_options_1["fleetChallengeId"],
+            webauthn_pre_csrf="pre-csrf-1",
+        )
+        assert first_result is not None
+
+        # A cloned authenticator presents a non-increasing counter.
+        login_options_2 = json.loads(
+            begin_login_authentication(storage, user, "pre-csrf-2", now)
+        )
+        cloned_assertion = authenticator.get_assertion(
+            rp_id(),
+            base64url_to_bytes(login_options_2["challenge"]),
+            "https://example.org",
+            credential_id,
+            sign_count_override=3,
+        )
+        with caplog.at_level(_logging.WARNING, logger="fleet.ui_auth"):
+            second_result = authenticate(
+                storage,
+                USERNAME,
+                password,
+                "",
+                now,
+                webauthn_assertion=cloned_assertion,
+                webauthn_challenge_id=login_options_2["fleetChallengeId"],
+                webauthn_pre_csrf="pre-csrf-2",
+            )
+
+    assert second_result is None
+    assert any("cloned authenticator" in record.message for record in caplog.records)
+
+
+def test_authenticate_two_concurrent_webauthn_assertions_allow_exactly_one_success(
+    storage: Storage, user_id: int, password: str
+) -> None:
+    """Full `authenticate()` integration path for the sign-count CAS
+    (cross-review): two threads, each with their own real, independently
+    issued challenge for the *same* registered credential, both presenting
+    an assertion for the *same* new sign count (as two cloned/duplicated
+    authenticator states racing to log in at the same instant would) --
+    real threads, a real `threading.Barrier`, a real SQLite database,
+    mirroring `test_totp_replay_race_allows_exactly_one_concurrent_login`'s
+    shape for the TOTP path. Exactly one must succeed."""
+
+    import json
+    import threading
+
+    from webauthn.helpers import base64url_to_bytes
+
+    from fleet.webauthn_auth import (
+        begin_login_authentication,
+        begin_registration,
+        complete_registration,
+        rp_id,
+    )
+    from tests.webauthn_fixtures import SoftAuthenticator
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("FLEET_WEBAUTHN_RP_ID", "example.org")
+        mp.setenv("FLEET_WEBAUTHN_ORIGIN", "https://example.org")
+
+        user = storage.get_ui_user_by_id(user_id)
+        assert user is not None
+        authenticator = SoftAuthenticator()
+        now = datetime.now(UTC)
+
+        reg_options = json.loads(begin_registration(storage, user, "session-a", now))
+        credential_id = b"concurrency-credential"
+        reg_json = authenticator.create_credential(
+            rp_id(),
+            base64url_to_bytes(reg_options["challenge"]),
+            "https://example.org",
+            credential_id,
+        )
+        reg_outcome = complete_registration(
+            storage, user, "session-a", reg_options["fleetChallengeId"], reg_json, "Key", now
+        )
+        assert reg_outcome.ok
+
+        thread_count = 2
+        barrier = threading.Barrier(thread_count)
+        results: list[object] = [None] * thread_count
+
+        def _attempt(index: int) -> None:
+            pre_csrf = f"pre-csrf-{index}"
+            login_options = json.loads(
+                begin_login_authentication(storage, user, pre_csrf, now)
+            )
+            assertion_json = authenticator.get_assertion(
+                rp_id(),
+                base64url_to_bytes(login_options["challenge"]),
+                "https://example.org",
+                credential_id,
+                sign_count_override=7,
+            )
+            barrier.wait()
+            results[index] = authenticate(
+                storage,
+                USERNAME,
+                password,
+                "",
+                now,
+                webauthn_assertion=assertion_json,
+                webauthn_challenge_id=login_options["fleetChallengeId"],
+                webauthn_pre_csrf=pre_csrf,
+            )
+
+        threads = [threading.Thread(target=_attempt, args=(i,)) for i in range(thread_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    successes = [result for result in results if result is not None]
+    assert len(successes) == 1, f"expected exactly one success, got {len(successes)}"
+    final_credential = storage.get_webauthn_credential(credential_id)
+    assert final_credential is not None
+    assert final_credential.sign_count == 7

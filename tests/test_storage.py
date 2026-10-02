@@ -13,6 +13,7 @@ as a real-looking example value").
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -3777,3 +3778,226 @@ def test_rotate_epoch_creates_a_row_if_the_table_is_empty(storage: Storage) -> N
 
     assert storage.get_epoch() == rotated
     assert len(rotated) == 32
+
+
+# -- migration 0017: TOTP encryption + webauthn tables (P6.2) --------------------
+
+
+def test_migration_0017_upgrade_creates_webauthn_tables(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+
+    engine = create_storage(url).engine
+    tables = set(inspect(engine).get_table_names())
+    assert {"webauthn_credentials", "webauthn_challenges"} <= tables
+
+
+def test_migration_0019_encrypts_an_existing_plaintext_totp_secret(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fleet.totp_crypto import decrypt_totp_secret, load_totp_key
+
+    path = f"{tmp_path}/legacy.db"
+    url = f"sqlite:///{path}"
+    config = _alembic_config(url)
+    command.upgrade(config, "0018")
+
+    plaintext_secret = "JBSWY3DPEHPK3PXP"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO ui_users "
+        "(username, password_hash, totp_secret, last_totp_step, failed_attempts, "
+        " locked_until, failure_window_started_at, created_at) "
+        "VALUES (?, ?, ?, NULL, 0, NULL, NULL, ?)",
+        ("landlord", "argon2-hash-placeholder", plaintext_secret, "2026-01-01 00:00:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    key_b64 = os.environ["FLEET_TOTP_KEY"]
+    monkeypatch.setenv("FLEET_TOTP_KEY", key_b64)
+    command.upgrade(config, "0019")
+
+    connection = sqlite3.connect(path)
+    row = connection.execute(
+        "SELECT id, totp_secret FROM ui_users WHERE username = 'landlord'"
+    ).fetchone()
+    connection.close()
+    assert row is not None
+    user_id, stored_secret = row
+    assert stored_secret != plaintext_secret
+    key = load_totp_key(key_b64)
+    assert decrypt_totp_secret(stored_secret, user_id, key) == plaintext_secret
+
+
+def test_migration_0019_upgrade_fails_loudly_without_a_totp_key(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = f"{tmp_path}/legacy.db"
+    url = f"sqlite:///{path}"
+    config = _alembic_config(url)
+    command.upgrade(config, "0018")
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO ui_users "
+        "(username, password_hash, totp_secret, last_totp_step, failed_attempts, "
+        " locked_until, failure_window_started_at, created_at) "
+        "VALUES (?, ?, ?, NULL, 0, NULL, NULL, ?)",
+        ("landlord", "argon2-hash-placeholder", "JBSWY3DPEHPK3PXP", "2026-01-01 00:00:00"),
+    )
+    connection.commit()
+    connection.close()
+
+    monkeypatch.delenv("FLEET_TOTP_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="FLEET_TOTP_KEY"):
+        command.upgrade(config, "0019")
+
+    # Nothing was left half-migrated: the column is still the old shape and
+    # the secret is still plaintext.
+    connection = sqlite3.connect(path)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(ui_users)").fetchall()}
+    secret = connection.execute(
+        "SELECT totp_secret FROM ui_users WHERE username = 'landlord'"
+    ).fetchone()[0]
+    connection.close()
+    assert "totp_secret" in columns
+    assert secret == "JBSWY3DPEHPK3PXP"
+
+
+def test_migration_0019_upgrade_with_no_ui_users_needs_no_key(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh database with no accounts yet migrates cleanly even with no
+    `FLEET_TOTP_KEY` set -- there is nothing to encrypt."""
+
+    path = f"{tmp_path}/fresh.db"
+    url = f"sqlite:///{path}"
+    config = _alembic_config(url)
+    command.upgrade(config, "0018")
+
+    monkeypatch.delenv("FLEET_TOTP_KEY", raising=False)
+    command.upgrade(config, "0019")  # must not raise
+
+    engine = create_storage(url).engine
+    assert "webauthn_credentials" in set(inspect(engine).get_table_names())
+
+
+def test_migration_0019_downgrade_decrypts_back_to_plaintext(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    from fleet.ui_auth import hash_password
+
+    record = storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password("unused-here"),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+    )
+    from fleet.totp_crypto import encrypt_totp_secret, load_totp_key
+
+    key = load_totp_key(os.environ["FLEET_TOTP_KEY"])
+    plaintext_secret = "JBSWY3DPEHPK3PXP"
+    storage.set_ui_user_totp_secret(
+        record.id, encrypt_totp_secret(plaintext_secret, record.id, key)
+    )
+
+    downgrade(url, "0018")
+
+    import sqlite3 as _sqlite3
+
+    path = url.removeprefix("sqlite:///")
+    connection = _sqlite3.connect(path)
+    secret_after = connection.execute(
+        "SELECT totp_secret FROM ui_users WHERE username = 'landlord'"
+    ).fetchone()[0]
+    connection.close()
+    assert secret_after == plaintext_secret
+
+
+def test_migration_0019_downgrade_fails_loudly_without_a_totp_key(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `test_migration_0019_upgrade_fails_loudly_without_a_totp_key`
+    for the opposite direction: `downgrade()` must decrypt every row back
+    to plaintext, so it needs the key just as much as `upgrade()` does --
+    and must fail loudly, leaving the schema and data untouched, if it is
+    missing."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    from fleet.totp_crypto import encrypt_totp_secret, load_totp_key
+    from fleet.ui_auth import hash_password
+
+    key = load_totp_key(os.environ["FLEET_TOTP_KEY"])
+    record = storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password("unused-here"),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+    )
+    ciphertext = encrypt_totp_secret("JBSWY3DPEHPK3PXP", record.id, key)
+    storage.set_ui_user_totp_secret(record.id, ciphertext)
+
+    monkeypatch.delenv("FLEET_TOTP_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="FLEET_TOTP_KEY"):
+        downgrade(url, "0018")
+
+    # Nothing was left half-migrated: still at 0017's schema, still the
+    # same ciphertext.
+    engine = create_storage(url).engine
+    assert "webauthn_credentials" in set(inspect(engine).get_table_names())
+    untouched = create_storage(url).get_ui_user_by_username("landlord")
+    assert untouched is not None
+    assert untouched.totp_secret == ciphertext
+
+
+def test_migration_0019_downgrade_fails_loudly_with_the_wrong_totp_key(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as above, but for a *present, well-shaped, wrong* key -- the
+    AEAD tag check must still refuse decryption rather than silently
+    writing a garbage "plaintext" secret back to the narrowed column."""
+
+    import base64
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+    from fleet.totp_crypto import encrypt_totp_secret, load_totp_key
+    from fleet.ui_auth import hash_password
+
+    key = load_totp_key(os.environ["FLEET_TOTP_KEY"])
+    record = storage.create_ui_user(
+        username="landlord",
+        password_hash=hash_password("unused-here"),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+    )
+    ciphertext = encrypt_totp_secret("JBSWY3DPEHPK3PXP", record.id, key)
+    storage.set_ui_user_totp_secret(record.id, ciphertext)
+
+    wrong_key_b64 = base64.urlsafe_b64encode(os.urandom(32)).decode()
+    monkeypatch.setenv("FLEET_TOTP_KEY", wrong_key_b64)
+    with pytest.raises(RuntimeError, match=f"ui_users.id={record.id}"):
+        downgrade(url, "0018")
+
+    engine = create_storage(url).engine
+    assert "webauthn_credentials" in set(inspect(engine).get_table_names())
+    untouched = create_storage(url).get_ui_user_by_username("landlord")
+    assert untouched is not None
+    assert untouched.totp_secret == ciphertext
+
+
+def test_migration_0019_downgrade_drops_webauthn_tables(tmp_path: object) -> None:
+    url = _database_url(tmp_path)
+    upgrade(url)
+
+    downgrade(url, "0018")
+
+    engine = create_storage(url).engine
+    tables = set(inspect(engine).get_table_names())
+    assert "webauthn_credentials" not in tables
+    assert "webauthn_challenges" not in tables

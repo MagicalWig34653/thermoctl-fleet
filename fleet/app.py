@@ -56,7 +56,7 @@ from fleet.storage import (
     get_storage,
     hash_token,
 )
-from fleet.ui_auth import resolve_client_ip
+from fleet.ui_auth import resolve_client_ip, totp_key
 from fleet.ui_routes import install_security_headers
 from fleet.ui_routes import router as ui_router
 from fleet.upload_streaming import (
@@ -484,6 +484,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     storage_for_epoch_rotation = app.dependency_overrides.get(get_storage, get_storage)()
     await asyncio.to_thread(storage_for_epoch_rotation.rotate_epoch, datetime.now(UTC))
+
+    # P6.2, CLAUDE.md "startup fails loudly": a `FLEET_TOTP_KEY` missing or
+    # the wrong shape must never surface only at the next login attempt --
+    # checked once, here, uncaught (same "abort startup" treatment as a
+    # failed epoch rotation and a misconfigured alert channel, just above
+    # and below). Skipped entirely on a database with **no** `ui_users` row
+    # yet (a fresh deployment, or any end-to-end test that never calls
+    # `fleet.admin create-user`) -- there is nothing to decrypt yet, so no
+    # key is required until the first account actually exists.
+    if await asyncio.to_thread(storage_for_epoch_rotation.list_ui_users):
+        totp_key()
 
     interval_s = float(os.environ.get(_ALARM_CHECK_INTERVAL_ENV, _DEFAULT_ALARM_CHECK_INTERVAL_S))
     notifiers = load_notifiers_from_env(os.environ)

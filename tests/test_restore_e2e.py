@@ -62,6 +62,7 @@ from fleet.restore_vendor import AGE_VENDOR_JS_SHA256
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from protocol.backups import BackupKind
+from tests.conftest import store_encrypted_totp_secret
 from tests.restore_helpers import make_confirmed_device
 from tests.tls_support import run_tls_fleet_app
 
@@ -162,12 +163,13 @@ def test_restore_end_to_end_over_the_real_fleet_app(
     # A UI user, for the "Wiederherstellen" form step.
     password = secrets.token_urlsafe(16)
     totp_secret = generate_totp_secret()
-    app_storage.create_ui_user(
+    ui_user = app_storage.create_ui_user(
         username=UI_USERNAME,
         password_hash=hash_password(password),
-        totp_secret=totp_secret,
+        totp_secret="",
         created_at=now,
     )
+    store_encrypted_totp_secret(app_storage, ui_user.id, totp_secret)
 
     agent_data_dir = tmp_path / "agent-data"
     agent_data_dir.mkdir()
