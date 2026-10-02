@@ -114,15 +114,49 @@ def test_event_exactly_at_boundary_is_kept_one_microsecond_older_is_deleted(
 def test_alarm_exactly_at_boundary_is_kept_one_microsecond_older_is_deleted(
     storage: Storage,
 ) -> None:
+    """Both alarms here are **cleared** -- see
+    `test_open_alarm_older_than_365_days_survives` for the owner's
+    2026-10-02 decision that an open alarm is never deleted regardless of
+    age, tested separately."""
+
     _make_apartment(storage)
     at_boundary = NOW - timedelta(days=FAULT_RETENTION_DAYS)
     just_older = at_boundary - timedelta(microseconds=1)
-    storage.raise_alarm("apt-1", "absence", "critical", at_boundary)
-    storage.raise_alarm("apt-1", "sensor_fault", "warning", just_older)
+    alarm_at_boundary = storage.raise_alarm("apt-1", "absence", "critical", at_boundary)
+    alarm_just_older = storage.raise_alarm("apt-1", "sensor_fault", "warning", just_older)
+    assert alarm_at_boundary is not None and alarm_just_older is not None
+    storage.clear_alarm(alarm_at_boundary.id, NOW)
+    storage.clear_alarm(alarm_just_older.id, NOW)
 
     result = run_data_retention(storage, NOW)
 
     assert result.alarms_deleted == 1
+
+
+def test_open_alarm_older_than_365_days_survives_cleared_one_at_the_same_age_is_deleted(
+    storage: Storage,
+) -> None:
+    """Owner decision, 2026-10-02 (docs/specification.md section 12's
+    dated addendum): "the 365-day limit applies only to cleared/closed
+    alarms ... anything still open is kept with its real start time
+    regardless of age." Two alarms of the same age, one left open, one
+    cleared -- only the cleared one is deleted."""
+
+    _make_apartment(storage)
+    ancient = NOW - timedelta(days=FAULT_RETENTION_DAYS * 3)
+    open_alarm = storage.raise_alarm("apt-1", "absence", "critical", ancient)
+    cleared_alarm = storage.raise_alarm("apt-1", "sensor_fault", "warning", ancient)
+    assert open_alarm is not None and cleared_alarm is not None
+    storage.clear_alarm(cleared_alarm.id, NOW)
+    # `open_alarm` is deliberately left uncleared.
+
+    result = run_data_retention(storage, NOW)
+
+    assert result.alarms_deleted == 1
+    remaining_kinds = {
+        alarm.kind for alarm in storage.list_alarms_for_apartment("apt-1")
+    }
+    assert remaining_kinds == {"absence"}
 
 
 def test_retention_is_idempotent(storage: Storage) -> None:
@@ -181,7 +215,9 @@ def test_backups_audit_log_and_command_log_excerpts_are_never_touched(
         Event(schluessel="zigbee2mqtt:bridge", schwere="warnung", titel="t", text="x"),
         very_old,
     )
-    storage.raise_alarm("apt-1", "absence", "critical", very_old)
+    old_alarm = storage.raise_alarm("apt-1", "absence", "critical", very_old)
+    assert old_alarm is not None
+    storage.clear_alarm(old_alarm.id, NOW)
 
     result = run_data_retention(storage, NOW)
 

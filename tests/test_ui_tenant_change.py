@@ -15,8 +15,10 @@ import pyotp
 import pytest
 from fastapi.testclient import TestClient
 
+from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
+from protocol.commands import CommandType
 
 USERNAME = "landlord"
 APARTMENT = "house7-a03"
@@ -27,6 +29,13 @@ def storage(tmp_path: object) -> Storage:
     url = f"sqlite:///{tmp_path}/tenant-change-ui-test.db"
     upgrade(url)
     return create_storage(url)
+
+
+@pytest.fixture
+def bundle_storage(tmp_path: object) -> DiagnosticBundleBlobStorage:
+    from pathlib import Path
+
+    return DiagnosticBundleBlobStorage(Path(str(tmp_path)) / "bundles")
 
 
 @pytest.fixture
@@ -51,14 +60,18 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
 
 
 @pytest.fixture
-def client(storage: Storage) -> Iterator[TestClient]:
+def client(
+    storage: Storage, bundle_storage: DiagnosticBundleBlobStorage
+) -> Iterator[TestClient]:
     from fleet.app import app
 
     app.dependency_overrides[get_storage] = lambda: storage
+    app.dependency_overrides[get_bundle_storage] = lambda: bundle_storage
     try:
         yield TestClient(app, base_url="https://testserver")
     finally:
         app.dependency_overrides.pop(get_storage, None)
+        app.dependency_overrides.pop(get_bundle_storage, None)
 
 
 def _extract_hidden_field(html: str, name: str) -> str:
@@ -214,6 +227,50 @@ def test_successful_submit_rotates_and_redirects_and_is_audited(
     assert entries[0].action == "tenant_change"
     assert entries[0].reason == "Mieter ausgezogen"
     assert entries[0].ui_username == USERNAME
+
+
+def test_successful_submit_deletes_diagnostic_bundle_rows_and_blob_files(
+    client: TestClient,
+    storage: Storage,
+    bundle_storage: DiagnosticBundleBlobStorage,
+    password: str,
+    totp_secret: str,
+    user_id: int,
+) -> None:
+    """Owner decision, 2026-10-02: tenant change also deletes the
+    apartment's diagnostic bundles -- both the database row *and* the
+    blob file on disk, proven here through the real UI route (not only at
+    the `Storage` level, see `tests/test_token_rotation.py`)."""
+
+    _make_apartment(storage)
+    now = datetime.now(UTC)
+    command = storage.create_command(
+        APARTMENT, CommandType.DIAGNOSTIC_BUNDLE, lines=None, ui_username=USERNAME, now=now
+    )
+    storage_path = f"{APARTMENT}/bundle.age"
+    blob_path = bundle_storage.root / storage_path
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(b"age-encryption.org/v1\nfake bundle content")
+    outcome, _summary = storage.store_diagnostic_bundle(
+        APARTMENT, command.id, size_bytes=blob_path.stat().st_size, content_hash="0" * 64,
+        storage_path=storage_path, now=now,
+    )
+    assert outcome.name == "STORED"
+    assert blob_path.exists()
+
+    _login(client, password, totp_secret)
+    csrf_token = _extract_hidden_field(
+        client.get(f"/ui/apartments/{APARTMENT}/tenant-change/confirm").text, "csrf_token"
+    )
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/tenant-change/confirm",
+        data={"reason": "Mieterwechsel", "csrf_token": csrf_token},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert storage.get_diagnostic_bundle_for_apartment_command(APARTMENT, command.id) is None
+    assert not blob_path.exists()
 
 
 def test_unknown_apartment_post_is_404(

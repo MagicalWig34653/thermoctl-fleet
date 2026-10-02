@@ -374,7 +374,9 @@ def test_run_cli_reauthenticates_once_then_succeeds(
             raise CommandStreamReauthRequired("reauth required")
         assert client.headers["Authorization"] == f"Bearer {new_token}"
 
-    def fake_reauthenticate(apartment_id: str, data_dir: Path, client: httpx.Client) -> object:
+    def fake_reauthenticate(
+        apartment_id: str, data_dir: Path, client: httpx.Client, old_token: str
+    ) -> object:
         reauth_calls.append(apartment_id)
         return TokenRotationOutcome(token=new_token)
 
@@ -437,7 +439,9 @@ def test_run_cli_reauth_required_twice_gives_up_without_looping(
         calls.append(1)
         raise CommandStreamReauthRequired("reauth required")
 
-    def fake_reauthenticate(apartment_id: str, data_dir: Path, client: httpx.Client) -> object:
+    def fake_reauthenticate(
+        apartment_id: str, data_dir: Path, client: httpx.Client, old_token: str
+    ) -> object:
         reauth_calls.append(apartment_id)
         return TokenRotationOutcome(token=secrets.token_urlsafe(32))
 
@@ -495,7 +499,9 @@ def test_run_cli_reauth_required_without_apartment_id_gives_up_immediately(
 
     reauth_calls: list[str] = []
 
-    def fake_reauthenticate(apartment_id: str, data_dir: Path, client: httpx.Client) -> object:
+    def fake_reauthenticate(
+        apartment_id: str, data_dir: Path, client: httpx.Client, old_token: str
+    ) -> object:
         reauth_calls.append(apartment_id)  # pragma: no cover -- must never be called
         raise AssertionError("must not be called without --apartment-id")
 
@@ -546,7 +552,9 @@ def test_run_cli_reauthentication_itself_fails_gives_up_with_a_clear_message(
     def runner(client: httpx.Client, **kwargs: object) -> None:
         raise CommandStreamReauthRequired("reauth required")
 
-    def failing_reauthenticate(apartment_id: str, data_dir: Path, client: httpx.Client) -> object:
+    def failing_reauthenticate(
+        apartment_id: str, data_dir: Path, client: httpx.Client, old_token: str
+    ) -> object:
         raise TokenRotationError("POST .../token-rotation/challenge was refused: 404")
 
     monkeypatch.setattr(agent_main, "build_client", client_factory)

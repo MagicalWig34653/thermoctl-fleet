@@ -30,14 +30,18 @@ from typing import Annotated
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from fleet.age_key_block import AgeRecipientError, validate_age_recipient
 from fleet.alarms import Notifier, check_absence_alarms, load_notifiers_from_env
-from fleet.auth import require_apartment_token, require_apartment_token_by_hash
+from fleet.auth import (
+    require_apartment_reauth_old_token,
+    require_apartment_token,
+    require_apartment_token_by_hash,
+)
 from fleet.backup_retention import run_backup_retention
 from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
@@ -2196,6 +2200,7 @@ def _uniform_rotation_failure() -> HTTPException:
 def request_token_rotation_challenge(
     apartment: str,
     request: Request,
+    authorization: Annotated[str | None, Header()] = None,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """P6.1, section 12's "Decided afterward" (2026-10-01): the first half
@@ -2207,20 +2212,27 @@ def request_token_rotation_challenge(
     "re-authenticate" signal instead of a generic 403, which is what
     triggers this call.
 
-    Exactly mirrors `request_token_challenge` above (P4.2b), substituting
-    `apartment` for `registration_id` as the subject and a dedicated
-    throttle purpose/budget. **No `202`/pending branch here** -- unlike a
-    fresh device registration, which waits for a human to confirm it in the
-    UI, a rotation challenge either is pending (the UI action already ran)
-    or is not; there is nothing to poll for.
+    **Requires the OLD token as Bearer** (`fleet.auth.require_apartment_
+    reauth_old_token`, cross-review fix, 2026-10-02): an apartment id is
+    not a secret, so without this gate, anyone who merely knows a rotated
+    apartment's id could call this endpoint and overwrite the single
+    active rotation nonce, permanently locking the real device out of ever
+    completing its own recovery (reproduced in cross-review -- "rotation
+    pending" has no expiry of its own). Checked *after* the per-IP
+    throttle, so throttling still happens before any token lookup.
+
+    Otherwise exactly mirrors `request_token_challenge` above (P4.2b),
+    substituting `apartment` for `registration_id` as the subject and a
+    dedicated throttle purpose/budget. **No `202`/pending branch here** --
+    unlike a fresh device registration, which waits for a human to confirm
+    it in the UI, a rotation challenge either is pending (the UI action
+    already ran) or is not; there is nothing to poll for.
     """
 
     ip = resolve_client_ip(request)
     now = datetime.now(UTC)
     _enforce_registration_throttle(storage, ip, _THROTTLE_PURPOSE_TOKEN_ROTATION, now)
-
-    if not storage.apartment_reauth_pending(apartment):
-        raise _uniform_rotation_failure()
+    require_apartment_reauth_old_token(apartment, authorization, storage)
 
     raw_nonce = secrets.token_bytes(MIN_NONCE_BYTES)
     encoded_nonce = encode_bytes(raw_nonce)
@@ -2249,6 +2261,7 @@ def request_token_rotation_token(
     apartment: str,
     payload: TokenRequest,
     request: Request,
+    authorization: Annotated[str | None, Header()] = None,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> JSONResponse:
     """P6.1 -- proof of private-key possession for a tenant-change
@@ -2263,20 +2276,26 @@ def request_token_rotation_token(
     flow can never be replayed against the other, even though both sign
     over a nonce of the same shape.
 
-    Every failure is the same uniform response (`_uniform_rotation_
-    failure`): unknown apartment, no rotation pending, no device currently
-    assigned (so no key to verify against at all), a wrong, malformed, or
-    low-order public key/signature half, and a wrong/expired/already-
-    consumed nonce -- none distinguished any further, mirroring
-    `request_device_token`'s own identical reasoning.
+    **Also requires the OLD token as Bearer** (`fleet.auth.require_
+    apartment_reauth_old_token`, cross-review fix, 2026-10-02 -- see
+    `request_token_rotation_challenge`'s own docstring for the gap this
+    closes): two independent factors, the old token *and* a signature from
+    the device's current Ed25519 key, neither sufficient alone.
+
+    Every failure past that gate is the same uniform response
+    (`_uniform_rotation_failure`): no device currently assigned (so no key
+    to verify against at all), a wrong, malformed, or low-order public
+    key/signature half, and a wrong/expired/already-consumed nonce -- none
+    distinguished any further, mirroring `request_device_token`'s own
+    identical reasoning. A wrong/missing old token, or no rotation pending
+    at all, is instead the generic 403 from the auth gate itself, identical
+    to an apartment that was never rotated.
     """
 
     ip = resolve_client_ip(request)
     now = datetime.now(UTC)
     _enforce_registration_throttle(storage, ip, _THROTTLE_PURPOSE_TOKEN_ROTATION, now)
-
-    if not storage.apartment_reauth_pending(apartment):
-        raise _uniform_rotation_failure()
+    require_apartment_reauth_old_token(apartment, authorization, storage)
 
     public_key = storage.get_current_device_public_key_for_apartment(apartment)
     if public_key is None:

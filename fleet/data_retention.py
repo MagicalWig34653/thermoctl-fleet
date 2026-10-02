@@ -6,6 +6,16 @@ log excerpts and diagnostic bundles keep their own shorter retention;
 backups keep section 15.2's rhythm; the audit log is not deleted. Deletion
 runs as a background job, periods configurable."
 
+**Owner decision, 2026-10-02 (section 12's dated addendum): "the 365-day
+limit applies only to cleared/closed alarms, faults and events; anything
+still open is kept with its real start time regardless of age."**
+`Storage.delete_alarms_older_than` applies this directly (`cleared_at IS
+NOT NULL` alongside the age cutoff -- a still-open alarm is never deleted,
+no matter how old). `EventRecord` has no "open"/"closed" state of its own
+to gate on at all (a fault event is a single, instantaneous report, not an
+ongoing condition) -- see that method's own docstring for the full
+reasoning.
+
 Mirrors `fleet.backup_retention`'s own split exactly: a thin, pure function
 (`run_data_retention`) that only ever calls three already-tested `Storage`
 methods (`delete_heartbeats_older_than`/`delete_events_older_than`/

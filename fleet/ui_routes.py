@@ -2317,11 +2317,18 @@ def tenant_change_confirm_submit(
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    bundle_storage: DiagnosticBundleBlobStorage = Depends(get_bundle_storage),  # noqa: B008
 ) -> Response:
     """Validates the confirmation and performs the tenant change -- token
     rotation plus history deletion plus the audit entry, all in
     `Storage.rotate_apartment_token_for_tenant_change`'s one transaction
-    (see that method's own docstring)."""
+    (see that method's own docstring). Owner decision, 2026-10-02: also
+    deletes the apartment's diagnostic bundles -- the metadata rows are
+    gone by the time that call returns; this route deletes each returned
+    blob path afterward (filesystem writes are not transactional with the
+    database, same "row first, then blob" ordering
+    `apartment_diagnostic_bundle_download`'s own sibling retention job
+    already uses)."""
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
@@ -2346,9 +2353,11 @@ def tenant_change_confirm_submit(
     if length_error is not None:
         return _error(length_error)
 
-    storage.rotate_apartment_token_for_tenant_change(
+    outcome = storage.rotate_apartment_token_for_tenant_change(
         apartment_id, reason.strip(), authenticated.user.username, datetime.now(UTC)
     )
+    for storage_path in outcome.diagnostic_bundle_storage_paths:
+        bundle_storage.delete(storage_path)
 
     return RedirectResponse(
         url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303

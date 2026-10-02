@@ -23,11 +23,17 @@ flow again.
 **The flow itself, run over the same per-call, pinned HTTPS client
 (`agent.transport.build_client`) every other agent call uses:**
 
-1. `POST /v1/apartments/{apartment}/token-rotation/challenge` -- no bearer
-   token presented at all (the old one no longer works, by construction);
-   identified by the apartment id alone, which this agent already knows
-   locally (the same `--apartment-id` CLI argument `agent.loop.BackupConfig`
-   already takes, see `agent.__main__`).
+1. `POST /v1/apartments/{apartment}/token-rotation/challenge` -- **the OLD
+   (just-rotated-away) token as Bearer** (cross-review fix, 2026-10-02):
+   `fleet.auth.require_apartment_reauth_old_token` now requires it on both
+   rotation endpoints, closing a gap where anyone who merely knew the
+   (non-secret) apartment id could otherwise overwrite the device's single
+   active rotation nonce and permanently lock it out. This agent already
+   has the old token in hand -- it is exactly the one that just failed
+   with the 401 reauth signal (`agent.commands_channel
+   .CommandStreamReauthRequired`), passed in here by the caller
+   (`agent.__main__._run_agent`) as `old_token`, never read back off disk
+   or out of ambient client state.
 2. Sign the domain-separated message `fleet.app.request_token_rotation_token`
    verifies, `b"thermoctl-fleet/token-rotation/v1\\0" + apartment_id +
    b"\\0" + nonce`, with the **same** Ed25519 private key generated at
@@ -109,27 +115,37 @@ def reauthenticate(
     apartment_id: str,
     data_dir: Path,
     client: httpx.Client,
+    old_token: str,
 ) -> TokenRotationOutcome:
     """Runs the token-rotation recovery flow once and persists the new
-    token. Raises `TokenRotationError` for any refusal (no rotation
-    pending, wrong/expired nonce, ...) or `pydantic.ValidationError` for a
-    response that does not match the expected model -- **never retried
-    internally**; the caller decides what "give up" means (see module
-    docstring).
+    token. Raises `TokenRotationError` for any refusal (old token wrong or
+    no longer recognised, no rotation pending, wrong/expired nonce, ...) or
+    `pydantic.ValidationError` for a response that does not match the
+    expected model -- **never retried internally**; the caller decides
+    what "give up" means (see module docstring).
+
+    `old_token` is presented as an ordinary `Authorization: Bearer` header
+    on **both** requests below (cross-review fix, 2026-10-02 -- see the
+    module docstring) -- never read back from disk or from the client's
+    own ambient headers, so this function's behaviour does not depend on
+    what the caller happened to set `client.headers["Authorization"]` to
+    beforehand.
 
     `client` is the agent's **already pinned, already connected**
     `httpx.Client` (`agent.transport.build_client`) -- reused as-is, not
     rebuilt here, since the fleet's TLS certificate/fingerprint have not
-    changed just because the apartment token was rotated. Its
-    `Authorization` header is irrelevant for the challenge/token calls
-    below (fleet.auth is never consulted for these two routes) and is left
-    untouched by this function; the **caller** is responsible for updating
-    it to the new token afterwards.
+    changed just because the apartment token was rotated. This function
+    never mutates `client.headers`; the **caller** is responsible for
+    updating it to the newly issued token afterwards.
     """
 
     private_key = load_or_create_private_key(data_dir)
+    old_token_headers = {"Authorization": f"Bearer {old_token}"}
 
-    challenge_response = client.post(f"/v1/apartments/{apartment_id}/token-rotation/challenge")
+    challenge_response = client.post(
+        f"/v1/apartments/{apartment_id}/token-rotation/challenge",
+        headers=old_token_headers,
+    )
     if challenge_response.status_code != 200:
         raise TokenRotationError(
             "POST .../token-rotation/challenge was refused: "
@@ -149,6 +165,7 @@ def reauthenticate(
     token_response = client.post(
         f"/v1/apartments/{apartment_id}/token-rotation/token",
         json=token_request.model_dump(mode="json"),
+        headers=old_token_headers,
     )
     if token_response.status_code != 200:
         raise TokenRotationError(

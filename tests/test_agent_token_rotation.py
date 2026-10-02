@@ -49,6 +49,9 @@ def _make_apartment_and_device(storage: Storage) -> None:
 # -- unit level, MockTransport ---------------------------------------------------
 
 
+_FAKE_OLD_TOKEN = "agent_house7-a03_fake-old-token"  # noqa: S105 -- test fixture, not a secret
+
+
 def test_reauthenticate_non_200_challenge_raises(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -60,7 +63,7 @@ def test_reauthenticate_non_200_challenge_raises(tmp_path: Path) -> None:
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://fleet.test")
 
     with pytest.raises(TokenRotationError):
-        reauthenticate(APARTMENT, data_dir, client)
+        reauthenticate(APARTMENT, data_dir, client, _FAKE_OLD_TOKEN)
 
 
 def test_reauthenticate_non_200_token_raises(tmp_path: Path) -> None:
@@ -78,7 +81,7 @@ def test_reauthenticate_non_200_token_raises(tmp_path: Path) -> None:
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://fleet.test")
 
     with pytest.raises(TokenRotationError):
-        reauthenticate(APARTMENT, data_dir, client)
+        reauthenticate(APARTMENT, data_dir, client, _FAKE_OLD_TOKEN)
 
 
 def test_reauthenticate_never_regenerates_the_private_key(tmp_path: Path) -> None:
@@ -92,10 +95,32 @@ def test_reauthenticate_never_regenerates_the_private_key(tmp_path: Path) -> Non
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://fleet.test")
     with pytest.raises(TokenRotationError):
-        reauthenticate(APARTMENT, data_dir, client)
+        reauthenticate(APARTMENT, data_dir, client, _FAKE_OLD_TOKEN)
 
     reloaded = load_or_create_private_key(data_dir)
     assert reloaded.public_key().public_bytes_raw() == original_public
+
+
+def test_reauthenticate_sends_the_old_token_as_bearer_on_both_calls(tmp_path: Path) -> None:
+    """Cross-review fix (2026-10-02): both the challenge and the token call
+    must carry `old_token` as `Authorization: Bearer ...` -- proven
+    directly against the request the (fake) transport actually received,
+    not only inferred from the overall outcome."""
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    load_or_create_private_key(data_dir)
+    seen_auth_headers: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth_headers.append(request.headers.get("Authorization"))
+        return httpx.Response(404, json={"detail": "nope"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://fleet.test")
+    with pytest.raises(TokenRotationError):
+        reauthenticate(APARTMENT, data_dir, client, _FAKE_OLD_TOKEN)
+
+    assert seen_auth_headers == [f"Bearer {_FAKE_OLD_TOKEN}"]
 
 
 # -- real TLS end to end ----------------------------------------------------------
@@ -163,10 +188,10 @@ def test_rotation_recovery_end_to_end_over_real_tls(tmp_path: Path, db_url: str)
             old_token = token_path(data_dir).read_text(encoding="utf-8").strip()
 
             # Landlord performs a tenant change.
-            ok = landlord_storage.rotate_apartment_token_for_tenant_change(
+            rotate_outcome = landlord_storage.rotate_apartment_token_for_tenant_change(
                 APARTMENT, "Mieterwechsel", USERNAME, datetime.now(UTC)
             )
-            assert ok is True
+            assert rotate_outcome.ok is True
 
             from agent.transport import build_client
 
@@ -179,7 +204,7 @@ def test_rotation_recovery_end_to_end_over_real_tls(tmp_path: Path, db_url: str)
                 assert "reauth_required" in stale.headers["www-authenticate"]
 
                 # Agent recovers, exactly once.
-                outcome = reauthenticate(APARTMENT, data_dir, client)
+                outcome = reauthenticate(APARTMENT, data_dir, client, old_token)
                 assert outcome.token != old_token
                 assert outcome.token.startswith(f"agent_{APARTMENT}_")
 

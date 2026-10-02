@@ -1088,6 +1088,20 @@ Follow-up packages for the three open points the project owner decided in
   once by `agent.__main__._run_agent`. Migration `0017`, chained onto
   main's `0016`. `ruff`/`mypy`/`pytest` all clean, coverage 99% overall,
   every new line in this package's own files at 100%.
+- [x] **cross-review fix** (2026-10-02, see `docs/STATUS.md`'s own entry
+  for the full account): both token-rotation endpoints now also require
+  the OLD token as Bearer (`fleet.auth.require_apartment_reauth_old_
+  token`) -- closes a found-and-reproduced gap where anyone who merely
+  knew a rotated apartment's (non-secret) id could overwrite the real
+  device's single active nonce and permanently lock it out. Rotation-
+  pending state is now also cleared by `confirm_device`/`issue_device_
+  token`/`remove_device`, not only by completing the rotation. A new
+  `agent/reauth_backoff.py` persists an exponential backoff across process
+  restarts so a persistently failing re-authentication cannot crash-loop a
+  supervised process. Two further owner decisions folded in: the 365-day
+  retention limit now applies only to cleared/closed alarms (an open one
+  survives regardless of age); tenant change additionally deletes the
+  apartment's diagnostic bundles (row and blob, scoped to that apartment).
 
 ---
 

@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pydantic
 
-from agent import loop
+from agent import loop, reauth_backoff
 from agent.commands_channel import CommandStreamAuthError, CommandStreamReauthRequired
 from agent.encryption import DEFAULT_RECIPIENTS_FILE
 from agent.registration import (
@@ -25,6 +26,11 @@ from agent.safe_io import UnsafeStateFileError
 from agent.token_rotation import TokenRotationError, reauthenticate
 from agent.transport import build_client
 from protocol.registration import AgentRegistrationFile
+
+# P6.1 cross-review fix (2026-10-02): the persisted re-authentication
+# backoff's own state file, next to the other data-dir state this CLI
+# already owns (the token, the private key, the registration status).
+_REAUTH_BACKOFF_FILENAME = "reauth_backoff"  # noqa: S105 -- a filename, not a secret
 
 # `python -m agent --version`/`agent_version` in the device-config backup
 # (P5.5a, `agent.loop._build_device_config_snapshot`) -- this scaffold has
@@ -79,6 +85,7 @@ def _run_agent(args: argparse.Namespace) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         data_dir = Path(args.data_dir)
+        backoff_path = data_dir / _REAUTH_BACKOFF_FILENAME
         token = load_token(data_dir)
         if not token:
             print(
@@ -132,15 +139,29 @@ def _run_agent(args: argparse.Namespace) -> int:
             # called from inside `loop.run`) is where this agent actually
             # notices -- the fleet answers its very next call with a 401
             # carrying `error="reauth_required"`, surfaced here as
-            # `CommandStreamReauthRequired`. **Retried at most once**: a
-            # `reauthenticated` flag, not a loop with no exit, is what keeps
-            # this from hammering the fleet service if the rotation flow
-            # itself keeps failing (e.g. no rotation actually pending, a
-            # wrong key, a transport error) -- the second occurrence
-            # (`reauthenticated` already `True`) is never caught here and
-            # propagates to the `except CommandStreamReauthRequired`/
+            # `CommandStreamReauthRequired`. **Retried at most once per
+            # process**: a `reauthenticated` flag, not a loop with no exit,
+            # is what keeps this from hammering the fleet service if the
+            # rotation flow itself keeps failing (e.g. no rotation actually
+            # pending, a wrong key, a transport error) -- the second
+            # occurrence (`reauthenticated` already `True`) is never caught
+            # here and propagates to the `except CommandStreamReauthRequired`/
             # `CommandStreamAuthError` clauses below instead, ending the
             # process with a clear message rather than retrying forever.
+            #
+            # **Cross-review fix (2026-10-02): a persisted backoff on top,
+            # across process restarts, not only within this one.** Bounding
+            # retries to one *per process* only prevents a tight loop
+            # *inside* a single run -- under a `Restart=always`/`restart:
+            # always` policy, a process that keeps exiting with this error
+            # would otherwise be restarted instantly, forever, by whatever
+            # supervises it. `reauth_backoff.wait_if_needed` sleeps out any
+            # pending backoff (persisted to `backoff_path`, surviving
+            # exactly this kind of restart) before even attempting the
+            # rotation flow; a failure doubles it (`record_failure`, capped
+            # at `reauth_backoff.MAX_BACKOFF_S`), a success clears it
+            # (`record_success`) so the next, unrelated failure streak (if
+            # any) starts fresh.
             reauthenticated = False
             while True:
                 try:
@@ -166,9 +187,26 @@ def _run_agent(args: argparse.Namespace) -> int:
                     break
                 except CommandStreamReauthRequired:
                     if reauthenticated or not args.apartment_id:
+                        if reauthenticated:
+                            # The rotation flow itself appeared to succeed
+                            # (a new token was obtained and set), yet the
+                            # fleet still answered the retried `loop.run`
+                            # with the same reauth signal -- genuinely
+                            # unresolved, counts as a failure for backoff
+                            # purposes. Missing `--apartment-id` is a
+                            # configuration problem, not a transient one --
+                            # nothing to back off from, so left alone.
+                            reauth_backoff.record_failure(backoff_path, datetime.now(UTC))
                         raise
                     reauthenticated = True
-                    outcome = reauthenticate(args.apartment_id, data_dir, client)
+                    reauth_backoff.wait_if_needed(backoff_path, datetime.now(UTC))
+                    try:
+                        outcome = reauthenticate(args.apartment_id, data_dir, client, token)
+                    except TokenRotationError:
+                        reauth_backoff.record_failure(backoff_path, datetime.now(UTC))
+                        raise
+                    reauth_backoff.record_success(backoff_path)
+                    token = outcome.token
                     client.headers["Authorization"] = f"Bearer {outcome.token}"
     except CommandStreamReauthRequired:
         print(

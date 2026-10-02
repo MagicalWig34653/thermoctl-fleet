@@ -2,6 +2,189 @@
 
 Last updated: 2026-10-02.
 
+## P6.1 cross-review fix: unauthenticated nonce overwrite, stale rotation state, no agent backoff, plus owner decisions on open alarms and diagnostic bundles (2026-10-02) **SR**
+
+Cross-review of P6.1 (commit `4268ae2`) found two required, reproduced
+issues plus a hardening gap; the project owner separately decided two
+further refinements to section 12. All five addressed in one fix round.
+
+**1. Unauthenticated nonce overwrite (reproduced in cross-review).** An
+apartment id is **not** a secret -- it is shown in the fleet UI, used in
+URLs, and follows the human-chosen `house7-a03` scheme. The original
+`POST /v1/apartments/{apartment}/token-rotation/challenge` issued (or
+silently overwrote) the single active rotation nonce for *any* apartment
+with `apartment_reauth_pending(apartment)` true, with no proof of anything
+from the caller. An attacker who merely knew a rotated apartment's id
+could therefore overwrite the real device's nonce whenever it liked --
+`Storage.issue_token_rotation_challenge`'s own "single current nonce"
+semantics mean the real device's subsequent `.../token` call then fails
+with the uniform 404, and "rotation pending" has no expiry of its own to
+ever clear that stuck state: a permanent lock-out, reachable by anyone who
+can read the apartment id off the fleet UI.
+
+**Fixed structurally**: both `.../challenge` and `.../token` now also
+require the **OLD** (just-rotated-away) token as an ordinary
+`Authorization: Bearer` header, checked via a new `fleet.auth.require_
+apartment_reauth_old_token` (not a FastAPI `Depends()` -- called directly
+from each route body, *after* the per-IP throttle check, so throttling
+still happens before any token lookup) against a new `Storage
+.get_apartment_reauth_old_token_hash` (the apartment-scoped counterpart of
+`get_apartment_token_hash`, in constant time via `hmac.compare_digest`).
+Two independent factors are now required: the old token *and* a valid
+Ed25519 signature from the device's current key -- neither alone is
+sufficient (proven directly: `test_rotation_token_with_the_old_token_
+alone_and_no_valid_signature_is_refused`). A caller without the old token
+gets the ordinary 401 (missing header) or 403 (wrong/unknown token) --
+indistinguishable from an apartment that was never rotated at all, same
+"no enumeration" reasoning `require_apartment_token`'s own module
+docstring already establishes for the identical class of problem.
+`agent.token_rotation.reauthenticate` gained a required `old_token`
+parameter (sent as `Authorization: Bearer` on both calls, never read back
+from disk or ambient client state) -- `agent.__main__._run_agent` passes
+the exact token that just failed with the 401 reauth signal.
+
+**Tests** (`tests/test_token_rotation.py`, largely rewritten to add the
+old-token header everywhere it is now required): a caller with no
+`Authorization` header at all gets 401 and the real device's own nonce
+survives untouched, still completing the rotation afterward
+(`test_rotation_challenge_without_any_authorization_header_is_401_and_
+does_not_touch_nonce`); a caller with a wrong token gets 403, same proof
+(`test_rotation_challenge_with_a_wrong_old_token_is_403_and_does_not_
+touch_nonce`); the old token alone with an invalid signature is refused
+and issues nothing; every existing happy-path/replay/wrong-key/stale-nonce
+test updated to present the old token and re-verified end to end, including
+the real-TLS agent test (`tests/test_agent_token_rotation.py
+::test_rotation_recovery_end_to_end_over_real_tls`) and a new unit test
+proving both HTTP calls actually carry the header
+(`test_reauthenticate_sends_the_old_token_as_bearer_on_both_calls`).
+
+**2. Rotation-pending state never cleared by an ordinary lifecycle event
+for the same apartment (reproduced in cross-review).** `reauth_old_token_
+hash`/`rotation_nonce_*` used to be cleared only by `complete_token_
+rotation` itself -- an entirely ordinary, independent event for the same
+apartment (a fresh device confirmation via `confirm_device`, an ordinary
+non-rotation token issuance via `issue_device_token`, or a device removal
+via `remove_device`) left the stale state in place, so a very old,
+already-superseded token could keep getting the 401 "re-authenticate"
+signal forever, long after the apartment's real token had already moved on
+through a completely different path.
+
+**Fixed** with a new, shared `Storage._clear_reauth_rotation_state`
+helper (same transaction as the caller's own write, a no-op and never
+audit-logged if nothing was actually pending) called from all three
+places: `confirm_device` (phase 2, right after the apartment lookup --
+covers both the "replace an existing device" and "first device ever"
+branches), `issue_device_token` (folded directly into its own guarded
+`UPDATE`'s `.values()`, harmless and idempotent even when nothing was
+pending), and `remove_device` (alongside its own token-hash clear). Tested
+directly for each of the three call sites
+(`test_confirm_device_clears_a_stale_rotation_state_for_the_apartment`,
+`test_issue_device_token_non_rotation_path_clears_a_stale_rotation_state`,
+`test_remove_device_clears_a_stale_rotation_state_for_the_apartment`).
+
+**3. No internal backoff on the agent side -- a persistently failing
+re-authentication would crash-loop a supervised process.** `agent
+.__main__._run_agent` already refused to retry a `CommandStreamReauth
+Required` more than once *within one process*, but a `Restart=always`
+systemd unit/`restart: always` Docker policy would otherwise restart the
+process instantly, forever, with no delay at all between attempts if the
+rotation flow keeps failing (a network blip, no rotation actually pending,
+...).
+
+**Fixed** with a new, small module, `agent/reauth_backoff.py` -- a
+persisted, exponential backoff (`MIN_BACKOFF_S` 60s, doubling, capped at
+`MAX_BACKOFF_S` 3600s/1h, reset to the minimum on success), stored in a
+line-based state file read via `agent.safe_io.read_text_safe` (the same
+symlink/non-regular-file hardening every other agent state file gets;
+fails *safe*, not closed, like `agent.commands_channel._read_last_event_
+id` -- an unreadable/unsafe file just means "nothing pending", never a
+crash). `_run_agent` calls `wait_if_needed` before attempting the rotation
+flow, `record_failure` on any failure (the rotation call itself raising,
+or a second, still-unresolved `CommandStreamReauthRequired` after an
+apparently successful rotation), `record_success` once it actually works.
+13 tests, injected clock throughout, no real sleeping in the test suite
+(`tests/test_agent_reauth_backoff.py`); `tests/test_agent_main.py` gained
+coverage for the `TokenRotationError`-during-reauth path that exercises
+`record_failure` through the real CLI flow (with `loop.run`/`reauthenticate`
+faked, the same established pattern that file's own docstring describes).
+
+**4. `complete_token_rotation`'s single-use guard, tested directly in
+isolation** (cross-review: previously only reachable indirectly through
+the HTTP-level replay test) -- `tests/test_token_rotation.py
+::test_complete_token_rotation_single_use_guard_in_isolation` calls it
+twice with the same nonce at the `Storage` level alone, no HTTP layer, no
+signature verification: the first call wins, the second returns `None`,
+and the winning token is unaffected by the loser's attempt.
+
+**Owner decision (2026-10-02), retention refined: "the 365-day limit
+applies only to cleared/closed alarms, faults and events; anything still
+open is kept with its real start time regardless of age."**
+`Storage.delete_alarms_older_than` now additionally requires `cleared_at
+IS NOT NULL` in the same `WHERE` clause as the age cutoff -- a still-open
+alarm is never deleted, no matter how old `raised_at` is. `EventRecord`
+(the "faults and events" half of that sentence) has **no "open"/"closed"
+state of its own anywhere in this schema** -- a fault event is a single,
+instantaneous report (section 6/18.1), never an ongoing condition tracked
+as "still open" the way `AlarmRecord.cleared_at` tracks an alarm -- so
+`delete_events_older_than` is unchanged; there is no column here for this
+decision to gate on. Tested directly: an open alarm older than 365 days
+survives a retention run; a cleared one of the exact same age is deleted
+(`tests/test_data_retention.py
+::test_open_alarm_older_than_365_days_survives_cleared_one_at_the_same_
+age_is_deleted`); the two pre-existing boundary/scoping tests that used an
+uncleared alarm were updated to clear it first, since they specifically
+mean to test the age boundary, not the new "closed" gate.
+
+**Owner decision (2026-10-02), tenant change refined: "additionally
+deletes the apartment's diagnostic bundles (DB rows and blob files, scoped
+to that apartment only); backups stay."** `Storage.rotate_apartment_token_
+for_tenant_change` now also deletes `DiagnosticBundleRecord` rows for the
+apartment (same transaction as everything else it already did) and
+returns their `storage_path`s in a new `TenantChangeOutcome` dataclass
+(`ok: bool`, `diagnostic_bundle_storage_paths: list[str]` -- the method's
+return type changed from a bare `bool`, every call site updated) -- the
+actual blob files are deleted by the caller afterward (`fleet.ui_routes
+.tenant_change_confirm_submit`, via `DiagnosticBundleBlobStorage.delete`),
+mirroring `delete_expired_diagnostic_bundles`'s own "row first, then blob,
+outside the transaction" ordering exactly, for the identical "filesystem
+writes are not transactional with the database" reason. Backups are
+untouched, as before. Tested at both layers: `Storage`-level scoping
+(another apartment's own diagnostic bundle survives,
+`test_rotate_returns_diagnostic_bundle_storage_paths_scoped_to_this_
+apartment_only`) and the full UI route proving the blob file is actually
+gone from disk afterward
+(`test_successful_submit_deletes_diagnostic_bundle_rows_and_blob_files`).
+
+Both owner decisions also recorded in `docs/specification.md` section 12
+as a dated addendum, 2026-10-02.
+
+**Files**: `fleet/auth.py` (new `require_apartment_reauth_old_token`),
+`fleet/app.py` (both rotation endpoints now take `authorization` and call
+it), `fleet/storage.py` (`get_apartment_reauth_old_token_hash`,
+`_clear_reauth_rotation_state` + its three call sites, `delete_alarms_
+older_than`'s new gate, `rotate_apartment_token_for_tenant_change`'s
+diagnostic-bundle deletion and new `TenantChangeOutcome` return type),
+`fleet/ui_routes.py` (blob deletion after rotation), `fleet/data_
+retention.py` (docstring), `agent/token_rotation.py` (`old_token`
+parameter), `agent/reauth_backoff.py` (new), `agent/__main__.py` (backoff
+wiring), `docs/specification.md`, plus the test files named above.
+
+**Verification** (same fresh venv as P6.1's own): `ruff check .` -- `All
+checks passed!`; `mypy .` -- `Success: no issues found in 150 source
+files`; `mypy protocol fleet agent tools` -- `Success: no issues found in
+74 source files`; `python -m pytest -W ignore::ResourceWarning -rA` --
+**1900 passed, 1 skipped** (the one skip: no `age` CLI binary on this
+machine, pre-existing and unrelated), coverage **99%** overall (7444
+statements, 20 missed) -- every file this fix round touched
+(`fleet/app.py`, `fleet/auth.py`, `fleet/storage.py`, `fleet/ui_routes.py`,
+`fleet/data_retention.py`, `agent/token_rotation.py`,
+`agent/reauth_backoff.py`, `agent/__main__.py`) at **100%**; the remaining
+20 misses are all pre-existing and unrelated to this package. `watchdog/`:
+`go vet ./...` clean, `go test ./...` -- all four packages `ok`, `bash
+watchdog/check_contract.sh` -- "Contract test passed". Migration (no new
+one this round; `0017` unchanged) re-verified upgrade/downgrade/upgrade on
+a throwaway sqlite file.
+
 ## P6.1 -- Retention and tenant change (section 12's "Decided afterward", 2026-10-01) **SR**
 
 Implements both of this paragraph's data-handling decisions: a background
