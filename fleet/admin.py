@@ -180,7 +180,7 @@ def rotate_totp_key() -> int:
     the command with `FLEET_TOTP_KEY` set to the new key (now correct for
     the already-rotated rows) and `FLEET_TOTP_KEY_NEW` unchanged resumes
     from there; it is not all-or-nothing the way the one-time migration
-    (`0017_totp_encryption_and_webauthn.py`) is, because unlike that
+    (`0019_totp_encryption_and_webauthn.py`) is, because unlike that
     migration this is an operator-driven, re-runnable maintenance command,
     not a single irreversible schema transition.
     """

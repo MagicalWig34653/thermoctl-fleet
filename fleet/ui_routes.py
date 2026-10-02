@@ -43,6 +43,7 @@ from fleet.ui_apartment import (
     DEFAULT_FETCH_LOGS_LINES,
     DESIRED_STATE_SERVICE_LABELS,
     DESIRED_STATE_SERVICE_ORDER,
+    MAX_FAULT_ACK_NOTE_LENGTH,
     MAX_FETCH_LOGS_LINES,
     MIN_FETCH_LOGS_LINES,
     DesiredStateServiceDisplay,
@@ -92,6 +93,7 @@ from fleet.ui_rollout import (
 from fleet.ui_tasks import build_task_overview
 from protocol.commands import CommandType
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
+from protocol.heartbeat import FaultKind
 from protocol.inventory import ApartmentState
 from protocol.registration import AgentRegistrationFile
 
@@ -2004,6 +2006,7 @@ def _rollout_new_response(
     stagger_hours: str,
     timeout_hours: str,
     selected_apartment_ids: set[str],
+    selected_test_apartment_id: str,
     error: str | None,
     status_code: int = 200,
 ) -> HTMLResponse:
@@ -2034,6 +2037,7 @@ def _rollout_new_response(
             "max_version_length": MAX_VERSION_LENGTH,
             "apartments": apartments,
             "selected_apartment_ids": selected_apartment_ids,
+            "selected_test_apartment_id": selected_test_apartment_id,
             "error": error,
         },
         status_code=status_code,
@@ -2058,6 +2062,7 @@ def rollout_new_form(
         stagger_hours=str(DEFAULT_STAGGER_HOURS),
         timeout_hours=str(DEFAULT_TIMEOUT_HOURS),
         selected_apartment_ids=set(),
+        selected_test_apartment_id="",
         error=None,
     )
 
@@ -2072,6 +2077,7 @@ def rollout_new_submit(
     stagger_hours: str = Form(str(DEFAULT_STAGGER_HOURS)),
     timeout_hours: str = Form(str(DEFAULT_TIMEOUT_HOURS)),
     apartment_ids: list[str] = Form(default_factory=list),  # noqa: B008
+    test_apartment_id: str = Form(""),
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
@@ -2084,8 +2090,19 @@ def rollout_new_submit(
     route's own displayed apartment order (`storage.list_apartments()`,
     filtered to the checked ids), not the order the checkboxes happened to
     be clicked in** -- an HTML form does not preserve click order, and
-    `Storage.create_rollout` moves pilot apartments to the front
-    regardless, so any deterministic order is sufficient here."""
+    `Storage.create_rollout` moves the rollout's own test apartment to the
+    front regardless, so any deterministic order is sufficient here.
+
+    **P5.4e (project owner, 2026-10-02):** the landlord may mark exactly
+    one apartment of the list as the rollout's own test apartment
+    (`test_apartment_id`, a radio button in the template, deliberately not
+    a checkbox -- exactly one or none). When none is marked, the first
+    apartment of this route's own displayed order is the test apartment --
+    resolved here (not left to `Storage.create_rollout`'s own identical
+    fallback) so the confirm page can show the landlord which apartment
+    that will be, explicitly, rather than leaving it implicit. This is
+    independent of `ApartmentRecord.pilot_mode` -- the former "at least one
+    selected apartment must carry `pilot_mode=True`" refusal is removed."""
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
@@ -2103,6 +2120,7 @@ def rollout_new_submit(
             stagger_hours=stagger_hours,
             timeout_hours=timeout_hours,
             selected_apartment_ids=selected,
+            selected_test_apartment_id=test_apartment_id.strip(),
             error=message,
             status_code=400,
         )
@@ -2129,10 +2147,16 @@ def rollout_new_submit(
         return _error("Mindestens eine Wohnung ist erforderlich.")
 
     ordered_ids = [a.id for a in storage.list_apartments() if a.id in selected]
-    pilot_ids = {a.id for a in storage.list_apartments() if a.pilot_mode}
-    if not (selected & pilot_ids):
-        return _error("Mindestens eine ausgewählte Wohnung muss im Pilotbetrieb sein.")
-    ordered_ids = sorted(ordered_ids, key=lambda a: (a not in pilot_ids,))
+
+    test_apartment_id_stripped = test_apartment_id.strip()
+    if test_apartment_id_stripped and test_apartment_id_stripped not in selected:
+        return _error(
+            "Die markierte Testwohnung muss eine der ausgewählten Wohnungen sein."
+        )
+    chosen_test_apartment_id = test_apartment_id_stripped or ordered_ids[0]
+    ordered_ids = [chosen_test_apartment_id] + [
+        a for a in ordered_ids if a != chosen_test_apartment_id
+    ]
 
     response = templates.TemplateResponse(
         request,
@@ -2147,7 +2171,7 @@ def rollout_new_submit(
             "stagger_hours": stagger_hours_value,
             "timeout_hours": timeout_hours_value,
             "ordered_apartment_ids": ordered_ids,
-            "pilot_apartment_ids": pilot_ids & selected,
+            "test_apartment_id": chosen_test_apartment_id,
             "error": None,
         },
     )
@@ -2165,13 +2189,20 @@ def rollout_confirm_submit(
     stagger_hours: str = Form(str(DEFAULT_STAGGER_HOURS)),
     timeout_hours: str = Form(str(DEFAULT_TIMEOUT_HOURS)),
     apartment_ids: list[str] = Form(default_factory=list),  # noqa: B008
+    test_apartment_id: str = Form(""),
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """The actual write -- `Storage.create_rollout` is only ever called
     from here, and re-validates every field again (the hidden fields
     carried over from step one are never trusted blindly, same rule
-    `desired_state_confirm_submit` already applies)."""
+    `desired_state_confirm_submit` already applies).
+
+    `test_apartment_id` is carried over as a hidden field from step one
+    (where it was already resolved to an explicit value, never left
+    blank, see `rollout_new_submit`'s own docstring) and passed straight
+    through to `Storage.create_rollout`, which re-validates it against
+    `apartment_ids` itself."""
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
@@ -2200,6 +2231,7 @@ def rollout_confirm_submit(
             timeout_hours=timeout_hours_value,
             ui_username=authenticated.user.username,
             reason=reason.strip(),
+            test_apartment_id=test_apartment_id.strip() or None,
             now=datetime.now(UTC),
         )
     except ValueError as error:
@@ -2473,6 +2505,237 @@ def apartment_diagnostic_bundle_download(
     )
 
 
+# -----------------------------------------------------------------------------
+# Tenant change (P6.1, section 12's "Decided afterward" 2026-10-01): "an
+# explicit UI action (confirmation, mandatory reason, audited) rotates the
+# apartment's device token ... and deletes the apartment's heartbeats,
+# events, faults, alarms and command log excerpts." Same two-step,
+# GET-renders/POST-confirms shape as `command_confirm_form`/
+# `command_confirm_submit` above -- `Storage.rotate_apartment_token_for_
+# tenant_change` is the only place this actually happens, called only from
+# the POST below, never the GET.
+#
+# Registered here, above `apartment_detail`'s own `{apartment_id:path}`
+# route below -- the same route-ordering rule that route's own comment
+# already states.
+# -----------------------------------------------------------------------------
+
+
+def _tenant_change_confirm_response(
+    request: Request,
+    authenticated: AuthenticatedUiSession,
+    *,
+    apartment_id: str,
+    apartment_label: str,
+    error: str | None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "tenant_change_confirm.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "apartment_id": apartment_id,
+            "apartment_label": apartment_label,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/apartments/{apartment_id}/tenant-change/confirm", response_class=HTMLResponse)
+def tenant_change_confirm_form(
+    request: Request,
+    apartment_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """Step one of two: names the apartment and spells out, in words, what
+    the action does (rotates the token, deletes the apartment's history),
+    and asks for a mandatory reason. Never calls `Storage.rotate_apartment
+    _token_for_tenant_change` itself -- only the POST below does."""
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    return _tenant_change_confirm_response(
+        request,
+        authenticated,
+        apartment_id=apartment_id,
+        apartment_label=apartment.label,
+        error=None,
+    )
+
+
+@router.post("/apartments/{apartment_id}/tenant-change/confirm")
+def tenant_change_confirm_submit(
+    request: Request,
+    apartment_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    bundle_storage: DiagnosticBundleBlobStorage = Depends(get_bundle_storage),  # noqa: B008
+) -> Response:
+    """Validates the confirmation and performs the tenant change -- token
+    rotation plus history deletion plus the audit entry, all in
+    `Storage.rotate_apartment_token_for_tenant_change`'s one transaction
+    (see that method's own docstring). Owner decision, 2026-10-02: also
+    deletes the apartment's diagnostic bundles -- the metadata rows are
+    gone by the time that call returns; this route deletes each returned
+    blob path afterward (filesystem writes are not transactional with the
+    database, same "row first, then blob" ordering
+    `apartment_diagnostic_bundle_download`'s own sibling retention job
+    already uses).
+
+    **The blob-deletion loop never fails the request (cross-review fix,
+    2026-10-02).** The tenant change itself -- the security-relevant part
+    (token rotation, history deletion, the audit entry) -- has already
+    committed by the time this loop runs; a single `OSError` deleting one
+    blob file (a permissions problem, the file already gone, a transient
+    disk error) must not turn an already-successful tenant change into a
+    `500` or orphan every blob *after* the one that failed. Each delete is
+    therefore wrapped individually: a failure is logged (the storage
+    *path* only, never any blob content -- nothing sensitive to begin
+    with, since this fleet never holds the decryption key) and the loop
+    continues; the redirect always happens. If anything failed, a short,
+    one-line notice is carried to the apartment page via a query
+    parameter (`apartment_detail` reads it) -- a landlord who wants the
+    file gone still learns it is not, rather than silently believing
+    everything was cleaned up."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    def _error(message: str) -> HTMLResponse:
+        return _tenant_change_confirm_response(
+            request,
+            authenticated,
+            apartment_id=apartment_id,
+            apartment_label=apartment.label,
+            error=message,
+            status_code=400,
+        )
+
+    if not reason.strip():
+        return _error("Ein Grund ist erforderlich.")
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        return _error(length_error)
+
+    outcome = storage.rotate_apartment_token_for_tenant_change(
+        apartment_id, reason.strip(), authenticated.user.username, datetime.now(UTC)
+    )
+    bundle_cleanup_failed = False
+    for storage_path in outcome.diagnostic_bundle_storage_paths:
+        try:
+            bundle_storage.delete(storage_path)
+        except OSError:
+            logger.warning(
+                "Tenant change for %r: could not delete diagnostic bundle blob %r "
+                "(continuing with the remaining ones).",
+                apartment_id,
+                storage_path,
+            )
+            bundle_cleanup_failed = True
+
+    redirect_url = f"/ui/apartments/{quote(apartment_id, safe='')}"
+    if bundle_cleanup_failed:
+        redirect_url += "?bundle_cleanup_failed=1"
+    return RedirectResponse(url=redirect_url, status_code=303)
+
+
+# Fault acknowledgement (P6.3, section 12's "Decided afterward", 2026-10-01).
+# Registered here, above `apartment_detail`'s own `{apartment_id:path}` route
+# below -- same route-ordering rule as the command-confirmation/desired-state
+# routes' own comments already state.
+@router.post("/apartments/{apartment_id:path}/faults/acknowledge")
+def fault_acknowledge_submit(
+    apartment_id: str,
+    fault_kind: str = Form(...),
+    zone: str = Form(...),
+    since: str = Form(...),
+    note: str = Form(""),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Acknowledges one fault occurrence on "Eine Wohnung" (P6.3). Only ever
+    called from that page's own "Quittieren" form -- `fault_kind`/`zone`/
+    `since` are its hidden fields, carrying exactly the occurrence key
+    `fleet.storage.FaultAcknowledgementRecord`'s docstring defines.
+
+    **Re-validated against the apartment's *current* `open_faults`
+    (`Storage.get_latest_heartbeat`), not trusted from the form alone** --
+    an unknown `fault_kind` value, or a `(fault_kind, zone, since)` triple
+    that does not match any fault the apartment's latest heartbeat actually
+    reports as open right now, is rejected with 400 before
+    `Storage.acknowledge_fault` is ever called. This is what keeps a
+    stale or hand-crafted form from creating an acknowledgement row for an
+    occurrence that was never genuinely open -- the same "the agent/cloud
+    is not trusted to self-report what's valid" reasoning this package's
+    other state-changing routes already apply to their own inputs.
+    """
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    try:
+        parsed_kind = FaultKind(fault_kind)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Unbekannte Störungsart.") from exc
+
+    try:
+        parsed_since = datetime.fromisoformat(since)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Ungültiger Zeitpunkt.") from exc
+
+    stripped_note = note.strip() or None
+    if stripped_note is not None:
+        length_error = _first_length_error(("Hinweis", stripped_note, MAX_FAULT_ACK_NOTE_LENGTH))
+        if length_error is not None:
+            raise HTTPException(status_code=400, detail=length_error)
+
+    latest = storage.get_latest_heartbeat(apartment_id)
+    currently_open = latest is not None and any(
+        fault.kind == parsed_kind
+        and fault.zone == zone
+        and fault.since.replace(tzinfo=None) == parsed_since.replace(tzinfo=None)
+        for fault in latest.heartbeat.open_faults
+    )
+    if not currently_open:
+        raise HTTPException(
+            status_code=400,
+            detail="Diese Störung ist derzeit nicht offen.",
+        )
+
+    storage.acknowledge_fault(
+        apartment_id,
+        parsed_kind.value,
+        zone,
+        parsed_since,
+        acknowledged_by=authenticated.user.username,
+        note=stripped_note,
+        now=datetime.now(UTC),
+    )
+
+    return RedirectResponse(
+        url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+    )
+
+
 # P3.2 review: any future `/ui/apartments/...` sub-route (a fixed suffix,
 # not a `{apartment_id}`) **must** be registered above this one -- FastAPI/
 # Starlette matches routes in registration order, and `{apartment_id:path}`
@@ -2523,6 +2786,16 @@ def apartment_detail(
     """
 
     detail = build_apartment_detail(storage, apartment_id, datetime.now(UTC), days)
+    # Cross-review fix (2026-10-02): a one-shot notice carried via a query
+    # parameter from `tenant_change_confirm_submit`'s own redirect -- the
+    # tenant change itself always succeeds by the time that redirect
+    # happens; this only ever says "some diagnostic bundle blob files
+    # could not be removed", never anything about the rotation/deletion
+    # itself. Deliberately just a presence check (`"1"` or anything else),
+    # not parsed as a count or a list of paths -- the exact failure is
+    # only ever in the server log, never echoed back into a URL a browser
+    # history/referrer could carry.
+    bundle_cleanup_failed = request.query_params.get("bundle_cleanup_failed") is not None
     response = templates.TemplateResponse(
         request,
         "apartment.html",
@@ -2531,6 +2804,7 @@ def apartment_detail(
             "csrf_token": authenticated.session.csrf_token,
             "apartment_id": apartment_id,
             "detail": detail,
+            "bundle_cleanup_failed": bundle_cleanup_failed,
         },
         status_code=200 if detail is not None else 404,
     )

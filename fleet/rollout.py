@@ -201,6 +201,10 @@ def advance_rollout(storage: Storage, rollout_id: str, now: datetime) -> None:
 
 
 def _maybe_set_pilot_converged(storage: Storage, rollout_id: str, now_naive: datetime) -> None:
+    # `Storage.create_rollout` always marks exactly one row `is_pilot=True`
+    # (P5.4e: the rollout's own test apartment) -- `pilots` below is kept
+    # as a list rather than a single lookup only because this code path is
+    # defensive against a row it is handed, not something it re-derives.
     apartments = storage.rollout_apartments(rollout_id)
     pilots = [a for a in apartments if a.is_pilot]
     if pilots and all(p.status == "converged" for p in pilots):

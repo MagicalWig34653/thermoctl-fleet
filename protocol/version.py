@@ -48,4 +48,10 @@ between the two packages of this repository and future compatibility checks.
 # wholly new models, same "counts as a change to the models" reading as
 # every prior bump above; see `protocol/desired_state.py` and
 # `docs/STATUS.md`'s P5.4b section.
-PROTOCOL_VERSION = 8
+# 9: adds `protocol.heartbeat.PerDeviceState` and
+# `DeviceState.per_device` (P6.3, section 12's "Decided afterward",
+# 2026-10-01: "Battery and signal per device may be transmitted ..."). A
+# wholly new model plus an additive field on an existing one -- same
+# "counts as a change to the models" reading as every prior bump above; see
+# `protocol/heartbeat.py` and `docs/STATUS.md`'s P6.3 section.
+PROTOCOL_VERSION = 9

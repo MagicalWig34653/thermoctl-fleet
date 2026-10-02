@@ -55,8 +55,8 @@ single-use, bounded lifetime) -- see `fleet/storage.py`'s
 `WebauthnCredentialRecord`/`WebauthnChallengeRecord` docstrings for the full
 column-by-column reasoning.
 
-Revision ID: 0017
-Revises: 0016
+Revision ID: 0019
+Revises: 0018
 Create Date: 2026-10-01
 """
 
@@ -68,8 +68,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0017"
-down_revision: str | Sequence[str] | None = "0016"
+revision: str = "0019"
+down_revision: str | Sequence[str] | None = "0018"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

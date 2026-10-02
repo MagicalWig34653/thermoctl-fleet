@@ -136,7 +136,9 @@ def _make_apartment(
         )
 
 
-def _new_form(apartment_ids: list[str]) -> dict[str, str | list[str]]:
+def _new_form(
+    apartment_ids: list[str], *, test_apartment_id: str = ""
+) -> dict[str, str | list[str]]:
     return {
         "service": "thermoctl",
         "version": "1.1",
@@ -144,6 +146,7 @@ def _new_form(apartment_ids: list[str]) -> dict[str, str | list[str]]:
         "stagger_hours": "48",
         "timeout_hours": "2",
         "apartment_ids": apartment_ids,
+        "test_apartment_id": test_apartment_id,
     }
 
 
@@ -240,6 +243,9 @@ def test_new_form_get_renders_apartments(
     assert "kein Sollzustand" in response.text
     # A retired apartment is not offered at all.
     assert retired_apartment not in response.text
+    # P5.4e: each apartment offers a radio button to mark it as this
+    # rollout's own test apartment, independent of `pilot_mode`.
+    assert 'name="test_apartment_id"' in response.text
 
 
 def test_full_flow_creates_rollout_with_audit_row(
@@ -282,15 +288,90 @@ def test_full_flow_creates_rollout_with_audit_row(
     assert len(rows) == 1
 
 
-def test_new_step_refuses_without_pilot_apartment(
+def test_new_step_succeeds_without_any_pilot_mode_apartment(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:
+    """P5.4e (project owner, 2026-10-02): replaces the former
+    `test_new_step_refuses_without_pilot_apartment` -- the old refusal when
+    no selected apartment carried `pilot_mode=True` is removed. The
+    rollout's own test apartment is independent of that device-side flag,
+    so OTHER_APARTMENT (no `pilot_mode`) alone is now a perfectly ordinary
+    rollout, not an error -- and, with no explicit marking, becomes the
+    test apartment simply by being the first (and only) one of the list."""
+
     _make_apartment(storage, OTHER_APARTMENT, pilot_mode=False)
     _login(client, password, totp_secret)
     csrf = _csrf_token(client)
 
     response = client.post(
         "/ui/rollouts/new", data={**_new_form([OTHER_APARTMENT]), "csrf_token": csrf}
+    )
+    assert response.status_code == 200
+    assert "(Testwohnung)" in response.text
+    assert OTHER_APARTMENT in response.text
+
+
+def test_new_step_explicit_test_apartment_shown_on_confirm_page(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """The landlord may mark any apartment of the selected list as the
+    test apartment -- not necessarily the first one -- and the confirm
+    page shows exactly that one as the test apartment, independent of
+    `pilot_mode` (OTHER_APARTMENT carries no `pilot_mode` here)."""
+
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _make_apartment(storage, OTHER_APARTMENT, pilot_mode=False)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    response = client.post(
+        "/ui/rollouts/new",
+        data={
+            **_new_form([PILOT_APARTMENT, OTHER_APARTMENT], test_apartment_id=OTHER_APARTMENT),
+            "csrf_token": csrf,
+        },
+    )
+    assert response.status_code == 200
+    # The explicitly marked apartment is listed first and tagged.
+    other_index = response.text.index(OTHER_APARTMENT)
+    pilot_index = response.text.index(PILOT_APARTMENT)
+    assert other_index < pilot_index
+    assert f"{OTHER_APARTMENT} (Testwohnung)" in response.text
+
+    confirm_csrf = _extract_hidden_field(response.text, "csrf_token")
+    confirm_response = client.post(
+        "/ui/rollouts/confirm",
+        data={
+            **_new_form([PILOT_APARTMENT, OTHER_APARTMENT], test_apartment_id=OTHER_APARTMENT),
+            "csrf_token": confirm_csrf,
+            "reason": "test apartment marked explicitly",
+        },
+        follow_redirects=False,
+    )
+    assert confirm_response.status_code == 303
+
+    rollout = storage.list_rollouts()[0]
+    apartments = {a.apartment_id: a for a in storage.rollout_apartments(rollout.id)}
+    assert apartments[OTHER_APARTMENT].is_pilot is True
+    assert apartments[OTHER_APARTMENT].position == 0
+    assert apartments[PILOT_APARTMENT].is_pilot is False
+    assert apartments[PILOT_APARTMENT].position == 1
+
+
+def test_new_step_refuses_test_apartment_not_among_selected(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage, PILOT_APARTMENT, pilot_mode=True)
+    _make_apartment(storage, OTHER_APARTMENT, pilot_mode=False)
+    _login(client, password, totp_secret)
+    csrf = _csrf_token(client)
+
+    response = client.post(
+        "/ui/rollouts/new",
+        data={
+            **_new_form([PILOT_APARTMENT], test_apartment_id=OTHER_APARTMENT),
+            "csrf_token": csrf,
+        },
     )
     assert response.status_code == 400
     assert storage.list_rollouts() == []
@@ -460,12 +541,16 @@ def test_confirm_step_storage_refusal_becomes_400(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:
     """`rollout_confirm_submit` does not re-check everything `/new` already
-    did (no pilot presence check of its own, for one) -- `Storage
-    .create_rollout`'s own `ValueError` must still surface as a clean
-    `400` when reached directly, e.g. by posting to `/confirm` for an
-    apartment with no `pilot_mode`, bypassing `/new` entirely."""
+    did (no "has a current desired state" check of its own, for one --
+    `/new` only *displays* "kein Sollzustand", it does not refuse to
+    submit it) -- `Storage.create_rollout`'s own `ValueError` must still
+    surface as a clean `400` when reached directly, e.g. by posting to
+    `/confirm` for an apartment with no desired state yet, bypassing
+    `/new` entirely. (Since P5.4e, `pilot_mode` absence alone no longer
+    causes any refusal here -- see `test_new_step_succeeds_without_any
+    _pilot_mode_apartment`.)"""
 
-    _make_apartment(storage, OTHER_APARTMENT, pilot_mode=False)
+    _make_apartment(storage, OTHER_APARTMENT, pilot_mode=False, with_desired_state=False)
     _login(client, password, totp_secret)
     csrf = _csrf_token(client)
 

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block title %}Mieterwechsel bestätigen – thermoctl-fleet{% endblock %}
+
+{% block content %}
+{# Tenant change (P6.1, section 12: "Decided afterward" 2026-10-01). This
+   page only ever names the apartment and spells out what the action does
+   in words -- the POST below is the only place
+   Storage.rotate_apartment_token_for_tenant_change is ever called. #}
+<p><a href="/ui/apartments/{{ apartment_id | urlpath }}">&larr; Zurück zur Wohnung</a></p>
+<h1>Mieterwechsel bestätigen</h1>
+
+<p>
+    Für Wohnung <strong>{{ apartment_id }}</strong>{% if apartment_label and apartment_label != apartment_id %} ({{ apartment_label }}){% endif %}
+    wird ein Mieterwechsel durchgeführt:
+</p>
+<ul>
+    <li>Das Gerätetoken dieser Wohnung wird sofort ungültig. Das Gerät holt sich über eine
+        signierte Challenge mit seinem vorhandenen Geräteschlüssel automatisch ein neues Token.</li>
+    <li>Heartbeats, Ereignisse, Störungen, Alarme und gespeicherte Log-Auszüge dieser Wohnung
+        werden gelöscht.</li>
+    <li>Sicherungen und das Audit-Log bleiben unverändert erhalten.</li>
+</ul>
+
+{% if error %}
+<p class="error" role="alert">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="reason">Grund (Pflichtfeld)
+        <input type="text" id="reason" name="reason" required>
+    </label>
+    <button type="submit">Mieterwechsel bestätigen</button>
+</form>
+{% endblock %}

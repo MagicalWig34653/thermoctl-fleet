@@ -41,6 +41,7 @@ from agent.commands_channel import (
     CommandResultError,
     CommandStreamAuthError,
     CommandStreamError,
+    CommandStreamReauthRequired,
     RejectedCommand,
     _append_to_outbox,
     _classify,
@@ -558,6 +559,19 @@ def _mock_status_client(status_code: int) -> httpx.Client:
     return httpx.Client(base_url="https://example.invalid", transport=httpx.MockTransport(handler))
 
 
+def _mock_reauth_required_client() -> httpx.Client:
+    """P6.1: a 401 carrying the specific `fleet.auth._reauth_required`
+    header -- distinguished from an ordinary 401/403 by
+    `_raise_for_non_200`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401, headers={"WWW-Authenticate": 'Bearer error="reauth_required"'}
+        )
+
+    return httpx.Client(base_url="https://example.invalid", transport=httpx.MockTransport(handler))
+
+
 def _sse_body_client(body: str) -> httpx.Client:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -624,6 +638,35 @@ def test_poll_once_403_raises_command_stream_auth_error_not_the_generic_one(
 ) -> None:
     with pytest.raises(CommandStreamAuthError):
         _poll_once(_mock_status_client(403), tmp_path / "last-event-id")
+
+
+def test_stream_once_401_with_reauth_header_raises_the_specific_subclass(
+    tmp_path: Path,
+) -> None:
+    """P6.1: a 401 carrying `WWW-Authenticate: Bearer error="reauth_
+    required"` (`fleet.auth._reauth_required`, sent for the device still
+    presenting a token a tenant-change rotation just revoked) raises
+    `CommandStreamReauthRequired`, not the generic `CommandStreamAuthError`
+    -- caught separately by `agent.__main__._run_agent`."""
+
+    with pytest.raises(CommandStreamReauthRequired):
+        list(_stream_once(_mock_reauth_required_client(), tmp_path / "last-event-id"))
+
+
+def test_poll_once_401_with_reauth_header_raises_the_specific_subclass(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CommandStreamReauthRequired):
+        _poll_once(_mock_reauth_required_client(), tmp_path / "last-event-id")
+
+
+def test_reauth_required_is_also_an_auth_error(tmp_path: Path) -> None:
+    """A caller that only ever catches the broader `CommandStreamAuthError`
+    (every existing caller, before P6.1) still catches this -- it is a
+    subclass, never a parallel, unrelated exception type."""
+
+    with pytest.raises(CommandStreamAuthError):
+        list(_stream_once(_mock_reauth_required_client(), tmp_path / "last-event-id"))
 
 
 def test_receive_commands_uses_the_poll_fallback_when_only_the_stream_fails(

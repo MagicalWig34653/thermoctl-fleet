@@ -34,7 +34,7 @@ needs no key. `fleet.admin create-user`/`reset-totp` fetch and validate the
 key *before* prompting for a password, so a missing key fails immediately,
 not after the operator has already typed one in.
 
-**Migration `0017_totp_encryption_and_webauthn.py`:** widens the column and
+**Migration `0019_totp_encryption_and_webauthn.py`:** widens the column and
 re-encrypts every existing plaintext row in place, in one transaction --
 requires `FLEET_TOTP_KEY` already set in the environment it runs in if any
 `ui_users` row exists, and raises `RuntimeError` (whole migration rolled
@@ -157,17 +157,811 @@ re-auth, challenge binding, and clone detection are all implementation
 choices for mechanisms the spec already approved (TOTP encryption,
 passkeys), not new security policy.
 
-## Owner decisions on section 12 and remaining open points (2026-10-01, main session)
+## P5.4e -- rollout test apartment decoupled from `pilot_mode` (2026-10-02)
 
-Recorded in `docs/specification.md` section 12 ("Decided afterward"):
-retention 90/365 days (audit log kept); tenant change = token rotation via
-signed challenge + deletion of the apartment's history (backups stay);
-passkeys as second factor + TOTP secrets encrypted with an environment
-key; fault acknowledgement for the current occurrence only; per-device
-battery/signal as (device id, battery %, signal) without names or measured
-values. Packages P6.1 (retention + tenant change), P6.2 (login), P6.3
-(acknowledgement + per-device values). Still blocked on thermoctl (no
-`/api/v1/health` yet): P2.3 and activating desired-state updates.
+Implements the owner decision recorded just below ("Owner confirmations"):
+`Storage.create_rollout` gains an optional `test_apartment_id` parameter.
+When given, it must name one of the rollout's own `apartment_ids`
+(`ValueError` otherwise) and is moved to the front of the queue; when
+omitted, the first apartment of `apartment_ids` (before de-duplication)
+is used instead. `RolloutApartmentRecord.is_pilot` is `True` for exactly
+that one apartment per rollout -- the column is reused unchanged (no
+migration), but no longer reflects `ApartmentRecord.pilot_mode` at all.
+The former "at least one selected apartment must carry `pilot_mode=True`"
+refusal is **removed**.
+
+`fleet/ui_routes.py`'s two-step rollout form now lets the landlord mark
+one apartment as the test apartment with a radio button
+(`rollout_new.html`); when none is marked, `rollout_new_submit` resolves
+the fallback itself (first of the displayed, order-preserving list) so
+the confirm page (`rollout_confirm.html`) can show explicitly which
+apartment that will be, tagged "(Testwohnung)", rather than leaving it
+implicit until creation. `rollout_confirm_submit` passes the resolved
+`test_apartment_id` straight through to `Storage.create_rollout`, which
+re-validates it. `fleet/rollout.py`'s worker logic needed no behaviour
+change -- it already read `is_pilot` generically; only docstrings/comments
+were updated to stop implying "an inventory can carry `pilot_mode` on
+several apartments" (a rollout now always has exactly one test apartment
+by construction). German UI text in `rollout_list.html`/`rollout_detail
+.html` renamed "Pilot"/"Pilot-Wohnung" to "Testwohnung" where it referred
+to this package's own queue position, keeping "Pilotbetrieb" only where
+the text actually means the device-side `pilot_mode` flag (section 21.4,
+CLAUDE.md security principle 5 -- unchanged, still the agent's own
+`open_access` gate and, while inactive, the desired-state pre-check).
+
+**Tests** (updated, not silently removed):
+`tests/test_storage_rollouts.py::test_create_rollout_refuses_without_any
+_pilot` is replaced by `test_create_rollout_succeeds_without_any_pilot
+_mode_apartment` (asserts the rollout now succeeds) plus
+`test_create_rollout_defaults_test_apartment_to_first_of_list` (renamed
+from `test_create_rollout_orders_pilot_first`, same apartments, new
+expected order: first-of-list, not pilot-mode-first),
+`test_create_rollout_explicit_test_apartment_moves_to_front`,
+`test_create_rollout_refuses_test_apartment_not_in_list`, and
+`test_create_rollout_single_apartment_rollout_works`.
+`tests/test_rollout_worker.py::test_advance_rollout_starts_pilot_first`/
+`test_advance_rollout_full_pilot_convergence_then_gate`/
+`test_advance_rollout_retired_apartment_mid_rollout_fails_gracefully`/
+`test_maybe_start_next_self_heals_missing_pilot_converged_at` now pass an
+explicit `test_apartment_id` (the apartment they already call "pilot" is
+listed second in `apartment_ids`, so without the explicit mark it would
+no longer be started first); new
+`test_advance_rollout_pilot_mode_is_irrelevant_for_ordering` and
+`test_advance_rollout_single_apartment_rollout_runs_to_completion` added.
+`tests/test_ui_rollout.py::test_new_step_refuses_without_pilot_apartment`
+is replaced by `test_new_step_succeeds_without_any_pilot_mode_apartment`;
+`test_confirm_step_storage_refusal_becomes_400` now reaches its "a
+storage-layer refusal `/new` does not duplicate" case through "no
+current desired state yet" instead of the removed pilot refusal; new
+`test_new_step_explicit_test_apartment_shown_on_confirm_page` and
+`test_new_step_refuses_test_apartment_not_among_selected` added;
+`test_new_form_get_renders_apartments` extended to assert the new radio
+input is present.
+
+**Verification.** `ruff check .` clean; `mypy .` (143 files) and `mypy
+protocol fleet agent tools` (71 files) clean; pytest: **1878 passed, 1
+skipped**, TOTAL **7198 stmts / 22 missed / 99%** (unchanged coverage
+percentage from before this package -- every new branch in `fleet
+/storage.py`/`fleet/rollout.py`/`fleet/ui_rollout.py`/`fleet/ui_routes.py`
+covered); `go vet ./...`/`go test ./...` clean (this package never
+touches `watchdog/`); `watchdog/check_contract.sh` passing. No migration
+-- `RolloutApartmentRecord.is_pilot` reused, confirmed by `git status`
+showing no new file under `fleet/migrations/versions/`.
+
+**Files:** `fleet/storage.py`, `fleet/rollout.py`, `fleet/ui_routes.py`,
+`fleet/templates/ui/rollout_new.html`, `fleet/templates/ui
+/rollout_confirm.html`, `fleet/templates/ui/rollout_detail.html`, `fleet
+/templates/ui/rollout_list.html`, `tests/test_storage_rollouts.py`,
+`tests/test_rollout_worker.py`, `tests/test_ui_rollout.py`.
+
+## Owner confirmations (2026-10-02, main session)
+
+- P5.4c's "decisions to confirm" are settled (spec section 13, "Decided
+  afterward" 2026-10-02): healthy = successful outcome + later heartbeat
+  with thermoctl reachable; the rollout runs on its own after one
+  creation; every apartment needs an existing desired state (new
+  apartments are set up on their own page, never via a rollout).
+  **Changed:** a rollout no longer requires an apartment with `pilot_mode`
+  -- if none in the list is marked as the rollout's test apartment, the
+  first apartment of the list is; the rollout test apartment is decoupled
+  from the device-side `pilot_mode` gate. Package P5.4e implements this.
+- Retention reading confirmed: "faults 365 days" = stored event entries;
+  the heartbeat-embedded open-fault history follows the 90-day heartbeat
+  retention (current "open since" always visible).
+## P6.1 cross-review fix: unauthenticated nonce overwrite, stale rotation state, no agent backoff, plus owner decisions on open alarms and diagnostic bundles (2026-10-02) **SR**
+
+Cross-review of P6.1 (commit `4268ae2`) found two required, reproduced
+issues plus a hardening gap; the project owner separately decided two
+further refinements to section 12. All five addressed in one fix round.
+
+**1. Unauthenticated nonce overwrite (reproduced in cross-review).** An
+apartment id is **not** a secret -- it is shown in the fleet UI, used in
+URLs, and follows the human-chosen `house7-a03` scheme. The original
+`POST /v1/apartments/{apartment}/token-rotation/challenge` issued (or
+silently overwrote) the single active rotation nonce for *any* apartment
+with `apartment_reauth_pending(apartment)` true, with no proof of anything
+from the caller. An attacker who merely knew a rotated apartment's id
+could therefore overwrite the real device's nonce whenever it liked --
+`Storage.issue_token_rotation_challenge`'s own "single current nonce"
+semantics mean the real device's subsequent `.../token` call then fails
+with the uniform 404, and "rotation pending" has no expiry of its own to
+ever clear that stuck state: a permanent lock-out, reachable by anyone who
+can read the apartment id off the fleet UI.
+
+**Fixed structurally**: both `.../challenge` and `.../token` now also
+require the **OLD** (just-rotated-away) token as an ordinary
+`Authorization: Bearer` header, checked via a new `fleet.auth.require_
+apartment_reauth_old_token` (not a FastAPI `Depends()` -- called directly
+from each route body, *after* the per-IP throttle check, so throttling
+still happens before any token lookup) against a new `Storage
+.get_apartment_reauth_old_token_hash` (the apartment-scoped counterpart of
+`get_apartment_token_hash`, in constant time via `hmac.compare_digest`).
+Two independent factors are now required: the old token *and* a valid
+Ed25519 signature from the device's current key -- neither alone is
+sufficient (proven directly: `test_rotation_token_with_the_old_token_
+alone_and_no_valid_signature_is_refused`). A caller without the old token
+gets the ordinary 401 (missing header) or 403 (wrong/unknown token) --
+indistinguishable from an apartment that was never rotated at all, same
+"no enumeration" reasoning `require_apartment_token`'s own module
+docstring already establishes for the identical class of problem.
+`agent.token_rotation.reauthenticate` gained a required `old_token`
+parameter (sent as `Authorization: Bearer` on both calls, never read back
+from disk or ambient client state) -- `agent.__main__._run_agent` passes
+the exact token that just failed with the 401 reauth signal.
+
+**Tests** (`tests/test_token_rotation.py`, largely rewritten to add the
+old-token header everywhere it is now required): a caller with no
+`Authorization` header at all gets 401 and the real device's own nonce
+survives untouched, still completing the rotation afterward
+(`test_rotation_challenge_without_any_authorization_header_is_401_and_
+does_not_touch_nonce`); a caller with a wrong token gets 403, same proof
+(`test_rotation_challenge_with_a_wrong_old_token_is_403_and_does_not_
+touch_nonce`); the old token alone with an invalid signature is refused
+and issues nothing; every existing happy-path/replay/wrong-key/stale-nonce
+test updated to present the old token and re-verified end to end, including
+the real-TLS agent test (`tests/test_agent_token_rotation.py
+::test_rotation_recovery_end_to_end_over_real_tls`) and a new unit test
+proving both HTTP calls actually carry the header
+(`test_reauthenticate_sends_the_old_token_as_bearer_on_both_calls`).
+
+**2. Rotation-pending state never cleared by an ordinary lifecycle event
+for the same apartment (reproduced in cross-review).** `reauth_old_token_
+hash`/`rotation_nonce_*` used to be cleared only by `complete_token_
+rotation` itself -- an entirely ordinary, independent event for the same
+apartment (a fresh device confirmation via `confirm_device`, an ordinary
+non-rotation token issuance via `issue_device_token`, or a device removal
+via `remove_device`) left the stale state in place, so a very old,
+already-superseded token could keep getting the 401 "re-authenticate"
+signal forever, long after the apartment's real token had already moved on
+through a completely different path.
+
+**Fixed** with a new, shared `Storage._clear_reauth_rotation_state`
+helper (same transaction as the caller's own write, a no-op and never
+audit-logged if nothing was actually pending) called from all three
+places: `confirm_device` (phase 2, right after the apartment lookup --
+covers both the "replace an existing device" and "first device ever"
+branches), `issue_device_token` (folded directly into its own guarded
+`UPDATE`'s `.values()`, harmless and idempotent even when nothing was
+pending), and `remove_device` (alongside its own token-hash clear). Tested
+directly for each of the three call sites
+(`test_confirm_device_clears_a_stale_rotation_state_for_the_apartment`,
+`test_issue_device_token_non_rotation_path_clears_a_stale_rotation_state`,
+`test_remove_device_clears_a_stale_rotation_state_for_the_apartment`).
+
+**3. No internal backoff on the agent side -- a persistently failing
+re-authentication would crash-loop a supervised process.** `agent
+.__main__._run_agent` already refused to retry a `CommandStreamReauth
+Required` more than once *within one process*, but a `Restart=always`
+systemd unit/`restart: always` Docker policy would otherwise restart the
+process instantly, forever, with no delay at all between attempts if the
+rotation flow keeps failing (a network blip, no rotation actually pending,
+...).
+
+**Fixed** with a new, small module, `agent/reauth_backoff.py` -- a
+persisted, exponential backoff (`MIN_BACKOFF_S` 60s, doubling, capped at
+`MAX_BACKOFF_S` 3600s/1h, reset to the minimum on success), stored in a
+line-based state file read via `agent.safe_io.read_text_safe` (the same
+symlink/non-regular-file hardening every other agent state file gets;
+fails *safe*, not closed, like `agent.commands_channel._read_last_event_
+id` -- an unreadable/unsafe file just means "nothing pending", never a
+crash). `_run_agent` calls `wait_if_needed` before attempting the rotation
+flow, `record_failure` on any failure (the rotation call itself raising,
+or a second, still-unresolved `CommandStreamReauthRequired` after an
+apparently successful rotation), `record_success` once it actually works.
+13 tests, injected clock throughout, no real sleeping in the test suite
+(`tests/test_agent_reauth_backoff.py`); `tests/test_agent_main.py` gained
+coverage for the `TokenRotationError`-during-reauth path that exercises
+`record_failure` through the real CLI flow (with `loop.run`/`reauthenticate`
+faked, the same established pattern that file's own docstring describes).
+
+**4. `complete_token_rotation`'s single-use guard, tested directly in
+isolation** (cross-review: previously only reachable indirectly through
+the HTTP-level replay test) -- `tests/test_token_rotation.py
+::test_complete_token_rotation_single_use_guard_in_isolation` calls it
+twice with the same nonce at the `Storage` level alone, no HTTP layer, no
+signature verification: the first call wins, the second returns `None`,
+and the winning token is unaffected by the loser's attempt.
+
+**Owner decision (2026-10-02), retention refined: "the 365-day limit
+applies only to cleared/closed alarms, faults and events; anything still
+open is kept with its real start time regardless of age."**
+`Storage.delete_alarms_older_than` now additionally requires `cleared_at
+IS NOT NULL` in the same `WHERE` clause as the age cutoff -- a still-open
+alarm is never deleted, no matter how old `raised_at` is. `EventRecord`
+(the "faults and events" half of that sentence) has **no "open"/"closed"
+state of its own anywhere in this schema** -- a fault event is a single,
+instantaneous report (section 6/18.1), never an ongoing condition tracked
+as "still open" the way `AlarmRecord.cleared_at` tracks an alarm -- so
+`delete_events_older_than` is unchanged; there is no column here for this
+decision to gate on. Tested directly: an open alarm older than 365 days
+survives a retention run; a cleared one of the exact same age is deleted
+(`tests/test_data_retention.py
+::test_open_alarm_older_than_365_days_survives_cleared_one_at_the_same_
+age_is_deleted`); the two pre-existing boundary/scoping tests that used an
+uncleared alarm were updated to clear it first, since they specifically
+mean to test the age boundary, not the new "closed" gate.
+
+**A reading, not yet confirmed by the project owner (recorded here per
+cross-review, 2026-10-02):** section 12's "faults" in "the 365-day limit
+applies only to cleared/closed alarms, faults and events" is read as
+meaning the fault `EventRecord` rows themselves (section 6/18.1's
+single, instantaneous reports, 365-day retention, kept while "open"
+*where that is applicable* -- which, as the paragraph above explains, this
+schema currently has no column to express for an `EventRecord` at all, so
+in practice every `EventRecord` is deleted once older than 365 days,
+regardless). The **current status of a long-open fault is read as staying
+accurate through the latest heartbeat's own `open_faults` snapshot**
+(`protocol.heartbeat.Heartbeat.open_faults`) instead -- that snapshot is
+display/transport data, not an audit trail, and therefore follows the
+90-day *heartbeat* retention (`Storage.delete_heartbeats_older_than`), not
+the 365-day fault-event one: a fault still open today is still visible
+via any heartbeat from the last 90 days, independent of whether the
+`EventRecord` that originally reported it has since aged out past 365
+days. **This reading has not been put to the project owner explicitly**
+-- if it is wrong (e.g. if "faults" was meant to require a genuine
+"still open" column on `EventRecord` itself, which would need its own
+schema change, likely alongside P6.3's fault-acknowledgement work), this
+paragraph and `delete_events_older_than`'s own docstring are the two
+places to revisit.
+
+**Owner decision (2026-10-02), tenant change refined: "additionally
+deletes the apartment's diagnostic bundles (DB rows and blob files, scoped
+to that apartment only); backups stay."** `Storage.rotate_apartment_token_
+for_tenant_change` now also deletes `DiagnosticBundleRecord` rows for the
+apartment (same transaction as everything else it already did) and
+returns their `storage_path`s in a new `TenantChangeOutcome` dataclass
+(`ok: bool`, `diagnostic_bundle_storage_paths: list[str]` -- the method's
+return type changed from a bare `bool`, every call site updated) -- the
+actual blob files are deleted by the caller afterward (`fleet.ui_routes
+.tenant_change_confirm_submit`, via `DiagnosticBundleBlobStorage.delete`),
+mirroring `delete_expired_diagnostic_bundles`'s own "row first, then blob,
+outside the transaction" ordering exactly, for the identical "filesystem
+writes are not transactional with the database" reason. Backups are
+untouched, as before. Tested at both layers: `Storage`-level scoping
+(another apartment's own diagnostic bundle survives,
+`test_rotate_returns_diagnostic_bundle_storage_paths_scoped_to_this_
+apartment_only`) and the full UI route proving the blob file is actually
+gone from disk afterward
+(`test_successful_submit_deletes_diagnostic_bundle_rows_and_blob_files`).
+
+Both owner decisions also recorded in `docs/specification.md` section 12
+as a dated addendum, 2026-10-02.
+
+**Files**: `fleet/auth.py` (new `require_apartment_reauth_old_token`),
+`fleet/app.py` (both rotation endpoints now take `authorization` and call
+it), `fleet/storage.py` (`get_apartment_reauth_old_token_hash`,
+`_clear_reauth_rotation_state` + its three call sites, `delete_alarms_
+older_than`'s new gate, `rotate_apartment_token_for_tenant_change`'s
+diagnostic-bundle deletion and new `TenantChangeOutcome` return type),
+`fleet/ui_routes.py` (blob deletion after rotation), `fleet/data_
+retention.py` (docstring), `agent/token_rotation.py` (`old_token`
+parameter), `agent/reauth_backoff.py` (new), `agent/__main__.py` (backoff
+wiring), `docs/specification.md`, plus the test files named above.
+
+**Verification** (same fresh venv as P6.1's own): `ruff check .` -- `All
+checks passed!`; `mypy .` -- `Success: no issues found in 150 source
+files`; `mypy protocol fleet agent tools` -- `Success: no issues found in
+74 source files`; `python -m pytest -W ignore::ResourceWarning -rA` --
+**1900 passed, 1 skipped** (the one skip: no `age` CLI binary on this
+machine, pre-existing and unrelated), coverage **99%** overall (7444
+statements, 20 missed) -- every file this fix round touched
+(`fleet/app.py`, `fleet/auth.py`, `fleet/storage.py`, `fleet/ui_routes.py`,
+`fleet/data_retention.py`, `agent/token_rotation.py`,
+`agent/reauth_backoff.py`, `agent/__main__.py`) at **100%**; the remaining
+20 misses are all pre-existing and unrelated to this package. `watchdog/`:
+`go vet ./...` clean, `go test ./...` -- all four packages `ok`, `bash
+watchdog/check_contract.sh` -- "Contract test passed". Migration (no new
+one this round; `0017` unchanged) re-verified upgrade/downgrade/upgrade on
+a throwaway sqlite file.
+
+## P6.1 -- Retention and tenant change (section 12's "Decided afterward", 2026-10-01) **SR**
+
+Implements both of this paragraph's data-handling decisions: a background
+retention job, and the tenant-change UI action (token rotation + history
+deletion).
+
+**Retention (`fleet/data_retention.py`, new).** "Heartbeats 90 days; faults,
+alarms and events 365 days ... deletion runs as a background job, periods
+configurable" -- `run_data_retention(storage, now, *, heartbeat_retention_
+days=90, fault_retention_days=365)` is a thin, clock-injected wrapper
+around three new `Storage` methods (`delete_heartbeats_older_than`/
+`delete_events_older_than`/`delete_alarms_older_than`), each its own single
+`DELETE ... WHERE <timestamp> < cutoff` -- mirrors `fleet.backup_retention
+.run_backup_retention`'s own exact split (pure function, real I/O wrapper,
+periodic `fleet.app` lifespan task). **Boundary is strict `<`**: a row
+exactly at the cutoff is kept, one microsecond older is deleted -- tested
+directly at that exact boundary for all three tables, not merely "roughly
+90 days". **Deliberately touches exactly three tables and imports none of
+the others**: command log excerpts and diagnostic bundles keep their own,
+separate, already-existing retention loops (`fleet.app._log_retention_
+loop`/`_diagnostic_bundle_retention_loop`); backups keep `fleet.backup_
+retention`'s own grandfather-father-son rotation; the audit log
+(`InventoryAuditLogRecord`) has no retention at all, by the project owner's
+own explicit decision -- proven with a test that plants old rows in all
+three of those "never touched" tables alongside old heartbeats/events/
+alarms and asserts only the latter three are gone afterward. Wired into
+`fleet/app.py`'s lifespan as `_data_retention_loop` (new), the same
+"`asyncio.to_thread`, so a slow DB does not freeze every other request"
+shape every sibling retention loop already uses; configurable via
+`FLEET_RETENTION_INTERVAL_S` (default hourly, matching the backup-retention
+interval's own reasoning), `FLEET_RETENTION_HEARTBEAT_DAYS`,
+`FLEET_RETENTION_FAULT_DAYS`.
+
+**Tenant change -- token rotation (section 12: "an explicit UI action
+(confirmation, mandatory reason, audited) rotates the apartment's device
+token -- the agent obtains the new one through a signed challenge with its
+existing device key, no private key ever leaves the device -- and deletes
+the apartment's heartbeats, events, faults, alarms and command log
+excerpts. Encrypted backups stay, under their own retention.").**
+
+- **`Storage.rotate_apartment_token_for_tenant_change(apartment_id, reason,
+  ui_username, now)`** (new) -- one transaction: clears `token_hash`,
+  moves the *previous* hash to a new `reauth_old_token_hash` column (see
+  below for why), deletes this apartment's heartbeats/events/alarms/
+  command-log-excerpts (never backups, the audit log, or any inventory
+  row -- `ApartmentRecord`/`AssignmentRecord`/`DeviceRecord` are untouched,
+  proven directly against a second, unrelated apartment's own history,
+  which survives unchanged), and writes one audit-log entry
+  (`action="tenant_change"`, the mandatory `reason`). Returns `False` only
+  for an unknown apartment id; a tenant change on an apartment whose device
+  never completed registration (no token to rotate) still deletes any
+  stray history and is still audited.
+- **How the agent learns to re-authenticate (the work order's own open
+  design question, decided here):** the old token is not merely deleted --
+  its hash is preserved in the apartment's new `reauth_old_token_hash`
+  column until the device actually recovers. `fleet.auth`'s two
+  dependencies (`require_apartment_token`/`require_apartment_token_by_
+  hash`) now check that column **after** the ordinary token match fails:
+  a token that matches it gets a **401** with `WWW-Authenticate: Bearer
+  error="reauth_required"` (`_reauth_required`, new) instead of the
+  generic 403 every other wrong/unknown token gets. **Not an enumeration
+  oracle**: reaching this branch requires already possessing a token that
+  *was* valid for that apartment a moment ago -- a token nobody ever issued
+  still falls through to the ordinary 403. Both dependencies' own doctests
+  spell this out; `tests/test_token_rotation.py
+  ::test_old_token_gets_401_reauth_via_apartment_in_url_endpoint_too`
+  proves it for `require_apartment_token` too (`POST /v1/events/
+  {apartment}`), not only the by-hash variant.
+- **The recovery flow itself -- new endpoints, reusing P4.2b's exact
+  signed-challenge shape, no new protocol model:**
+  `POST /v1/apartments/{apartment}/token-rotation/challenge` and
+  `.../token` (`fleet/app.py`) answer with `protocol.registration
+  .TokenChallenge`/accept `TokenRequest`/return `TokenIssued` -- the same
+  three models P4.2b already defined, under a **distinct domain-separated
+  message** (`b"thermoctl-fleet/token-rotation/v1\0" + apartment_id +
+  b"\0" + nonce`, vs. `request_device_token`'s own `.../token/v1\0`), so a
+  signature produced for one flow can never replay against the other even
+  though both sign a nonce of the same shape. **No `PROTOCOL_VERSION`
+  bump** -- reusing existing models under a new subject/domain prefix is
+  not "a change to the models" the way P4.2b's own four brand-new models
+  were. The challenge endpoint only ever issues a nonce when
+  `Storage.apartment_reauth_pending` is `True` (`reauth_old_token_hash IS
+  NOT NULL`) -- an apartment that was never rotated, or whose rotation
+  already completed, gets the same uniform 404
+  (`_uniform_rotation_failure`) every other precondition failure here
+  gets. The token endpoint verifies the signature against `Storage
+  .get_current_device_public_key_for_apartment` (the currently-assigned
+  device's public key, read from the `DeviceRegistrationRecord` row that
+  actually issued the apartment's current token -- never a key the
+  request itself supplies), applying the identical low-order-key/
+  malleable-signature defenses (`fleet.ed25519_checks`) P4.2b's own token
+  endpoint already does. `Storage.complete_token_rotation` is one guarded
+  `UPDATE` (nonce unexpired, unconsumed, rotation still pending, all in
+  the same `WHERE` as the actual token write and rotation-state clear) --
+  a replay with the same nonce, or a stale nonce overwritten by a second
+  challenge call, matches no row and is refused uniformly, proven under
+  both scenarios directly. Its own per-IP throttle
+  (`_THROTTLE_PURPOSE_TOKEN_ROTATION`, configurable via
+  `FLEET_TOKEN_ROTATION_THROTTLE_{THRESHOLD,WINDOW_S,DURATION_S}`) mirrors
+  P4.2b's `token` purpose's own tight default, independent budget.
+- **Schema** (`fleet/migrations/versions/0017_retention_and_tenant_
+  change.py`, `down_revision` `"0016"`): four new, nullable columns on
+  `apartments` -- `reauth_old_token_hash` (the mechanism above) and
+  `rotation_nonce_hash`/`rotation_nonce_expires_at`/`rotation_nonce_
+  consumed_at` (a single active rotation-challenge nonce per apartment,
+  the exact same shape `DeviceRegistrationRecord.token_nonce_*` already
+  uses per registration row). No new table -- a tenant change rotates at
+  most one apartment's token at a time.
+- **Agent side (`agent/token_rotation.py`, new; `agent/commands_channel.py`;
+  `agent/__main__.py`).** `agent.commands_channel._raise_for_non_200`
+  distinguishes the specific 401 above from an ordinary 401/403, raising a
+  new `CommandStreamReauthRequired` (a subclass of the existing
+  `CommandStreamAuthError`, so every caller that only ever catches the
+  broader type is unaffected). `agent.token_rotation.reauthenticate`
+  signs the domain-separated rotation message with the device's
+  **existing, never-regenerated** Ed25519 private key
+  (`agent.registration.load_or_create_private_key`, loaded not
+  regenerated -- a tenant change never invalidates this device's own
+  identity, only its token) and overwrites the stored token file.
+  `agent.__main__._run_agent` catches `CommandStreamReauthRequired`
+  specifically (before the broader `CommandStreamAuthError`), calls
+  `reauthenticate` exactly **once** (a `reauthenticated` flag, not an
+  unbounded loop -- a *second* occurrence propagates to a dedicated
+  `except` clause instead, exiting cleanly with "already attempted once,"
+  never retried again), updates `client.headers["Authorization"]`, and
+  retries `loop.run` exactly once more. Requires `--apartment-id` (already
+  an existing, optional CLI argument for backups) to know which apartment
+  to recover as -- without it, a `CommandStreamReauthRequired` is refused
+  immediately, since this agent would have no way to name itself to the
+  rotation-challenge endpoint. Proven end to end against a real,
+  TLS-pinned `fleet.app` (`tests/test_agent_token_rotation.py
+  ::test_rotation_recovery_end_to_end_over_real_tls`): register, confirm,
+  issue a token, rotate from the "landlord" side, the stale token gets the
+  401 reauth signal, `reauthenticate` recovers a working new token, the
+  old one then gets the ordinary 403 (never the reauth signal a second
+  time, so a caller retrying the stale token cannot loop either); plus
+  `tests/test_agent_main.py`'s own retry-once/no-loop/no-apartment-id
+  scenarios with a faked `loop.run`.
+
+**UI (`fleet/ui_routes.py`, `fleet/templates/ui/tenant_change_confirm
+.html`, new; a "Mieterwechsel" button added to `fleet/templates/ui/
+apartment.html`).** The exact two-step, GET-renders/POST-confirms shape
+`command_confirm_form`/`command_confirm_submit` already established:
+login required (`require_ui_user`), CSRF-checked
+(`authenticated.session.csrf_token`), a mandatory `reason` (length-checked
+against `MAX_REASON_LENGTH`), and nothing is ever touched until the POST.
+A successful submit redirects back to the apartment detail page; the
+response is always audited, even when the apartment had no token yet to
+rotate.
+
+**Tests** (`tests/test_data_retention.py`, `tests/test_token_rotation.py`,
+`tests/test_ui_tenant_change.py`, `tests/test_agent_token_rotation.py`;
+additions to `tests/test_agent_main.py`, `tests/test_agent_commands_
+channel.py`; two pre-existing `tests/test_storage.py` migration tests
+adjusted -- see below): every new `Storage`/`fleet.app`/`fleet.ui_routes`/
+`agent.token_rotation` function and endpoint covered, including every
+uniform-failure branch (no rotation pending at all, no device currently
+assigned, malformed signature, stale/replayed/expired nonce, wrong key);
+old-token-403-after-rotation and new-token-works proven at the HTTP level;
+retention boundaries exact with an injected clock; deletion scope exact
+(a second, untouched apartment's own history and every "never touched"
+table checked directly); CSRF/login/mandatory-reason/length-limit on the
+UI action; the full agent recovery flow over real TLS, plus the no-loop
+guarantee with a faked `loop.run`.
+
+**Two pre-existing migration tests in `tests/test_storage.py` needed a
+narrow fix, not a weakening**: `test_migration_0006_downgrade_refuses_
+when_an_apartment_has_no_token` and `test_migration_0006_backfills_a_
+legacy_apartment_row` both used to read the `apartments` row back through
+`Storage.get_apartment` (the full ORM model) after deliberately stopping
+the migration chain at an older revision -- `ApartmentRecord`'s mapping
+always reflects *head*, so once this package's migration added four new
+columns to `apartments`, reading an intentionally-partial (pre-0017)
+schema through that mapping raised "no such column" unrelated to what
+either test actually means to prove. Both switched to a raw SQL read of
+exactly the columns that exist at the revision under test; the third
+affected test (`test_migration_0006_upgrade_creates_the_new_tables`, which
+upgrades to head) simply gained the four new column names in its exact-set
+assertion.
+
+**Verification** (fresh venv, `python3.13 -m venv`, `pip install -e
+".[dev,fleet,agent]"`): `ruff check .` -- `All checks passed!`; `mypy .` --
+`Success: no issues found in 148 source files`; `mypy protocol fleet agent
+tools` -- `Success: no issues found in 73 source files`; `python -m pytest
+-W ignore::ResourceWarning -rA` -- **1875 passed, 1 skipped** (the one
+skip: no `age` CLI binary on this machine, pre-existing and unrelated),
+coverage **99%** overall (7354 statements, 20 missed) -- every file this
+package touched (`fleet/app.py`, `fleet/auth.py`, `fleet/storage.py`,
+`fleet/data_retention.py`, `fleet/ui_routes.py`,
+`fleet/migrations/versions/0018_retention_and_tenant_change.py`,
+`agent/token_rotation.py`, `agent/__main__.py`) at **100%**; the remaining
+20 misses are all pre-existing and unrelated (`agent/loop.py`'s own
+still-open placeholders, `agent/commands_channel.py`'s one pre-existing
+empty-file branch, `agent/log_filter.py`/`fleet/admin.py`'s own
+pre-existing gaps, `tools/check_image_config.py`'s own pre-existing
+CLI-entry-point gaps). `watchdog/`: `go vet ./...` clean, `go test
+./...` -- all four packages `ok`, `bash watchdog/check_contract.sh` --
+"Contract test passed" (`protocol/` itself unchanged by this package, run
+anyway per instruction since `fleet/`/`agent/` both changed
+substantially). Migration `0017` (renumbered to `0018` at the main-merge
+below, after P6.3's own `0017_fault_acknowledgements.py`) verified both
+directions (`upgrade`/`downgrade`/`upgrade` again on a throwaway sqlite
+file).
+
+## Open point from the flaky-test investigation (main session, 2026-10-02)
+
+The agent's background threads (restore poll, backup scheduler, desired-state
+reconciler) and the main command loop share one `httpx.Client`. The
+investigation observed a `500` on one request tearing down the connection
+under a *different*, concurrent request on the same client (the
+`agent_restart` result POST failing with "Server disconnected"). In tests the
+`500` came from a missing test configuration; in production any fleet-side
+`500` could do the same and lose or delay a command result. To be examined:
+one client per thread, or making result reporting robust against a
+connection torn down by a concurrent request.
+
+## Flaky test fixes (test-only, 2026-10-02)
+
+Three tests in the P5.4d/P5.5b end-to-end area restructured; no production
+code touched. Two root causes, same "command batch races the reconciler/
+poll thread" family the P5.4d merge already hit once
+(`test_run_accepts_a_newer_revision_and_replaces_the_held_state`):
+
+1. **`tests/test_agent_loop_desired_state.py
+   ::test_run_reports_pilot_mode_rejection_for_a_delivered_desired_state`**
+   and **`::test_run_reports_disabled_reconciliation_when_backup_config_
+   missing`** (the latter found by searching the rest of the file for the
+   same shape, not in the original report): both delivered `agent_restart`
+   in the same connect-time batch as a desired-state revision and then
+   checked the outcome synchronously after `run` returned -- since P5.4d
+   the outcome is reported by the reconciler's own background thread, so
+   the restart can stop the loop before it reports. Restructured exactly
+   like the already-fixed sibling: `run` on its own thread, bounded poll
+   of real storage for the outcome, `agent_restart` delivered live only
+   afterward. `test_run_ignores_a_stale_desired_state_revision` was
+   checked too and left alone -- a stale revision is ignored synchronously
+   (`_handle_desired_state_received` never sets the trigger event for it),
+   so there is nothing there for `agent_restart` to race.
+2. **`tests/test_agent_loop_run.py
+   ::test_run_starts_and_stops_the_restore_poll_thread_when_configured`**:
+   a different race, found while investigating a report of this test
+   failing once under full-suite load (passing alone). Two contributing
+   issues, confirmed independently: (a) the test never configured
+   `FLEET_BACKUP_STORAGE_DIR` -- unlike a real deployment -- so the
+   restore-poll thread's own `GET /v1/restore` hit `fleet.backup_storage
+   .get_backup_storage`'s fail-closed `RuntimeError` every tick (a `500`,
+   not the `200`/`404` it gets in production); with the deliberately tight
+   `restore_poll_interval_s=0.05` and one `httpx.Client` shared between
+   that thread and the main loop's own result-reporting POST, an
+   occasional `500` was enough to tear down the connection out from under
+   the concurrent `agent_restart` result-report, which then failed
+   outright ("Server disconnected without sending a response") and never
+   reached storage at all -- reproduced locally at a high rate without the
+   fix, zero failures across repeated runs with `FLEET_BACKUP_STORAGE_DIR`
+   configured like a real deployment has it; (b) separately, `run` signals
+   its background threads to stop in its own `finally` but never joins
+   them (daemon threads, so a stuck one can't block process exit) -- left
+   running past the test's own teardown, a later exception in one can be
+   misattributed by pytest's thread-exception hook to whatever test is
+   running by the time it surfaces. Fixed by configuring
+   `FLEET_BACKUP_STORAGE_DIR` for the test and explicitly joining the
+   restore-poll thread (only that one -- the desired-state reconcile
+   thread, always started regardless of this test's configuration, can
+   legitimately take up to its own 600s default interval to notice a stop
+   signal, since nothing sets its `trigger_event`; not this test's
+   concern) before the `with` blocks holding the client/server close. Not
+   a production bug: in production `exit_fn` is `sys.exit`, so a daemon
+   thread taking a while to notice `stop_event` is moot -- the whole
+   process ends with it. Worth a note for whoever next touches
+   `fleet/app.py`'s `BaseHTTPMiddleware` stack, though: an unrelated
+   concurrent request's `500` visibly disrupting a *different* request on
+   the same client is a fragility this package did not go looking for and
+   did not fix, only worked around in the one test it was hitting.
+
+**Verification.** Each of the three restructured tests run 30x in
+isolation: **30/30 passed**, all three. Full suite run 3x: **1871 passed,
+1 skipped**, all three runs identical (no new tests added, restructurings
+only). `ruff check .` clean; `mypy .` (143 files) and `mypy protocol fleet
+agent tools` (71 files) clean.
+
+## P6.3 -- Fault acknowledgement + per-device battery/signal (section 12's "Decided afterward", 2026-10-01)
+
+Closes the two open points this package's own predecessors left on
+purpose: P3.4's "no acknowledge/confirm mechanism exists, on purpose --
+open point, not built here" (its own docstring named exactly what a future
+package needs: a new table/column, a CSRF-protected `POST`, and a decision
+on the re-occurrence question) and P3.2's "per-device battery/signal
+values ... are not in the heartbeat wire protocol at all" (noted as
+needing a protocol extension cleared with the project owner first -- done
+2026-10-01, recorded in `docs/specification.md` section 12).
+
+**What "occurrence" means, precisely -- not decided by the specification,
+defined here from the existing fault model, since nothing else pins it
+down.** An open fault is never its own row in this database: it only ever
+exists as one entry of the *latest* stored heartbeat's `open_faults` list
+(`protocol.heartbeat.OpenFault`: `kind`, `zone`, `since`). `since` is the
+moment thermoctl itself considers the fault to have become open, and stays
+identical across every heartbeat for as long as thermoctl keeps reporting
+the same still-open fault -- it only changes when the fault **clears and
+reopens** (thermoctl has no reason to report a new "became open" time for
+what is, from its own perspective, the same continuous problem). The tuple
+`(apartment_id, fault_kind, zone, since)` therefore already *is* the
+occurrence: stable for as long as the fault stays open (one
+acknowledgement covers every later heartbeat still reporting the identical
+`since`), and naturally a *different* occurrence the moment it reopens
+with a new `since` -- exactly "applies to the current occurrence only ...
+shows again" (section 12) without any extra bookkeeping, no separate
+"cleared" signal needed: the fault simply stops appearing in
+`open_faults`, and its acknowledgement row, now orphaned, is never matched
+against anything again. See `fleet/storage.py::FaultAcknowledgementRecord`'s
+own docstring for the full account.
+
+**Storage:** one new table, `fault_acknowledgements`
+(`fleet/migrations/versions/0017_fault_acknowledgements.py`,
+`FaultAcknowledgementRecord`) -- `apartment_id`, `fault_kind`, `zone`,
+`since`, `acknowledged_by`, `acknowledged_at`, `note` (optional, 500
+chars), a unique index on the occurrence tuple. `Storage.acknowledge_fault`
+performs a dialect-native `INSERT ... ON CONFLICT ... DO UPDATE` (same
+reasoning as `raise_alarm`'s own insert-or-ignore) so re-acknowledging the
+identical occurrence (e.g. to fix a typo in the note) updates the one row
+in place instead of racing a second insert -- "one row per acknowledged
+occurrence, not per key forever," per the work package's own instruction.
+`Storage.list_all_fault_acknowledgement_keys` is a single batched query
+across every apartment (mirrors `_get_open_not_reporting_alarms`'s own
+"don't N+1" reasoning), used by `fleet.ui_tasks.build_task_overview` to
+filter the "Aufgaben" unconfirmed-faults group.
+
+**UI:** acknowledged occurrences are **hidden** from "Aufgaben"'s
+"Unbestätigte Störungen" group (not shown separately as quittiert there --
+that view is explicitly "what is still due", per its own module docstring,
+and an acknowledged fault is no longer due). "Eine Wohnung" shows every
+currently open fault including acknowledged ones, each with a "Quittieren"
+form (login + CSRF, mandatory `fault_kind`/`zone`/`since` hidden fields
+carrying the occurrence key, optional note) -- an already-acknowledged
+fault additionally shows who/when/the note and the button relabels to
+"Erneut quittieren". `POST /ui/apartments/{id}/faults/acknowledge`
+(`fleet/ui_routes.py::fault_acknowledge_submit`) re-validates the
+submitted occurrence against the apartment's **current**
+`open_faults` (`Storage.get_latest_heartbeat`) before writing anything --
+a stale or hand-crafted form naming an occurrence that is not actually
+open right now is rejected with 400, never silently accepted.
+
+**Per-device battery/signal (protocol):** `protocol.heartbeat.PerDeviceState`
+(new), `DeviceState.per_device: list[PerDeviceState]` (new, optional,
+`default_factory=list`, bounded by `MAX_PER_DEVICE_ENTRIES` = 128). Exactly
+three fields -- `device_id`, `battery_percent` (0-100 or `None`),
+`signal_quality` (0-100 or `None`) -- `model_config = ConfigDict(extra=
+"forbid")` makes "no other fields" (section 12: "no device names ..., no
+measured values") a structural guarantee, not a convention: a heartbeat
+carrying `{"name": ...}`/`{"room": ...}`/`{"temperature": ...}` on a
+per-device entry is rejected with 422 before any fleet code ever sees the
+extra field. `device_id` is constrained by `Field(pattern=r"^0x[0-9a-f]
+{16}$")` -- a Zigbee IEEE address shape, lowercase, exactly 16 hex digits
+-- refusing anything else (a friendly/room name, upper-case, wrong length,
+missing prefix) so a tenant-chosen or room-derived name can never be
+represented, let alone transmitted. The fleet-wide aggregates
+(`weakest_battery_percent`/`worst_signal_quality`/`silent_devices`/
+`zigbee_bridge`) are unchanged. `PROTOCOL_VERSION` bumped 8 -> 9
+(`protocol/version.py`, "a wholly new model plus an additive field on an
+existing one ... counts as a change to the models too", same literal
+reading every prior bump used) -- **re-chained at merge** if a parallel
+package (P6.1) also bumps it in the same window. **A tripwire test,
+`tests/test_protocol.py::test_protocol_version_is_exactly_9`, pins this
+exact value and must be edited together with `protocol/version.py` on
+every future bump** -- it is the one test in this repository deliberately
+allowed to assert exact equality on `PROTOCOL_VERSION`, replacing the role
+a pre-existing, mis-scoped exact-equality assertion in
+`tests/test_protocol_desired_state.py` used to serve (that one was pinned
+to P5.4b's own historical bump value and would have failed on every later,
+unrelated bump forever after -- loosened to `>= 8` and renamed
+`test_protocol_version_is_at_least_8`, its actual, narrower guarantee kept).
+
+**Precision (cross-review, 2026-10-02): `extra="forbid"` is scoped to
+`PerDeviceState` only, not to `Heartbeat`/`DeviceState` or any other
+heartbeat model.** Those deliberately keep Pydantic's default
+`extra="ignore"` (section 18.2: "the fleet service accepts an older
+version as long as it understands its fields", the forward-compatibility
+guarantee `tests/test_fleet.py
+::test_heartbeat_higher_version_with_an_unknown_extra_field_is_204` already
+pins for the top-level heartbeat) -- an unknown top-level field from a
+*newer* agent is silently dropped during validation, never stored (only
+the validated model is persisted, see `fleet/storage.py`'s own module
+docstring) and never rendered. `PerDeviceState` is the one place in this
+protocol where "unknown field" and "a name/room/measured value sneaking
+in disguised as a new field" are the same risk, which is why it alone
+trades that forward-compatibility leniency for a hard 422 instead.
+
+**UI (per-device display):** "Eine Wohnung" gained a "Je Gerät" table next
+to the existing aggregates, from the latest heartbeat's `devices.per_device`
+(`fleet.ui_apartment.PerDeviceDisplay`). **`label` is always `None` in
+this scaffold** -- checked against P4.1's inventory first, per the work
+package's own instruction: the `devices` table (section 20.1) tracks the
+*base station hardware* itself, one row per apartment (serial number,
+model, image/watchdog version, lifecycle state) -- there is no table
+anywhere that maps an individual Zigbee device id to a landlord-chosen
+label. The template therefore falls back to the opaque `device_id` as-is;
+`PerDeviceDisplay.label`'s own docstring documents that the only source it
+may ever be populated from is a future inventory table, never a name read
+from the heartbeat itself (CLAUDE.md: "never take names from the agent").
+A future package wanting friendly per-device labels needs its own new
+inventory table (Zigbee device id -> label), not a field re-purposed from
+`protocol.heartbeat.PerDeviceState` or `fleet.storage.DeviceRecord`. An
+agent that has not been upgraded to send `per_device` yet (P2.3, still
+deferred) simply omits the field -- shown as "Keine Angaben je Gerät
+(der Agent dieser Wohnung sendet diese Liste noch nicht)", not conflated
+with `never_reported`.
+
+**Precision (cross-review, 2026-10-02): per-device values are not a
+separate, latest-only store -- they are part of each heartbeat row and
+therefore follow the 90-day heartbeat retention from section 12, not some
+shorter or longer lifetime of their own.** `HeartbeatRecord.payload_json`
+already persists the whole validated `Heartbeat` verbatim (`fleet/storage
+.py`'s own module docstring: "not split into columns per field"), and
+`per_device` is just one more field inside that same JSON blob -- storing
+it needed no new column and no new retention rule, it rides along with
+whatever retention/deletion the heartbeats table already has (P6.1's
+retention job, developed in parallel). **"Latest only" is a read-time,
+UI-only choice**, not a storage one: `fleet.ui_apartment.build_apartment_
+detail` reads `devices.per_device` off `Storage.get_latest_heartbeat`'s
+single most-recent row -- the same read path the fleet-wide aggregates
+and every other per-heartbeat value on "Eine Wohnung" already use -- it
+simply never queries `list_heartbeats`/`get_heartbeat_history` for this
+field. A future package wanting a per-device *history* (not just the
+latest reading) already has the raw data available in every stored
+heartbeat row; it is not re-derivable only going forward from here.
+
+**Files:** `protocol/heartbeat.py`, `protocol/version.py`,
+`protocol/__init__.py`, `fleet/storage.py`
+(`FaultAcknowledgementRecord`, `acknowledge_fault`,
+`list_fault_acknowledgements_for_apartment`,
+`list_all_fault_acknowledgement_keys`),
+`fleet/migrations/versions/0017_fault_acknowledgements.py`,
+`fleet/ui_tasks.py`, `fleet/ui_apartment.py`
+(`PerDeviceDisplay`, `OpenFaultDisplay`'s new fields,
+`MAX_FAULT_ACK_NOTE_LENGTH`), `fleet/ui_routes.py`
+(`fault_acknowledge_submit`), `fleet/templates/ui/apartment.html`.
+`agent/` is untouched (P2.3's heartbeat collector is still deferred, per
+the work package's own instruction) -- the model and fleet side are
+complete and ready for whenever the agent can fill the list.
+
+**Tests (new/updated):** `tests/test_protocol.py` (valid per-device entry
+accepted; battery/signal optional; per_device defaults to empty; every
+non-opaque `device_id` shape parametrized and rejected, including a
+literal room name; `name`/`room`/`temperature` extra fields parametrized
+and rejected, both on `PerDeviceState` directly and end-to-end through
+`Heartbeat`; bounds on battery/signal; the list-length bound; **the
+`PROTOCOL_VERSION` tripwire**, `test_protocol_version_is_exactly_9` --
+pins the exact current value, by design the one test allowed to do so,
+meant to be edited together with `protocol/version.py` on every future
+bump); `tests/test_storage.py` (`acknowledge_fault` creates/updates/is
+apartment-scoped; **recurrence**: a new `since` is a different occurrence,
+the old acknowledgement does not apply; **audit**:
+`test_acknowledge_fault_writes_an_audit_row_every_call` -- landlord A
+acknowledges, landlord B corrects -> two `inventory_audit_log` rows, both
+identities present (the `fault_acknowledgements` row itself only ever
+shows B, the current acknowledger); `list_all_fault_acknowledgement_keys`
+spans every apartment; migration 0017 up/down, including the schema-diff
+check `test_migrations_match_the_orm_model_exactly` already covers
+automatically); `tests/test_ui_tasks.py` (an acknowledged fault is hidden;
+a recurring fault with a new `since` shows again despite the old
+acknowledgement); `tests/test_ui_apartment.py` (open fault carries its
+occurrence key and acknowledgement state; a different `since` does not
+inherit a stale acknowledgement; per-device values shown with no
+inventory label; empty when the agent omits the field; `never_reported`
+carries `per_device == []`); `tests/test_ui_faults.py` (new -- every HTTP
+behavior of the acknowledge endpoint: unauthenticated redirect, missing/
+wrong CSRF rejected, unknown apartment 404, happy path creates a row and
+redirects, an occurrence not currently open rejected with 400, unknown
+fault kind rejected, an overlong note rejected, re-acknowledging updates
+the note, the acknowledged fault disappears from `/ui/tasks`, and **an
+XSS regression**, `test_acknowledgement_note_with_a_script_tag_renders_
+escaped` -- a note containing `<script>alert('xss')</script>` is stored
+verbatim but renders HTML-escaped on "Eine Wohnung", Jinja2's default
+autoescaping, not a hand-rolled sanitizer).
+
+**Cross-review (2026-10-02): four items closed in the same commit, no
+behavior change beyond the audit write** -- (1) `Storage.acknowledge_fault`
+now writes an `InventoryAuditLogRecord` in the same transaction on every
+call, including a re-acknowledgement that only updates the existing
+`fault_acknowledgements` row, so an earlier acknowledger stays traceable
+even after someone else corrects the note; (2) the `PROTOCOL_VERSION`
+tripwire above, restoring the "fails on a forgotten bump" guarantee the
+loosened `test_protocol_version_is_at_least_8` deliberately gave up, in a
+test scoped to not fight future bumps; (3) the XSS regression above; (4)
+the two precision notes above (`extra="forbid"` is `PerDeviceState`-only,
+`Heartbeat`/`DeviceState` keep the existing forward-compatible
+`extra="ignore"`; per-device values live inside the heartbeat row and
+follow its 90-day retention, "latest only" is a read-time UI choice, not a
+storage one).
+
+**Verification:** `ruff check .`, `mypy .`, `mypy protocol fleet agent
+tools` all clean; `python -m pytest -W ignore::ResourceWarning` --
+**1871 passed, 1 skipped**, coverage **99%** overall
+(`fleet/storage.py`, `fleet/ui_apartment.py`, `fleet/ui_tasks.py`,
+`protocol/heartbeat.py`, and the new migration all at 100%); `go vet
+./...`/`go test ./...` clean (watchdog untouched by this package);
+`watchdog/check_contract.sh` passes; migration 0017 verified both
+directions (`upgrade`, `downgrade` to 0016, re-`upgrade`) via
+`tests/test_storage.py` and a manual round-trip. One pre-existing test
+(`tests/test_protocol_desired_state.py::test_protocol_version_is_8`) was
+pinned to an exact `PROTOCOL_VERSION` value and would have failed on
+every future bump forever after -- loosened to `>= 8` (renamed
+`test_protocol_version_is_at_least_8`), its actual guarantee (P5.4b's own
+bump happened) preserved, with a new, narrowly-scoped exact-equality
+tripwire added elsewhere (`test_protocol_version_is_exactly_9`, see
+above) to keep the "forgotten bump" guarantee the loosening gave up;
+flagged for main-session read-back together with the rest of this
+package, not changed silently.
 
 ## P5.4d -- pre-activation points from the P5.4b merge (section 13)
 
@@ -871,10 +1665,15 @@ rejected outcome, by design, until thermoctl ships a real health API.
   no device clock is ever read or trusted for this ordering, so an
   apartment's own clock drift (section 8's own "clock drift" alarm) cannot
   skew which outcome a heartbeat counts as "after".
-- **A rollout must include at least one `pilot_mode` apartment -- decision
-  to confirm.** Without one, "the pilot apartment first, then the rest no
-  earlier than 48 hours later" has nothing to gate on; refused fail-closed
-  (`ValueError`) rather than silently skipping the pilot phase.
+- ~~**A rollout must include at least one `pilot_mode` apartment --
+  decision to confirm.** Without one, "the pilot apartment first, then
+  the rest no earlier than 48 hours later" has nothing to gate on;
+  refused fail-closed (`ValueError`) rather than silently skipping the
+  pilot phase.~~ **Changed by the owner's P5.4e decision (2026-10-02,
+  see that package's own section above):** this refusal is removed. The
+  rollout always has exactly one test apartment to gate on -- the one
+  explicitly marked in the create form, or else the first apartment of
+  the list -- entirely independent of `ApartmentRecord.pilot_mode`.
 - **An apartment must already carry a current desired state to join a
   rollout -- decision to confirm.** This package only ever changes the
   rollout's own target service on top of an apartment's existing desired
@@ -970,13 +1769,15 @@ none does).
   needs a real thermoctl health endpoint and `pilot_mode` set per
   apartment before any rollout this package sequences can actually apply
   anything.
-- **Four "decision to confirm" points** -- worth a project-owner
-  confirmation before this package is ever used against a live pilot,
-  none of them security-relevant (CLAUDE.md principle 7) on their own:
-  the rollout worker implements the queue for one authored rollout, not a
-  "for all" button (see "Design" above); a rollout must include a pilot;
-  an apartment must already carry a current desired state to join one;
-  "resumed" retries the blocking apartment rather than skipping past it.
+- **Three "decision to confirm" points remain** (a fourth, "a rollout
+  must include a pilot", was settled and changed by the owner's P5.4e
+  decision, 2026-10-02, see that package's own section above) -- worth a
+  project-owner confirmation before this package is ever used against a
+  live rollout, none of them security-relevant (CLAUDE.md principle 7) on
+  their own: the rollout worker implements the queue for one authored
+  rollout, not a "for all" button (see "Design" above); an apartment must
+  already carry a current desired state to join one; "resumed" retries
+  the blocking apartment rather than skipping past it.
 - **`fleet.rollout._maybe_start_next`'s "not all pilots converged" branch
   is marked `# pragma: no cover`, not tested** -- `Storage.create_rollout`
   always positions every pilot ahead of every non-pilot, so this branch is
@@ -7458,7 +8259,8 @@ its own row exactly as before. Pinned by
 no trailing gap).
 
 **Battery/signal values -- section 9's wording vs. the actual protocol
-(open point, not built, not invented).** Section 9 says "battery and
+(open point, not built, not invented -- closed by P6.3, see this file's own
+P6.3 section at the top).** Section 9 says "battery and
 signal values ... per device"; `protocol.heartbeat.DeviceState` only ever
 carries the fleet-wide aggregates (`weakest_battery_percent`,
 `worst_signal_quality`, `silent_devices`, `zigbee_bridge`) -- there is no
@@ -7729,7 +8531,8 @@ agent tools` all clean; `python -m pytest -W ignore::ResourceWarning`
 (728 passed, 99% coverage overall, `fleet/ui_tasks.py` at 100%).
 
 **No acknowledge/confirm mechanism exists, on purpose -- open point, not
-built here.** The work package's own instruction: an "acknowledge" action on
+built here (closed by P6.3, see this file's own P6.3 section at the
+top).** The work package's own instruction: an "acknowledge" action on
 a fault would be a state-changing `POST` (its own CSRF handling, its own
 authorization question, its own persistence -- does acknowledging a fault
 on the fault's *current* occurrence carry forward to a later re-occurrence

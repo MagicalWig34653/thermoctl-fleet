@@ -29,7 +29,7 @@ calls for.
 (urlsafe, no padding stripped -- `base64.urlsafe_b64encode` keeps the `=`
 padding, which is fine, this is a stored value, not a URL path segment) for
 storage in `ui_users.totp_secret` (`Text`, see
-`fleet/migrations/versions/0017_totp_encryption_and_webauthn.py`, which also
+`fleet/migrations/versions/0019_totp_encryption_and_webauthn.py`, which also
 widens the column -- a base64 nonce+ciphertext blob is longer than the
 raw base32 secret the column used to hold).
 

@@ -20,7 +20,7 @@ from protocol.events import (
     fault_event_from_event,
     fault_kind_from_key,
 )
-from protocol.heartbeat import FaultKind, Heartbeat
+from protocol.heartbeat import MAX_PER_DEVICE_ENTRIES, FaultKind, Heartbeat, PerDeviceState
 from protocol.version import PROTOCOL_VERSION
 
 # Taken literally from docs/specification.md, section 5, extended by
@@ -81,6 +81,144 @@ def test_heartbeat_with_unknown_fault_kind_is_rejected() -> None:
 
     with pytest.raises(pydantic.ValidationError):
         Heartbeat.model_validate(malformed)
+
+
+def test_protocol_version_is_exactly_9() -> None:
+    """A tripwire for a forgotten bump (cross-review, 2026-10-02):
+    `protocol/version.py`'s own docstring says any change to a model in
+    `protocol/` -- including a purely additive one -- bumps
+    `PROTOCOL_VERSION`. Nothing enforces that mechanically; this exact-
+    equality assertion is the one test in this repository that will fail
+    the moment a future change to any `protocol/` model lands without the
+    matching bump, forcing whoever makes that change to update **both**
+    this literal (to the new value) **and** `protocol/version.py`'s own
+    changelog comment in the same commit.
+
+    **Unlike** `tests/test_protocol_desired_state.py
+    ::test_protocol_version_is_at_least_8` (a per-package regression test
+    that only checks "P5.4b's own historical bump happened", loosened from
+    an exact-equality pin specifically so later, unrelated bumps -- this
+    one included -- would not break it forever after): this test is the
+    one tripwire allowed to pin the *current* value exactly, and it is
+    expected to be edited on every single future bump, not relaxed."""
+
+    assert PROTOCOL_VERSION == 9
+
+
+# -- per-device battery/signal (P6.3, section 12's "Decided afterward",
+# 2026-10-01) ------------------------------------------------------------
+
+_VALID_DEVICE_ID = "0x00124b0012345678"
+
+
+def _heartbeat_with_per_device(per_device: list[dict[str, object]]) -> dict[str, object]:
+    """`HEARTBEAT_EXAMPLE` with `devices.per_device` replaced -- a full,
+    explicit `devices` dict literal rather than `**HEARTBEAT_EXAMPLE["devices"]`
+    (mypy cannot narrow a `dict[str, object]` value's own type enough to
+    unpack it back into a new dict literal)."""
+
+    return {
+        **HEARTBEAT_EXAMPLE,
+        "devices": {
+            "zigbee_bridge": "connected",
+            "weakest_battery_percent": 62,
+            "worst_signal_quality": 47,
+            "silent_devices": 0,
+            "per_device": per_device,
+        },
+    }
+
+
+def test_heartbeat_with_valid_per_device_entry_is_accepted() -> None:
+    payload = _heartbeat_with_per_device(
+        [{"device_id": _VALID_DEVICE_ID, "battery_percent": 62, "signal_quality": 47}]
+    )
+
+    heartbeat = Heartbeat.model_validate(payload)
+
+    assert heartbeat.devices.per_device[0].device_id == _VALID_DEVICE_ID
+    assert heartbeat.devices.per_device[0].battery_percent == 62
+    assert heartbeat.devices.per_device[0].signal_quality == 47
+
+
+def test_per_device_battery_and_signal_are_optional() -> None:
+    entry = PerDeviceState.model_validate({"device_id": _VALID_DEVICE_ID})
+
+    assert entry.battery_percent is None
+    assert entry.signal_quality is None
+
+
+def test_heartbeat_omitting_per_device_defaults_to_empty_list() -> None:
+    heartbeat = Heartbeat.model_validate(HEARTBEAT_EXAMPLE)
+
+    assert heartbeat.devices.per_device == []
+
+
+@pytest.mark.parametrize(
+    "device_id",
+    [
+        "Küche",  # a friendly/room name -- exactly what section 12 forbids
+        "kitchen-sensor",
+        "0x00124b001234567",  # one hex digit short
+        "0x00124b00123456789",  # one hex digit too many
+        "0X00124B0012345678",  # uppercase prefix/digits
+        "00124b0012345678",  # missing the 0x prefix
+        "",
+    ],
+)
+def test_per_device_rejects_anything_that_is_not_an_opaque_zigbee_address(
+    device_id: str,
+) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        PerDeviceState.model_validate({"device_id": device_id})
+
+
+@pytest.mark.parametrize("extra_field", ["name", "room", "temperature"])
+def test_per_device_rejects_extra_fields(extra_field: str) -> None:
+    """Section 12: "no device names (they may contain room names), no
+    measured values." `extra="forbid"` makes this a structural guarantee,
+    not a convention -- any extra field at all is rejected, these three are
+    just the ones the work package names explicitly."""
+
+    with pytest.raises(pydantic.ValidationError):
+        PerDeviceState.model_validate({"device_id": _VALID_DEVICE_ID, extra_field: "x"})
+
+
+def test_heartbeat_with_a_name_like_per_device_entry_is_rejected() -> None:
+    """End-to-end at the `Heartbeat` level (not just `PerDeviceState` in
+    isolation) -- a heartbeat carrying a friendly device name is rejected,
+    the same 422 a real `POST /v1/heartbeat` would produce."""
+
+    payload = _heartbeat_with_per_device([{"device_id": "Küche", "battery_percent": 50}])
+
+    with pytest.raises(pydantic.ValidationError):
+        Heartbeat.model_validate(payload)
+
+
+def test_heartbeat_with_an_extra_field_on_a_per_device_entry_is_rejected() -> None:
+    payload = _heartbeat_with_per_device(
+        [{"device_id": _VALID_DEVICE_ID, "battery_percent": 50, "name": "Küche"}]
+    )
+
+    with pytest.raises(pydantic.ValidationError):
+        Heartbeat.model_validate(payload)
+
+
+def test_per_device_battery_percent_bounds_are_enforced() -> None:
+    with pytest.raises(pydantic.ValidationError):
+        PerDeviceState.model_validate({"device_id": _VALID_DEVICE_ID, "battery_percent": 101})
+    with pytest.raises(pydantic.ValidationError):
+        PerDeviceState.model_validate({"device_id": _VALID_DEVICE_ID, "signal_quality": -1})
+
+
+def test_per_device_list_is_bounded() -> None:
+    too_many: list[dict[str, object]] = [
+        {"device_id": f"0x{i:016x}"} for i in range(MAX_PER_DEVICE_ENTRIES + 1)
+    ]
+    payload = _heartbeat_with_per_device(too_many)
+
+    with pytest.raises(pydantic.ValidationError):
+        Heartbeat.model_validate(payload)
 
 
 def test_command_list_is_closed() -> None:

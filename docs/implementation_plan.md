@@ -779,6 +779,50 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Read back by:** main session (the shared lock and the non-blocking
   trigger both touch CLAUDE.md security principles 2 and 5 directly).
 
+### P5.4e -- Rollout test apartment decoupled from `pilot_mode`
+- [x] done -- see `docs/STATUS.md`'s own P5.4e section for the full design
+  and verification output.
+- **Goal:** owner decision (section 13, "Decided afterward", 2026-10-02):
+  a rollout no longer requires any selected apartment to carry the
+  device-side `pilot_mode` flag. The rollout's own test apartment is now
+  chosen within the rollout itself -- the landlord may mark exactly one
+  apartment of the create form's list as the test apartment, or else the
+  first apartment of the list is used. The 48-hour stagger gate and
+  everything else about the queue (one apartment at a time, stop at the
+  first failure/timeout) stays unchanged; only the *selection* of which
+  apartment goes first changes.
+- **Files:** `fleet/storage.py` (`Storage.create_rollout`'s new
+  `test_apartment_id` parameter; `RolloutRecord`/`RolloutApartmentRecord`
+  docstrings), `fleet/rollout.py` (docstring/comment updates only, no
+  behaviour change -- `is_pilot` already generalized to "the rollout's
+  own test apartment"), `fleet/ui_routes.py` (`rollout_new_submit`/
+  `rollout_confirm_submit`), `fleet/templates/ui/rollout_new.html`
+  (per-apartment radio button), `fleet/templates/ui/rollout_confirm.html`
+  (hidden field, "(Testwohnung)" tag), `fleet/templates/ui
+  /rollout_detail.html`/`rollout_list.html` (German text), `tests/test
+  _storage_rollouts.py`, `tests/test_rollout_worker.py`, `tests/test_ui
+  _rollout.py`.
+- **No migration.** `RolloutApartmentRecord.is_pilot` is reused unchanged
+  -- its meaning since this package is "this rollout's own test
+  apartment", decoupled from `ApartmentRecord.pilot_mode`, but the column
+  itself needed no schema change.
+- **Section:** 13.
+- **Acceptance:** no apartment marked -> the first apartment of the
+  submitted list is the test apartment and is started first, with the
+  48h gate applying to the rest; an apartment explicitly marked (not
+  first in the list) goes first instead; a single-apartment rollout
+  works trivially; `pilot_mode` flags are irrelevant to rollout ordering
+  (tested directly: a `pilot_mode=True` apartment listed first is *not*
+  started first unless also marked); the former "at least one selected
+  apartment must carry `pilot_mode=True`" refusal is removed (tested:
+  a rollout across apartments with no `pilot_mode` at all now succeeds);
+  the create/confirm UI shows which apartment is the test apartment.
+- **Depends on:** P5.4c (the rollout queue this package only changes test
+  apartment selection within).
+- **Read back by:** main session (changes `Storage.create_rollout`'s own
+  validation, shared with P6.1/P6.2 work on `fleet/storage.py` in
+  parallel worktrees -- confined to the rollout-specific code paths only).
+
 ### P5.5a -- Backup creation and upload **SR**
 - [x] done -- see `docs/STATUS.md`'s P5.5a section.
 - **Goal:** implement `agent/loop.py::create_backup` for both kinds of
@@ -1040,6 +1084,118 @@ they must also stay conceptually separate, not just separately scheduled.
   (`watchdog/check_contract.sh`). `go vet`/`go test -count=1 ./...` clean
   across all three watchdog-module packages, `gofmt -l .` empty,
   `tools/check_image_config.py` gained `check_leds_unit`.
+
+---
+
+## Step 6 -- Section 12's owner decisions (2026-10-01)
+
+Three packages closing the "Decided afterward" paragraphs the project
+owner added to section 12 in the main session: P6.1 (retention + tenant
+change), P6.2 (login hardening -- passkeys + encrypted TOTP secrets), P6.3
+(fault acknowledgement + per-device battery/signal). Developed in
+parallel worktrees; `PROTOCOL_VERSION` and `fleet/migrations/versions/`
+are re-chained at merge if more than one bumps/adds at once.
+
+### P6.1 -- Retention and tenant change (section 12) **SR**
+- **Goal:** a background job deleting heartbeats older than 90 days and
+  faults/alarms/events older than 365 days (both periods configurable),
+  never the audit log; and an explicit UI action, per apartment, that
+  rotates the apartment's device token (old token stops working
+  immediately, the agent recovers it via a signed challenge with its
+  existing Ed25519 device key -- no private key ever leaves the device)
+  and deletes that apartment's heartbeats, events, faults, alarms, and
+  command log excerpts (not backups, not the audit log, not inventory).
+- **Files:** `fleet/data_retention.py` (new), `fleet/storage.py`,
+  `fleet/auth.py`, `fleet/app.py`, `fleet/ui_routes.py`,
+  `fleet/templates/ui/tenant_change_confirm.html` (new),
+  `fleet/migrations/versions/0018_retention_and_tenant_change.py` (new),
+  `agent/token_rotation.py` (new), `agent/commands_channel.py`,
+  `agent/__main__.py`.
+- **Section:** 12.
+- **Acceptance:** retention boundaries exact (a row exactly at the cutoff
+  kept, one microsecond older deleted) with an injected clock; unrelated
+  tables (backups, audit log, command log excerpts, diagnostic bundles)
+  never touched by the retention job; old token 403 after rotation for an
+  unrelated caller, 401 "re-authenticate" for the device that actually held
+  it; replay/wrong-key/expired-challenge all refused; deletion scope exact
+  (another apartment's history untouched); CSRF/login/mandatory-reason
+  enforced on the UI action; agent recovers once, end to end, over a real
+  TLS harness, never loops.
+- **Depends on:** P4.2b (the signed-challenge design this package reuses),
+  P5.5a (the backup-retention pattern this package's own retention job
+  mirrors).
+- [x] done -- see `docs/STATUS.md`'s own P6.1 section for the full design:
+  no new protocol model (the token-rotation challenge/token pair reuses
+  P4.2b's `TokenChallenge`/`TokenRequest`/`TokenIssued` under a distinct
+  domain-separated message, `thermoctl-fleet/token-rotation/v1`), so
+  `PROTOCOL_VERSION` is unchanged. `fleet.auth`'s new 401 "re-authenticate"
+  signal (`WWW-Authenticate: Bearer error="reauth_required"`) is how the
+  agent learns to run the recovery flow, surfaced to it as
+  `agent.commands_channel.CommandStreamReauthRequired`, retried at most
+  once by `agent.__main__._run_agent`. Migration `0017` (renumbered to
+  `0018` at the main-merge below, after P6.3's own parallel
+  `0017_fault_acknowledgements.py`). `ruff`/`mypy`/`pytest` all clean,
+  coverage 99% overall, every new line in this package's own files at
+  100%.
+- [x] **cross-review fix** (2026-10-02, see `docs/STATUS.md`'s own entry
+  for the full account): both token-rotation endpoints now also require
+  the OLD token as Bearer (`fleet.auth.require_apartment_reauth_old_
+  token`) -- closes a found-and-reproduced gap where anyone who merely
+  knew a rotated apartment's (non-secret) id could overwrite the real
+  device's single active nonce and permanently lock it out. Rotation-
+  pending state is now also cleared by `confirm_device`/`issue_device_
+  token`/`remove_device`, not only by completing the rotation. A new
+  `agent/reauth_backoff.py` persists an exponential backoff across process
+  restarts so a persistently failing re-authentication cannot crash-loop a
+  supervised process. Two further owner decisions folded in: the 365-day
+  retention limit now applies only to cleared/closed alarms (an open one
+  survives regardless of age); tenant change additionally deletes the
+  apartment's diagnostic bundles (row and blob, scoped to that apartment).
+
+### P6.3 -- Fault acknowledgement + per-device battery/signal **SR**
+- [x] done -- see `docs/STATUS.md`'s own P6.3 section for the full design
+  and verification output.
+- **Goal:** close P3.2's "per-device battery/signal values are not in the
+  heartbeat wire protocol" open point and P3.4's "no acknowledge/confirm
+  mechanism" open point, both per section 12's 2026-10-01 "Decided
+  afterward" paragraphs: an acknowledgement applies to the fault's current
+  occurrence only (it shows again if the identical kind/zone fault clears
+  and reopens with a new `since`); a per-device heartbeat list of
+  `(device_id, battery_percent, signal_quality)` only, `device_id` a
+  structurally-enforced opaque Zigbee IEEE address, no name/room/measured
+  value ever representable.
+- **Files:** `protocol/heartbeat.py` (`PerDeviceState`,
+  `DeviceState.per_device`, `MAX_PER_DEVICE_ENTRIES`),
+  `protocol/version.py` (`PROTOCOL_VERSION` 8 -> 9), `fleet/storage.py`
+  (`FaultAcknowledgementRecord`, `acknowledge_fault`,
+  `list_fault_acknowledgements_for_apartment`,
+  `list_all_fault_acknowledgement_keys`),
+  `fleet/migrations/versions/0017_fault_acknowledgements.py`,
+  `fleet/ui_tasks.py` (acknowledged occurrences filtered out of
+  "Aufgaben"), `fleet/ui_apartment.py` (`PerDeviceDisplay`,
+  `OpenFaultDisplay`'s new acknowledgement fields), `fleet/ui_routes.py`
+  (`POST /ui/apartments/{id}/faults/acknowledge`),
+  `fleet/templates/ui/apartment.html`.
+- **Section:** 9, 12.
+- **Acceptance:** an acknowledged occurrence (exact `apartment_id`/
+  `fault_kind`/`zone`/`since` match) is hidden from "Aufgaben" and shown as
+  quittiert on "Eine Wohnung"; the identical kind/zone fault reopening with
+  a new `since` is unaffected by the old acknowledgement and shows again;
+  acknowledgement requires login + CSRF, is re-validated against the
+  apartment's *currently* open faults (never trusted from the form alone),
+  and is audited (who/when/optional note); a heartbeat with a name-like
+  `device_id` or an extra field (`name`/`room`/`temperature`) on a
+  per-device entry is rejected with 422; the list is bounded; the
+  fleet-wide aggregates are unchanged. `fleet/ui_apartment.py::PerDeviceDisplay
+  .label` is always `None` in this scaffold -- the P4.1 inventory has no
+  table mapping a Zigbee device id to a landlord-chosen label (its
+  `Device` table tracks the base station hardware, not individual Zigbee
+  devices), left as an open point for a future package, not invented here.
+- **Depends on:** P3.2/P3.4a (the views this closes open points in), P1.3
+  (storage layer).
+- **Read back by:** main session (a new optional heartbeat field is a
+  protocol change, CLAUDE.md's "not a data collector"/"a field may only
+  ever be added" principle).
 
 ---
 

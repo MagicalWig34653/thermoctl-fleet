@@ -60,6 +60,7 @@ def _make_heartbeat(
     agent_version: str = "0.1.0",
     protocol_version: int = PROTOCOL_VERSION,
     open_faults: list[dict[str, str]] | None = None,
+    per_device: list[dict[str, object]] | None = None,
 ) -> Heartbeat:
     return Heartbeat.model_validate(
         {
@@ -79,6 +80,7 @@ def _make_heartbeat(
                 "weakest_battery_percent": 62,
                 "worst_signal_quality": 47,
                 "silent_devices": 0,
+                "per_device": per_device or [],
             },
             "system": {
                 "uptime_s": 962114,
@@ -155,6 +157,7 @@ def test_never_reported_apartment_has_no_data_but_is_not_none(storage: Storage) 
     assert detail.timeline == []
     assert detail.open_faults == []
     assert detail.weakest_battery_percent is None
+    assert detail.per_device == []
     assert detail.alarms == []
 
 
@@ -392,6 +395,120 @@ def test_open_faults_come_from_the_latest_heartbeat(storage: Storage) -> None:
     assert detail.open_faults[0].kind_label == "Sensorfehler"
     assert detail.open_faults[0].zone == "bad"
     assert "seit" in detail.open_faults[0].since_text
+    assert detail.open_faults[0].fault_kind == "sensor_fault"
+    assert detail.open_faults[0].since == BASE_TIME
+    assert detail.open_faults[0].acknowledged_by is None
+
+
+def test_an_acknowledged_open_fault_carries_who_when_and_the_note(storage: Storage) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(
+            APARTMENT,
+            sent_at=BASE_TIME,
+            open_faults=[
+                {"kind": "sensor_fault", "since": BASE_TIME.isoformat(), "zone": "bad"},
+            ],
+        ),
+        BASE_TIME,
+    )
+    ack_time = BASE_TIME + timedelta(minutes=10)
+    storage.acknowledge_fault(
+        APARTMENT,
+        "sensor_fault",
+        "bad",
+        BASE_TIME,
+        acknowledged_by=USERNAME,
+        note="Techniker informiert",
+        now=ack_time,
+    )
+
+    detail = build_apartment_detail(storage, APARTMENT, BASE_TIME + timedelta(hours=1), None)
+
+    assert detail is not None
+    assert len(detail.open_faults) == 1
+    fault = detail.open_faults[0]
+    assert fault.acknowledged_by == USERNAME
+    assert fault.acknowledged_at == ack_time.replace(tzinfo=None)
+    assert fault.acknowledged_note == "Techniker informiert"
+
+
+def test_an_acknowledgement_for_a_different_since_does_not_apply(storage: Storage) -> None:
+    """A fault that cleared and reopened (a new `since`) must not inherit a
+    stale acknowledgement of the previous occurrence (section 12: "if the
+    same fault recurs, it shows again")."""
+
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    storage.acknowledge_fault(
+        APARTMENT,
+        "sensor_fault",
+        "bad",
+        BASE_TIME,
+        acknowledged_by=USERNAME,
+        note=None,
+        now=BASE_TIME + timedelta(minutes=10),
+    )
+    reopened_since = BASE_TIME + timedelta(days=1)
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(
+            APARTMENT,
+            sent_at=reopened_since + timedelta(hours=1),
+            open_faults=[
+                {"kind": "sensor_fault", "since": reopened_since.isoformat(), "zone": "bad"},
+            ],
+        ),
+        reopened_since + timedelta(hours=1),
+    )
+
+    detail = build_apartment_detail(
+        storage, APARTMENT, reopened_since + timedelta(hours=2), None
+    )
+
+    assert detail is not None
+    assert len(detail.open_faults) == 1
+    assert detail.open_faults[0].acknowledged_by is None
+
+
+def test_per_device_values_are_shown_with_no_inventory_label(storage: Storage) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(
+            APARTMENT,
+            sent_at=BASE_TIME,
+            per_device=[
+                {
+                    "device_id": "0x00124b0012345678",
+                    "battery_percent": 55,
+                    "signal_quality": 70,
+                }
+            ],
+        ),
+        BASE_TIME,
+    )
+
+    detail = build_apartment_detail(storage, APARTMENT, BASE_TIME + timedelta(minutes=1), None)
+
+    assert detail is not None
+    assert len(detail.per_device) == 1
+    assert detail.per_device[0].device_id == "0x00124b0012345678"
+    assert detail.per_device[0].label is None
+    assert detail.per_device[0].battery_percent == 55
+    assert detail.per_device[0].signal_quality == 70
+
+
+def test_per_device_is_empty_when_the_agent_does_not_send_it(storage: Storage) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    storage.save_heartbeat(
+        APARTMENT, _make_heartbeat(APARTMENT, sent_at=BASE_TIME), BASE_TIME
+    )
+
+    detail = build_apartment_detail(storage, APARTMENT, BASE_TIME + timedelta(minutes=1), None)
+
+    assert detail is not None
+    assert detail.per_device == []
 
 
 def test_battery_signal_version_system_and_control_fields(storage: Storage) -> None:
