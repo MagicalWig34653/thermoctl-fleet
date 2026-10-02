@@ -313,6 +313,10 @@ protocol code.
   are stored encrypted with a key from the environment, never in the database.
 - **Faults can be acknowledged** in the UI; an acknowledgement applies to the current
   occurrence only -- if the same fault recurs, it shows again.
+- **Retention reading (2026-10-02):** "faults 365 days" refers to the stored event
+  entries. Open faults are part of each heartbeat; their heartbeat-by-heartbeat history
+  older than 90 days goes with the heartbeats, while the current state (open since ...)
+  always stays visible through the latest heartbeat.
 - **Battery and signal per device** may be transmitted: a list of device id, battery
   percent and signal quality only -- no device names (they may contain room names), no
   measured values. Section 6 stays intact.
@@ -397,6 +401,17 @@ before the heating season of operational experience section 7 asks for `apply_up
 
 No new `CommandType`; `apply_update` stays stage 2. Both rejection paths (health missing,
 `pilot_mode` missing) are tested, since they are the only code path that is actually live.
+
+**Decided afterward (project owner, 2026-10-02), rollout queue:** a rollout is created once
+(one service, one version, one list of apartments) and then works through the list on its
+own, one apartment at a time, stopping at the first problem. An apartment counts as "back
+healthy" when the agent reports the revision as successfully reconciled and a heartbeat with
+thermoctl reachable arrives afterwards (both fleet-side timestamps). The test apartment is
+the one marked as such in the list, or else simply the first apartment of the list; the rest
+follow no earlier than 48 hours after it came back healthy. This rollout test apartment is
+independent of the device-side `pilot_mode` gate above. A new apartment is never set up
+through a rollout -- it gets its desired state directly on its own page; a rollout only
+updates apartments that already have one.
 
 ### Operating system and firmware
 

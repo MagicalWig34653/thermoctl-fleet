@@ -2,6 +2,21 @@
 
 Last updated: 2026-10-02.
 
+## Owner confirmations (2026-10-02, main session)
+
+- P5.4c's "decisions to confirm" are settled (spec section 13, "Decided
+  afterward" 2026-10-02): healthy = successful outcome + later heartbeat
+  with thermoctl reachable; the rollout runs on its own after one
+  creation; every apartment needs an existing desired state (new
+  apartments are set up on their own page, never via a rollout).
+  **Changed:** a rollout no longer requires an apartment with `pilot_mode`
+  -- if none in the list is marked as the rollout's test apartment, the
+  first apartment of the list is; the rollout test apartment is decoupled
+  from the device-side `pilot_mode` gate. Package P5.4e implements this.
+- Retention reading confirmed: "faults 365 days" = stored event entries;
+  the heartbeat-embedded open-fault history follows the 90-day heartbeat
+  retention (current "open since" always visible).
+
 ## Open point from the flaky-test investigation (main session, 2026-10-02)
 
 The agent's background threads (restore poll, backup scheduler, desired-state
