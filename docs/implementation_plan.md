@@ -1043,6 +1043,54 @@ they must also stay conceptually separate, not just separately scheduled.
 
 ---
 
+## Step 6 -- Owner decisions on section 12's open points (2026-10-01)
+
+Follow-up packages for the three open points the project owner decided in
+`docs/specification.md` section 12's "Decided afterward" paragraph and
+`docs/STATUS.md`'s own "Owner decisions on section 12" entry.
+
+### P6.1 -- Retention and tenant change (section 12) **SR**
+- **Goal:** a background job deleting heartbeats older than 90 days and
+  faults/alarms/events older than 365 days (both periods configurable),
+  never the audit log; and an explicit UI action, per apartment, that
+  rotates the apartment's device token (old token stops working
+  immediately, the agent recovers it via a signed challenge with its
+  existing Ed25519 device key -- no private key ever leaves the device)
+  and deletes that apartment's heartbeats, events, faults, alarms, and
+  command log excerpts (not backups, not the audit log, not inventory).
+- **Files:** `fleet/data_retention.py` (new), `fleet/storage.py`,
+  `fleet/auth.py`, `fleet/app.py`, `fleet/ui_routes.py`,
+  `fleet/templates/ui/tenant_change_confirm.html` (new),
+  `fleet/migrations/versions/0017_retention_and_tenant_change.py` (new),
+  `agent/token_rotation.py` (new), `agent/commands_channel.py`,
+  `agent/__main__.py`.
+- **Section:** 12.
+- **Acceptance:** retention boundaries exact (a row exactly at the cutoff
+  kept, one microsecond older deleted) with an injected clock; unrelated
+  tables (backups, audit log, command log excerpts, diagnostic bundles)
+  never touched by the retention job; old token 403 after rotation for an
+  unrelated caller, 401 "re-authenticate" for the device that actually held
+  it; replay/wrong-key/expired-challenge all refused; deletion scope exact
+  (another apartment's history untouched); CSRF/login/mandatory-reason
+  enforced on the UI action; agent recovers once, end to end, over a real
+  TLS harness, never loops.
+- **Depends on:** P4.2b (the signed-challenge design this package reuses),
+  P5.5a (the backup-retention pattern this package's own retention job
+  mirrors).
+- [x] done -- see `docs/STATUS.md`'s own P6.1 section for the full design:
+  no new protocol model (the token-rotation challenge/token pair reuses
+  P4.2b's `TokenChallenge`/`TokenRequest`/`TokenIssued` under a distinct
+  domain-separated message, `thermoctl-fleet/token-rotation/v1`), so
+  `PROTOCOL_VERSION` is unchanged. `fleet.auth`'s new 401 "re-authenticate"
+  signal (`WWW-Authenticate: Bearer error="reauth_required"`) is how the
+  agent learns to run the recovery flow, surfaced to it as
+  `agent.commands_channel.CommandStreamReauthRequired`, retried at most
+  once by `agent.__main__._run_agent`. Migration `0017`, chained onto
+  main's `0016`. `ruff`/`mypy`/`pytest` all clean, coverage 99% overall,
+  every new line in this package's own files at 100%.
+
+---
+
 ## Only after operational experience (stage 2, sections 21 and 24)
 
 Per the specification, explicitly not before a heating season of

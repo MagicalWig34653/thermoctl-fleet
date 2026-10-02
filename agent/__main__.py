@@ -11,7 +11,7 @@ import httpx
 import pydantic
 
 from agent import loop
-from agent.commands_channel import CommandStreamAuthError
+from agent.commands_channel import CommandStreamAuthError, CommandStreamReauthRequired
 from agent.encryption import DEFAULT_RECIPIENTS_FILE
 from agent.registration import (
     DEFAULT_DATA_DIR,
@@ -22,6 +22,7 @@ from agent.registration import (
 )
 from agent.restore import DEFAULT_RESTORE_POLL_INTERVAL_S, RestoreTargets
 from agent.safe_io import UnsafeStateFileError
+from agent.token_rotation import TokenRotationError, reauthenticate
 from agent.transport import build_client
 from protocol.registration import AgentRegistrationFile
 
@@ -125,25 +126,61 @@ def _run_agent(args: argparse.Namespace) -> int:
                 staging_dir=Path(args.restore_staging_dir),
                 mover_status_path=Path(args.restore_mover_status_file),
             )
-            loop.run(
-                client,
-                last_event_id_path=data_dir / loop.DEFAULT_LAST_EVENT_ID_FILE,
-                outbox_path=data_dir / loop.DEFAULT_COMMAND_OUTBOX_FILE,
-                executed_ids_path=data_dir / loop.DEFAULT_EXECUTED_IDS_FILE,
-                local_log_path=data_dir / loop.DEFAULT_LOCAL_LOG_FILE,
-                watchdog_state_path=Path(args.watchdog_state_file),
-                led_status_path=Path(args.led_status_file),
-                backup_config=backup_config,
-                restore_targets=restore_targets,
-                restore_poll_interval_s=args.restore_poll_interval_s,
-                pending_swap_path=data_dir / loop.DEFAULT_PENDING_SWAP_FILE,
-                desired_state_held_state_path=(
-                    data_dir / loop.DEFAULT_DESIRED_STATE_HELD_STATE_FILE
-                ),
-                desired_state_failed_rollback_path=(
-                    data_dir / loop.DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE
-                ),
-            )
+            # P6.1 (section 12's "Decided afterward" 2026-10-01): a tenant
+            # change rotates this apartment's agent token server-side. The
+            # SSE command channel (`agent.commands_channel.receive_commands`,
+            # called from inside `loop.run`) is where this agent actually
+            # notices -- the fleet answers its very next call with a 401
+            # carrying `error="reauth_required"`, surfaced here as
+            # `CommandStreamReauthRequired`. **Retried at most once**: a
+            # `reauthenticated` flag, not a loop with no exit, is what keeps
+            # this from hammering the fleet service if the rotation flow
+            # itself keeps failing (e.g. no rotation actually pending, a
+            # wrong key, a transport error) -- the second occurrence
+            # (`reauthenticated` already `True`) is never caught here and
+            # propagates to the `except CommandStreamReauthRequired`/
+            # `CommandStreamAuthError` clauses below instead, ending the
+            # process with a clear message rather than retrying forever.
+            reauthenticated = False
+            while True:
+                try:
+                    loop.run(
+                        client,
+                        last_event_id_path=data_dir / loop.DEFAULT_LAST_EVENT_ID_FILE,
+                        outbox_path=data_dir / loop.DEFAULT_COMMAND_OUTBOX_FILE,
+                        executed_ids_path=data_dir / loop.DEFAULT_EXECUTED_IDS_FILE,
+                        local_log_path=data_dir / loop.DEFAULT_LOCAL_LOG_FILE,
+                        watchdog_state_path=Path(args.watchdog_state_file),
+                        led_status_path=Path(args.led_status_file),
+                        backup_config=backup_config,
+                        restore_targets=restore_targets,
+                        restore_poll_interval_s=args.restore_poll_interval_s,
+                        pending_swap_path=data_dir / loop.DEFAULT_PENDING_SWAP_FILE,
+                        desired_state_held_state_path=(
+                            data_dir / loop.DEFAULT_DESIRED_STATE_HELD_STATE_FILE
+                        ),
+                        desired_state_failed_rollback_path=(
+                            data_dir / loop.DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE
+                        ),
+                    )
+                    break
+                except CommandStreamReauthRequired:
+                    if reauthenticated or not args.apartment_id:
+                        raise
+                    reauthenticated = True
+                    outcome = reauthenticate(args.apartment_id, data_dir, client)
+                    client.headers["Authorization"] = f"Bearer {outcome.token}"
+    except CommandStreamReauthRequired:
+        print(
+            "thermoctl-agent: token re-authentication already attempted once; "
+            "refusing to retry again. Check --apartment-id and that a tenant "
+            "change is actually pending for this apartment.",
+            file=sys.stderr,
+        )
+        return 1
+    except TokenRotationError as error:
+        print(f"thermoctl-agent: token re-authentication failed: {error}", file=sys.stderr)
+        return 1
     except CommandStreamAuthError:
         print(
             "thermoctl-agent: command authorization refused; token revoked or invalid.",

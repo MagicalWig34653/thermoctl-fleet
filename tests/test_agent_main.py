@@ -330,6 +330,242 @@ def test_run_cli_reports_a_clear_error_for_an_unsafe_state_file(
     assert "refusing to run" in capsys.readouterr().err
 
 
+def test_run_cli_reauthenticates_once_then_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """P6.1: `loop.run` raising `CommandStreamReauthRequired` once is
+    recovered from automatically -- `agent.token_rotation.reauthenticate`
+    is called exactly once, the client's `Authorization` header is updated,
+    and `loop.run` is retried exactly once more, after which it succeeds."""
+
+    import json
+    import secrets
+
+    from agent.commands_channel import CommandStreamReauthRequired
+    from agent.registration import _store_token
+    from agent.token_rotation import TokenRotationOutcome
+
+    old_token = secrets.token_urlsafe(32)
+    new_token = secrets.token_urlsafe(32)
+    _store_token(tmp_path, old_token)
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+
+    calls: list[int] = []
+    reauth_calls: list[str] = []
+
+    def client_factory(address: str, pin: str) -> httpx.Client:
+        return httpx.Client(base_url=address)
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            assert client.headers["Authorization"] == f"Bearer {old_token}"
+            raise CommandStreamReauthRequired("reauth required")
+        assert client.headers["Authorization"] == f"Bearer {new_token}"
+
+    def fake_reauthenticate(apartment_id: str, data_dir: Path, client: httpx.Client) -> object:
+        reauth_calls.append(apartment_id)
+        return TokenRotationOutcome(token=new_token)
+
+    monkeypatch.setattr(agent_main, "build_client", client_factory)
+    monkeypatch.setattr(loop, "run", runner)
+    monkeypatch.setattr(agent_main, "reauthenticate", fake_reauthenticate)
+
+    code = agent_main.main(
+        [
+            "run",
+            "--data-dir", str(tmp_path),
+            "--registration-file", str(config),
+            "--apartment-id", "house7-a03",
+        ]
+    )
+
+    assert code == 0
+    assert len(calls) == 2
+    assert reauth_calls == ["house7-a03"]
+    assert capsys.readouterr().err == ""
+
+
+def test_run_cli_reauth_required_twice_gives_up_without_looping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A **second** `CommandStreamReauthRequired` (the rotation flow itself
+    did not actually fix anything, or no rotation was really pending) is
+    never retried a second time -- `reauthenticate` is called at most once
+    per run, proving this cannot hammer the fleet service in a loop."""
+
+    import json
+    import secrets
+
+    from agent.commands_channel import CommandStreamReauthRequired
+    from agent.registration import _store_token
+    from agent.token_rotation import TokenRotationOutcome
+
+    old_token = secrets.token_urlsafe(32)
+    _store_token(tmp_path, old_token)
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+
+    calls: list[int] = []
+    reauth_calls: list[str] = []
+
+    def client_factory(address: str, pin: str) -> httpx.Client:
+        return httpx.Client(base_url=address)
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        calls.append(1)
+        raise CommandStreamReauthRequired("reauth required")
+
+    def fake_reauthenticate(apartment_id: str, data_dir: Path, client: httpx.Client) -> object:
+        reauth_calls.append(apartment_id)
+        return TokenRotationOutcome(token=secrets.token_urlsafe(32))
+
+    monkeypatch.setattr(agent_main, "build_client", client_factory)
+    monkeypatch.setattr(loop, "run", runner)
+    monkeypatch.setattr(agent_main, "reauthenticate", fake_reauthenticate)
+
+    code = agent_main.main(
+        [
+            "run",
+            "--data-dir", str(tmp_path),
+            "--registration-file", str(config),
+            "--apartment-id", "house7-a03",
+        ]
+    )
+
+    assert code == 1
+    assert len(calls) == 2  # the original attempt, plus exactly one retry
+    assert len(reauth_calls) == 1  # reauthenticate itself never retried
+    assert "already attempted once" in capsys.readouterr().err
+
+
+def test_run_cli_reauth_required_without_apartment_id_gives_up_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Without `--apartment-id` this agent has no way to name itself to the
+    rotation-challenge endpoint -- it must refuse cleanly, not attempt a
+    call that cannot possibly succeed."""
+
+    import json
+    import secrets
+
+    from agent.commands_channel import CommandStreamReauthRequired
+    from agent.registration import _store_token
+
+    _store_token(tmp_path, secrets.token_urlsafe(32))
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+
+    def client_factory(address: str, pin: str) -> httpx.Client:
+        return httpx.Client(base_url=address)
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        raise CommandStreamReauthRequired("reauth required")
+
+    reauth_calls: list[str] = []
+
+    def fake_reauthenticate(apartment_id: str, data_dir: Path, client: httpx.Client) -> object:
+        reauth_calls.append(apartment_id)  # pragma: no cover -- must never be called
+        raise AssertionError("must not be called without --apartment-id")
+
+    monkeypatch.setattr(agent_main, "build_client", client_factory)
+    monkeypatch.setattr(loop, "run", runner)
+    monkeypatch.setattr(agent_main, "reauthenticate", fake_reauthenticate)
+
+    code = agent_main.main(
+        ["run", "--data-dir", str(tmp_path), "--registration-file", str(config)]
+    )
+
+    assert code == 1
+    assert reauth_calls == []
+    assert "already attempted once" in capsys.readouterr().err
+
+
+def test_run_cli_reauthentication_itself_fails_gives_up_with_a_clear_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When `reauthenticate` itself raises (e.g. the fleet refused the
+    rotation challenge/token call), the process exits cleanly with a
+    specific message -- never a raw traceback, and never retried again."""
+
+    import json
+    import secrets
+
+    from agent.commands_channel import CommandStreamReauthRequired
+    from agent.registration import _store_token
+    from agent.token_rotation import TokenRotationError
+
+    _store_token(tmp_path, secrets.token_urlsafe(32))
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+
+    def client_factory(address: str, pin: str) -> httpx.Client:
+        return httpx.Client(base_url=address)
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        raise CommandStreamReauthRequired("reauth required")
+
+    def failing_reauthenticate(apartment_id: str, data_dir: Path, client: httpx.Client) -> object:
+        raise TokenRotationError("POST .../token-rotation/challenge was refused: 404")
+
+    monkeypatch.setattr(agent_main, "build_client", client_factory)
+    monkeypatch.setattr(loop, "run", runner)
+    monkeypatch.setattr(agent_main, "reauthenticate", failing_reauthenticate)
+
+    code = agent_main.main(
+        [
+            "run",
+            "--data-dir", str(tmp_path),
+            "--registration-file", str(config),
+            "--apartment-id", "house7-a03",
+        ]
+    )
+
+    assert code == 1
+    assert "token re-authentication failed" in capsys.readouterr().err
+
+
 def test_run_cli_invalid_config_does_not_echo_secrets(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -2243,6 +2243,118 @@ def apartment_diagnostic_bundle_download(
     )
 
 
+# -----------------------------------------------------------------------------
+# Tenant change (P6.1, section 12's "Decided afterward" 2026-10-01): "an
+# explicit UI action (confirmation, mandatory reason, audited) rotates the
+# apartment's device token ... and deletes the apartment's heartbeats,
+# events, faults, alarms and command log excerpts." Same two-step,
+# GET-renders/POST-confirms shape as `command_confirm_form`/
+# `command_confirm_submit` above -- `Storage.rotate_apartment_token_for_
+# tenant_change` is the only place this actually happens, called only from
+# the POST below, never the GET.
+#
+# Registered here, above `apartment_detail`'s own `{apartment_id:path}`
+# route below -- the same route-ordering rule that route's own comment
+# already states.
+# -----------------------------------------------------------------------------
+
+
+def _tenant_change_confirm_response(
+    request: Request,
+    authenticated: AuthenticatedUiSession,
+    *,
+    apartment_id: str,
+    apartment_label: str,
+    error: str | None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    response = templates.TemplateResponse(
+        request,
+        "tenant_change_confirm.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "apartment_id": apartment_id,
+            "apartment_label": apartment_label,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/apartments/{apartment_id}/tenant-change/confirm", response_class=HTMLResponse)
+def tenant_change_confirm_form(
+    request: Request,
+    apartment_id: str,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """Step one of two: names the apartment and spells out, in words, what
+    the action does (rotates the token, deletes the apartment's history),
+    and asks for a mandatory reason. Never calls `Storage.rotate_apartment
+    _token_for_tenant_change` itself -- only the POST below does."""
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    return _tenant_change_confirm_response(
+        request,
+        authenticated,
+        apartment_id=apartment_id,
+        apartment_label=apartment.label,
+        error=None,
+    )
+
+
+@router.post("/apartments/{apartment_id}/tenant-change/confirm")
+def tenant_change_confirm_submit(
+    request: Request,
+    apartment_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(...),
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> Response:
+    """Validates the confirmation and performs the tenant change -- token
+    rotation plus history deletion plus the audit entry, all in
+    `Storage.rotate_apartment_token_for_tenant_change`'s one transaction
+    (see that method's own docstring)."""
+
+    if not check_csrf(authenticated.session.csrf_token, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
+
+    apartment = storage.get_apartment(apartment_id)
+    if apartment is None:
+        raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
+
+    def _error(message: str) -> HTMLResponse:
+        return _tenant_change_confirm_response(
+            request,
+            authenticated,
+            apartment_id=apartment_id,
+            apartment_label=apartment.label,
+            error=message,
+            status_code=400,
+        )
+
+    if not reason.strip():
+        return _error("Ein Grund ist erforderlich.")
+    length_error = _first_length_error(("Grund", reason.strip(), MAX_REASON_LENGTH))
+    if length_error is not None:
+        return _error(length_error)
+
+    storage.rotate_apartment_token_for_tenant_change(
+        apartment_id, reason.strip(), authenticated.user.username, datetime.now(UTC)
+    )
+
+    return RedirectResponse(
+        url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+    )
+
+
 # P3.2 review: any future `/ui/apartments/...` sub-route (a fixed suffix,
 # not a `{apartment_id}`) **must** be registered above this one -- FastAPI/
 # Starlette matches routes in registration order, and `{apartment_id:path}`

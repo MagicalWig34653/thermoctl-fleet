@@ -151,6 +151,11 @@
     {% endif %}
 </section>
 
+<section aria-labelledby="tenant-change-heading">
+    <h2 id="tenant-change-heading">Mieterwechsel</h2>
+    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">Mieterwechsel durchführen</a></p>
+</section>
+
 <section aria-labelledby="commands-heading">
     <h2 id="commands-heading">Befehle</h2>
     {% if detail.retired %}

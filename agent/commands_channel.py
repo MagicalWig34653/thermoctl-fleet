@@ -196,6 +196,21 @@ class CommandStreamAuthError(Exception):
     `agent.heartbeat_sender.send_heartbeat`."""
 
 
+class CommandStreamReauthRequired(CommandStreamAuthError):
+    """P6.1: the specific 401 `fleet.auth` sends when the presented token is
+    exactly the one a tenant-change rotation just revoked
+    (`WWW-Authenticate: Bearer error="reauth_required"`) -- distinguishable
+    from every other 401/403 (`CommandStreamAuthError`, raised for those),
+    which means "this token was never going to work again, give up".
+    **This** one instead means "this device's own agent token was rotated
+    away by the landlord; run the signed-challenge recovery flow
+    (`agent.token_rotation.reauthenticate`) and retry" -- the caller
+    (`agent.__main__._run_agent`) catches this subclass specifically,
+    before the broader `CommandStreamAuthError`, and retries **exactly
+    once** with a freshly obtained token; it must never loop on this by
+    itself (see that module's own docstring for why)."""
+
+
 class CommandResultError(Exception):
     """A non-204 response from `POST /v1/commands/{id}/result` that is not
     a transport failure -- the cloud explicitly refused this result (e.g.
@@ -344,12 +359,28 @@ def _write_last_event_id(path: Path, value: str) -> None:
     temp.replace(path)
 
 
-def _raise_for_non_200(status_code: int, description: str) -> None:
+def _raise_for_non_200(response: httpx.Response, description: str) -> None:
     """Shared status-code check for `_stream_once` and `_poll_once`: 401/403
     is `CommandStreamAuthError` (never retried by `receive_commands`, see
     that class's own docstring), any other non-200 is the ordinary,
-    fallback-triggering `CommandStreamError`."""
+    fallback-triggering `CommandStreamError`.
 
+    **P6.1**: a 401 whose `WWW-Authenticate` header carries
+    `error="reauth_required"` (`fleet.auth._reauth_required`) raises the
+    more specific `CommandStreamReauthRequired` instead -- checked before
+    the generic 401/403 branch, since it is a subclass and would otherwise
+    never be distinguishable by an `except CommandStreamAuthError` clause
+    that wants to tell the two apart. A bare string-equality check against
+    the header value, not a full RFC 7235 challenge parse -- this header's
+    one value is entirely this codebase's own, not a general-purpose
+    `WWW-Authenticate` consumer.
+    """
+
+    status_code = response.status_code
+    if status_code == 401 and "error=\"reauth_required\"" in response.headers.get(
+        "WWW-Authenticate", ""
+    ):
+        raise CommandStreamReauthRequired(f"{description} was refused: {status_code}")
     if status_code in (401, 403):
         raise CommandStreamAuthError(f"{description} was refused: {status_code}")
     if status_code != 200:
@@ -385,7 +416,7 @@ def _stream_once(
         headers["Last-Event-ID"] = last_event_id
 
     with connect_sse(client, "GET", "/v1/commands", headers=headers) as event_source:
-        _raise_for_non_200(event_source.response.status_code, "GET /v1/commands (SSE)")
+        _raise_for_non_200(event_source.response, "GET /v1/commands (SSE)")
         on_contact(True)
         for sse in event_source.iter_sse():
             # Persisted as soon as the event is off the wire, **before**
@@ -440,7 +471,7 @@ def _poll_once(
         headers["Last-Event-ID"] = last_event_id
 
     response = client.get("/v1/commands", params={"wait": 0}, headers=headers)
-    _raise_for_non_200(response.status_code, "GET /v1/commands?wait=0")
+    _raise_for_non_200(response, "GET /v1/commands?wait=0")
     items = [_parse_command_obj(raw) for raw in response.json()]
     return items, response.headers.get("Retry-After")
 
