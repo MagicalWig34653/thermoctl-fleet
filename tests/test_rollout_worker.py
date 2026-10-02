@@ -73,6 +73,7 @@ def _create_rollout(
     timeout_hours: float = 2.0,
     reason: str = "rollout",
     now: datetime = T0,
+    test_apartment_id: str | None = None,
 ) -> RolloutRecord:
     return storage.create_rollout(
         service=service,
@@ -83,6 +84,7 @@ def _create_rollout(
         timeout_hours=timeout_hours,
         ui_username="landlord",
         reason=reason,
+        test_apartment_id=test_apartment_id,
         now=now,
     )
 
@@ -135,9 +137,13 @@ def _current_revision(storage: Storage, apartment_id: str) -> int:
 
 
 def test_advance_rollout_starts_pilot_first(storage: Storage) -> None:
+    """`pilot_mode` is irrelevant here (P5.4e) -- "pilot" is started first
+    only because it is explicitly marked as this rollout's own test
+    apartment, even though it is the second entry of `apartment_ids`."""
+
     _make_apartment(storage, "pilot", pilot_mode=True)
     _make_apartment(storage, "other", pilot_mode=False)
-    rollout = _create_rollout(storage, ["other", "pilot"])
+    rollout = _create_rollout(storage, ["other", "pilot"], test_apartment_id="pilot")
 
     advance_rollout(storage, rollout.id, T0)
 
@@ -150,7 +156,9 @@ def test_advance_rollout_starts_pilot_first(storage: Storage) -> None:
 def test_advance_rollout_full_pilot_convergence_then_gate(storage: Storage) -> None:
     _make_apartment(storage, "pilot", pilot_mode=True)
     _make_apartment(storage, "other", pilot_mode=False)
-    rollout = _create_rollout(storage, ["other", "pilot"], stagger_hours=48.0)
+    rollout = _create_rollout(
+        storage, ["other", "pilot"], stagger_hours=48.0, test_apartment_id="pilot"
+    )
 
     advance_rollout(storage, rollout.id, T0)
     pilot_row = next(a for a in storage.rollout_apartments(rollout.id) if a.apartment_id == "pilot")
@@ -180,6 +188,55 @@ def test_advance_rollout_full_pilot_convergence_then_gate(storage: Storage) -> N
     advance_rollout(storage, rollout.id, gate_passed)
     apartments = {a.apartment_id: a for a in storage.rollout_apartments(rollout.id)}
     assert apartments["other"].status == "in_progress"
+
+
+def test_advance_rollout_pilot_mode_is_irrelevant_for_ordering(storage: Storage) -> None:
+    """P5.4e (project owner, 2026-10-02): the rollout's own test apartment
+    is decoupled from `ApartmentRecord.pilot_mode`. Here "has-pilot-mode"
+    is listed first but is *not* marked as the test apartment, and
+    "no-pilot-mode" is -- the worker must still start "no-pilot-mode"
+    first, exactly as if the flag did not exist."""
+
+    _make_apartment(storage, "has-pilot-mode", pilot_mode=True)
+    _make_apartment(storage, "no-pilot-mode", pilot_mode=False)
+    rollout = _create_rollout(
+        storage,
+        ["has-pilot-mode", "no-pilot-mode"],
+        test_apartment_id="no-pilot-mode",
+    )
+
+    advance_rollout(storage, rollout.id, T0)
+
+    apartments = {a.apartment_id: a for a in storage.rollout_apartments(rollout.id)}
+    assert apartments["no-pilot-mode"].status == "in_progress"
+    assert apartments["has-pilot-mode"].status == "queued"
+
+
+def test_advance_rollout_single_apartment_rollout_runs_to_completion(storage: Storage) -> None:
+    """A rollout naming exactly one apartment (no `pilot_mode` needed)
+    runs the full one-apartment path to completion."""
+
+    _make_apartment(storage, "solo", pilot_mode=False)
+    rollout = _create_rollout(storage, ["solo"])
+
+    advance_rollout(storage, rollout.id, T0)
+    revision = next(iter(storage.rollout_apartments(rollout.id))).revision
+    assert revision is not None
+
+    outcome_time = T0 + timedelta(minutes=5)
+    _report_outcome(storage, "solo", revision, successful=True, now=outcome_time)
+    storage.save_heartbeat(
+        "solo",
+        _heartbeat("solo", outcome_time + timedelta(minutes=1)),
+        outcome_time + timedelta(minutes=1),
+    )
+    advance_rollout(storage, rollout.id, outcome_time + timedelta(minutes=2))
+
+    apartment = next(iter(storage.rollout_apartments(rollout.id)))
+    assert apartment.status == "converged"
+    completed = storage.get_rollout(rollout.id)
+    assert completed is not None
+    assert completed.state == "completed"
 
 
 def test_advance_rollout_stops_on_reported_failure(storage: Storage) -> None:
@@ -408,7 +465,7 @@ def test_advance_rollout_retired_apartment_mid_rollout_fails_gracefully(storage:
 
     _make_apartment(storage, "pilot", pilot_mode=True)
     _make_apartment(storage, "other", pilot_mode=False)
-    rollout = _create_rollout(storage, ["other", "pilot"])
+    rollout = _create_rollout(storage, ["other", "pilot"], test_apartment_id="pilot")
 
     # Converge the pilot immediately so "other" is next in line.
     advance_rollout(storage, rollout.id, T0)
@@ -522,7 +579,9 @@ def test_maybe_start_next_self_heals_missing_pilot_converged_at(storage: Storage
 
     _make_apartment(storage, "pilot", pilot_mode=True)
     _make_apartment(storage, "other", pilot_mode=False)
-    rollout = _create_rollout(storage, ["other", "pilot"], stagger_hours=48.0)
+    rollout = _create_rollout(
+        storage, ["other", "pilot"], stagger_hours=48.0, test_apartment_id="pilot"
+    )
     advance_rollout(storage, rollout.id, T0)  # starts "pilot"
 
     # Mark the pilot converged directly, bypassing `_maybe_set_pilot_converged`

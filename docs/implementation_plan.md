@@ -779,6 +779,50 @@ they must also stay conceptually separate, not just separately scheduled.
 - **Read back by:** main session (the shared lock and the non-blocking
   trigger both touch CLAUDE.md security principles 2 and 5 directly).
 
+### P5.4e -- Rollout test apartment decoupled from `pilot_mode`
+- [x] done -- see `docs/STATUS.md`'s own P5.4e section for the full design
+  and verification output.
+- **Goal:** owner decision (section 13, "Decided afterward", 2026-10-02):
+  a rollout no longer requires any selected apartment to carry the
+  device-side `pilot_mode` flag. The rollout's own test apartment is now
+  chosen within the rollout itself -- the landlord may mark exactly one
+  apartment of the create form's list as the test apartment, or else the
+  first apartment of the list is used. The 48-hour stagger gate and
+  everything else about the queue (one apartment at a time, stop at the
+  first failure/timeout) stays unchanged; only the *selection* of which
+  apartment goes first changes.
+- **Files:** `fleet/storage.py` (`Storage.create_rollout`'s new
+  `test_apartment_id` parameter; `RolloutRecord`/`RolloutApartmentRecord`
+  docstrings), `fleet/rollout.py` (docstring/comment updates only, no
+  behaviour change -- `is_pilot` already generalized to "the rollout's
+  own test apartment"), `fleet/ui_routes.py` (`rollout_new_submit`/
+  `rollout_confirm_submit`), `fleet/templates/ui/rollout_new.html`
+  (per-apartment radio button), `fleet/templates/ui/rollout_confirm.html`
+  (hidden field, "(Testwohnung)" tag), `fleet/templates/ui
+  /rollout_detail.html`/`rollout_list.html` (German text), `tests/test
+  _storage_rollouts.py`, `tests/test_rollout_worker.py`, `tests/test_ui
+  _rollout.py`.
+- **No migration.** `RolloutApartmentRecord.is_pilot` is reused unchanged
+  -- its meaning since this package is "this rollout's own test
+  apartment", decoupled from `ApartmentRecord.pilot_mode`, but the column
+  itself needed no schema change.
+- **Section:** 13.
+- **Acceptance:** no apartment marked -> the first apartment of the
+  submitted list is the test apartment and is started first, with the
+  48h gate applying to the rest; an apartment explicitly marked (not
+  first in the list) goes first instead; a single-apartment rollout
+  works trivially; `pilot_mode` flags are irrelevant to rollout ordering
+  (tested directly: a `pilot_mode=True` apartment listed first is *not*
+  started first unless also marked); the former "at least one selected
+  apartment must carry `pilot_mode=True`" refusal is removed (tested:
+  a rollout across apartments with no `pilot_mode` at all now succeeds);
+  the create/confirm UI shows which apartment is the test apartment.
+- **Depends on:** P5.4c (the rollout queue this package only changes test
+  apartment selection within).
+- **Read back by:** main session (changes `Storage.create_rollout`'s own
+  validation, shared with P6.1/P6.2 work on `fleet/storage.py` in
+  parallel worktrees -- confined to the rollout-specific code paths only).
+
 ### P5.5a -- Backup creation and upload **SR**
 - [x] done -- see `docs/STATUS.md`'s P5.5a section.
 - **Goal:** implement `agent/loop.py::create_backup` for both kinds of

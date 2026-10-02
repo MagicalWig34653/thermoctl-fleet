@@ -17,7 +17,7 @@
 
 <ol>
     {% for apartment_id in ordered_apartment_ids %}
-    <li>{{ apartment_id }}{% if apartment_id in pilot_apartment_ids %} (Pilot){% endif %}</li>
+    <li>{{ apartment_id }}{% if apartment_id == test_apartment_id %} (Testwohnung){% endif %}</li>
     {% endfor %}
 </ol>
 
@@ -35,6 +35,7 @@
     {% for apartment_id in ordered_apartment_ids %}
     <input type="hidden" name="apartment_ids" value="{{ apartment_id }}">
     {% endfor %}
+    <input type="hidden" name="test_apartment_id" value="{{ test_apartment_id }}">
     <label for="reason">Grund (Pflichtfeld)
         <input type="text" id="reason" name="reason" required>
     </label>

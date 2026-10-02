@@ -798,13 +798,10 @@ class RolloutRecord(Base):
     deleted -- `"cancelled"`/`"completed"` are terminal, not tombstones.
 
     `pilot_converged_at` is set once, by the worker
-    (`fleet.rollout.advance_rollout`), the moment the **last** pilot
-    apartment in this rollout's queue converges -- section 13: "the pilot
-    apartment first, then the rest no earlier than 48 hours later". A
-    rollout with more than one pilot apartment (an inventory can carry the
-    flag on several) gates the whole non-pilot tail on the *slowest*
-    pilot, not the fastest -- the strictest reasonable reading of "the
-    pilot phase" as a single gate, not per-pilot fan-out.
+    (`fleet.rollout.advance_rollout`), the moment the rollout's own test
+    apartment (`RolloutApartmentRecord.is_pilot`, exactly one per rollout
+    since P5.4e) converges -- section 13: "the pilot apartment first, then
+    the rest no earlier than 48 hours later".
 
     `stagger_hours`/`timeout_hours` are per-rollout, not global constants
     (CLAUDE.md: "nothing hard-coded" applied to every timing threshold in
@@ -847,12 +844,19 @@ class RolloutApartmentRecord(Base):
     cancelled while this apartment was still queued).
 
     `position` is the queue order **after** `Storage.create_rollout` has
-    already moved every pilot apartment to the front (section 13: "the
-    pilot apartment first" is automatic, not something the caller has to
-    get right) -- `is_pilot` is stored redundantly (rather than re-derived
-    from `apartments.pilot_mode` on every read) so a later flip of the
-    inventory flag cannot silently change what an already-created rollout
-    considers its pilot after the fact.
+    already moved the rollout's own test apartment to the front (section
+    13: "the pilot apartment first" is automatic, not something the caller
+    has to get right). `is_pilot` is `True` for exactly one row per
+    rollout -- the apartment explicitly marked as the test apartment on
+    the create form, or else the first apartment of the submitted list
+    (P5.4e, project owner 2026-10-02); it is stored on this row rather than
+    re-derived from anything else so a later edit elsewhere cannot silently
+    change what an already-created rollout considers its test apartment
+    after the fact. **Decoupled from `ApartmentRecord.pilot_mode`**: the
+    column name is unchanged (no migration needed, reusing a column that
+    already had exactly the right shape), but its meaning since P5.4e is
+    "this rollout's own test apartment", nothing about the device-side
+    activation flag.
 
     A `(rollout_id, apartment_id)` pair is unique -- one apartment cannot
     appear twice in the same rollout's own queue.
@@ -2902,12 +2906,31 @@ class Storage:
         ui_username: str,
         reason: str,
         now: datetime,
+        test_apartment_id: str | None = None,
     ) -> RolloutRecord:
         """Creates one rollout (P5.4c scope item 1) -- a fresh `RolloutRecord`
         plus one `RolloutApartmentRecord` per (de-duplicated,
-        order-preserving) entry of `apartment_ids`, pilot apartments moved
-        to the front automatically (section 13: "the pilot apartment
-        first").
+        order-preserving) entry of `apartment_ids`, the rollout's own test
+        apartment moved to the front automatically (section 13: "the pilot
+        apartment first").
+
+        **P5.4e (project owner, 2026-10-02): the rollout's own test
+        apartment is independent of the device-side `pilot_mode` flag.**
+        `test_apartment_id`, when given, names the one apartment of
+        `apartment_ids` the landlord explicitly marked as the test
+        apartment in the create form; when omitted (`None`), the test
+        apartment is simply the first entry of `apartment_ids` (before
+        de-duplication). Exactly one apartment per rollout ever carries
+        `RolloutApartmentRecord.is_pilot=True` -- the column name is
+        unchanged (reused rather than renamed, so no migration is needed
+        for this package), but it no longer reflects
+        `ApartmentRecord.pilot_mode` at all: a rollout against apartments
+        that carry no `pilot_mode` whatsoever is now perfectly normal.
+        `pilot_mode` stays exactly what section 21.4 and CLAUDE.md security
+        principle 5 already make it -- the device-side gate `agent.loop
+        .open_access` enforces for `open_access`, and (while P5.4/P5.4b/P5.4d
+        stay inactive) the agent's own desired-state pre-check -- this
+        package never reads it for sequencing anymore.
 
         Validated, in order, before anything is written (`ValueError` on
         the first failure, same convention as `create_desired_state_revision`):
@@ -2932,11 +2955,14 @@ class Storage:
            `docs/STATUS.md`, non-security-relevant): the strictest
            reasonable reading of an open point the specification does not
            address directly.
-        6. At least one named apartment carries `pilot_mode=True` --
-           without one, "the pilot apartment first, then the rest no
-           earlier than 48 hours later" has nothing to gate on; refused
-           fail-closed rather than silently skipping the pilot phase.
-           Same "decision to confirm" as point 5.
+        6. `test_apartment_id`, when given, must name one of the
+           (de-duplicated) `apartment_ids` -- refused fail-closed rather
+           than silently falling back to "first of the list" for a typo'd
+           or stale value. **The former "at least one apartment must carry
+           `pilot_mode=True`" refusal is removed by P5.4e** -- see the
+           class docstring above; a rollout always has exactly one test
+           apartment (the marked one, or else the first of the list),
+           regardless of `pilot_mode`.
         7. None of `apartment_ids` is already queued in another rollout
            whose own `state` is `"running"` or `"stopped"` (i.e. still
            "touching" it) -- "never two rollouts touching the same
@@ -3015,9 +3041,10 @@ class Storage:
                     )
                 apartments[apartment_id] = apartment
 
-            if not any(apartments[a].pilot_mode for a in deduped_ids):
+            if test_apartment_id is not None and test_apartment_id not in apartments:
                 raise ValueError(
-                    "At least one apartment in the rollout must carry pilot_mode=True."
+                    f"Test apartment {test_apartment_id!r} must be one of the rollout's "
+                    "own apartments."
                 )
 
             already_touched = session.scalars(
@@ -3034,9 +3061,14 @@ class Storage:
                     f"{sorted(set(already_touched))}."
                 )
 
-            ordered_ids = sorted(
-                deduped_ids, key=lambda a: (not apartments[a].pilot_mode, deduped_ids.index(a))
-            )
+            # P5.4e: the test apartment is the explicitly marked one, or
+            # else simply the first of the (order-preserving, de-duplicated)
+            # list -- `ApartmentRecord.pilot_mode` plays no part in this
+            # choice any more (see this method's own docstring).
+            chosen_test_apartment_id = test_apartment_id or deduped_ids[0]
+            ordered_ids = [chosen_test_apartment_id] + [
+                a for a in deduped_ids if a != chosen_test_apartment_id
+            ]
 
             rollout_id = str(uuid.uuid4())
             created_at = _naive_utc(now)
@@ -3062,7 +3094,7 @@ class Storage:
                         rollout_id=rollout_id,
                         apartment_id=apartment_id,
                         position=position,
-                        is_pilot=apartments[apartment_id].pilot_mode,
+                        is_pilot=apartment_id == chosen_test_apartment_id,
                         status="queued",
                         revision=None,
                         started_at=None,
@@ -3084,7 +3116,7 @@ class Storage:
                     "version": version.strip(),
                     "digest": digest,
                     "apartment_ids": ordered_ids,
-                    "pilot_apartment_ids": [a for a in ordered_ids if apartments[a].pilot_mode],
+                    "test_apartment_id": chosen_test_apartment_id,
                 },
             )
             session.flush()
