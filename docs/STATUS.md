@@ -83,7 +83,31 @@ represented, let alone transmitted. The fleet-wide aggregates
 (`protocol/version.py`, "a wholly new model plus an additive field on an
 existing one ... counts as a change to the models too", same literal
 reading every prior bump used) -- **re-chained at merge** if a parallel
-package (P6.1) also bumps it in the same window.
+package (P6.1) also bumps it in the same window. **A tripwire test,
+`tests/test_protocol.py::test_protocol_version_is_exactly_9`, pins this
+exact value and must be edited together with `protocol/version.py` on
+every future bump** -- it is the one test in this repository deliberately
+allowed to assert exact equality on `PROTOCOL_VERSION`, replacing the role
+a pre-existing, mis-scoped exact-equality assertion in
+`tests/test_protocol_desired_state.py` used to serve (that one was pinned
+to P5.4b's own historical bump value and would have failed on every later,
+unrelated bump forever after -- loosened to `>= 8` and renamed
+`test_protocol_version_is_at_least_8`, its actual, narrower guarantee kept).
+
+**Precision (cross-review, 2026-10-02): `extra="forbid"` is scoped to
+`PerDeviceState` only, not to `Heartbeat`/`DeviceState` or any other
+heartbeat model.** Those deliberately keep Pydantic's default
+`extra="ignore"` (section 18.2: "the fleet service accepts an older
+version as long as it understands its fields", the forward-compatibility
+guarantee `tests/test_fleet.py
+::test_heartbeat_higher_version_with_an_unknown_extra_field_is_204` already
+pins for the top-level heartbeat) -- an unknown top-level field from a
+*newer* agent is silently dropped during validation, never stored (only
+the validated model is persisted, see `fleet/storage.py`'s own module
+docstring) and never rendered. `PerDeviceState` is the one place in this
+protocol where "unknown field" and "a name/room/measured value sneaking
+in disguised as a new field" are the same risk, which is why it alone
+trades that forward-compatibility leniency for a hard 422 instead.
 
 **UI (per-device display):** "Eine Wohnung" gained a "Je Gerät" table next
 to the existing aggregates, from the latest heartbeat's `devices.per_device`
@@ -105,6 +129,25 @@ deferred) simply omits the field -- shown as "Keine Angaben je Gerät
 (der Agent dieser Wohnung sendet diese Liste noch nicht)", not conflated
 with `never_reported`.
 
+**Precision (cross-review, 2026-10-02): per-device values are not a
+separate, latest-only store -- they are part of each heartbeat row and
+therefore follow the 90-day heartbeat retention from section 12, not some
+shorter or longer lifetime of their own.** `HeartbeatRecord.payload_json`
+already persists the whole validated `Heartbeat` verbatim (`fleet/storage
+.py`'s own module docstring: "not split into columns per field"), and
+`per_device` is just one more field inside that same JSON blob -- storing
+it needed no new column and no new retention rule, it rides along with
+whatever retention/deletion the heartbeats table already has (P6.1's
+retention job, developed in parallel). **"Latest only" is a read-time,
+UI-only choice**, not a storage one: `fleet.ui_apartment.build_apartment_
+detail` reads `devices.per_device` off `Storage.get_latest_heartbeat`'s
+single most-recent row -- the same read path the fleet-wide aggregates
+and every other per-heartbeat value on "Eine Wohnung" already use -- it
+simply never queries `list_heartbeats`/`get_heartbeat_history` for this
+field. A future package wanting a per-device *history* (not just the
+latest reading) already has the raw data available in every stored
+heartbeat row; it is not re-derivable only going forward from here.
+
 **Files:** `protocol/heartbeat.py`, `protocol/version.py`,
 `protocol/__init__.py`, `fleet/storage.py`
 (`FaultAcknowledgementRecord`, `acknowledge_fault`,
@@ -124,10 +167,17 @@ accepted; battery/signal optional; per_device defaults to empty; every
 non-opaque `device_id` shape parametrized and rejected, including a
 literal room name; `name`/`room`/`temperature` extra fields parametrized
 and rejected, both on `PerDeviceState` directly and end-to-end through
-`Heartbeat`; bounds on battery/signal; the list-length bound);
-`tests/test_storage.py` (`acknowledge_fault` creates/updates/is apartment-
-scoped; **recurrence**: a new `since` is a different occurrence, the old
-acknowledgement does not apply; `list_all_fault_acknowledgement_keys`
+`Heartbeat`; bounds on battery/signal; the list-length bound; **the
+`PROTOCOL_VERSION` tripwire**, `test_protocol_version_is_exactly_9` --
+pins the exact current value, by design the one test allowed to do so,
+meant to be edited together with `protocol/version.py` on every future
+bump); `tests/test_storage.py` (`acknowledge_fault` creates/updates/is
+apartment-scoped; **recurrence**: a new `since` is a different occurrence,
+the old acknowledgement does not apply; **audit**:
+`test_acknowledge_fault_writes_an_audit_row_every_call` -- landlord A
+acknowledges, landlord B corrects -> two `inventory_audit_log` rows, both
+identities present (the `fault_acknowledgements` row itself only ever
+shows B, the current acknowledger); `list_all_fault_acknowledgement_keys`
 spans every apartment; migration 0017 up/down, including the schema-diff
 check `test_migrations_match_the_orm_model_exactly` already covers
 automatically); `tests/test_ui_tasks.py` (an acknowledged fault is hidden;
@@ -141,11 +191,30 @@ behavior of the acknowledge endpoint: unauthenticated redirect, missing/
 wrong CSRF rejected, unknown apartment 404, happy path creates a row and
 redirects, an occurrence not currently open rejected with 400, unknown
 fault kind rejected, an overlong note rejected, re-acknowledging updates
-the note, and the acknowledged fault disappears from `/ui/tasks`).
+the note, the acknowledged fault disappears from `/ui/tasks`, and **an
+XSS regression**, `test_acknowledgement_note_with_a_script_tag_renders_
+escaped` -- a note containing `<script>alert('xss')</script>` is stored
+verbatim but renders HTML-escaped on "Eine Wohnung", Jinja2's default
+autoescaping, not a hand-rolled sanitizer).
+
+**Cross-review (2026-10-02): four items closed in the same commit, no
+behavior change beyond the audit write** -- (1) `Storage.acknowledge_fault`
+now writes an `InventoryAuditLogRecord` in the same transaction on every
+call, including a re-acknowledgement that only updates the existing
+`fault_acknowledgements` row, so an earlier acknowledger stays traceable
+even after someone else corrects the note; (2) the `PROTOCOL_VERSION`
+tripwire above, restoring the "fails on a forgotten bump" guarantee the
+loosened `test_protocol_version_is_at_least_8` deliberately gave up, in a
+test scoped to not fight future bumps; (3) the XSS regression above; (4)
+the two precision notes above (`extra="forbid"` is `PerDeviceState`-only,
+`Heartbeat`/`DeviceState` keep the existing forward-compatible
+`extra="ignore"`; per-device values live inside the heartbeat row and
+follow its 90-day retention, "latest only" is a read-time UI choice, not a
+storage one).
 
 **Verification:** `ruff check .`, `mypy .`, `mypy protocol fleet agent
 tools` all clean; `python -m pytest -W ignore::ResourceWarning` --
-**1868 passed, 1 skipped**, coverage **99%** overall
+**1871 passed, 1 skipped**, coverage **99%** overall
 (`fleet/storage.py`, `fleet/ui_apartment.py`, `fleet/ui_tasks.py`,
 `protocol/heartbeat.py`, and the new migration all at 100%); `go vet
 ./...`/`go test ./...` clean (watchdog untouched by this package);
@@ -156,8 +225,11 @@ directions (`upgrade`, `downgrade` to 0016, re-`upgrade`) via
 pinned to an exact `PROTOCOL_VERSION` value and would have failed on
 every future bump forever after -- loosened to `>= 8` (renamed
 `test_protocol_version_is_at_least_8`), its actual guarantee (P5.4b's own
-bump happened) preserved; flagged for main-session read-back together
-with the rest of this package, not changed silently.
+bump happened) preserved, with a new, narrowly-scoped exact-equality
+tripwire added elsewhere (`test_protocol_version_is_exactly_9`, see
+above) to keep the "forgotten bump" guarantee the loosening gave up;
+flagged for main-session read-back together with the rest of this
+package, not changed silently.
 
 ## P5.4d -- pre-activation points from the P5.4b merge (section 13)
 

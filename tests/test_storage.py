@@ -1042,6 +1042,54 @@ def test_acknowledging_the_same_occurrence_twice_updates_the_one_row(storage: St
     assert rows[0].note == "korrigierter Hinweis"
 
 
+def test_acknowledge_fault_writes_an_audit_row_every_call(storage: Storage) -> None:
+    """Cross-review (2026-10-02): the upsert on `fault_acknowledgements`
+    only ever keeps the *current* acknowledger -- an earlier one, overwritten
+    by a later re-acknowledgement, must stay traceable through
+    `inventory_audit_log`. A acknowledges, B corrects -> two audit rows,
+    both identities present (not just the final row's own `acknowledged_by`,
+    which only ever shows B)."""
+
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord-a",
+        note="erster Hinweis",
+        now=datetime(2026, 9, 22, 8, 0, 0, tzinfo=UTC),
+    )
+    storage.acknowledge_fault(
+        _ACK_APARTMENT,
+        FaultKind.SENSOR_FAULT.value,
+        "bathroom",
+        _ACK_SINCE,
+        acknowledged_by="landlord-b",
+        note="korrigierter Hinweis",
+        now=datetime(2026, 9, 22, 9, 0, 0, tzinfo=UTC),
+    )
+
+    with storage.session() as session:
+        audit_rows = session.scalars(
+            select(InventoryAuditLogRecord)
+            .where(InventoryAuditLogRecord.entity_type == "fault_acknowledgement")
+            .order_by(InventoryAuditLogRecord.id)
+        ).all()
+
+    assert len(audit_rows) == 2
+    assert audit_rows[0].ui_username == "landlord-a"
+    assert audit_rows[0].before_json is None
+    assert "erster Hinweis" in (audit_rows[0].after_json or "")
+    assert audit_rows[1].ui_username == "landlord-b"
+    assert "landlord-a" in (audit_rows[1].before_json or "")
+    assert "korrigierter Hinweis" in (audit_rows[1].after_json or "")
+    # The current `fault_acknowledgements` row alone only shows the final
+    # acknowledger -- the point of this test is that the audit log still
+    # carries both.
+    rows = storage.list_fault_acknowledgements_for_apartment(_ACK_APARTMENT)
+    assert rows[0].acknowledged_by == "landlord-b"
+
+
 def test_a_recurrence_with_a_new_since_is_a_different_occurrence(storage: Storage) -> None:
     """The actual "recurrence" guarantee: acknowledging the fault when it
     was first open, then it clears and reopens with a new `since`, must

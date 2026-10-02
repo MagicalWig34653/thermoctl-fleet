@@ -257,7 +257,12 @@ class FaultAcknowledgementRecord(Base):
     updates this row in place rather than creating a second one, enforced
     by the unique index below via `Storage.acknowledge_fault`'s
     `INSERT ... ON CONFLICT ... DO UPDATE` (mirroring `AlarmRecord`'s own
-    conflict-handling reasoning, see `Storage.raise_alarm`).
+    conflict-handling reasoning, see `Storage.raise_alarm`). **This row
+    therefore only ever shows the *current* acknowledger** -- an earlier
+    one, overwritten by a later re-acknowledgement, stays traceable only
+    through `inventory_audit_log` (`Storage.acknowledge_fault` writes one
+    audit row per call, including re-acknowledgements, in the same
+    transaction -- see that method's own docstring).
     """
 
     __tablename__ = "fault_acknowledgements"
@@ -4079,6 +4084,25 @@ class Storage:
         (e.g. to fix a typo in the note) updates the one existing row
         rather than racing a second insert against the unique index under
         concurrent requests.
+
+        **Cross-review (2026-10-02): every call -- including a re-
+        acknowledgement that only updates the existing row -- also writes an
+        `InventoryAuditLogRecord`, in the same transaction, same as every
+        other landlord action (section 20.3: "every change ... is logged:
+        who, when, why").** The upsert keeps only the *current*
+        `acknowledged_by`/`note` on the `fault_acknowledgements` row itself
+        -- without this, an earlier acknowledger would become untraceable
+        the moment someone else re-acknowledges the same occurrence (e.g.
+        to correct a typo). `before` (the row's state prior to this call,
+        `None` for a first-time acknowledgement) plus `after` (this call's
+        own values) together keep every acknowledger of a given occurrence
+        visible in `inventory_audit_log`, not just the most recent one.
+        `entity_id` is the occurrence key itself (`apartment_id` is already
+        `entity_type`-scoped elsewhere via its own column, but the
+        occurrence has no numeric row id a caller could stably reference
+        before the first insert, hence a composed string here, unlike
+        `entity_id`s elsewhere that reuse an existing natural/surrogate
+        key).
         """
 
         since_naive = _naive_utc(since)
@@ -4092,6 +4116,24 @@ class Storage:
             "note": note,
         }
         with self.session() as session:
+            existing = session.scalar(
+                select(FaultAcknowledgementRecord).where(
+                    FaultAcknowledgementRecord.apartment_id == apartment_id,
+                    FaultAcknowledgementRecord.fault_kind == fault_kind,
+                    FaultAcknowledgementRecord.zone == zone,
+                    FaultAcknowledgementRecord.since == since_naive,
+                )
+            )
+            before: dict[str, object] | None = (
+                {
+                    "acknowledged_by": existing.acknowledged_by,
+                    "acknowledged_at": existing.acknowledged_at.isoformat(),
+                    "note": existing.note,
+                }
+                if existing is not None
+                else None
+            )
+
             dialect = session.get_bind().dialect.name
             # See `_insert_heartbeats_ignoring_conflicts`/`raise_alarm` above
             # for why this branches on dialect name and why
@@ -4117,6 +4159,22 @@ class Storage:
                 },
             )
             session.execute(statement)
+
+            entity_id = f"{apartment_id}:{fault_kind}:{zone}:{since_naive.isoformat()}"
+            self._write_inventory_audit_log(
+                session,
+                ui_username=acknowledged_by,
+                entity_type="fault_acknowledgement",
+                entity_id=entity_id,
+                action="acknowledged",
+                reason=note,
+                before=before,
+                after={
+                    "acknowledged_by": acknowledged_by,
+                    "acknowledged_at": _naive_utc(now).isoformat(),
+                    "note": note,
+                },
+            )
 
     def list_fault_acknowledgements_for_apartment(
         self, apartment_id: str

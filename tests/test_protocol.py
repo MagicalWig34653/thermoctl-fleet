@@ -83,6 +83,28 @@ def test_heartbeat_with_unknown_fault_kind_is_rejected() -> None:
         Heartbeat.model_validate(malformed)
 
 
+def test_protocol_version_is_exactly_9() -> None:
+    """A tripwire for a forgotten bump (cross-review, 2026-10-02):
+    `protocol/version.py`'s own docstring says any change to a model in
+    `protocol/` -- including a purely additive one -- bumps
+    `PROTOCOL_VERSION`. Nothing enforces that mechanically; this exact-
+    equality assertion is the one test in this repository that will fail
+    the moment a future change to any `protocol/` model lands without the
+    matching bump, forcing whoever makes that change to update **both**
+    this literal (to the new value) **and** `protocol/version.py`'s own
+    changelog comment in the same commit.
+
+    **Unlike** `tests/test_protocol_desired_state.py
+    ::test_protocol_version_is_at_least_8` (a per-package regression test
+    that only checks "P5.4b's own historical bump happened", loosened from
+    an exact-equality pin specifically so later, unrelated bumps -- this
+    one included -- would not break it forever after): this test is the
+    one tripwire allowed to pin the *current* value exactly, and it is
+    expected to be edited on every single future bump, not relaxed."""
+
+    assert PROTOCOL_VERSION == 9
+
+
 # -- per-device battery/signal (P6.3, section 12's "Decided afterward",
 # 2026-10-01) ------------------------------------------------------------
 

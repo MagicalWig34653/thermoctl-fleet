@@ -256,6 +256,44 @@ def test_acknowledge_happy_path_creates_a_row_and_redirects(
     assert "quittiert" in detail_page.text.lower()
 
 
+def test_acknowledgement_note_with_a_script_tag_renders_escaped(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """XSS regression (cross-review, 2026-10-02): a note is landlord-
+    supplied free text (the work package's own "an optional short note"),
+    rendered back on "Eine Wohnung" -- Jinja2's default autoescaping must
+    turn it into inert text, not live markup, the same guarantee every
+    other free-text field on this page (reason fields, error texts) already
+    relies on."""
+
+    _make_apartment(storage)
+    _store_open_fault(storage, BASE_TIME)
+    _login(client, password, totp_secret)
+    csrf_token = _csrf_from_apartment_page(client, APARTMENT)
+    payload = "<script>alert('xss')</script>"
+
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/faults/acknowledge",
+        data={
+            "fault_kind": "sensor_fault",
+            "zone": "bathroom",
+            "since": BASE_TIME.isoformat(),
+            "note": payload,
+            "csrf_token": csrf_token,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    detail_page = client.get(f"/ui/apartments/{APARTMENT}")
+    assert payload not in detail_page.text
+    assert "&lt;script&gt;" in detail_page.text
+    # The raw note is still stored verbatim -- only the *rendering* escapes
+    # it, the data itself is not mangled.
+    rows = storage.list_fault_acknowledgements_for_apartment(APARTMENT)
+    assert rows[0].note == payload
+
+
 def test_acknowledge_an_occurrence_that_is_not_currently_open_is_rejected(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:
