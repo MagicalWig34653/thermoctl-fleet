@@ -2,6 +2,18 @@
 
 Last updated: 2026-10-02.
 
+## Open point from the flaky-test investigation (main session, 2026-10-02)
+
+The agent's background threads (restore poll, backup scheduler, desired-state
+reconciler) and the main command loop share one `httpx.Client`. The
+investigation observed a `500` on one request tearing down the connection
+under a *different*, concurrent request on the same client (the
+`agent_restart` result POST failing with "Server disconnected"). In tests the
+`500` came from a missing test configuration; in production any fleet-side
+`500` could do the same and lose or delay a command result. To be examined:
+one client per thread, or making result reporting robust against a
+connection torn down by a concurrent request.
+
 ## Flaky test fixes (test-only, 2026-10-02)
 
 Three tests in the P5.4d/P5.5b end-to-end area restructured; no production
