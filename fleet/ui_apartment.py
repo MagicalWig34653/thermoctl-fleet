@@ -49,15 +49,33 @@ is derived from what is read. `Event.titel`/`Event.text` are not even
 columns on `EventRecord` (see `fleet/storage.py`'s module docstring) --
 structurally nothing to leak from the events table, not merely "tested to
 be absent". **Per-device battery/signal values (section 9's own wording,
-"battery and signal values ... per device") are not in the heartbeat wire
-protocol at all** -- `protocol.heartbeat.DeviceState` only ever carries the
-fleet-wide aggregates (`weakest_battery_percent`, `worst_signal_quality`,
-`silent_devices`, `zigbee_bridge`); showing a value "per device" would need
-a protocol extension, which is exactly the kind of change CLAUDE.md's
-"nothing hard-coded except the security principles" and "a field may only
-ever be added" (section 18.2) require clearing with the project owner
-first, not invented here. Noted as an open point in `docs/STATUS.md`, not
-built.
+"battery and signal values ... per device") -- closed by P6.3, cleared
+with the project owner first (section 12's "Decided afterward",
+2026-10-01): `protocol.heartbeat.DeviceState.per_device` now carries a
+bounded list of `(device_id, battery_percent, signal_quality)` only -- no
+device name, no room, no measured value (`protocol.heartbeat
+.PerDeviceState`, `extra="forbid"`). `PerDeviceDisplay.label` is always
+`None` today -- the fleet inventory (P4.1, section 20.1) has no table that
+maps a Zigbee device id to a landlord-chosen label (its `Device` table
+tracks the base station hardware itself, one row per apartment), so this
+view shows the opaque `device_id` as-is, never a name read from the
+heartbeat. The fleet-wide aggregates stay exactly as before, unchanged by
+this addition.**
+
+**Fault acknowledgement (P6.3, section 12's "Decided afterward",
+2026-10-01) -- "an acknowledgement applies to the current occurrence only
+... if the same fault recurs, it shows again".** `fleet.storage
+.FaultAcknowledgementRecord`'s own docstring defines "occurrence"
+precisely: `(apartment_id, fault_kind, zone, since)`, the same tuple that
+already identifies one entry of `Heartbeat.open_faults` -- `since` stays
+the same for as long as thermoctl keeps reporting the same still-open
+fault, and only changes when it clears and reopens. `OpenFaultDisplay`
+below carries both the raw occurrence key (for the "Quittieren" form's
+hidden fields) and, once acknowledged, who/when/the optional note; the
+actual `POST` lives in `fleet/ui_routes.py` (login + CSRF, same pattern as
+every other state-changing `/ui` route), re-validated against the
+apartment's *current* `open_faults` so a stale or forged form cannot
+acknowledge an occurrence that was never actually open.
 
 **Commands (P5.1b, section 9: "the four to seven allowed commands as
 buttons with confirmation") -- built here, on top of P5.1's storage
@@ -88,6 +106,7 @@ from fleet.storage import (
     CommandRecord,
     DesiredStateOutcomeRecord,
     DesiredStateRecord,
+    FaultAcknowledgementRecord,
     HeartbeatHistoryEntry,
     Storage,
 )
@@ -96,6 +115,7 @@ from protocol import FaultKind
 from protocol.backups import BackupKind
 from protocol.commands import CommandType
 from protocol.desired_state import DesiredState
+from protocol.heartbeat import OpenFault
 
 # P5.5a, section 15.1/15.2 -- German label per `protocol.backups.BackupKind`
 # value, the same "covers exactly the enum" reasoning
@@ -151,6 +171,12 @@ COMMAND_TYPE_LABELS: dict[CommandType, str] = {
 MIN_FETCH_LOGS_LINES = 1
 MAX_FETCH_LOGS_LINES = 500
 DEFAULT_FETCH_LOGS_LINES = 200
+
+# P6.3 -- the fault-acknowledgement form's optional note, mirrored from
+# `fleet.storage.FaultAcknowledgementRecord.note`'s own `String(500)`
+# column, same "mirror the storage bound, don't re-derive it" reasoning as
+# `MAX_FETCH_LOGS_LINES` above.
+MAX_FAULT_ACK_NOTE_LENGTH = 500
 
 # A sane display cap for `CommandRecord.error_text` (P5.3's future
 # diagnostic-bundle/fetch_logs content is masked before it ever reaches
@@ -620,6 +646,45 @@ class OpenFaultDisplay:
     kind_label: str
     zone: str
     since_text: str
+    # P6.3 -- the raw occurrence key, carried through so the template can
+    # render the "Quittieren" form's hidden fields (`fault_kind`/`zone`/
+    # `since`) without the route re-deriving them from a `kind_label`
+    # (German text) it would otherwise have to parse back.
+    fault_kind: str
+    since: datetime
+    # `None` until acknowledged; the owner decision's "an optional short
+    # note" is shown alongside who/when, never edited here (re-submitting
+    # the form updates it, see `Storage.acknowledge_fault`).
+    acknowledged_by: str | None
+    acknowledged_at: datetime | None
+    acknowledged_note: str | None
+
+
+@dataclass(frozen=True)
+class PerDeviceDisplay:
+    """One Zigbee device's battery/signal row (P6.3, section 9: "battery
+    and signal values ... per device", section 12's "Decided afterward").
+
+    `label` is the inventory's own label for this device id, if the fleet
+    inventory maps one -- **it never is today** (section 20.1's `Device`
+    inventory table tracks the base station hardware itself, one row per
+    apartment, not the individual Zigbee devices inside it; there is no
+    table anywhere that maps a Zigbee device id to a landlord-chosen label
+    -- see `docs/STATUS.md`'s P6.3 section). `label` is therefore always
+    `None` in this scaffold and the template falls back to the opaque
+    `device_id` -- **never** a name read from the heartbeat itself (section
+    12: "no device names ... they may contain room names" -- the protocol
+    model enforces this structurally, see `protocol.heartbeat
+    .PerDeviceState`, but this field also makes the "never take names from
+    the agent" rule explicit on the fleet side: the only source this
+    dataclass is ever allowed to populate `label` from is a future
+    inventory table, not `Heartbeat.devices.per_device` itself).
+    """
+
+    device_id: str
+    label: str | None
+    battery_percent: int | None
+    signal_quality: int | None
 
 
 @dataclass(frozen=True)
@@ -653,12 +718,19 @@ class ApartmentDetail:
     open_faults: list[OpenFaultDisplay]
     past_faults: list[PastFaultDisplay]
     # Battery/signal (section 9) -- the fleet-wide aggregates the heartbeat
-    # protocol actually carries, see this module's docstring for why "per
-    # device" is not built here.
+    # protocol has always carried.
     weakest_battery_percent: int | None
     worst_signal_quality: int | None
     silent_devices: int | None
     zigbee_bridge: str | None
+    # Per-device battery/signal (P6.3, section 9's own wording, "battery and
+    # signal values ... per device" -- closed here; see `PerDeviceDisplay`'s
+    # own docstring for why `label` is always `None` today). Empty for an
+    # agent that has not been upgraded to send `per_device` yet (P2.3,
+    # still deferred) -- not a `None`/missing-data distinction, since an
+    # empty list and "the agent does not send this yet" render identically
+    # ("keine Angaben").
+    per_device: list[PerDeviceDisplay]
     # Version (section 9).
     agent_version: str | None
     thermoctl_version: str | None
@@ -915,14 +987,45 @@ def build_apartment_detail(
     timeline = _build_timeline(history_rows, now)
 
     latest = storage.get_latest_heartbeat(apartment_id)
+
+    # P6.3 -- acknowledgements keyed by the same occurrence tuple
+    # `FaultAcknowledgementRecord`'s docstring defines (`fault_kind`,
+    # `zone`, `since`, all already `apartment_id`-scoped by the query).
+    acknowledgements: dict[tuple[str, str, datetime], FaultAcknowledgementRecord] = {
+        (ack.fault_kind, ack.zone, _naive_utc(ack.since)): ack
+        for ack in storage.list_fault_acknowledgements_for_apartment(apartment_id)
+    }
+
+    def _open_fault_display(fault: OpenFault) -> OpenFaultDisplay:
+        ack = acknowledgements.get((str(fault.kind), fault.zone, _naive_utc(fault.since)))
+        return OpenFaultDisplay(
+            kind_label=FAULT_KIND_LABELS[fault.kind],
+            zone=fault.zone,
+            since_text=f"seit {_relative_duration(now, fault.since)}",
+            fault_kind=str(fault.kind),
+            since=fault.since,
+            acknowledged_by=ack.acknowledged_by if ack is not None else None,
+            acknowledged_at=ack.acknowledged_at if ack is not None else None,
+            acknowledged_note=ack.note if ack is not None else None,
+        )
+
     open_faults = (
+        [_open_fault_display(fault) for fault in latest.heartbeat.open_faults]
+        if latest is not None
+        else []
+    )
+
+    # P6.3 -- per-device battery/signal (section 9). `label` is always
+    # `None` today, see `PerDeviceDisplay`'s own docstring.
+    per_device = (
         [
-            OpenFaultDisplay(
-                kind_label=FAULT_KIND_LABELS[fault.kind],
-                zone=fault.zone,
-                since_text=f"seit {_relative_duration(now, fault.since)}",
+            PerDeviceDisplay(
+                device_id=entry.device_id,
+                label=None,
+                battery_percent=entry.battery_percent,
+                signal_quality=entry.signal_quality,
             )
-            for fault in latest.heartbeat.open_faults
+            for entry in latest.heartbeat.devices.per_device
         ]
         if latest is not None
         else []
@@ -956,6 +1059,7 @@ def build_apartment_detail(
             worst_signal_quality=None,
             silent_devices=None,
             zigbee_bridge=None,
+            per_device=per_device,
             agent_version=None,
             thermoctl_version=None,
             protocol_version=None,
@@ -999,6 +1103,7 @@ def build_apartment_detail(
         worst_signal_quality=heartbeat.devices.worst_signal_quality,
         silent_devices=heartbeat.devices.silent_devices,
         zigbee_bridge=heartbeat.devices.zigbee_bridge,
+        per_device=per_device,
         agent_version=heartbeat.agent,
         thermoctl_version=heartbeat.thermoctl.version,
         protocol_version=heartbeat.protocol_version,
@@ -1038,6 +1143,7 @@ __all__ = [
     "DEFAULT_HISTORY_DAYS",
     "DESIRED_STATE_SERVICE_LABELS",
     "DESIRED_STATE_SERVICE_ORDER",
+    "MAX_FAULT_ACK_NOTE_LENGTH",
     "MAX_FETCH_LOGS_LINES",
     "MAX_HISTORY_DAYS",
     "MIN_FETCH_LOGS_LINES",
@@ -1052,6 +1158,7 @@ __all__ = [
     "LogExcerptDisplay",
     "OpenFaultDisplay",
     "PastFaultDisplay",
+    "PerDeviceDisplay",
     "TimelineEntry",
     "available_commands",
     "build_apartment_detail",

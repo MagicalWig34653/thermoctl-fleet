@@ -236,6 +236,77 @@ def test_fault_tasks_sorted_oldest_first(storage: Storage) -> None:
     assert [task.zone for task in overview.unconfirmed_faults] == ["older", "newer"]
 
 
+# -- fault acknowledgement (P6.3, section 12's "Decided afterward") -----------
+
+
+def test_acknowledged_fault_is_hidden_from_unconfirmed_faults(storage: Storage) -> None:
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
+    since = BASE_TIME
+    storage.save_heartbeat(
+        APARTMENT_A,
+        _make_heartbeat(
+            APARTMENT_A,
+            sent_at=BASE_TIME,
+            open_faults=[{"kind": "sensor_fault", "since": since.isoformat(), "zone": "bathroom"}],
+        ),
+        BASE_TIME,
+    )
+    now = BASE_TIME + timedelta(hours=3)
+    storage.acknowledge_fault(
+        APARTMENT_A,
+        "sensor_fault",
+        "bathroom",
+        since,
+        acknowledged_by=USERNAME,
+        note=None,
+        now=now,
+    )
+
+    overview = build_task_overview(storage, now)
+
+    assert overview.unconfirmed_faults == []
+
+
+def test_a_recurring_fault_with_a_new_since_shows_again_despite_the_old_acknowledgement(
+    storage: Storage,
+) -> None:
+    """The actual "recurrence" guarantee (section 12: "if the same fault
+    recurs, it shows again") -- acknowledging the first occurrence must not
+    silence a later, genuinely new occurrence of the identical
+    kind/zone."""
+
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
+    first_since = BASE_TIME
+    storage.acknowledge_fault(
+        APARTMENT_A,
+        "sensor_fault",
+        "bathroom",
+        first_since,
+        acknowledged_by=USERNAME,
+        note=None,
+        now=BASE_TIME + timedelta(hours=1),
+    )
+
+    reopened_since = BASE_TIME + timedelta(days=1)
+    sent_at = reopened_since + timedelta(hours=3)
+    storage.save_heartbeat(
+        APARTMENT_A,
+        _make_heartbeat(
+            APARTMENT_A,
+            sent_at=sent_at,
+            open_faults=[
+                {"kind": "sensor_fault", "since": reopened_since.isoformat(), "zone": "bathroom"}
+            ],
+        ),
+        sent_at,
+    )
+
+    overview = build_task_overview(storage, sent_at)
+
+    assert len(overview.unconfirmed_faults) == 1
+    assert overview.unconfirmed_faults[0].zone == "bathroom"
+
+
 def test_never_reported_apartment_excluded_from_every_group(storage: Storage) -> None:
     storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
 
