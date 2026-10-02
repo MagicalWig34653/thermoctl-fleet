@@ -2,6 +2,83 @@
 
 Last updated: 2026-10-02.
 
+## P5.4e -- rollout test apartment decoupled from `pilot_mode` (2026-10-02)
+
+Implements the owner decision recorded just below ("Owner confirmations"):
+`Storage.create_rollout` gains an optional `test_apartment_id` parameter.
+When given, it must name one of the rollout's own `apartment_ids`
+(`ValueError` otherwise) and is moved to the front of the queue; when
+omitted, the first apartment of `apartment_ids` (before de-duplication)
+is used instead. `RolloutApartmentRecord.is_pilot` is `True` for exactly
+that one apartment per rollout -- the column is reused unchanged (no
+migration), but no longer reflects `ApartmentRecord.pilot_mode` at all.
+The former "at least one selected apartment must carry `pilot_mode=True`"
+refusal is **removed**.
+
+`fleet/ui_routes.py`'s two-step rollout form now lets the landlord mark
+one apartment as the test apartment with a radio button
+(`rollout_new.html`); when none is marked, `rollout_new_submit` resolves
+the fallback itself (first of the displayed, order-preserving list) so
+the confirm page (`rollout_confirm.html`) can show explicitly which
+apartment that will be, tagged "(Testwohnung)", rather than leaving it
+implicit until creation. `rollout_confirm_submit` passes the resolved
+`test_apartment_id` straight through to `Storage.create_rollout`, which
+re-validates it. `fleet/rollout.py`'s worker logic needed no behaviour
+change -- it already read `is_pilot` generically; only docstrings/comments
+were updated to stop implying "an inventory can carry `pilot_mode` on
+several apartments" (a rollout now always has exactly one test apartment
+by construction). German UI text in `rollout_list.html`/`rollout_detail
+.html` renamed "Pilot"/"Pilot-Wohnung" to "Testwohnung" where it referred
+to this package's own queue position, keeping "Pilotbetrieb" only where
+the text actually means the device-side `pilot_mode` flag (section 21.4,
+CLAUDE.md security principle 5 -- unchanged, still the agent's own
+`open_access` gate and, while inactive, the desired-state pre-check).
+
+**Tests** (updated, not silently removed):
+`tests/test_storage_rollouts.py::test_create_rollout_refuses_without_any
+_pilot` is replaced by `test_create_rollout_succeeds_without_any_pilot
+_mode_apartment` (asserts the rollout now succeeds) plus
+`test_create_rollout_defaults_test_apartment_to_first_of_list` (renamed
+from `test_create_rollout_orders_pilot_first`, same apartments, new
+expected order: first-of-list, not pilot-mode-first),
+`test_create_rollout_explicit_test_apartment_moves_to_front`,
+`test_create_rollout_refuses_test_apartment_not_in_list`, and
+`test_create_rollout_single_apartment_rollout_works`.
+`tests/test_rollout_worker.py::test_advance_rollout_starts_pilot_first`/
+`test_advance_rollout_full_pilot_convergence_then_gate`/
+`test_advance_rollout_retired_apartment_mid_rollout_fails_gracefully`/
+`test_maybe_start_next_self_heals_missing_pilot_converged_at` now pass an
+explicit `test_apartment_id` (the apartment they already call "pilot" is
+listed second in `apartment_ids`, so without the explicit mark it would
+no longer be started first); new
+`test_advance_rollout_pilot_mode_is_irrelevant_for_ordering` and
+`test_advance_rollout_single_apartment_rollout_runs_to_completion` added.
+`tests/test_ui_rollout.py::test_new_step_refuses_without_pilot_apartment`
+is replaced by `test_new_step_succeeds_without_any_pilot_mode_apartment`;
+`test_confirm_step_storage_refusal_becomes_400` now reaches its "a
+storage-layer refusal `/new` does not duplicate" case through "no
+current desired state yet" instead of the removed pilot refusal; new
+`test_new_step_explicit_test_apartment_shown_on_confirm_page` and
+`test_new_step_refuses_test_apartment_not_among_selected` added;
+`test_new_form_get_renders_apartments` extended to assert the new radio
+input is present.
+
+**Verification.** `ruff check .` clean; `mypy .` (143 files) and `mypy
+protocol fleet agent tools` (71 files) clean; pytest: **1878 passed, 1
+skipped**, TOTAL **7198 stmts / 22 missed / 99%** (unchanged coverage
+percentage from before this package -- every new branch in `fleet
+/storage.py`/`fleet/rollout.py`/`fleet/ui_rollout.py`/`fleet/ui_routes.py`
+covered); `go vet ./...`/`go test ./...` clean (this package never
+touches `watchdog/`); `watchdog/check_contract.sh` passing. No migration
+-- `RolloutApartmentRecord.is_pilot` reused, confirmed by `git status`
+showing no new file under `fleet/migrations/versions/`.
+
+**Files:** `fleet/storage.py`, `fleet/rollout.py`, `fleet/ui_routes.py`,
+`fleet/templates/ui/rollout_new.html`, `fleet/templates/ui
+/rollout_confirm.html`, `fleet/templates/ui/rollout_detail.html`, `fleet
+/templates/ui/rollout_list.html`, `tests/test_storage_rollouts.py`,
+`tests/test_rollout_worker.py`, `tests/test_ui_rollout.py`.
+
 ## Owner confirmations (2026-10-02, main session)
 
 - P5.4c's "decisions to confirm" are settled (spec section 13, "Decided
@@ -1024,10 +1101,15 @@ rejected outcome, by design, until thermoctl ships a real health API.
   no device clock is ever read or trusted for this ordering, so an
   apartment's own clock drift (section 8's own "clock drift" alarm) cannot
   skew which outcome a heartbeat counts as "after".
-- **A rollout must include at least one `pilot_mode` apartment -- decision
-  to confirm.** Without one, "the pilot apartment first, then the rest no
-  earlier than 48 hours later" has nothing to gate on; refused fail-closed
-  (`ValueError`) rather than silently skipping the pilot phase.
+- ~~**A rollout must include at least one `pilot_mode` apartment --
+  decision to confirm.** Without one, "the pilot apartment first, then
+  the rest no earlier than 48 hours later" has nothing to gate on;
+  refused fail-closed (`ValueError`) rather than silently skipping the
+  pilot phase.~~ **Changed by the owner's P5.4e decision (2026-10-02,
+  see that package's own section above):** this refusal is removed. The
+  rollout always has exactly one test apartment to gate on -- the one
+  explicitly marked in the create form, or else the first apartment of
+  the list -- entirely independent of `ApartmentRecord.pilot_mode`.
 - **An apartment must already carry a current desired state to join a
   rollout -- decision to confirm.** This package only ever changes the
   rollout's own target service on top of an apartment's existing desired
@@ -1123,13 +1205,15 @@ none does).
   needs a real thermoctl health endpoint and `pilot_mode` set per
   apartment before any rollout this package sequences can actually apply
   anything.
-- **Four "decision to confirm" points** -- worth a project-owner
-  confirmation before this package is ever used against a live pilot,
-  none of them security-relevant (CLAUDE.md principle 7) on their own:
-  the rollout worker implements the queue for one authored rollout, not a
-  "for all" button (see "Design" above); a rollout must include a pilot;
-  an apartment must already carry a current desired state to join one;
-  "resumed" retries the blocking apartment rather than skipping past it.
+- **Three "decision to confirm" points remain** (a fourth, "a rollout
+  must include a pilot", was settled and changed by the owner's P5.4e
+  decision, 2026-10-02, see that package's own section above) -- worth a
+  project-owner confirmation before this package is ever used against a
+  live rollout, none of them security-relevant (CLAUDE.md principle 7) on
+  their own: the rollout worker implements the queue for one authored
+  rollout, not a "for all" button (see "Design" above); an apartment must
+  already carry a current desired state to join one; "resumed" retries
+  the blocking apartment rather than skipping past it.
 - **`fleet.rollout._maybe_start_next`'s "not all pilots converged" branch
   is marked `# pragma: no cover`, not tested** -- `Storage.create_rollout`
   always positions every pilot ahead of every non-pilot, so this branch is

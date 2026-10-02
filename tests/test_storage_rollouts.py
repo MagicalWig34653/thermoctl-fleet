@@ -96,6 +96,7 @@ def _create_rollout(
     service: str = "thermoctl",
     digest: str = OTHER_DIGEST,
     reason: str = "routine update",
+    test_apartment_id: str | None = None,
 ) -> RolloutRecord:
     return storage.create_rollout(
         service=service,
@@ -106,11 +107,17 @@ def _create_rollout(
         timeout_hours=2.0,
         ui_username="landlord",
         reason=reason,
+        test_apartment_id=test_apartment_id,
         now=NOW,
     )
 
 
-def test_create_rollout_orders_pilot_first(storage: Storage) -> None:
+def test_create_rollout_defaults_test_apartment_to_first_of_list(storage: Storage) -> None:
+    """P5.4e (project owner, 2026-10-02): without an explicit
+    `test_apartment_id`, the first apartment of the submitted list is the
+    rollout's own test apartment -- regardless of `pilot_mode`, which this
+    package no longer reads for sequencing at all."""
+
     _make_apartment(storage, "a1", pilot_mode=False)
     _make_apartment(storage, "a2", pilot_mode=True)
     _make_apartment(storage, "a3", pilot_mode=False)
@@ -118,12 +125,76 @@ def test_create_rollout_orders_pilot_first(storage: Storage) -> None:
     rollout = _create_rollout(storage, ["a1", "a2", "a3"])
     apartments = storage.rollout_apartments(rollout.id)
 
+    assert [a.apartment_id for a in apartments] == ["a1", "a2", "a3"]
+    assert [a.position for a in apartments] == [0, 1, 2]
+    assert apartments[0].is_pilot is True
+    assert apartments[1].is_pilot is False
+    assert apartments[2].is_pilot is False
+    assert all(a.status == "queued" for a in apartments)
+    assert rollout.state == "running"
+
+
+def test_create_rollout_explicit_test_apartment_moves_to_front(storage: Storage) -> None:
+    """An explicitly marked test apartment goes first even when it is not
+    the first entry of the submitted list, and even though it does not
+    carry `pilot_mode` -- the two are fully decoupled since P5.4e."""
+
+    _make_apartment(storage, "a1", pilot_mode=False)
+    _make_apartment(storage, "a2", pilot_mode=False)
+    _make_apartment(storage, "a3", pilot_mode=True)
+
+    rollout = _create_rollout(storage, ["a1", "a2", "a3"], test_apartment_id="a2")
+    apartments = storage.rollout_apartments(rollout.id)
+
     assert [a.apartment_id for a in apartments] == ["a2", "a1", "a3"]
     assert [a.position for a in apartments] == [0, 1, 2]
     assert apartments[0].is_pilot is True
     assert apartments[1].is_pilot is False
-    assert all(a.status == "queued" for a in apartments)
+    assert apartments[2].is_pilot is False
+
+
+def test_create_rollout_refuses_test_apartment_not_in_list(storage: Storage) -> None:
+    _make_apartment(storage, "a1", pilot_mode=False)
+    _make_apartment(storage, "a2", pilot_mode=False)
+
+    with pytest.raises(ValueError, match="Test apartment"):
+        _create_rollout(storage, ["a1", "a2"], test_apartment_id="does-not-exist")
+
+
+def test_create_rollout_single_apartment_rollout_works(storage: Storage) -> None:
+    """A rollout naming exactly one apartment -- that apartment is the
+    test apartment trivially, with or without `pilot_mode`."""
+
+    _make_apartment(storage, "solo", pilot_mode=False)
+
+    rollout = _create_rollout(storage, ["solo"])
+    apartments = storage.rollout_apartments(rollout.id)
+
+    assert len(apartments) == 1
+    assert apartments[0].apartment_id == "solo"
+    assert apartments[0].is_pilot is True
+    assert apartments[0].status == "queued"
     assert rollout.state == "running"
+
+
+def test_create_rollout_succeeds_without_any_pilot_mode_apartment(storage: Storage) -> None:
+    """Replaces the former `test_create_rollout_refuses_without_any_pilot`
+    (P5.4e, project owner 2026-10-02): the old fail-closed refusal when no
+    selected apartment carried `pilot_mode=True` is removed -- the
+    rollout's own test apartment is independent of that device-side flag,
+    so a rollout across apartments with no `pilot_mode` at all is now
+    ordinary, not an error."""
+
+    _make_apartment(storage, "a1", pilot_mode=False)
+    _make_apartment(storage, "a2", pilot_mode=False)
+
+    rollout = _create_rollout(storage, ["a1", "a2"])
+    apartments = storage.rollout_apartments(rollout.id)
+
+    assert rollout.state == "running"
+    assert [a.apartment_id for a in apartments] == ["a1", "a2"]
+    assert apartments[0].is_pilot is True
+    assert apartments[1].is_pilot is False
 
 
 def test_create_rollout_writes_audit_row(storage: Storage) -> None:
@@ -174,13 +245,6 @@ def test_create_rollout_refuses_apartment_without_desired_state(storage: Storage
     _make_apartment(storage, "a1", pilot_mode=True, with_desired_state=False)
     with pytest.raises(ValueError, match="desired state"):
         _create_rollout(storage, ["a1"])
-
-
-def test_create_rollout_refuses_without_any_pilot(storage: Storage) -> None:
-    _make_apartment(storage, "a1", pilot_mode=False)
-    _make_apartment(storage, "a2", pilot_mode=False)
-    with pytest.raises(ValueError, match="pilot_mode"):
-        _create_rollout(storage, ["a1", "a2"])
 
 
 def test_create_rollout_requires_nonempty_reason(storage: Storage) -> None:

@@ -1776,6 +1776,7 @@ def _rollout_new_response(
     stagger_hours: str,
     timeout_hours: str,
     selected_apartment_ids: set[str],
+    selected_test_apartment_id: str,
     error: str | None,
     status_code: int = 200,
 ) -> HTMLResponse:
@@ -1806,6 +1807,7 @@ def _rollout_new_response(
             "max_version_length": MAX_VERSION_LENGTH,
             "apartments": apartments,
             "selected_apartment_ids": selected_apartment_ids,
+            "selected_test_apartment_id": selected_test_apartment_id,
             "error": error,
         },
         status_code=status_code,
@@ -1830,6 +1832,7 @@ def rollout_new_form(
         stagger_hours=str(DEFAULT_STAGGER_HOURS),
         timeout_hours=str(DEFAULT_TIMEOUT_HOURS),
         selected_apartment_ids=set(),
+        selected_test_apartment_id="",
         error=None,
     )
 
@@ -1844,6 +1847,7 @@ def rollout_new_submit(
     stagger_hours: str = Form(str(DEFAULT_STAGGER_HOURS)),
     timeout_hours: str = Form(str(DEFAULT_TIMEOUT_HOURS)),
     apartment_ids: list[str] = Form(default_factory=list),  # noqa: B008
+    test_apartment_id: str = Form(""),
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
@@ -1856,8 +1860,19 @@ def rollout_new_submit(
     route's own displayed apartment order (`storage.list_apartments()`,
     filtered to the checked ids), not the order the checkboxes happened to
     be clicked in** -- an HTML form does not preserve click order, and
-    `Storage.create_rollout` moves pilot apartments to the front
-    regardless, so any deterministic order is sufficient here."""
+    `Storage.create_rollout` moves the rollout's own test apartment to the
+    front regardless, so any deterministic order is sufficient here.
+
+    **P5.4e (project owner, 2026-10-02):** the landlord may mark exactly
+    one apartment of the list as the rollout's own test apartment
+    (`test_apartment_id`, a radio button in the template, deliberately not
+    a checkbox -- exactly one or none). When none is marked, the first
+    apartment of this route's own displayed order is the test apartment --
+    resolved here (not left to `Storage.create_rollout`'s own identical
+    fallback) so the confirm page can show the landlord which apartment
+    that will be, explicitly, rather than leaving it implicit. This is
+    independent of `ApartmentRecord.pilot_mode` -- the former "at least one
+    selected apartment must carry `pilot_mode=True`" refusal is removed."""
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
@@ -1875,6 +1890,7 @@ def rollout_new_submit(
             stagger_hours=stagger_hours,
             timeout_hours=timeout_hours,
             selected_apartment_ids=selected,
+            selected_test_apartment_id=test_apartment_id.strip(),
             error=message,
             status_code=400,
         )
@@ -1901,10 +1917,16 @@ def rollout_new_submit(
         return _error("Mindestens eine Wohnung ist erforderlich.")
 
     ordered_ids = [a.id for a in storage.list_apartments() if a.id in selected]
-    pilot_ids = {a.id for a in storage.list_apartments() if a.pilot_mode}
-    if not (selected & pilot_ids):
-        return _error("Mindestens eine ausgewählte Wohnung muss im Pilotbetrieb sein.")
-    ordered_ids = sorted(ordered_ids, key=lambda a: (a not in pilot_ids,))
+
+    test_apartment_id_stripped = test_apartment_id.strip()
+    if test_apartment_id_stripped and test_apartment_id_stripped not in selected:
+        return _error(
+            "Die markierte Testwohnung muss eine der ausgewählten Wohnungen sein."
+        )
+    chosen_test_apartment_id = test_apartment_id_stripped or ordered_ids[0]
+    ordered_ids = [chosen_test_apartment_id] + [
+        a for a in ordered_ids if a != chosen_test_apartment_id
+    ]
 
     response = templates.TemplateResponse(
         request,
@@ -1919,7 +1941,7 @@ def rollout_new_submit(
             "stagger_hours": stagger_hours_value,
             "timeout_hours": timeout_hours_value,
             "ordered_apartment_ids": ordered_ids,
-            "pilot_apartment_ids": pilot_ids & selected,
+            "test_apartment_id": chosen_test_apartment_id,
             "error": None,
         },
     )
@@ -1937,13 +1959,20 @@ def rollout_confirm_submit(
     stagger_hours: str = Form(str(DEFAULT_STAGGER_HOURS)),
     timeout_hours: str = Form(str(DEFAULT_TIMEOUT_HOURS)),
     apartment_ids: list[str] = Form(default_factory=list),  # noqa: B008
+    test_apartment_id: str = Form(""),
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """The actual write -- `Storage.create_rollout` is only ever called
     from here, and re-validates every field again (the hidden fields
     carried over from step one are never trusted blindly, same rule
-    `desired_state_confirm_submit` already applies)."""
+    `desired_state_confirm_submit` already applies).
+
+    `test_apartment_id` is carried over as a hidden field from step one
+    (where it was already resolved to an explicit value, never left
+    blank, see `rollout_new_submit`'s own docstring) and passed straight
+    through to `Storage.create_rollout`, which re-validates it against
+    `apartment_ids` itself."""
 
     if not check_csrf(authenticated.session.csrf_token, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid or missing CSRF token.")
@@ -1972,6 +2001,7 @@ def rollout_confirm_submit(
             timeout_hours=timeout_hours_value,
             ui_username=authenticated.user.username,
             reason=reason.strip(),
+            test_apartment_id=test_apartment_id.strip() or None,
             now=datetime.now(UTC),
         )
     except ValueError as error:
