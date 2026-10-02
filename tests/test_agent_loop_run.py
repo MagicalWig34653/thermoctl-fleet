@@ -14,6 +14,7 @@ package adds.
 from __future__ import annotations
 
 import secrets
+import threading
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -205,7 +206,7 @@ def test_run_executes_agent_restart_end_to_end_and_stops(
 
 
 def test_run_starts_and_stops_the_restore_poll_thread_when_configured(
-    tmp_path: Path, app_storage: Storage
+    tmp_path: Path, app_storage: Storage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """P5.5b: `run`'s own `restore_targets` parameter starts a background
     restore-poll thread (mirroring the daily backup scheduler's own
@@ -213,13 +214,56 @@ def test_run_starts_and_stops_the_restore_poll_thread_when_configured(
     stops the loop" shape as the test above, just with `restore_targets`
     also configured so this test actually exercises `agent.loop.run`'s own
     thread-creation branch, not only `agent.restore`'s own already fully
-    covered internals."""
+    covered internals.
+
+    Two things made this intermittently fail (found while investigating a
+    report of it failing once under full-suite load, always passing alone):
+
+    1. **The real root cause.** This test never configured
+       `FLEET_BACKUP_STORAGE_DIR` -- unlike a real deployment, where the
+       fleet side always has one. Every tick, the restore-poll thread's own
+       `GET /v1/restore` therefore hit `fleet.backup_storage
+       .get_backup_storage`'s fail-closed `RuntimeError` and got back a
+       `500`, not the `200`/`404` it would in production. With
+       `restore_poll_interval_s=0.05` (deliberately tight, see below) and a
+       single `client` shared between this thread and the main command
+       loop's own result-reporting POST, an occasional `500` on one request
+       was enough to tear down the connection from under a *different*,
+       concurrent request on the same client -- observed directly as the
+       `agent_restart` result-report POST itself failing with "Server
+       disconnected without sending a response" and never reaching storage
+       at all (`row.successful` staying `None`, not the buffered-and-
+       retried case `agent.commands_channel` otherwise logs a warning for).
+       Configuring `FLEET_BACKUP_STORAGE_DIR` below -- matching what a real
+       deployment already has -- removes the spurious `500` and, with it,
+       the great majority of the flakiness; reproduced locally at a high
+       rate without this fix, zero failures across repeated runs with it.
+    2. A smaller, separate issue: `run` signals its background threads to
+       stop in its own `finally` right before returning, but never joins
+       them (they are daemon threads, by design, so a stuck one can never
+       block process exit). Left unjoined, a thread can still be alive when
+       this test's own `with` blocks tear down the client/TLS server right
+       after `run` returns -- harmless by itself, but a stray thread
+       surviving past this test can have a *later* exception misattributed
+       to whatever test is running by then (pytest's thread-exception hook
+       fires whenever the exception actually surfaces, not when the thread
+       started). Explicitly joining the restore-poll thread below, still
+       inside both `with` blocks, also finally gives this test's own name
+       ("starts *and stops*") something it actually checks.
+    """
+
+    monkeypatch.setenv("FLEET_BACKUP_STORAGE_DIR", str(tmp_path / "backup-storage"))
 
     token = _issue_token(app_storage)
     command = app_storage.create_command(
         APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
         now=datetime.now(UTC),
     )
+
+    # Threads already running before `run` starts (the test runner's own
+    # pool, coverage, etc.) -- excluded below so only the ones `run` itself
+    # creates are joined.
+    threads_before = {existing.ident for existing in threading.enumerate()}
 
     with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
         with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
@@ -243,6 +287,33 @@ def test_run_starts_and_stops_the_restore_poll_thread_when_configured(
                 restore_poll_interval_s=0.05,
                 exit_fn=lambda code: None,
             )
+
+            # Point 2 from the docstring above: explicitly join the
+            # restore-poll thread, still inside both `with` blocks (so any
+            # very last in-flight request completes against a live server
+            # instead of a closing one). Deliberately only this one thread,
+            # not every `thermoctl-agent-*` thread `run` starts: the
+            # desired-state reconcile thread (always started, regardless of
+            # this test's configuration) waits on its own `trigger_event
+            # .wait(timeout=desired_state_reconcile_interval_s)` between
+            # attempts -- `desired_state_stop_event` is only re-checked once
+            # that wait returns, and nothing in `run`'s `finally` sets the
+            # trigger event itself, so it can legitimately take up to
+            # `desired_state_reconcile_interval_s` (600s by default, not
+            # overridden by this test) to actually exit. That is not this
+            # test's concern -- it never configures a desired state at all
+            # -- and joining it here would make the test itself flaky
+            # (hang/fail depending on timing) for an unrelated reason.
+            restore_poll_threads = [
+                candidate
+                for candidate in threading.enumerate()
+                if candidate.ident not in threads_before
+                and candidate.name == "thermoctl-agent-restore-poll"
+            ]
+            assert restore_poll_threads, "expected `run` to have started the restore-poll thread"
+            for restore_poll_thread in restore_poll_threads:
+                restore_poll_thread.join(timeout=5.0)
+                assert not restore_poll_thread.is_alive(), restore_poll_thread.name
 
     with app_storage.session() as session:
         row = session.scalar(select(CommandRecord).where(CommandRecord.command_id == command.id))

@@ -1,6 +1,70 @@
 # Status
 
-Last updated: 2026-10-01.
+Last updated: 2026-10-02.
+
+## Flaky test fixes (test-only, 2026-10-02)
+
+Three tests in the P5.4d/P5.5b end-to-end area restructured; no production
+code touched. Two root causes, same "command batch races the reconciler/
+poll thread" family the P5.4d merge already hit once
+(`test_run_accepts_a_newer_revision_and_replaces_the_held_state`):
+
+1. **`tests/test_agent_loop_desired_state.py
+   ::test_run_reports_pilot_mode_rejection_for_a_delivered_desired_state`**
+   and **`::test_run_reports_disabled_reconciliation_when_backup_config_
+   missing`** (the latter found by searching the rest of the file for the
+   same shape, not in the original report): both delivered `agent_restart`
+   in the same connect-time batch as a desired-state revision and then
+   checked the outcome synchronously after `run` returned -- since P5.4d
+   the outcome is reported by the reconciler's own background thread, so
+   the restart can stop the loop before it reports. Restructured exactly
+   like the already-fixed sibling: `run` on its own thread, bounded poll
+   of real storage for the outcome, `agent_restart` delivered live only
+   afterward. `test_run_ignores_a_stale_desired_state_revision` was
+   checked too and left alone -- a stale revision is ignored synchronously
+   (`_handle_desired_state_received` never sets the trigger event for it),
+   so there is nothing there for `agent_restart` to race.
+2. **`tests/test_agent_loop_run.py
+   ::test_run_starts_and_stops_the_restore_poll_thread_when_configured`**:
+   a different race, found while investigating a report of this test
+   failing once under full-suite load (passing alone). Two contributing
+   issues, confirmed independently: (a) the test never configured
+   `FLEET_BACKUP_STORAGE_DIR` -- unlike a real deployment -- so the
+   restore-poll thread's own `GET /v1/restore` hit `fleet.backup_storage
+   .get_backup_storage`'s fail-closed `RuntimeError` every tick (a `500`,
+   not the `200`/`404` it gets in production); with the deliberately tight
+   `restore_poll_interval_s=0.05` and one `httpx.Client` shared between
+   that thread and the main loop's own result-reporting POST, an
+   occasional `500` was enough to tear down the connection out from under
+   the concurrent `agent_restart` result-report, which then failed
+   outright ("Server disconnected without sending a response") and never
+   reached storage at all -- reproduced locally at a high rate without the
+   fix, zero failures across repeated runs with `FLEET_BACKUP_STORAGE_DIR`
+   configured like a real deployment has it; (b) separately, `run` signals
+   its background threads to stop in its own `finally` but never joins
+   them (daemon threads, so a stuck one can't block process exit) -- left
+   running past the test's own teardown, a later exception in one can be
+   misattributed by pytest's thread-exception hook to whatever test is
+   running by the time it surfaces. Fixed by configuring
+   `FLEET_BACKUP_STORAGE_DIR` for the test and explicitly joining the
+   restore-poll thread (only that one -- the desired-state reconcile
+   thread, always started regardless of this test's configuration, can
+   legitimately take up to its own 600s default interval to notice a stop
+   signal, since nothing sets its `trigger_event`; not this test's
+   concern) before the `with` blocks holding the client/server close. Not
+   a production bug: in production `exit_fn` is `sys.exit`, so a daemon
+   thread taking a while to notice `stop_event` is moot -- the whole
+   process ends with it. Worth a note for whoever next touches
+   `fleet/app.py`'s `BaseHTTPMiddleware` stack, though: an unrelated
+   concurrent request's `500` visibly disrupting a *different* request on
+   the same client is a fragility this package did not go looking for and
+   did not fix, only worked around in the one test it was hitting.
+
+**Verification.** Each of the three restructured tests run 30x in
+isolation: **30/30 passed**, all three. Full suite run 3x: **1871 passed,
+1 skipped**, all three runs identical (no new tests added, restructurings
+only). `ruff check .` clean; `mypy .` (143 files) and `mypy protocol fleet
+agent tools` (71 files) clean.
 
 ## P6.3 -- Fault acknowledgement + per-device battery/signal (section 12's "Decided afterward", 2026-10-01)
 
