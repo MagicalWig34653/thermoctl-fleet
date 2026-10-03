@@ -64,6 +64,9 @@ udev
 # WireGuard "installiert, aber nicht eingerichtet" (Abschnitt 14, 19.3).
 wireguard-tools
 
+# WLAN-Ersteinrichtung aus der Boot-Partition (thermoctl-firstboot-wifi.service).
+network-manager
+
 # TLS-Zertifikatsprüfung des Melders (Abschnitt 4) braucht aktuelle
 # Wurzelzertifikate.
 ca-certificates

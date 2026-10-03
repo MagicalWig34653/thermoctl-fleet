@@ -60,6 +60,8 @@ def test_dry_run_places_expected_files(tmp_path: Path) -> None:
         "etc/systemd/system/thermoctl-watchdog.service",
         "etc/systemd/system/thermoctl-restore-mover.service",
         "etc/systemd/system/thermoctl-restore-mover.path",
+        "etc/systemd/system/thermoctl-firstboot-wifi.service",
+        "usr/local/bin/thermoctl-firstboot-wifi",
         "etc/systemd/system/thermoctl-leds.service",
         "etc/udev/rules.d/99-zigbee-stick.rules",
         "etc/apt/apt.conf.d/50unattended-upgrades",

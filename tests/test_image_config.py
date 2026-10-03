@@ -22,6 +22,7 @@ from tools.check_image_config import (
     check_docker_apt_source,
     check_docker_key_fetch,
     check_docker_packages_from_official_repo,
+    check_firstboot_wifi_unit,
     check_leds_unit,
     check_package_list,
     check_restore_mover_tmpfiles_entry,
@@ -34,6 +35,21 @@ from tools.check_image_config import (
 
 def test_real_image_configuration_is_plausible() -> None:
     check_all(IMAGE_DIR)
+
+
+def test_firstboot_wifi_unit_requires_boot_path_and_ordering(tmp_path: Path) -> None:
+    original = IMAGE_DIR / "common/thermoctl-firstboot-wifi.service"
+    path = tmp_path / "thermoctl-firstboot-wifi.service"
+    content = original.read_text(encoding="utf-8")
+    for required in (
+        "ConditionPathExists=|/boot/firmware/thermoctl/wifi.env",
+        "ConditionPathExists=|/efi/thermoctl/wifi.env",
+        "Before=NetworkManager-wait-online.service network-online.target",
+        "ExecStart=/usr/local/bin/thermoctl-firstboot-wifi",
+    ):
+        path.write_text(content.replace(required, ""), encoding="utf-8")
+        with pytest.raises(ImageError):
+            check_firstboot_wifi_unit(path)
 
 
 def test_package_list_rejects_empty_file(tmp_path: Path) -> None:

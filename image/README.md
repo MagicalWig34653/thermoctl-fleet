@@ -115,6 +115,24 @@ Confirms interactively (type the disk's own device path back -- not just
 "y") unless `--yes` is given; `--dry-run` decompresses and hashes the whole
 image without ever touching a disk, for a quick sanity check or in a test.
 
+If Wi-Fi credentials are supplied, `flash_image.py` writes
+`thermoctl/wifi.env` on the boot partition. The Wi-Fi importer checks
+`/boot/firmware` on Pi and `/efi` on the amd64 mkosi image. The shared recipe
+installs NetworkManager and enables
+`thermoctl-firstboot-wifi.service`, which runs before the NetworkManager
+online wait. Its script accepts exactly `SSID=<1..32 bytes>` and
+`PASSWORD=<8..63 printable ASCII bytes or 64 hex digits>`, creates or updates
+the `thermoctl-firstboot-wifi` NetworkManager profile, then overwrites and
+removes the boot file. It logs only the SSID. Malformed files are overwritten
+and removed with an error; if NetworkManager cannot save the profile, the
+file remains for a retry on the next boot. FAT and flash wear leveling mean
+overwriting is not a forensic erase of earlier physical copies, so keep the
+unbooted card or drive under physical control.
+The amd64 mkosi image still needs an end-to-end boot test. Other boot files
+used by the agent (`agent-registration.json` and backup recipients) still
+assume `/boot/firmware` on amd64; this Wi-Fi importer does not resolve that
+separate mount-path gap.
+
 ### 2. Build the images in CI (`.github/workflows/image.yml`)
 
 Push a `v*` tag -- the same tag the watchdog's own binaries are built

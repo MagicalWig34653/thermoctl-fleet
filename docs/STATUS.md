@@ -37,15 +37,25 @@ Verified again after the fix: `ruff check .` and `mypy .` both exit 0;
 full suite 2143 tests, 0 failures/errors, 1 pre-existing/unrelated skip;
 `tools/docs_screenshots.py` at 100% line coverage.
 
-Website follow-up: `site/docs/wohnung.html` now documents the released
-image artifacts and checksum, the macOS flash CLI and its safety checks,
-plus the Lima enrollment walkthrough and digest-swap limitation. The
-Wi-Fi file is described as written but not yet consumed at boot --
-**open point:** `tools/flash_image.py` writes `wifi.env` to the boot
-partition, but nothing in `image/` reads it yet (needs a first-boot unit
-that hands it to NetworkManager and then deletes it). No FAQ
-entry claimed this tooling was missing, so `site/docs/faq.html` was left
-unchanged.
+Website follow-up: `site/docs/wohnung.html` documents the released image
+artifacts and checksum, the macOS flash CLI and its safety checks, plus
+the Lima enrollment walkthrough and digest-swap limitation. The Wi-Fi
+first-boot open point is now closed: `image/common/firstboot-wifi.sh` and
+`thermoctl-firstboot-wifi.service` import the file from `/boot/firmware`
+(Pi) or `/efi` (amd64 mkosi) into NetworkManager before the online wait,
+then overwrite and remove it. Invalid files are
+removed with an error; a NetworkManager failure leaves a valid file for
+retry. No FAQ entry claimed this tooling was missing, so
+`site/docs/faq.html` was left unchanged. The amd64 agent's other boot files
+still assume `/boot/firmware`; that pre-existing mount-path gap needs an
+end-to-end mkosi boot test and is separate from the Wi-Fi importer.
+`tools/flash_image.py` now validates SSID/password with the same rules
+(`validate_wifi_credentials`: SSID 1-32 bytes without control characters;
+password 8-63 printable ASCII or 64-digit hex) **before touching any
+disk** -- a file the device rejects is erased on first boot and would
+leave a Wi-Fi-only station offline (main-session read-back finding).
+**Open point:** amd64 images still expect agent boot files under
+`/boot/firmware` while mkosi mounts the ESP at `/efi`.
 
 ## `tools/docs_screenshots.py` test coverage (2026-10-03)
 
@@ -441,9 +451,8 @@ targets" extended to a third consumer):
    `protocol.registration.AgentRegistrationFile`'s three fields),
    `thermoctl/backup-recipients.txt`, and an optional
    `thermoctl/wifi.env` (section 15.4's recommended path -- format
-   documented in the module, not yet consumed by `install.sh` or any
-   boot-time service, tracked here like `agent-compose.yml` was before
-   P5.4). 29 tests (`tests/test_flash_image.py`), every disk-facing call
+   documented in the module; now consumed by the first-boot service noted
+   above). 29 tests (`tests/test_flash_image.py`), every disk-facing call
    through mocked `subprocess` -- no test ever touches a real disk.
 4. **`tools/mac-test-vm`** -- the Lima test VM (Debian 13 arm64,
    `tools/mac-test-vm.lima.yaml`), applying `install.sh` as a real

@@ -188,10 +188,11 @@ python -m tools.flash_image flash \
   mit WLAN-Angaben entsteht <code>thermoctl/wifi.env</code> mit SSID und Passwort
   im Klartext.</p>
   <div class="callout warn">
-    <p>Die WLAN-Datei wird zwar geschrieben, aber <code>image/common/install.sh</code>
-    und die bisherigen Startdienste lesen sie noch nicht ein. Prüfen Sie für ein Gerät
-    ohne Netzwerkkabel die WLAN-Einrichtung separat; die Datei allein stellt noch
-    keine Verbindung her.</p>
+    <p>Beim ersten Start liest ein systemd-Dienst die WLAN-Datei vor der
+    Netzwerk-Online-Prüfung ein, speichert das Profil in NetworkManager und
+    überschreibt und entfernt danach die Klartextdatei von der Boot-Partition.
+    Bei ungültigem Format entfernt er die Datei ebenfalls; prüfen Sie dann
+    die Fehlermeldung im Journal und bereiten Sie den Datenträger erneut vor.</p>
   </div>
 
   <h3>3. Registrierung ohne echte Hardware auf dem Mac testen</h3>

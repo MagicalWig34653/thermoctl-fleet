@@ -40,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends shellcheck
-          shellcheck image/common/install.sh image/common/apt/fetch-docker-key.sh
+          shellcheck image/common/install.sh image/common/firstboot-wifi.sh image/common/apt/fetch-docker-key.sh
 
   # Builds the three watchdog binaries once, for both architectures, and
   # hands them to the two real image-build jobs below as artifacts -- the

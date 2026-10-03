@@ -72,14 +72,10 @@ CHUNK_SIZE = 4 * 1024 * 1024
 # constants.
 REGISTRATION_FILE_NAME = "agent-registration.json"
 BACKUP_RECIPIENTS_RELATIVE_PATH = "thermoctl/backup-recipients.txt"
-# Not yet consumed by image/common/install.sh or any boot-time service --
-# tracked as an open point in docs/STATUS.md, same "define the format now,
-# wire up the consumer later" pattern this repository already uses for
-# image/common/agent-compose.yml before P5.4 existed. KEY=VALUE, like
+# Consumed on first boot by image/common/firstboot-wifi.sh. KEY=VALUE, like
 # /etc/thermoctl-agent/.env, deliberately not a shell-sourced wpa_supplicant
 # .conf (Debian 13/Raspberry Pi OS trixie moved to NetworkManager; plain
-# KEY=VALUE keeps this tool's own output format independent of whichever
-# network stack a future consumer ends up using).
+# KEY=VALUE keeps this tool's output independent of shell syntax).
 WIFI_CONFIG_RELATIVE_PATH = "thermoctl/wifi.env"
 
 
@@ -479,6 +475,23 @@ def write_backup_recipients(boot_mount_point: Path, recipients: list[str]) -> Pa
     return path
 
 
+def validate_wifi_credentials(ssid: str, password: str) -> None:
+    """The same rules `image/common/firstboot-wifi.sh` enforces on the
+    device -- checked here at write time, because a file the device rejects
+    is erased on first boot and leaves a Wi-Fi-only base station offline.
+    SSID: 1-32 bytes, no control characters. Password: 8-63 printable
+    ASCII characters, or a 64-digit hex PSK."""
+
+    if not 1 <= len(ssid.encode("utf-8")) <= 32 or any(ord(c) < 32 or ord(c) == 127 for c in ssid):
+        raise ValueError("ssid must be 1-32 bytes without control characters.")
+    printable = all(32 <= ord(c) <= 126 for c in password)
+    hex_psk = len(password) == 64 and all(c in "0123456789abcdefABCDEF" for c in password)
+    if not (hex_psk or (8 <= len(password) <= 63 and printable)):
+        raise ValueError(
+            "password must be 8-63 printable ASCII characters or a 64-digit hex key (WPA2)."
+        )
+
+
 def write_wifi_config(boot_mount_point: Path, *, ssid: str, password: str) -> Path:
     """Writes the Wi-Fi credentials section 15.4 recommends providing at
     image-write time (the "no radio window, no UI" path -- the other two
@@ -487,8 +500,7 @@ def write_wifi_config(boot_mount_point: Path, *, ssid: str, password: str) -> Pa
     plain `KEY=VALUE`, see this module's own `WIFI_CONFIG_RELATIVE_PATH`
     docstring for why not a `wpa_supplicant.conf`."""
 
-    if not ssid:
-        raise ValueError("ssid must not be empty.")
+    validate_wifi_credentials(ssid, password)
     path = boot_mount_point / WIFI_CONFIG_RELATIVE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"SSID={ssid}\nPASSWORD={password}\n", encoding="utf-8")
@@ -525,6 +537,14 @@ def _run_flash(args: argparse.Namespace) -> int:
     if not image_path.is_file():
         print(f"tools/flash_image.py: no such file: {image_path}", file=sys.stderr)  # noqa: T201
         return 1
+    if args.wifi_ssid:
+        # Before touching any disk: a credential file the device would reject
+        # is erased on first boot and leaves a Wi-Fi-only station offline.
+        try:
+            validate_wifi_credentials(args.wifi_ssid, args.wifi_password or "")
+        except ValueError as error:
+            print(f"tools/flash_image.py: {error}", file=sys.stderr)  # noqa: T201
+            return 1
 
     disks = {disk.device: disk for disk in list_removable_disks()}
     disk = disks.get(args.disk)
