@@ -658,17 +658,53 @@ below, after P6.3's own `0017_fault_acknowledgements.py`) verified both
 directions (`upgrade`/`downgrade`/`upgrade` again on a throwaway sqlite
 file).
 
-## Open point from the flaky-test investigation (main session, 2026-10-02)
+## Closed: one `httpx.Client` per background thread (2026-10-03)
 
-The agent's background threads (restore poll, backup scheduler, desired-state
-reconciler) and the main command loop share one `httpx.Client`. The
-investigation observed a `500` on one request tearing down the connection
-under a *different*, concurrent request on the same client (the
-`agent_restart` result POST failing with "Server disconnected"). In tests the
-`500` came from a missing test configuration; in production any fleet-side
-`500` could do the same and lose or delay a command result. To be examined:
-one client per thread, or making result reporting robust against a
-connection torn down by a concurrent request.
+Closes the "Open point from the flaky-test investigation" above: the
+agent's background threads (restore poll, daily backup scheduler,
+desired-state reconciler) no longer share the main command loop's own
+`httpx.Client`. `agent.loop.run` gained a `client_factory` parameter
+(`Callable[[], httpx.Client]`, default `None` keeps every existing test
+that does not pass one on the previous, single-shared-client behaviour
+byte for byte); when given, each of the three background threads builds
+its own client through it (`_start_background_thread`, closed once that
+thread's own loop notices its `stop_event` and returns -- not from
+`run`'s own `finally`, which still never joins these daemon threads, on
+purpose), and `BackupConfig`/`ExecutionContext` get a thread-scoped
+`dataclasses.replace` copy pointing at that client instead of the
+original. `agent.__main__._run_agent` always passes a real one -- a
+closure that rebuilds a client the same way `build_client` built the
+main one (same pinned-TLS transport, base URL, timeout) and reads the
+current bearer token at call time, so a later re-authentication is
+picked up by every subsequent `loop.run` call's background threads too,
+not just the main one.
+
+The second half of the open point -- "making result reporting robust
+against a connection torn down by a concurrent request" -- turned out to
+already be covered: `agent.commands_channel.report_result`'s existing
+`except httpx.TransportError` clause already catches
+`httpx.RemoteProtocolError` ("Server disconnected without sending a
+response") by type, since it is a `TransportError` subclass; buffered to
+the outbox and retried on the next call/idle flush, same as any other
+transport failure. Proven directly, not just inferred from the exception
+hierarchy, by a new real-TLS test
+(`tests/test_agent_commands_channel.py
+::test_report_result_buffers_on_a_server_disconnect_and_retries_on_next_call`)
+against a new helper, `tests/tls_support.run_disconnecting_tls_server`
+-- a real TLS server that completes the handshake, reads the request,
+and closes without writing a single response byte.
+
+Two more new tests, `tests/test_agent_loop_run.py
+::test_run_uses_a_distinct_client_per_background_thread` (object-identity
+proof: `client_factory` is called once per background thread, each
+client distinct from the other two and from the main loop's own) and
+`::test_run_restore_poll_failures_do_not_break_concurrent_result_reporting`
+(the regression test for the original failure: `FLEET_BACKUP_STORAGE_DIR`
+deliberately left unconfigured, so the restore-poll thread's own `GET
+/v1/restore` hits a real `500` on every tick for the whole test, running
+concurrently with 25 ordinary `report_now` results plus a final
+`agent_restart` -- all 26 must still reach the fleet). All three new/
+changed tests run clean 20 times in a row with no flakiness.
 
 ## Flaky test fixes (test-only, 2026-10-02)
 

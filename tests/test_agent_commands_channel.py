@@ -69,6 +69,7 @@ from tests.tls_support import (
     _wait_until_reachable,
     generate_ca,
     generate_leaf,
+    run_disconnecting_tls_server,
     run_recording_tls_server,
     run_tls_fleet_app,
 )
@@ -470,6 +471,59 @@ def test_report_result_buffers_on_failure_and_retries_on_next_call(
         with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
             client.headers["Authorization"] = f"Bearer {token}"
             # A second, unrelated call flushes the outbox first.
+            second_command = app_storage.create_command(
+                APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+                now=datetime.now(UTC),
+            )
+            report_result(
+                client,
+                CommandResult(id=second_command.id, successful=True, duration_s=1.0),
+                outbox_path=outbox_path,
+            )
+
+    assert outbox_path.read_text(encoding="utf-8").strip() in ("", "[]")
+    assert app_storage.pending_commands(APARTMENT, 0, datetime.now(UTC)) == []
+
+
+def test_report_result_buffers_on_a_server_disconnect_and_retries_on_next_call(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    """The specific failure the flaky-test investigation observed in
+    production use (`docs/STATUS.md`'s "Open point" section, main session
+    2026-10-02): a result-report `POST` whose peer accepts the connection,
+    reads the request, and then closes it **without sending a response**
+    -- `httpx.RemoteProtocolError("Server disconnected without sending a
+    response")`, not the plain `httpx.ConnectError` (nothing listening at
+    all) `test_report_result_buffers_on_failure_and_retries_on_next_call`
+    above already covers. `RemoteProtocolError` is itself an
+    `httpx.TransportError` subclass (`agent.transport`'s own exception
+    map, and `httpx`'s own hierarchy), so `report_result`'s existing
+    `except httpx.TransportError` already catches it by type -- this test
+    is what actually proves that against a real socket performing a real
+    TLS handshake and a real close, not merely by reading the exception
+    hierarchy, and would fail if that catch clause were ever narrowed to
+    `httpx.ConnectError` alone."""
+
+    token = _issue_token(app_storage)
+    command = app_storage.create_command(
+        APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+    outbox_path = tmp_path / "outbox.json"
+    result = CommandResult(id=command.id, successful=True, duration_s=1.0)
+
+    with run_disconnecting_tls_server(tmp_path) as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=5.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            report_result(client, result, outbox_path=outbox_path)
+
+    assert outbox_path.exists()
+    assert command.id in outbox_path.read_text(encoding="utf-8")
+    assert app_storage.pending_commands(APARTMENT, 0, datetime.now(UTC)) != []
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
             second_command = app_storage.create_command(
                 APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
                 now=datetime.now(UTC),

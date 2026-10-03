@@ -753,4 +753,185 @@ def test_run_delivers_a_buffered_result_via_idle_flush_without_a_new_command(
         assert row is not None
         assert row.successful is False
         assert row.error_text == buffered_result.error_text
-        assert row.result_received_at is not None
+
+
+# -----------------------------------------------------------------------------
+# `client_factory` (flaky-test investigation follow-up, `docs/STATUS.md`'s
+# "Open point", main session 2026-10-02): each background thread gets its own
+# `httpx.Client`/connection pool, never the one `receive_commands`/
+# `report_result` use on this function's own calling thread.
+# -----------------------------------------------------------------------------
+
+
+def test_run_uses_a_distinct_client_per_background_thread(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    """Direct, object-identity proof that `client_factory` is actually used
+    to build a *separate* client for each of the three background threads
+    (restore poll, daily backup scheduler, desired-state reconciler --
+    the latter always started, see `run`'s own docstring) rather than
+    only indirectly through the connection-isolation test below. Backups
+    are deliberately pointed at a `staging_dir` that does not exist --
+    `run_daily_backup_scheduler`'s own single immediate attempt fails
+    fast and locally (`tempfile.mkstemp` on a missing directory), logged
+    and swallowed exactly like any other transient backup failure, never
+    needing its own client for a real request; this test's only interest
+    in that thread is that `client_factory` was called for it at all.
+    """
+
+    token = _issue_token(app_storage)
+    command = app_storage.create_command(
+        APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    created_clients: list[httpx.Client] = []
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+
+        def _client_factory() -> httpx.Client:
+            thread_client = build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0)
+            thread_client.headers["Authorization"] = f"Bearer {token}"
+            created_clients.append(thread_client)
+            return thread_client
+
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+
+            from agent import loop as loop_module
+
+            restore_targets = RestoreTargets(
+                data_dir=tmp_path / "agent-data",
+                thermoctl_db_path=tmp_path / "thermoctl.db",
+                zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+                staging_dir=tmp_path / "restore-staging",
+                mover_status_path=tmp_path / "mover-status.json",
+            )
+            backup_config = loop_module.BackupConfig(
+                apartment_id=APARTMENT,
+                agent_version="0.0.0-test",
+                staging_dir=tmp_path / "backup-staging-never-created",
+                thermoctl_db_path=tmp_path / "thermoctl.db",
+                zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+                client=client,
+                recipients_file=tmp_path / "recipients-never-created.txt",
+            )
+
+            run(
+                client,
+                last_event_id_path=tmp_path / "last-event-id",
+                outbox_path=tmp_path / "outbox.json",
+                executed_ids_path=tmp_path / "executed-ids",
+                local_log_path=tmp_path / "agent.log",
+                watchdog_state_path=tmp_path / "watchdog-state.env",
+                led_status_path=tmp_path / "led-status.env",
+                backup_config=backup_config,
+                restore_targets=restore_targets,
+                restore_poll_interval_s=0.05,
+                client_factory=_client_factory,
+                exit_fn=lambda code: None,
+            )
+
+    with app_storage.session() as session:
+        row = session.scalar(select(CommandRecord).where(CommandRecord.command_id == command.id))
+        assert row is not None
+        assert row.successful is True
+
+    # One call per background thread: daily backup scheduler, restore
+    # poll, desired-state reconciler -- in that construction order inside
+    # `run`.
+    assert len(created_clients) == 3
+    # Every one of them is its own object -- `len(set(...))`, not just
+    # `!=` pairwise, so this would also catch a factory that returns the
+    # same client twice and a different one the third time.
+    assert len({id(created) for created in created_clients}) == 3
+    # None of the three is the client `run` itself (and thus
+    # `receive_commands`/`report_result`) uses on this calling thread.
+    assert all(created is not client for created in created_clients)
+
+
+def test_run_restore_poll_failures_do_not_break_concurrent_result_reporting(
+    tmp_path: Path, app_storage: Storage
+) -> None:
+    """Regression test for the flaky-test investigation's "Open point"
+    (`docs/STATUS.md`, main session 2026-10-02): before `client_factory`
+    existed, the restore-poll thread and this function's own result-
+    report `POST` shared one `httpx.Client`/connection pool -- a `500` on
+    the restore-poll thread's request could tear down a connection a
+    *different*, concurrent result-report request was using, observed
+    directly as an `agent_restart` result-report failing with "Server
+    disconnected without sending a response" and the result never
+    reaching the fleet at all (see `tests/test_agent_loop_run.py`'s own
+    `test_run_starts_and_stops_the_restore_poll_thread_when_configured`,
+    which hit exactly this before it configured `FLEET_BACKUP_STORAGE_DIR`
+    to remove the spurious `500`).
+
+    This test does the opposite on purpose: it deliberately does **not**
+    configure `FLEET_BACKUP_STORAGE_DIR`, so the restore-poll thread's own
+    `GET /v1/restore` hits `fleet.backup_storage.get_backup_storage`'s
+    fail-closed `RuntimeError` -- a real `500` -- on every single one of
+    its ticks (`restore_poll_interval_s=0.01`, deliberately tight),
+    running concurrently with a burst of 25 ordinary `report_now` command
+    results plus one final `agent_restart`, all delivered over the same
+    real SSE connection on this function's own thread. With
+    `client_factory` given, the restore-poll thread's `500`s run on their
+    own, separate connection pool -- there is no longer a shared
+    connection for them to tear down out from under any of the 26 result
+    reports, which this test asserts all reached the fleet, not just most
+    of them.
+    """
+
+    token = _issue_token(app_storage)
+    report_commands = [
+        app_storage.create_command(
+            APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+            now=datetime.now(UTC),
+        )
+        for _ in range(25)
+    ]
+    app_storage.create_command(
+        APARTMENT, CommandType.AGENT_RESTART, lines=None, ui_username="landlord",
+        now=datetime.now(UTC),
+    )
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+
+        def _client_factory() -> httpx.Client:
+            thread_client = build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0)
+            thread_client.headers["Authorization"] = f"Bearer {token}"
+            return thread_client
+
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=20.0) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            restore_targets = RestoreTargets(
+                data_dir=tmp_path / "agent-data",
+                thermoctl_db_path=tmp_path / "thermoctl.db",
+                zigbee2mqtt_dir=tmp_path / "zigbee2mqtt",
+                staging_dir=tmp_path / "restore-staging",
+                mover_status_path=tmp_path / "mover-status.json",
+            )
+            exit_calls: list[int] = []
+            run(
+                client,
+                last_event_id_path=tmp_path / "last-event-id",
+                outbox_path=tmp_path / "outbox.json",
+                executed_ids_path=tmp_path / "executed-ids",
+                local_log_path=tmp_path / "agent.log",
+                watchdog_state_path=tmp_path / "watchdog-state.env",
+                led_status_path=tmp_path / "led-status.env",
+                restore_targets=restore_targets,
+                restore_poll_interval_s=0.01,
+                client_factory=_client_factory,
+                exit_fn=exit_calls.append,
+            )
+
+    assert exit_calls == [0]
+    with app_storage.session() as session:
+        for report_command in report_commands:
+            row = session.scalar(
+                select(CommandRecord).where(CommandRecord.command_id == report_command.id)
+            )
+            assert row is not None
+            assert row.result_received_at is not None, (
+                f"result for {report_command.id} never reached the fleet"
+            )
