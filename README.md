@@ -1,5 +1,7 @@
 # thermoctl-fleet
 
+<img src="site/assets/icon/apple-touch-icon.png" alt="" width="96" height="96" align="right">
+
 A small cloud service for landlords with several [`thermoctl`](../thermoctl)
 installations: it receives a heartbeat with health data from every
 apartment, collects faults, alarms on **absence** of a heartbeat, and can
@@ -104,6 +106,21 @@ Check the watchdog (own toolchain, see
 ```bash
 cd watchdog && go vet ./... && go test ./...
 ```
+
+## Documentation website
+
+A German-language documentation site for landlords/operators -- explains the
+project from scratch, the security model, and day-to-day operation -- lives
+under [`site/`](site/) (plain HTML/CSS, no build step) and is published via
+GitHub Pages at **<https://magicalwig34653.github.io/thermoctl-fleet/>**
+(deployed by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) on
+every push to `main` that touches `site/**`). Its screenshots are captured
+against a throwaway, locally seeded demo fleet by
+[`tools/docs_screenshots.py`](tools/docs_screenshots.py) -- reproducible, no
+real apartment or tenant data.
+
+The app icon lives at [`branding/thermoctl-fleet.icon`](branding/thermoctl-fleet.icon)
+(an Xcode Icon Composer bundle) and is also used as the site's favicon.
 
 ## License
 

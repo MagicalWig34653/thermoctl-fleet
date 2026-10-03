@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wohnung hinzufügen -- thermoctl-fleet</title>
+<meta name="description" content="Basisstation vorbereiten und eine Wohnung in thermoctl-fleet in Betrieb nehmen: Registrierungscode, Verifizierungscode, Zuordnung.">
+<link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Zum Inhalt springen</a>
+<header class="site-header">
+  <img class="logo" src="../assets/icon/favicon.svg" alt="">
+  <a class="brand" href="../index.html">thermoctl-fleet</a>
+  <nav>
+    <a href="index.html">Dokumentation</a>
+    <a href="sicherheit.html">Sicherheit</a>
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet">GitHub</a>
+  </nav>
+</header>
+<main id="main" class="wide">
+<div class="docs-layout">
+<aside>
+  <h2>Dokumentation</h2>
+  <ul>
+    <li><a href="einstieg.html">Einstieg &amp; Fleet-Server</a></li>
+    <li><a href="benutzer.html">Benutzer anlegen</a></li>
+    <li><a class="current" href="wohnung.html">Wohnung hinzufügen</a></li>
+    <li><a href="betrieb.html">Täglicher Betrieb</a></li>
+    <li><a href="sicherheit.html">Sicherheit</a></li>
+    <li><a href="faq.html">FAQ</a></li>
+    <li><a href="glossar.html">Glossar</a></li>
+  </ul>
+</aside>
+<div>
+  <h1>Wohnung hinzufügen</h1>
+  <p>
+    Ziel (Spezifikation, Abschnitt 15.3): Gerät kaputt → Ersatzgerät aus dem Regal →
+    einstecken → wenige Minuten später ist die Wohnung wieder unter Kontrolle. Derselbe
+    Ablauf gilt für die Erstinstallation. Die Id einer Wohnung allein reicht dabei
+    bewusst nicht, um an ihre Konfiguration zu kommen -- sonst bekäme, wer eine Id errät,
+    gleich die Zugangsdaten dazu.
+  </p>
+
+  <h2 id="ablauf">Der Ablauf in fünf Schritten</h2>
+  <ol>
+    <li>
+      <strong>Image schreiben.</strong> Ein vorbereitetes System (<code>image/</code>,
+      Debian 13, Raspberry Pi OS oder amd64) wird auf Karte oder Datenträger geschrieben.
+      Auf der Boot-Partition liegt zusätzlich <code>agent-registration.json</code> mit der
+      Adresse des Fleet-Dienstes, seinem Zertifikats-Fingerabdruck und einem einmaligen
+      Registrierungscode -- keiner dieser Werte ist ein dauerhaftes Geheimnis.
+    </li>
+    <li>
+      <strong>Einstecken.</strong> Beim ersten Start erzeugt der Agent sein eigenes
+      Schlüsselpaar, meldet sich mit dem Registrierungscode und seinem
+      <strong>öffentlichen</strong> Schlüssel bei der Cloud an und zeigt einen kurzen
+      Verifizierungscode an.
+    </li>
+    <li>
+      <strong>Zuordnen.</strong> In der Fleet-Oberfläche, unter Inventar, erscheint das
+      Gerät mit demselben Verifizierungscode. Erst diese Bestätigung gibt die
+      Konfiguration frei -- gebunden an den Schlüssel genau dieses Geräts.
+    </li>
+    <li>
+      <strong>Einrichten.</strong> Der Agent holt die Gerätekonfiguration und, bei einem
+      Gerätetausch, die verschlüsselten Betriebsdaten. Der Entschlüsselungsschlüssel wird
+      einmalig in der Fleet-Oberfläche eingegeben -- er wird dort nur durchgereicht, nie
+      gespeichert (siehe <a href="sicherheit.html#backups">Sicherheit</a>).
+    </li>
+    <li>
+      <strong>Fertig.</strong> Der Agent startet die vier Container im gesicherten
+      Zustand und meldet den ersten Heartbeat -- die Wohnung ist wieder unter Kontrolle.
+    </li>
+  </ol>
+  <p>Realistische Dauer für einen Gerätetausch: 10 bis 20 Minuten, der meiste davon
+  Wartezeit auf den Image-Download. Was noch von Hand zu tun bleibt: hinfahren, Gerät
+  tauschen, den Zigbee-Funkstick mit umstecken.</p>
+
+  <h2 id="in-der-oberflaeche">Vorbereiten in der Fleet-Oberfläche</h2>
+  <p>
+    Unter Inventar wählen Sie ein Gerät und klicken "Vorbereiten". Die Oberfläche erzeugt
+    dabei einen frischen, einmaligen Registrierungscode und zeigt ihn <strong>genau
+    einmal</strong> an -- er wird nirgends protokolliert und nie im Klartext gespeichert,
+    nur sein Hash. Sind <code>FLEET_PUBLIC_URL</code> und <code>FLEET_CERT_FINGERPRINT</code>
+    gesetzt (siehe <a href="einstieg.html#env">Einstieg</a>), erzeugt die Seite direkt den
+    fertigen Inhalt für <code>agent-registration.json</code> zum Herunterladen. Fehlt eine
+    der beiden Variablen, zeigt die Seite einen klaren Hinweis statt eines erfundenen
+    Platzhalterwerts.
+  </p>
+  <p>Für ein Gerät, das vorher in einer anderen Wohnung lief, verlangt das Formular die
+  Bestätigung "Gerät wurde zurückgesetzt" -- nur für Geräte im Status "auf Lager".</p>
+  <figure class="shot">
+    <img class="screenshot" src="../assets/img/inventory-light.png" alt="Inventaransicht mit Immobilien, Wohnungen und Geräten" loading="lazy">
+    <figcaption>Die Inventaransicht mit den Demo-Wohnungen.</figcaption>
+  </figure>
+
+  <h2 id="wifi">Wenn das Gerät nur WLAN hat</h2>
+  <p>Mit Netzwerkkabel ist der Registrierungscode im Image genug. Ohne Kabel muss das
+  WLAN-Passwort auf einem anderen Weg ankommen:</p>
+  <table>
+    <tr><th>Weg</th><th>Bewertung</th></tr>
+    <tr><td>WLAN-Zugangsdaten schon beim Schreiben des Images mitgeben</td><td><strong>Empfohlen.</strong> Kein Funkfenster, keine Oberfläche, nichts, das offenbleiben kann.</td></tr>
+    <tr><td>Eigener Einrichtungs-Zugangspunkt des Geräts, <strong>mit</strong> Passwort</td><td>Akzeptabel, wenn das Passwort zufällig erzeugt wird, der Zugangspunkt nach der Einrichtung verschwindet und sich spätestens nach 30 Minuten von selbst schließt.</td></tr>
+    <tr><td><strong>Offenes</strong> WLAN zur Einrichtung</td><td><strong>Nein.</strong> Wer in Reichweite ist, liest das Mieter-WLAN-Passwort mit und übernimmt das Gerät, bevor es zugeordnet ist.</td></tr>
+  </table>
+
+  <h2 id="image-bauen">Image bauen, SD-Karte flashen, Test-VM auf dem Mac</h2>
+  <div class="callout soon">
+    <span class="tag">Kommt in Kürze</span>
+    <p>Dieser Abschnitt wird gefüllt, sobald der Image-Build samt Flash-Werkzeug und die
+    Test-VM unter <code>tools/</code> aus einem parallel laufenden Entwicklungszweig in
+    <code>main</code> gemergt sind. Bis dahin: <code>image/README.md</code> im
+    Quellcode beschreibt den aktuellen Stand.</p>
+  </div>
+  <!-- TODO: filled after merge -->
+
+  <h2 id="naechste-schritte">Nächste Schritte</h2>
+  <p>Mit der ersten Wohnung in Betrieb, weiter mit
+  <a href="betrieb.html">Täglicher Betrieb</a>.</p>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+  <p><a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation, Abschnitte 15.3, 19, 21</a></p>
+</footer>
+</body>
+</html>

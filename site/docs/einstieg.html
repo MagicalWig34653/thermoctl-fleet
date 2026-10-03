@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Einstieg &amp; Fleet-Server-Betrieb -- thermoctl-fleet</title>
+<meta name="description" content="Fleet-Server mit Docker starten, Umgebungsvariablen (FLEET_TOTP_KEY, FLEET_WEBAUTHN_RP_ID/ORIGIN), TLS und Fingerprint-Pinning.">
+<link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Zum Inhalt springen</a>
+<header class="site-header">
+  <img class="logo" src="../assets/icon/favicon.svg" alt="">
+  <a class="brand" href="../index.html">thermoctl-fleet</a>
+  <nav>
+    <a href="index.html">Dokumentation</a>
+    <a href="sicherheit.html">Sicherheit</a>
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet">GitHub</a>
+  </nav>
+</header>
+<main id="main" class="wide">
+<div class="docs-layout">
+<aside>
+  <h2>Dokumentation</h2>
+  <ul>
+    <li><a class="current" href="einstieg.html">Einstieg &amp; Fleet-Server</a></li>
+    <li><a href="benutzer.html">Benutzer anlegen</a></li>
+    <li><a href="wohnung.html">Wohnung hinzufügen</a></li>
+    <li><a href="betrieb.html">Täglicher Betrieb</a></li>
+    <li><a href="sicherheit.html">Sicherheit</a></li>
+    <li><a href="faq.html">FAQ</a></li>
+    <li><a href="glossar.html">Glossar</a></li>
+  </ul>
+</aside>
+<div>
+  <h1>Einstieg &amp; Fleet-Server-Betrieb</h1>
+  <p>
+    Der Fleet-Dienst (<code>fleet/</code>) läuft als ein Docker-Image, das Sie selbst
+    hosten -- in der EU, wegen der Datenschutzüberlegung aus Abschnitt 6 der Spezifikation.
+    Dieser Abschnitt beschreibt den Betrieb des Dienstes selbst, nicht einer einzelnen
+    Wohnung -- das folgt unter <a href="wohnung.html">Wohnung hinzufügen</a>.
+  </p>
+
+  <h2 id="docker">Mit Docker starten</h2>
+  <p>Das Repository liefert zwei getrennte Images aus einem Repository -- eines für die
+  Cloud, eines für den Agenten. Für den Fleet-Server:</p>
+  <pre><code>docker build -f docker/Dockerfile.fleet -t thermoctl-fleet .
+docker run -d --name fleet \
+  --env-file .env \
+  -p 127.0.0.1:8100:8000 \
+  thermoctl-fleet</code></pre>
+  <p>
+    <code>docker/compose.example.yml</code> zeigt das Zusammenspiel beider Images --
+    ausdrücklich nur zur Veranschaulichung der Topologie, nicht als Rollout-Rezept für
+    mehrere Wohnungen: der Agent läuft tatsächlich auf der Basisstation jeder Wohnung, nicht
+    neben dem Fleet-Dienst.
+  </p>
+  <div class="callout warn">
+    <p>Kein Secret steht in <code>compose.example.yml</code> oder im Repository. Eigene
+    Werte gehören ausschließlich in eine lokale <code>.env</code>-Datei, die nie committet
+    wird.</p>
+  </div>
+
+  <h2 id="env">Umgebungsvariablen</h2>
+  <p>Alle Werte unten sind direkt aus dem Quellcode abgeleitet (<code>fleet/</code>) --
+  keine davon hat einen Vorgabewert, wo ein Vorgabewert selbst wie eine echte
+  Konfiguration aussähe (CLAUDE.md: "nichts hartcodiert außer den Sicherheitsgrundsätzen").</p>
+
+  <h3>Pflicht für den Betrieb</h3>
+  <table>
+    <tr><th>Variable</th><th>Bedeutung</th></tr>
+    <tr><td><code>FLEET_DATABASE_URL</code></td><td>SQLAlchemy-Verbindungszeichenfolge der Datenbank, z.&nbsp;B. <code>sqlite:////var/lib/fleet/fleet.db</code>.</td></tr>
+    <tr><td><code>FLEET_TOTP_KEY</code></td><td>Schlüssel, mit dem TOTP-Secrets der Benutzerkonten verschlüsselt in der Datenbank liegen (<code>fleet/totp_crypto.py</code>). Wird für <code>create-user</code>, <code>reset-totp</code> und <code>rotate-totp-key</code> gebraucht. Niemals im Klartext in der Datenbank.</td></tr>
+    <tr><td><code>FLEET_TOTP_KEY_NEW</code></td><td>Nur während einer Schlüsselrotation gesetzt: der neue Schlüssel, zu dem <code>python -m fleet.admin rotate-totp-key</code> jedes Konto umschlüsselt.</td></tr>
+    <tr><td><code>FLEET_WEBAUTHN_RP_ID</code></td><td>"Relying Party"-Id für Passkeys -- in der Regel die Domain, unter der die Oberfläche erreichbar ist (ohne Schema, ohne Port).</td></tr>
+    <tr><td><code>FLEET_WEBAUTHN_ORIGIN</code></td><td>Die exakte Origin (Schema + Domain + Port), unter der der Browser die Seite lädt -- muss zur echten Aufruf-URL passen, sonst lehnt der Browser die Passkey-Zeremonie ab.</td></tr>
+    <tr><td><code>FLEET_WEBAUTHN_RP_NAME</code></td><td>Anzeigename, den der Authenticator dem Benutzer zeigt (z.&nbsp;B. "thermoctl-fleet").</td></tr>
+    <tr><td><code>FLEET_PUBLIC_URL</code></td><td>Öffentlich erreichbare Adresse des Fleet-Dienstes -- landet in der generierten <code>agent-registration.json</code> beim Vorbereiten eines Geräts (<a href="wohnung.html">Wohnung hinzufügen</a>).</td></tr>
+    <tr><td><code>FLEET_CERT_FINGERPRINT</code></td><td>SHA-256-Fingerabdruck (<code>sha256:&lt;64 Hex-Zeichen&gt;</code>) des Server-Zertifikats -- das Pinning, das der Agent zusätzlich zur üblichen TLS-Prüfung verlangt.</td></tr>
+  </table>
+
+  <h3>Betriebsfeinabstimmung (haben sinnvolle Vorgaben)</h3>
+  <table>
+    <tr><th>Variable</th><th>Bedeutung</th></tr>
+    <tr><td><code>FLEET_ALARM_CHECK_INTERVAL_S</code></td><td>Takt, in dem die Alarmregeln (Abschnitt 8) neu ausgewertet werden.</td></tr>
+    <tr><td><code>FLEET_COMMANDS_POLL_INTERVAL_S</code> / <code>FLEET_COMMANDS_SSE_PING_INTERVAL_S</code> / <code>FLEET_COMMANDS_SSE_RETRY_MS</code></td><td>Feinabstimmung des SSE-Kanals <code>GET /v1/commands</code>.</td></tr>
+    <tr><td><code>FLEET_RETENTION_INTERVAL_S</code>, <code>FLEET_RETENTION_HEARTBEAT_DAYS</code>, <code>FLEET_RETENTION_FAULT_DAYS</code></td><td>Aufbewahrungsfristen (90 Tage Heartbeats, 365 Tage Störungen/Alarme/Ereignisse -- Entscheidung des Projektinhabers, Abschnitt 12).</td></tr>
+    <tr><td><code>FLEET_BACKUP_RETENTION_INTERVAL_S</code>, <code>FLEET_BACKUP_STORAGE_DIR</code></td><td>Ablagepfad und Aufräumtakt für verschlüsselte Betriebsdaten-Backups.</td></tr>
+    <tr><td><code>FLEET_DIAGNOSTIC_BUNDLE_STORAGE_DIR</code>, <code>FLEET_DIAGNOSTIC_BUNDLE_RETENTION_DAYS</code>, <code>FLEET_DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_S</code></td><td>Ablage und Aufbewahrung der auf Abruf erzeugten Diagnosebündel.</td></tr>
+    <tr><td><code>FLEET_ROLLOUT_WORKER_INTERVAL_S</code></td><td>Takt des Hintergrundprozesses, der gestaffelte Rollouts weiterschaltet.</td></tr>
+    <tr><td><code>FLEET_RESTORE_KEY_BLOCK_TTL_S</code>, <code>FLEET_RESTORE_PURGE_INTERVAL_S</code></td><td>Wie lange der im Browser verschlüsselte Restore-Schlüsselblock aufbewahrt wird, bevor er automatisch gelöscht wird.</td></tr>
+    <tr><td><code>FLEET_UI_SESSION_IDLE_TIMEOUT_S</code>, <code>FLEET_UI_SESSION_ABSOLUTE_LIFETIME_S</code></td><td>Sitzungsdauer der Web-Oberfläche.</td></tr>
+    <tr><td><code>FLEET_UI_LOCKOUT_THRESHOLD</code>, <code>FLEET_UI_LOCKOUT_WINDOW_S</code>, <code>FLEET_UI_LOCKOUT_DURATION_S</code></td><td>Sperrverhalten nach wiederholt fehlgeschlagener Anmeldung.</td></tr>
+    <tr><td><code>FLEET_UI_IP_THROTTLE_THRESHOLD</code>, <code>FLEET_UI_IP_THROTTLE_WINDOW_S</code>, <code>FLEET_UI_IP_THROTTLE_DURATION_S</code></td><td>Drosselung pro IP-Adresse gegen automatisiertes Durchprobieren.</td></tr>
+    <tr><td><code>FLEET_UI_TRUSTED_PROXIES</code></td><td>Liste vertrauenswürdiger Reverse-Proxys, deren <code>X-Forwarded-For</code>-Header für die IP-Drosselung ausgewertet wird.</td></tr>
+    <tr><td><code>FLEET_REGISTRATION_THROTTLE_*</code>, <code>FLEET_REGISTRATION_TOKEN_THROTTLE_*</code>, <code>FLEET_REGISTRATION_CHALLENGE_THROTTLE_*</code></td><td>Drosselung der Geräte-Registrierungsendpunkte gegen das Durchprobieren von Registrierungscodes.</td></tr>
+    <tr><td><code>FLEET_ALERT_SMTP_*</code>, <code>FLEET_ALERT_WEBHOOK_URLS</code></td><td>Optionaler Versand von Alarmen per E-Mail und/oder Webhook, zusätzlich zur Oberfläche.</td></tr>
+  </table>
+
+  <h2 id="tls">TLS und Fingerprint-Pinning</h2>
+  <p>
+    TLS ist nie abschaltbar -- auch nicht für Tests (Abschnitt 4 der Spezifikation).
+    Üblicherweise terminiert ein Reverse-Proxy (z.&nbsp;B. Caddy oder nginx) das Zertifikat
+    vor dem Fleet-Container. Zusätzlich zur gewöhnlichen Zertifikatsprüfung kennt jeder
+    Agent den erwarteten SHA-256-Fingerabdruck des Server-Zertifikats
+    (<code>FLEET_CERT_FINGERPRINT</code>, Format <code>sha256:&lt;64 Hex-Zeichen&gt;</code>)
+    -- ein zweiter Riegel, falls eine Zertifizierungsstelle kompromittiert würde.
+  </p>
+  <p>Den Fingerabdruck des eigenen Zertifikats ermitteln:</p>
+  <pre><code>openssl x509 -in server.crt -noout -fingerprint -sha256</code></pre>
+  <p>Das Ergebnis (ohne die Doppelpunkte, in Kleinbuchstaben, mit dem Präfix
+  <code>sha256:</code>) ist der Wert für <code>FLEET_CERT_FINGERPRINT</code>.</p>
+
+  <h2 id="naechste-schritte">Nächste Schritte</h2>
+  <p>Weiter mit <a href="benutzer.html">Benutzer anlegen</a> -- der erste Zugang zur
+  Web-Oberfläche entsteht ausschließlich über die Kommandozeile, nie über die
+  Oberfläche selbst.</p>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+  <p><a href="https://github.com/MagicalWig34653/thermoctl-fleet">GitHub</a> ·
+  <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a></p>
+</footer>
+</body>
+</html>

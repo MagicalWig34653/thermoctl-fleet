@@ -2,6 +2,81 @@
 
 Last updated: 2026-10-03.
 
+## German documentation website, demo screenshots, app icon (2026-10-03)
+
+Added `site/`: a static, German-language documentation website (plain
+HTML/CSS, no build step, responsive, light/dark via
+`prefers-color-scheme`) aimed at a landlord who does not yet know the
+project -- a landing page (what it is/is not, an inline SVG architecture
+diagram, the six security principles, the feature list) and docs pages
+(`einstieg.html` Fleet-server setup and every `FLEET_*` env var grepped
+from the actual code, `benutzer.html` the `fleet.admin` CLI, `wohnung.html`
+the registration/enrollment flow from section 15.3/19/21, `betrieb.html`
+daily operation, `sicherheit.html` the six principles in detail, `faq.html`,
+`glossar.html`). Two sections are placeholders for work still on other
+branches, each marked with `<!-- TODO: filled after merge -->` plus a
+visible "kommt in Kürze" callout: passwordless passkey login
+(`FLEET_UI_PASSWORDLESS_NETWORKS`) in `betrieb.html`, and image
+build/flash/test-VM tooling in `wohnung.html`.
+
+`.github/workflows/pages.yml` deploys `site/` to GitHub Pages on every push
+to `main` touching `site/**` (`actions/upload-pages-artifact` +
+`actions/deploy-pages`, pinned the same way the existing workflows pin
+action versions) -- **not enabled via the API and not pushed by this
+task**, per instruction; the main session does that.
+
+`tools/docs_screenshots.py` seeds a throwaway SQLite database (fictional
+apartments "Musterstraße 1, WE 3/5", "Beispielweg 9, WE 1" -- heartbeats,
+one open fault, one absence alarm, a backup record, a desired-state
+revision and a rollout, all via `Storage`'s real API, never invented JSON),
+creates a UI account through the real `python -m fleet.admin create-user`
+CLI, starts the real `fleet.app` ASGI app via `uvicorn`, and drives the
+real login (password + TOTP computed with `pyotp`) and six further pages
+with Playwright/Chromium, in both `light` and `dark` `color_scheme`
+contexts (a 30 s wait between the two logins avoids a TOTP-replay
+rejection -- same time-step code twice is rejected by design). Captured
+PNGs are re-saved optimized plus a WebP copy under `site/assets/img/` and
+linked into the relevant docs pages. Excluded from meaningful coverage
+(`pytest`'s `--cov=tools` reports it at 0%, no `fail-under` threshold
+configured so this does not fail CI) -- it drives a browser against a
+throwaway server; nothing in it is reachable from the test suite, and a
+unit test would only re-mock Playwright.
+
+`branding/thermoctl-fleet.icon`: an Xcode Icon Composer bundle (`icon.json`
++ three layered SVGs -- a fleet/network motif, a thermometer-with-flame
+glyph, a glass highlight), modeled on the format of ClaudeWatch's and
+FiSiTrainer's own `AppIcon.icon` bundles. `xcrun --find ictool` resolves on
+this machine but rejects every tried invocation with an `actool`-style
+"Unknown argument" error (no documented CLI contract found for a bare
+`.icon` bundle outside Xcode itself) -- PNG renders for the website
+(favicon, `apple-touch-icon.png`) were instead produced by rendering a
+flattened equivalent SVG (`site/assets/icon/favicon.svg`) with Playwright,
+not by the Icon Composer bundle directly. The bundle itself is unverified
+inside actual Xcode/Icon Composer by this task.
+
+**Umlaut cleanup (CLAUDE.md task): no changes made.** Checked
+`protocol/events.py`, `agent/log_filter.py`, `tools/check_image_config.py`
+and their tests for `ae`/`oe`/`ue` transliterations, plus a broader grep
+across `fleet/`. Every genuine match is either a wire-contract field/value
+(`protocol.events.Event.schluessel`/`schwere`/`titel`, "mirrors
+thermoctl's real, unmodified webhook payload byte for byte" per that
+module's own docstring) or a log-filter keyword/regex matched verbatim
+against thermoctl's own real (and itself inconsistently transliterated,
+e.g. "Zigbee2MQTT-Geraeteliste ist ungültig") log message templates in
+`agent/log_filter.py`'s `_WARN_FIXED_MESSAGES`/`_WARN_TEMPLATES`/
+`_EXTRA_SAFE_KEY_SHAPES` -- changing any of these would silently break
+matching against the real log lines they exist to recognize. The
+`tools/check_image_config.py` match (`pruefe-konfiguration.py`) is a
+reference to another repository's actual filename, not prose. No display
+text using a transliteration instead of a real umlaut was found in these
+files.
+
+Verification run on this branch: `ruff check .` clean, `mypy protocol
+fleet agent tools` clean (79 source files), `pytest --junitxml=...` --
+`tests="2093" failures="0" errors="0" skipped="1"`. A standalone link
+checker confirmed every internal `href`/`src` in `site/**/*.html` resolves
+to an existing file.
+
 ## Codex full review findings 1, 6, 7: SSE bookmark ordering, record-before-
 ## execute, restore-report retry (2026-10-03)
 

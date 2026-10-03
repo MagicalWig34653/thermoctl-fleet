@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="thermoctl-fleet">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fa8f40" />
+      <stop offset="1" stop-color="#21609b" />
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)" />
+  <g fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round" opacity="0.55">
+    <line x1="512" y1="300" x2="300" y2="430" />
+    <line x1="512" y1="300" x2="724" y2="430" />
+    <line x1="512" y1="300" x2="340" y2="650" />
+    <line x1="512" y1="300" x2="684" y2="650" />
+  </g>
+  <g fill="#ffffff" opacity="0.85">
+    <circle cx="300" cy="430" r="26" />
+    <circle cx="724" cy="430" r="26" />
+    <circle cx="340" cy="650" r="22" />
+    <circle cx="684" cy="650" r="22" />
+  </g>
+  <g fill="#ffffff">
+    <rect x="472" y="300" width="80" height="330" rx="40" />
+    <circle cx="512" cy="660" r="90" />
+  </g>
+  <path d="M512 300 C460 250 452 190 500 150 C486 200 520 220 520 260 C548 230 548 190 524 150
+           C584 190 584 260 540 300 Z" fill="#ffffff" />
+  <ellipse cx="512" cy="330" rx="330" ry="170" fill="#ffffff" opacity="0.18" />
+</svg>

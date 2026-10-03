@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Top glass highlight layer, marked "glass": true in icon.json so Liquid
+       Glass applies its own specular/translucency pass on top. -->
+  <ellipse cx="512" cy="330" rx="330" ry="170" fill="#ffffff" opacity="0.35" />
+</svg>
