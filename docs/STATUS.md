@@ -2,6 +2,79 @@
 
 Last updated: 2026-10-03.
 
+## `tools/docs_screenshots.py` test coverage, cross-review follow-up (2026-10-03)
+
+Cross-review (Codex) on the package below found two issues, fixed in a
+follow-up commit on the same branch:
+
+1. **`main()` and `optimize_images()` had a blanket `# pragma: no
+   cover`**, hiding testable behaviour. Both are now tested for real:
+   `main()` by monkeypatching every function it calls (`seed`,
+   `create_ui_user`, `_free_port`, `start_server`, `_wait_for_server`,
+   `capture`, `optimize_images`) to a recorder and asserting call order,
+   arguments, and that the server subprocess is always torn down --
+   terminated normally, or killed if a clean `wait()` times out, including
+   when `capture` itself raises; `optimize_images()` against a real tiny
+   PNG (`pytest.importorskip("PIL")`, so it skips rather than mocks where
+   Pillow -- ad hoc only, not a project dependency -- is absent; installed
+   ad hoc in this worktree's own `.venv` to actually run it instead of
+   skipping). Only `capture()` and `start_server()` keep the pragma now
+   (real browser / real long-running server subprocess).
+2. **A `_free_port`/`_wait_for_server` test had a release-then-rebind
+   race** (ask the OS for a free port, close the socket, then open a new
+   one on the same port number). Fixed: the "returns a bindable int" test
+   no longer rebinds at all (that was never `_free_port`'s own contract),
+   and the "server answers" test already bound a real `HTTPServer` to
+   port 0 directly rather than going through `_free_port` first.
+
+Also caught in the same pass: `main()` test needed `monkeypatch.setenv`
+on `FLEET_TOTP_KEY` before calling it -- `main()` overwrites that env var
+directly (`os.environ[...] =`, not `setdefault`), which would otherwise
+leak into every later test in the session past `tests/conftest.py`'s own
+session-wide default.
+
+Verified again after the fix: `ruff check .` and `mypy .` both exit 0;
+full suite 2143 tests, 0 failures/errors, 1 pre-existing/unrelated skip;
+`tools/docs_screenshots.py` at 100% line coverage.
+
+## `tools/docs_screenshots.py` test coverage (2026-10-03)
+
+Was 0% covered (144 statements, no test file at all). Added
+`tests/test_docs_screenshots.py`:
+
+- **The valuable part:** `seed()` is now exercised against a real,
+  migrated temporary SQLite database (same `tmp_path`/`upgrade`/
+  `create_storage` pattern as `tests/test_storage_rollouts.py`) and read
+  back both through the raw `Storage` API (apartments, the open sensor
+  fault, the `not_reporting` alarm, the operational-data backup, the
+  desired-state revision, the rollout) and through the real UI view
+  builders (`fleet.ui_house.build_house_overview`, `fleet.ui_apartment
+  .build_apartment_detail`, `fleet.ui_rollout.build_rollout_list`/
+  `build_rollout_detail`) -- this is the part that actually breaks if
+  either changes shape, not a re-statement of what the code does.
+- **`create_ui_user()`** is exercised for real against the actual
+  `python -m fleet.admin create-user` subprocess (success, a duplicate
+  username failing loudly, env isolation, and that a shell metacharacter
+  in the username never runs as a shell command -- defending the
+  `# noqa: S603` next to it).
+- **Pure helpers** (`_free_port`, `_wait_for_server`, `_parse_totp_secret`,
+  `_seconds_until_next_totp_step`, `_wait_for_fresh_totp_window`,
+  `_webp_path_for`) each got real assertions, not mocks.
+- **Minimal refactor** to make the TOTP wait testable: the previously
+  nested `_wait_for_fresh_totp_window` inside `capture()` is now a
+  module-level function with injectable `clock`/`sleep` callables (default
+  `time.time`/`time.sleep`), backed by a new pure `_seconds_until_next_totp
+  _step`. `_parse_totp_secret` and `_webp_path_for` were split out of
+  `create_ui_user`/`optimize_images` the same way. `capture`,
+  `start_server`, `main`, and `optimize_images` (needs Pillow, which is
+  only installed ad hoc for this script, not a project dependency) stay
+  `# pragma: no cover`, each with its own reason -- they need a real
+  browser or a real long-running server subprocess, which a unit test
+  would only re-mock, not exercise for real.
+
+Result: `tools/docs_screenshots.py` is now at 100% line coverage; full
+suite still green (`ruff check .`, `mypy .`, `python -m pytest`).
+
 ## Documentation website review follow-up: icon redesign via ictool, passwordless section filled, typography, SVG diagram fix (2026-10-03)
 
 Main-session review of the documentation-website task below asked for six

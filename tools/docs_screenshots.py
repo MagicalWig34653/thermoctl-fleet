@@ -14,13 +14,22 @@ in the active environment (`playwright install chromium`):
 
     python tools/docs_screenshots.py
 
-Writes PNGs into `site/assets/img/`. Not covered by `tests/` (no `--cov`
-`fail-under` is configured, so an uncovered module here does not fail CI,
-same as `tools/check_image_config.py`'s own `if __name__ == "__main__"`
-guard) -- this drives a real browser against a real, throwaway server; a
-unit test for it would only re-mock Playwright and `subprocess`, not
-exercise anything this script doesn't already exercise for real against
-`fleet.app`/`fleet.storage`/`fleet.admin`.
+Writes PNGs into `site/assets/img/`. `tests/test_docs_screenshots.py` covers
+the parts that are worth covering for real: `seed()` against a real,
+migrated temporary SQLite database (read back through the actual
+`fleet.storage`/UI view-builder API -- this is the part that breaks when
+either changes shape), `create_ui_user()` against the real
+`python -m fleet.admin create-user` subprocess, `main()`'s own
+orchestration (every function it calls monkeypatched to a recorder,
+asserting call order/arguments and that the server subprocess is always
+torn down), `optimize_images()` against a real tiny PNG (skipped where
+Pillow, an ad-hoc-only dependency for this script, is absent), and every
+pure helper (`_free_port`, `_parse_totp_secret`,
+`_seconds_until_next_totp_step`, `_webp_path_for`). Only `capture()` and
+`start_server()` stay `# pragma: no cover`, each with its own reason --
+they need a real browser (Playwright/Chromium) or a real, long-running
+`uvicorn` server subprocess, which a unit test would only re-mock, not
+exercise for real.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -273,16 +283,27 @@ def create_ui_user(database_url: str, totp_key: str, username: str, password: st
             f"create-user failed (exit {result.returncode}):\n"
             f"stdout={result.stdout}\nstderr={result.stderr}"
         )
-    for line in result.stdout.splitlines():
+    return _parse_totp_secret(result.stdout)
+
+
+def _parse_totp_secret(stdout: str) -> str:
+    """Pulls the TOTP secret out of `fleet.admin create-user`'s one-time
+    provisioning-URI line (`otpauth://totp/...?secret=XXXX&issuer=...`) --
+    split out from `create_ui_user` so the parsing itself (not the
+    subprocess call) can be asserted on directly."""
+
+    for line in stdout.splitlines():
         if "secret=" in line:
-            # otpauth://totp/...?secret=XXXX&issuer=...
             for part in line.split("?", 1)[-1].split("&"):
                 if part.startswith("secret="):
                     return part[len("secret=") :]
-    raise RuntimeError(f"Could not find TOTP secret in admin output:\n{result.stdout}")
+    raise RuntimeError(f"Could not find TOTP secret in admin output:\n{stdout}")
 
 
-def start_server(database_url: str, port: int) -> subprocess.Popen[bytes]:
+# Starts a real `uvicorn` server subprocess and hands back the live
+# process -- a unit test would only re-mock `subprocess.Popen`, not
+# exercise anything for real; see the module docstring.
+def start_server(database_url: str, port: int) -> subprocess.Popen[bytes]:  # pragma: no cover
     env = dict(
         os.environ,
         FLEET_DATABASE_URL=database_url,
@@ -310,20 +331,50 @@ def start_server(database_url: str, port: int) -> subprocess.Popen[bytes]:
     return process
 
 
-def capture(base_url: str, username: str, password: str, totp_secret: str) -> None:
+def _seconds_until_next_totp_step(now: float, step: int = 30) -> float:
+    """How long to sleep from wall-clock time `now` (`time.time()`) until
+    the *next* TOTP step boundary, plus a one-second safety margin -- pure
+    arithmetic, split out of `_wait_for_fresh_totp_window` so it can be
+    asserted on for fixed `now` values without a real clock or a real
+    sleep."""
+
+    return (step - (int(now) % step)) + 1
+
+
+def _wait_for_fresh_totp_window(
+    clock: Callable[[], float] | None = None, sleep: Callable[[float], None] | None = None
+) -> None:
+    # The fleet rejects a reused TOTP code as a replay (same 30 s step
+    # already consumed by the previous login in this script) -- each
+    # capture pass logs in fresh, so each must land in its own step.
+    # `clock`/`sleep` default to the real `time.time`/`time.sleep`; a test
+    # injects fakes instead.
+    clock_fn = clock if clock is not None else time.time
+    sleep_fn = sleep if sleep is not None else time.sleep
+    sleep_fn(_seconds_until_next_totp_step(clock_fn()))
+
+
+def _webp_path_for(png_path: Path) -> Path:
+    """The WebP sibling path `optimize_images` writes next to each
+    captured PNG -- same stem, `.webp` suffix, same directory. Split out as
+    its own function so the path decision can be asserted on without
+    touching Pillow or the filesystem."""
+
+    return png_path.with_suffix(".webp")
+
+
+# Drives a real browser (Playwright/Chromium) against a real, already
+# running fleet server -- a unit test would only re-mock Playwright, not
+# exercise anything for real; see the module docstring.
+def capture(  # pragma: no cover
+    base_url: str, username: str, password: str, totp_secret: str
+) -> None:
     import pyotp
     from playwright.sync_api import sync_playwright
 
     IMG_DIR.mkdir(parents=True, exist_ok=True)
 
     totp = pyotp.TOTP(totp_secret)
-
-    def _wait_for_fresh_totp_window() -> None:
-        # The fleet rejects a reused TOTP code as a replay (same 30 s step
-        # already consumed by the previous login in this script) -- each
-        # capture pass logs in fresh, so each must land in its own step.
-        remaining = 30 - (int(time.time()) % 30)
-        time.sleep(remaining + 1)
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
@@ -378,16 +429,29 @@ def capture(base_url: str, username: str, password: str, totp_secret: str) -> No
 
 
 def optimize_images() -> None:
-    """Re-saves every captured PNG optimized, and adds a WebP copy next to it."""
+    """Re-saves every captured PNG optimized, and adds a WebP copy next to
+    it. Needs Pillow, which is only installed ad hoc for this script
+    (pyproject.toml's own mypy override comment above says so) -- not a
+    project dependency, so `tests/test_docs_screenshots.py` skips its one
+    real test here (`pytest.importorskip("PIL")`) in an environment where
+    it is absent, rather than mocking it."""
 
     from PIL import Image
 
     for png_path in sorted(IMG_DIR.glob("*.png")):
         with Image.open(png_path) as img:
             img.save(png_path, optimize=True)
-            img.convert("RGB").save(png_path.with_suffix(".webp"), quality=82, method=6)
+            img.convert("RGB").save(_webp_path_for(png_path), quality=82, method=6)
 
 
+# Orchestrates seed() -> create_ui_user() -> start_server() -> capture() ->
+# optimize_images() -- every one of those names is itself a module-level
+# function this module's own call sites use unqualified, so
+# `tests/test_docs_screenshots.py` exercises this function for real by
+# monkeypatching each of them to a recorder and asserting the call order,
+# arguments, and that the server subprocess is always torn down (even when
+# `capture` raises, and killed if a clean `wait()` times out) -- no pragma
+# needed, nothing here is actually untestable.
 def main() -> int:
     import base64
     import secrets as _secrets
