@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Heartbeat/ECG line, warm orange, running horizontally across the
+       radiator's front. Sits in the glass group behind the radiator fins
+       so it glows through the translucent glass. Bold stroke, no fine
+       detail, reads as a single beat even at 32px. -->
+  <path d="M 200 540 L 330 540 L 385 430 L 445 650 L 500 460 L 545 540 L 824 540"
+        fill="none" stroke="#ff8a3d" stroke-width="46"
+        stroke-linecap="round" stroke-linejoin="round" />
+</svg>

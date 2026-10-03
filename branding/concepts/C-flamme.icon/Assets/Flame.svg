@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Single bold flame, two nested teardrops, orange outer and yellow
+       inner, centered inside the dot ring. The main glyph, rendered as
+       glass for the Liquid Glass shine. -->
+  <path d="M512,296 C416,380 384,464 406,548 C422,628 460,688 512,744
+           C564,688 602,628 618,548 C640,464 608,380 512,296 Z" fill="#ff8a3d" />
+  <path d="M512,404 C462,462 442,520 452,580 C460,628 480,668 512,700
+           C544,668 564,628 572,580 C582,520 562,462 512,404 Z" fill="#ffd34d" />
+</svg>
