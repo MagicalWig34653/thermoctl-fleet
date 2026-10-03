@@ -574,6 +574,104 @@ def test_run_cli_reauthentication_itself_fails_gives_up_with_a_clear_message(
     assert "token re-authentication failed" in capsys.readouterr().err
 
 
+def test_run_cli_client_factory_carries_current_token_across_reauth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_run_agent` passes `loop.run` a `client_factory` (used for the
+    restore-poll/daily-backup/desired-state-reconciler background threads,
+    see the long comment above `_client_factory` in `agent/__main__.py`)
+    that must always build clients carrying the *current* `token` at call
+    time, not the one captured when `_run_agent` started -- in particular,
+    a factory handed to the *second* `loop.run` call (after a successful
+    re-authentication reassigned `token`) must produce clients bearing the
+    *new* token, never the old one. This is the one path
+    (`agent/__main__.py` lines ~178-181) with no other test coverage.
+
+    `_client_factory` is defined exactly once per `_run_agent` call and
+    closes over the enclosing `token` variable by reference, not by value
+    -- so `loop.run`'s stand-in below must call the factory it was handed
+    *immediately*, from inside itself, to observe what that factory
+    produces *at that moment* (mirroring how a real background thread
+    would call it right after `loop.run` received it). Calling the
+    factory only after `agent_main.main()` has returned would always see
+    the final value of `token`, regardless of which `loop.run` call the
+    factory was captured from -- that would not test anything."""
+
+    import json
+    import secrets
+
+    from agent.commands_channel import CommandStreamReauthRequired
+    from agent.registration import _store_token
+    from agent.token_rotation import TokenRotationOutcome
+
+    old_token = secrets.token_urlsafe(32)
+    new_token = secrets.token_urlsafe(32)
+    _store_token(tmp_path, old_token)
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+
+    def client_factory(address: str, pin: str) -> httpx.Client:
+        return httpx.Client(base_url=address)
+
+    runs: list[int] = []
+    observed_auth_headers: list[str] = []
+    thread_clients: list[httpx.Client] = []
+    main_clients: list[httpx.Client] = []
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        runs.append(1)
+        main_clients.append(client)
+        factory = kwargs["client_factory"]
+        assert callable(factory)
+        # Build two clients from the same factory, right now, to also
+        # confirm each call produces a distinct object (one per
+        # background thread), not a cached/shared client.
+        thread_client_a = factory()
+        thread_client_b = factory()
+        thread_clients.extend([thread_client_a, thread_client_b])
+        observed_auth_headers.append(thread_client_a.headers["Authorization"])
+        assert thread_client_a is not thread_client_b
+        assert thread_client_a is not client
+        assert thread_client_b is not client
+        if len(runs) == 1:
+            raise CommandStreamReauthRequired("reauth required")
+
+    def fake_reauthenticate(
+        apartment_id: str, data_dir: Path, client: httpx.Client, old_token: str
+    ) -> object:
+        return TokenRotationOutcome(token=new_token)
+
+    monkeypatch.setattr(agent_main, "build_client", client_factory)
+    monkeypatch.setattr(loop, "run", runner)
+    monkeypatch.setattr(agent_main, "reauthenticate", fake_reauthenticate)
+
+    try:
+        code = agent_main.main(
+            [
+                "run",
+                "--data-dir", str(tmp_path),
+                "--registration-file", str(config),
+                "--apartment-id", "house7-a03",
+            ]
+        )
+    finally:
+        for thread_client in thread_clients:
+            thread_client.close()
+
+    assert code == 0
+    assert len(runs) == 2
+    assert observed_auth_headers == [f"Bearer {old_token}", f"Bearer {new_token}"]
+
+
 def test_run_cli_invalid_config_does_not_echo_secrets(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
