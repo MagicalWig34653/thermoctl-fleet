@@ -11,6 +11,7 @@ import hashlib
 import io
 import lzma
 import plistlib
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -37,6 +38,21 @@ from tools.flash_image import (
     write_registration_file,
     write_wifi_config,
 )
+
+
+@pytest.fixture(autouse=True)
+def _diskutil_on_path(request: pytest.FixtureRequest) -> Iterator[None]:
+    """CI runs on Linux, where `diskutil` does not exist: every test sees a
+    fixed macOS path instead, so `_diskutil()` resolves and the mocked
+    `subprocess` calls below are what actually gets exercised. The one test
+    about the missing-binary error patches `shutil.which` itself."""
+
+    if request.node.name == "test_diskutil_missing_fails_with_clear_error":
+        yield
+        return
+    with patch("tools.flash_image.shutil.which", return_value="/usr/sbin/diskutil"):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # list_removable_disks
