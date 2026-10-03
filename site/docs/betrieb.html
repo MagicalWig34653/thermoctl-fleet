@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Täglicher Betrieb -- thermoctl-fleet</title>
+<title>Täglicher Betrieb – thermoctl-fleet</title>
 <meta name="description" content="Dashboard, Störungen, Alarme, Befehle, Backups, Restore, Rollouts und Mieterwechsel im täglichen Betrieb von thermoctl-fleet.">
 <link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
@@ -38,7 +38,7 @@
   <h1>Täglicher Betrieb</h1>
   <p>
     Drei Ansichten, nicht mehr (Abschnitt 9 der Spezifikation): das Haus, eine Wohnung,
-    die Aufgabenliste. Wer nichts zu tun hat, sieht eine ruhige Oberfläche -- das ist
+    die Aufgabenliste. Wer nichts zu tun hat, sieht eine ruhige Oberfläche – das ist
     Absicht.
   </p>
 
@@ -60,7 +60,18 @@
   </p>
   <figure class="shot">
     <img class="screenshot" src="../assets/img/apartment-light.png" alt="Detailansicht einer Demo-Wohnung mit offener Störung" loading="lazy">
-    <figcaption>Die Wohnungsansicht am Beispiel von "Musterstraße 1, WE 5" mit einem offenen Sensorfehler.</figcaption>
+    <figcaption>Die Wohnungsansicht am Beispiel von „Musterstraße 1, WE 5“ mit einem offenen Sensorfehler.</figcaption>
+  </figure>
+
+  <h2 id="aufgaben">Aufgaben</h2>
+  <p>
+    Was ansteht: fällige Batterierunden, ausstehende Updates, unbestätigte
+    Störungen – die Liste, von der aus tatsächlich gearbeitet wird. Wer nichts
+    zu tun hat, sieht hier eine leere Liste statt einer Kachel pro Wohnung.
+  </p>
+  <figure class="shot">
+    <img class="screenshot" src="../assets/img/tasks-light.png" alt="Aufgabenliste mit fälligen Punkten" loading="lazy">
+    <figcaption>Die Aufgabenansicht (Demo-Bestand).</figcaption>
   </figure>
 
   <h2 id="stoerungen">Störungen und Quittierung</h2>
@@ -68,9 +79,9 @@
     Die sechs thermoctl-Störungsarten (<code>sensor_fault</code>, <code>bridge_fault</code>,
     <code>command_failure</code>, <code>stuck_sensor</code>, <code>window_alarm</code>,
     <code>tenant_report</code>) laufen in der Cloud zusammen. Eine Quittierung gilt nur für
-    das aktuelle Auftreten -- tritt dieselbe Störung erneut auf, erscheint sie wieder.
+    das aktuelle Auftreten – tritt dieselbe Störung erneut auf, erscheint sie wieder.
     Beim Mieter-Problembericht (<code>tenant_report</code>) wird nur übertragen, <strong>dass</strong>
-    einer existiert, mit Zeit und Raum -- der Text selbst bleibt in der Wohnung
+    einer existiert, mit Zeit und Raum – der Text selbst bleibt in der Wohnung
     (Abschnitt 6).
   </p>
 
@@ -87,7 +98,7 @@
     <tr><td>Speicher voll</td><td>unter 10&nbsp;% frei</td><td>mittel</td></tr>
     <tr><td>Uhrabweichung</td><td>mehr als 60 Sekunden</td><td>mittel (Zeitpläne laufen falsch)</td></tr>
   </table>
-  <p>Jeder Alarm hat eine Entwarnung und ein Schlummern ("bis morgen früh"). Wiederholte
+  <p>Jeder Alarm hat eine Entwarnung und ein Schlummern („bis morgen früh“). Wiederholte
   Alarme derselben Art für dieselbe Wohnung werden gebündelt.</p>
 
   <h2 id="befehle">Befehle</h2>
@@ -97,21 +108,22 @@
     <tr><td><code>fetch_logs</code></td><td>Die letzten n Zeilen des Dienst-Logs, maskiert, an die Cloud</td><td>Inhalt, daher maskiert und auf 500 Zeilen begrenzt</td></tr>
     <tr><td><code>backup_now</code></td><td>Ein Datenbank-Backup auslösen und das Ergebnis melden</td><td>keines</td></tr>
     <tr><td><code>agent_restart</code></td><td>Nur den Agenten neu starten</td><td>keines</td></tr>
+    <tr><td><code>diagnostic_bundle</code></td><td>Logs der vier Dienste, Versionen und Digests, Container-Zustände, Speicher- und Plattenauslastung, Zigbee-Netzwerkzustand, letzte Steuerungsentscheidungen – maskiert, gebündelt, hochgeladen</td><td>macht eine SSH-Sitzung in den meisten Fällen überflüssig</td></tr>
   </table>
   <p>
     Jeder Befehl trägt eine Id und wird höchstens einmal ausgeführt, hat eine Ablaufzeit
     (üblicherweise 15 Minuten), und jeder Befehl samt jeder Ablehnung landet im
-    <strong>lokalen</strong> Protokoll der Wohnung -- nicht nur in der Cloud.
+    <strong>lokalen</strong> Protokoll der Wohnung – nicht nur in der Cloud.
   </p>
 
   <h2 id="backups">Backups &amp; Restore</h2>
   <p>
     Zwei Arten von Backup, die nicht gemischt werden: Gerätekonfiguration (keine
     Mieterdaten, liegt in der Cloud im Klartext) und Betriebsdaten (thermoctl-Datenbank,
-    Zigbee2MQTT-Gerätetabelle -- enthält Mieterdaten, wird auf dem Gerät verschlüsselt,
+    Zigbee2MQTT-Gerätetabelle – enthält Mieterdaten, wird auf dem Gerät verschlüsselt,
     bevor sie hochgeladen wird). Ein Restore läuft über dieselbe Oberfläche: der
     Entschlüsselungsschlüssel wird einmalig eingegeben, im Browser lokal für genau dieses
-    Gerät verschlüsselt, und von der Cloud nur durchgereicht -- nie gespeichert.
+    Gerät verschlüsselt, und von der Cloud nur durchgereicht – nie gespeichert.
   </p>
 
   <h2 id="rollouts">Gestaffelte Rollouts</h2>
@@ -128,9 +140,9 @@
   <h2 id="mieterwechsel">Mieterwechsel</h2>
   <p>
     Eine ausdrückliche Aktion in der Oberfläche (Bestätigung, Pflichtgrund, protokolliert)
-    rotiert den Gerätetoken der Wohnung -- der Agent holt den neuen über eine signierte
+    rotiert den Gerätetoken der Wohnung – der Agent holt den neuen über eine signierte
     Herausforderung mit seinem bestehenden Geräteschlüssel, kein privater Schlüssel
-    verlässt dabei je das Gerät -- und löscht die Heartbeats, Ereignisse, Störungen,
+    verlässt dabei je das Gerät – und löscht die Heartbeats, Ereignisse, Störungen,
     Alarme, Befehlsprotokoll-Auszüge und Diagnosebündel der Wohnung. Verschlüsselte
     Backups bleiben, unter eigener Aufbewahrungsfrist.
   </p>
@@ -142,14 +154,38 @@
   </p>
 
   <h2 id="passwortlos">Passwortlose Anmeldung mit Passkey aus bekannten Netzen</h2>
-  <div class="callout soon">
-    <span class="tag">Kommt in Kürze</span>
-    <p>Dieser Abschnitt wird gefüllt, sobald die parallele Entwicklung rund um
-    <code>FLEET_UI_PASSWORDLESS_NETWORKS</code> in <code>main</code> gemergt ist: eine
-    Liste vertrauenswürdiger Netze, aus denen heraus ein Passkey allein zur Anmeldung
-    genügt, ohne zusätzliches Passwort.</p>
+  <p>
+    Von den eigenen, bekannten externen Adressen des Vermieters genügt ein Passkey
+    allein – kein Passwort, kein Bestätigungscode. Eingerichtet über
+    <code>FLEET_UI_PASSWORDLESS_NETWORKS</code>: eine kommagetrennte Liste von
+    IP-Adressen/CIDR-Bereichen, dieselbe Schreibweise wie
+    <code>FLEET_UI_TRUSTED_PROXIES</code> (siehe <a href="einstieg.html#env">Einstieg</a>).
+    Leer bzw. nicht gesetzt (Vorgabe) = aus. Die Variable ist reine
+    Server-Konfiguration und bewusst nicht über die Oberfläche änderbar.
+  </p>
+  <p>
+    Nur <strong>globale, enge Netze</strong> werden akzeptiert: Einträge breiter als
+    /16 (IPv4) bzw. /32 (IPv6) werden abgelehnt, private, lokale und ungültige
+    Einträge mit einer Warnung verworfen. Läuft die Oberfläche hinter einem
+    Reverse-Proxy, muss zusätzlich <code>FLEET_UI_TRUSTED_PROXIES</code> gesetzt
+    sein – sonst erscheint jede Anfrage so, als käme sie vom Proxy selbst, und die
+    Funktion bleibt wirkungslos (sicher geschlossen, nicht versehentlich offen für
+    das gesamte Internet).
+  </p>
+  <p>
+    Ein getipptes Passwort wird weiterhin immer geprüft, wenn eines eingegeben
+    wird; ein Bestätigungscode allein genügt nie. Nur das Zusammenspiel aus
+    bekanntem Netz <strong>und</strong> einer bestätigten Passkey-Anmeldung lässt
+    das Passwortfeld leer bleiben. Auf der Anmeldeseite erscheint dafür in einem
+    bekannten Netz der Hinweis „Du bist in einem bekannten Netz: Mit Passkey
+    brauchst du kein Passwort und keinen Bestätigungscode – Benutzername
+    eingeben und „Mit Passkey anmelden“ wählen.“
+  </p>
+  <div class="callout ok">
+    <p>Sperren, Drosselung pro IP und Fehlzählung bleiben in jedem Fall identisch
+    zur normalen Anmeldung – eine fehlgeschlagene passwortlose Anmeldung zählt
+    genauso zur Sperre wie ein falsches Passwort.</p>
   </div>
-  <!-- TODO: filled after merge -->
 </div>
 </div>
 </main>

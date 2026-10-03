@@ -1,17 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
-  <!-- Fleet motif: four apartment nodes connected to a central cloud/landlord node.
-       Sits behind the flame/thermometer layer; rendered without its own fill so
-       the icon.json gradient shows through. -->
-  <g fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round" opacity="0.55">
-    <line x1="512" y1="300" x2="300" y2="430" />
-    <line x1="512" y1="300" x2="724" y2="430" />
-    <line x1="512" y1="300" x2="340" y2="650" />
-    <line x1="512" y1="300" x2="684" y2="650" />
-  </g>
-  <g fill="#ffffff" opacity="0.85">
-    <circle cx="300" cy="430" r="26" />
-    <circle cx="724" cy="430" r="26" />
-    <circle cx="340" cy="650" r="22" />
-    <circle cx="684" cy="650" r="22" />
+  <!-- Fleet motif: a thin arc of three small houses along the bottom edge,
+       well clear of the main house/thermometer glyph above, never
+       crossing it, even at small sizes. Bottom-most layer. -->
+  <path d="M 340 884 Q 512 824 684 884" fill="none" stroke="#ffffff" stroke-width="12"
+        stroke-linecap="round" opacity="0.55" />
+  <g fill="#ffffff" opacity="0.9">
+    <circle cx="340" cy="884" r="22" />
+    <circle cx="512" cy="852" r="26" />
+    <circle cx="684" cy="884" r="22" />
   </g>
 </svg>

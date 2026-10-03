@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>thermoctl-fleet -- Überblick für Vermieter</title>
+<title>thermoctl-fleet – Überblick für Vermieter</title>
 <meta name="description" content="thermoctl-fleet ist der Überblick des Vermieters über alle Wohnungen: Heartbeat, Störungsmeldungen, Alarm bei Ausbleiben, ein kurzer geschlossener Befehlskatalog. Keine zweite Steuerung, kein Datensammler.">
 <link rel="icon" href="assets/icon/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="assets/icon/favicon-32.png" sizes="32x32" type="image/png">
@@ -25,12 +25,12 @@
 <main id="main">
   <section class="hero">
     <img class="hero-icon" src="assets/icon/favicon.svg" alt="">
-    <h1>Der Überblick über alle Wohnungen -- ohne die zweite Steuerung zu werden</h1>
+    <h1>Der Überblick über alle Wohnungen – ohne die zweite Steuerung zu werden</h1>
     <p class="lead">
       thermoctl-fleet ist ein kleiner Cloud-Dienst für Vermieter mit mehreren
       <a href="https://github.com/MagicalWig34653/thermoctl">thermoctl</a>-Installationen:
       er empfängt von jeder Wohnung einen Herzschlag mit Gesundheitsdaten, sammelt
-      Störungen, schlägt Alarm beim <strong>Ausbleiben</strong> einer Meldung -- und kann
+      Störungen, schlägt Alarm beim <strong>Ausbleiben</strong> einer Meldung – und kann
       einer Wohnung einen kurzen, geschlossenen Katalog von Wartungsbefehlen schicken.
     </p>
     <div class="cta-row">
@@ -41,18 +41,18 @@
 
   <h2 id="ist-nicht">Was das hier nicht ist</h2>
   <p>
-    Diese drei Sätze stehen nicht nebenbei im Dokument -- sie sind in der
+    Diese drei Sätze stehen nicht nebenbei im Dokument – sie sind in der
     <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a>
     (Abschnitte 1 und 6) bewusst und unwiderruflich festgelegt:
   </p>
   <div class="callout not">
     <p><strong>Keine zweite Steuerung.</strong> Sollwerte, Zeitpläne, Frostschutz und
-    Scharfschaltung bleiben in der Wohnung. Die Cloud kann sie nicht ändern -- nicht
-    "derzeit nicht geplant", sondern: den Befehl dafür gibt es schlicht nicht, und er wird
+    Scharfschaltung bleiben in der Wohnung. Die Cloud kann sie nicht ändern – nicht
+    „derzeit nicht geplant“, sondern: den Befehl dafür gibt es schlicht nicht, und er wird
     nicht ohne ausdrückliche Freigabe des Projektinhabers nachgerüstet.</p>
     <p><strong>Kein Datensammler.</strong> Raumtemperaturen, Sollwerte, Zeitpläne,
     Abwesenheitszeiten sowie Mieternamen und Kontaktdaten werden nicht übertragen
-    (Abschnitt 6). Was der Betrieb braucht, sind Gesundheitsdaten -- kein Verhaltensprofil.</p>
+    (Abschnitt 6). Was der Betrieb braucht, sind Gesundheitsdaten – kein Verhaltensprofil.</p>
     <p><strong>Kein Ersatz für die Wohnungsansicht.</strong> Der Mieter sieht die Cloud nie.
     Er bedient weiterhin ausschließlich seine eigene thermoctl-Instanz.</p>
   </div>
@@ -66,11 +66,11 @@
   <h2 id="architektur">Wie die Teile zusammenspielen</h2>
   <p>
     Vier Bausteine, jeder mit genau einer Aufgabe. Die Wohnung spricht die Cloud nur über
-    den Agenten an -- nie direkt, und nur nach außen (keine Portweiterleitung im
+    den Agenten an – nie direkt, und nur nach außen (keine Portweiterleitung im
     Mieter-Router nötig).
   </p>
   <div class="diagram-wrap">
-    <svg viewBox="0 0 980 460" xmlns="http://www.w3.org/2000/svg" role="img"
+    <svg viewBox="0 0 1150 460" xmlns="http://www.w3.org/2000/svg" role="img"
          aria-label="Architekturdiagramm: thermoctl und Zigbee2MQTT in der Wohnung sprechen lokal mit dem Agenten; der Agent sendet per HTTPS einen Heartbeat an den Fleet-Dienst in der Cloud und hält eine SSE-Verbindung für Befehle offen; der Watchdog läuft neben dem Agenten auf dem bloßen System und tauscht Container anhand lokal bereits geprüfter Digests.">
       <defs>
         <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -82,7 +82,7 @@
           .sub { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); }
           .edge { stroke: var(--accent-2, #21609b); stroke-width: 2; fill: none; marker-end: url(#arrow); color: var(--accent-2, #21609b); }
           .edge2 { stroke: var(--accent, #c25a1a); stroke-width: 2; fill: none; marker-end: url(#arrow); color: var(--accent, #c25a1a); }
-          .edgelbl { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); }
+          .edgelbl { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); text-anchor: middle; }
           .frame { fill: none; stroke: var(--border, #ccc); stroke-width: 1; stroke-dasharray: 5 4; }
           .framelbl { font: 700 12px -apple-system, sans-serif; fill: var(--text-muted, #666); letter-spacing: .04em; text-transform: uppercase; }
         </style>
@@ -114,45 +114,50 @@
       <line class="edge" x1="135" y1="130" x2="200" y2="190"/>
       <line class="edge" x1="335" y1="130" x2="280" y2="190"/>
       <line class="edge" x1="250" y1="260" x2="250" y2="320"/>
-      <text class="edgelbl" x="256" y="296">geprüfte Digests</text>
+      <text class="edgelbl" x="256" y="296" text-anchor="start">geprüfte Digests</text>
 
       <!-- Cloud frame -->
-      <rect class="frame" x="530" y="20" width="430" height="420" rx="14"/>
-      <text class="framelbl" x="546" y="44">Cloud (Vermieter)</text>
+      <rect class="frame" x="700" y="20" width="430" height="420" rx="14"/>
+      <text class="framelbl" x="716" y="44">Cloud (Vermieter)</text>
 
-      <rect class="box" x="560" y="90" width="370" height="60" rx="10"/>
-      <text class="lbl" x="572" y="115">Fleet-Dienst</text>
-      <text class="sub" x="572" y="134">Heartbeat- und Ereignisannahme, Befehlsversand, Web-UI</text>
+      <rect class="box" x="730" y="90" width="370" height="60" rx="10"/>
+      <text class="lbl" x="742" y="115">Fleet-Dienst</text>
+      <text class="sub" x="742" y="134">Heartbeat- und Ereignisannahme, Befehlsversand, Web-UI</text>
 
-      <rect class="box" x="560" y="190" width="170" height="60" rx="10"/>
-      <text class="lbl" x="572" y="215">Alarme</text>
-      <text class="sub" x="572" y="234">bei Ausbleiben</text>
+      <rect class="box" x="730" y="190" width="170" height="60" rx="10"/>
+      <text class="lbl" x="742" y="215">Alarme</text>
+      <text class="sub" x="742" y="234">bei Ausbleiben</text>
 
-      <rect class="box" x="760" y="190" width="170" height="60" rx="10"/>
-      <text class="lbl" x="772" y="215">Web-UI</text>
-      <text class="sub" x="772" y="234">TOTP + Passkey</text>
+      <rect class="box" x="930" y="190" width="170" height="60" rx="10"/>
+      <text class="lbl" x="942" y="215">Web-UI</text>
+      <text class="sub" x="942" y="234">TOTP + Passkey</text>
 
-      <rect class="box" x="560" y="290" width="370" height="60" rx="10"/>
-      <text class="lbl" x="572" y="315">Verschlüsselte Backups</text>
-      <text class="sub" x="572" y="334">Cloud sieht nur den opaken Block, nie den Schlüssel</text>
+      <rect class="box" x="730" y="290" width="370" height="60" rx="10"/>
+      <text class="lbl" x="742" y="315">Verschlüsselte Backups</text>
+      <text class="sub" x="742" y="334">Cloud sieht nur den opaken Block, nie den Schlüssel</text>
 
-      <line class="edge" x1="745" y1="150" x2="745" y2="190"/>
-      <line class="edge" x1="745" y1="150" x2="845" y2="190"/>
-      <line class="edge" x1="745" y1="150" x2="745" y2="290"/>
+      <line class="edge" x1="915" y1="150" x2="915" y2="190"/>
+      <line class="edge" x1="915" y1="150" x2="1015" y2="190"/>
+      <line class="edge" x1="915" y1="150" x2="915" y2="290"/>
 
-      <!-- Cross-boundary connections -->
-      <line class="edge2" x1="350" y1="200" x2="560" y2="105" />
-      <text class="edgelbl" x="405" y="150">HTTPS, POST /v1/heartbeat (alle 120s)</text>
+      <!-- Cross-boundary connections, each in its own horizontal lane in
+           the gap between the two frames so the lines never cross each
+           other, and each label sits centered above/below its own lane,
+           clear of both the line and the boxes on either side. -->
+      <path class="edge2" d="M250,190 L250,140 L730,140" />
+      <text class="edgelbl" x="490" y="126">HTTPS POST /v1/heartbeat</text>
+      <text class="edgelbl" x="490" y="157">alle 120 s</text>
 
-      <line class="edge" x1="560" y1="135" x2="350" y2="235" />
-      <text class="edgelbl" x="400" y="190" fill="var(--accent-2,#21609b)">SSE GET /v1/commands (Befehle)</text>
+      <path class="edge" d="M915,150 L915,210 L350,210" />
+      <text class="edgelbl" x="490" y="196" fill="var(--accent-2,#21609b)">SSE GET /v1/commands</text>
+      <text class="edgelbl" x="490" y="227" fill="var(--accent-2,#21609b)">Befehle</text>
     </svg>
   </div>
   <p>
     Die Pfeilrichtung ist bewusst asymmetrisch: die Wohnung ruft die Cloud per gewöhnlichem
     <code>POST</code> (Heartbeat, Ereignisse, Befehlsergebnisse); die Cloud selbst öffnet
     nie eine Verbindung zur Wohnung. Befehle laufen stattdessen über einen offen gehaltenen
-    <code>GET /v1/commands</code> (Server-Sent Events) -- die Wohnung hält die Verbindung,
+    <code>GET /v1/commands</code> (Server-Sent Events) – die Wohnung hält die Verbindung,
     nicht umgekehrt. Kein Port muss im Router des Mieters freigegeben werden.
   </p>
 
@@ -162,12 +167,12 @@
     <div class="card">
       <h3>1. Geschlossener Befehlskatalog</h3>
       <p>Die Cloud kann einer Wohnung nur das schicken, was in einer kurzen, festen Liste
-      steht. Eine Erweiterung ist niemals "nur eine kleine Ergänzung".</p>
+      steht. Eine Erweiterung ist niemals „nur eine kleine Ergänzung“.</p>
     </div>
     <div class="card">
       <h3>2. Image-Quellen fest im Agenten</h3>
       <p>Die erlaubten Registrierungen stehen als Konstante im Agenten, nicht in der Cloud.
-      Die Cloud nennt nur Version und Digest -- nie die Quelle. Kein Digest, kein Start.</p>
+      Die Cloud nennt nur Version und Digest – nie die Quelle. Kein Digest, kein Start.</p>
     </div>
     <div class="card">
       <h3>3. Keine privaten Schlüssel in der Cloud</h3>
@@ -181,13 +186,13 @@
     </div>
     <div class="card">
       <h3>5. Der Agent ist die Sicherheitsgrenze</h3>
-      <p>Jede Prüfung, ob ein Befehl ausgeführt wird, sitzt im Agenten -- selbst wenn die
+      <p>Jede Prüfung, ob ein Befehl ausgeführt wird, sitzt im Agenten – selbst wenn die
       Cloud etwas anderes sagt. Eine kompromittierte Cloud kann keine Sitzung öffnen, die
       der Agent lokal verweigert.</p>
     </div>
     <div class="card">
       <h3>6. Der Watchdog kennt kein Netz</h3>
-      <p>Er tauscht nur zwischen zwei lokal bereits geprüften Digests -- in Go, statisch
+      <p>Er tauscht nur zwischen zwei lokal bereits geprüften Digests – in Go, statisch
       gebaut, ohne eine einzige Abhängigkeit. Genau deshalb funktioniert er noch, wenn
       alles andere kaputt ist.</p>
     </div>
@@ -203,19 +208,19 @@
     <div class="card">
       <h3>Störungen mit Quittierung</h3>
       <p>Die sechs thermoctl-Störungsarten laufen in der Cloud zusammen. Eine Quittierung
-      gilt nur für das aktuelle Auftreten -- tritt die Störung erneut auf, erscheint sie
+      gilt nur für das aktuelle Auftreten – tritt die Störung erneut auf, erscheint sie
       wieder.</p>
     </div>
     <div class="card">
       <h3>Batterie &amp; Signal pro Gerät</h3>
-      <p>Geräte-Id, Batteriestand und Signalqualität -- ohne Gerätenamen (die Raumnamen
+      <p>Geräte-Id, Batteriestand und Signalqualität – ohne Gerätenamen (die Raumnamen
       enthalten können) und ohne Messwerte.</p>
     </div>
     <div class="card">
       <h3>Geschlossener Befehlskatalog</h3>
       <p><code>report_now</code>, <code>fetch_logs</code>, <code>backup_now</code>,
-      <code>agent_restart</code> -- mit Id, Ablaufzeit und lokalem Protokoll in der
-      Wohnung selbst.</p>
+      <code>agent_restart</code>, <code>diagnostic_bundle</code> – mit Id, Ablaufzeit und
+      lokalem Protokoll in der Wohnung selbst.</p>
     </div>
     <div class="card">
       <h3>Verschlüsselte Backups &amp; Restore</h3>
@@ -224,19 +229,20 @@
     </div>
     <div class="card">
       <h3>Gestaffelte Rollouts</h3>
-      <p>Updates laufen über Soll-Zustand, nie per Fernsteuerung einzelner Befehle --
+      <p>Updates laufen über Soll-Zustand, nie per Fernsteuerung einzelner Befehle –
       kontrolliert, eine Wohnung nach der anderen, mit Rückfallpfad.</p>
     </div>
     <div class="card">
       <h3>Mieterwechsel</h3>
       <p>Eine ausdrückliche UI-Aktion mit Pflichtgrund rotiert den Gerätetoken und löscht
-      die Verlaufsdaten der vorherigen Mietzeit -- verschlüsselte Backups bleiben, unter
+      die Verlaufsdaten der vorherigen Mietzeit – verschlüsselte Backups bleiben, unter
       eigener Aufbewahrungsfrist.</p>
     </div>
     <div class="card">
       <h3>Anmeldung mit TOTP &amp; Passkey</h3>
       <p>Zwei-Faktor-Anmeldung der Web-Oberfläche: TOTP-Secrets liegen verschlüsselt mit
-      einem Schlüssel aus der Umgebung, Passkeys (WebAuthn) als zweiter Faktor.</p>
+      einem Schlüssel aus der Umgebung, Passkeys (WebAuthn) als zweiter Faktor. Aus
+      eigenen, bekannten Netzen genügt optional ein Passkey allein, ohne Passwort.</p>
     </div>
   </div>
 
@@ -253,10 +259,14 @@
 
 <footer class="site-footer">
   <p>
-    thermoctl-fleet ist freie Software (AGPL-3.0) --
+    thermoctl-fleet ist freie Software (AGPL-3.0) –
     <a href="https://github.com/MagicalWig34653/thermoctl-fleet">Quellcode auf GitHub</a>.
-    Diese Seite beschreibt den aktuellen Stand eines Gerüsts, keine fertige Anwendung --
-    siehe <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/STATUS.md">STATUS.md</a>.
+    Stufe 1 – Heartbeat, Störungen, Alarme, die Befehle oben, Backups/Restore,
+    Rollouts, Mieterwechsel, Anmeldung – ist implementiert und getestet.
+    Automatische Container-Updates (<code>apply_update</code>, Stufe 2) bleiben
+    inaktiv, bis thermoctl eine eigene Health-API bereitstellt; Details im
+    laufend aktualisierten
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/STATUS.md">STATUS.md</a>.
   </p>
 </footer>
 </body>

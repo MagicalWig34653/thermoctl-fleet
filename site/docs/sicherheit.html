@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sicherheit -- thermoctl-fleet</title>
+<title>Sicherheit – thermoctl-fleet</title>
 <meta name="description" content="Die sechs Sicherheitsgrundsätze von thermoctl-fleet im Detail: geschlossener Befehlskatalog, Image-Quellen im Agenten, keine privaten Schlüssel in der Cloud, keine Mieterdaten im Klartext, der Agent als Sicherheitsgrenze, der Watchdog ohne Netz.">
 <link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
@@ -43,14 +43,14 @@
   <h2 id="p1">1. Der Befehlskatalog ist geschlossen</h2>
   <p><code>protocol.commands.CommandType</code> enthält ausschließlich die von der
   Spezifikation freigegebenen Stufe-1-Befehle. Ein neuer Wert dort ist nie eine kleine
-  Ergänzung -- er erweitert, was ein möglicherweise kompromittierter Fleet-Server einer
+  Ergänzung – er erweitert, was ein möglicherweise kompromittierter Fleet-Server einer
   Wohnung befehlen kann. Stufe 2 (Abschnitt 7) erst nach ausdrücklicher Freigabe des
   Projektinhabers, nach einer Heizsaison Betriebserfahrung.</p>
 
   <h2 id="p2">2. Image-Quellen sind im Agenten hartcodiert, nicht in der Cloud</h2>
   <p>Die Liste erlaubter Registrierungs-Präfixe lebt als Konstante im <code>agent</code>-Paket.
-  Die Cloud nennt nur Version und Digest, nie die Quelle. Kein Digest, kein Start --
-  "latest" oder ein Tag ohne Digest wird ausnahmslos abgelehnt.</p>
+  Die Cloud nennt nur Version und Digest, nie die Quelle. Kein Digest, kein Start –
+  „latest“ oder ein Tag ohne Digest wird ausnahmslos abgelehnt.</p>
 
   <h2 id="p3">3. Keine privaten Schlüssel in der Cloud</h2>
   <p>WireGuard- und Geräteschlüsselpaare entstehen auf der Basisstation und verlassen sie
@@ -64,25 +64,25 @@
   Block und sieht nie den Schlüssel. Beim Restore verschlüsselt der Browser den vom
   Vermieter eingegebenen Schlüssel lokal für genau das Zielgerät; die Cloud reicht ihn nur
   durch und löscht ihn, sobald er abgerufen wurde oder abgelaufen ist. Gerätekonfiguration
-  ohne Mieterbezug darf im Klartext liegen -- die beiden Backup-Arten dürfen nicht
+  ohne Mieterbezug darf im Klartext liegen – die beiden Backup-Arten dürfen nicht
   gemischt werden.</p>
 
   <h2 id="p5">5. Der Agent ist die Sicherheitsgrenze, nicht die Cloud</h2>
   <p>Jede Prüfung, ob ein Befehl ausgeführt wird (Id schon gesehen? Ablaufzeit
   überschritten? Voraussetzung für eine Soll-Zustand-Änderung erfüllt?), gehört in den
-  Agenten und wird dort durchgesetzt -- selbst wenn die Cloud etwas anderes sagt. Konkretes
+  Agenten und wird dort durchgesetzt – selbst wenn die Cloud etwas anderes sagt. Konkretes
   Beispiel: fehlt einer Wohnung die <code>pilot_mode</code>-Markierung, verweigert
-  <strong>der Agent</strong> den Befehl <code>open_access</code> -- nicht die
+  <strong>der Agent</strong> den Befehl <code>open_access</code> – nicht die
   Fleet-Oberfläche. Eine kompromittierte Cloud kann deshalb keine SSH-Sitzung in einer
   Produktionswohnung öffnen.</p>
 
   <h2 id="p6">6. Der Watchdog kennt kein Netz und keine Registry</h2>
   <p>Arbeitsteilung: der Agent lädt ein neues Image herunter und prüft seinen Digest gegen
-  die hartcodierten Quellen (Grundsatz 2) -- der Watchdog tauscht danach nur zwischen zwei
+  die hartcodierten Quellen (Grundsatz 2) – der Watchdog tauscht danach nur zwischen zwei
   bereits lokal vorhandenen, bereits geprüften Digests. Er ist in Go geschrieben, statisch
-  gebaut, unter 300 Zeilen -- genau deshalb, weil er das Einzige sein muss, das noch
+  gebaut, unter 300 Zeilen – genau deshalb, weil er das Einzige sein muss, das noch
   funktioniert, wenn alles andere kaputt ist. Sein <code>go.mod</code> bleibt ohne eine
-  einzige Abhängigkeit, auch nicht für ein Docker-SDK "nur um die Laufzeit anzusprechen".</p>
+  einzige Abhängigkeit, auch nicht für ein Docker-SDK „nur um die Laufzeit anzusprechen“.</p>
 
   <h2 id="einordnung">Was das in der Praxis bedeutet</h2>
   <div class="callout ok">

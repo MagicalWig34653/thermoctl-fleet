@@ -6,23 +6,33 @@
     </linearGradient>
   </defs>
   <rect width="1024" height="1024" rx="224" fill="url(#bg)" />
-  <g fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round" opacity="0.55">
-    <line x1="512" y1="300" x2="300" y2="430" />
-    <line x1="512" y1="300" x2="724" y2="430" />
-    <line x1="512" y1="300" x2="340" y2="650" />
-    <line x1="512" y1="300" x2="684" y2="650" />
-  </g>
-  <g fill="#ffffff" opacity="0.85">
-    <circle cx="300" cy="430" r="26" />
-    <circle cx="724" cy="430" r="26" />
-    <circle cx="340" cy="650" r="22" />
-    <circle cx="684" cy="650" r="22" />
-  </g>
+
+  <!-- Flat, simplified version of branding/thermoctl-fleet.icon: a house
+       with a thermometer inside and a small flame at the roof apex, plus
+       a thin fleet arc below. No glass/translucency, just flat shapes,
+       for use as a scalable favicon. -->
+  <path d="M 512 196
+           L 772 410
+           L 772 792
+           Q 772 820 744 820
+           L 280 820
+           Q 252 820 252 792
+           L 252 410
+           Z"
+        fill="none" stroke="#ffffff" stroke-width="26" stroke-linejoin="round" />
+
   <g fill="#ffffff">
-    <rect x="472" y="300" width="80" height="330" rx="40" />
-    <circle cx="512" cy="660" r="90" />
+    <rect x="462" y="420" width="100" height="260" rx="50" />
+    <circle cx="512" cy="700" r="100" />
   </g>
-  <path d="M512 300 C460 250 452 190 500 150 C486 200 520 220 520 260 C548 230 548 190 524 150
-           C584 190 584 260 540 300 Z" fill="#ffffff" />
-  <ellipse cx="512" cy="330" rx="330" ry="170" fill="#ffffff" opacity="0.18" />
+  <path d="M512 330 C470 290 464 250 498 215 C490 252 516 266 516 296
+           C540 272 540 244 522 215 C566 250 566 296 532 330 Z" fill="#ffffff" />
+
+  <path d="M 340 884 Q 512 824 684 884" fill="none" stroke="#ffffff" stroke-width="12"
+        stroke-linecap="round" opacity="0.55" />
+  <g fill="#ffffff" opacity="0.9">
+    <circle cx="340" cy="884" r="22" />
+    <circle cx="512" cy="852" r="26" />
+    <circle cx="684" cy="884" r="22" />
+  </g>
 </svg>

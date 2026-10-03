@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FAQ &amp; Problemlösung -- thermoctl-fleet</title>
+<title>FAQ &amp; Problemlösung – thermoctl-fleet</title>
 <meta name="description" content="Häufige Fragen und Problemlösungen zu thermoctl-fleet.">
 <link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
@@ -46,21 +46,21 @@
   <p>Nein. Der Mieter bedient ausschließlich seine eigene thermoctl-Instanz in der
   Wohnung. thermoctl-fleet ist ausschließlich für den Vermieter.</p>
 
-  <h2>Meine Wohnung zeigt "nicht erreichbar", obwohl die Heizung funktioniert.</h2>
+  <h2>Meine Wohnung zeigt „nicht erreichbar“, obwohl die Heizung funktioniert.</h2>
   <p>Prüfen Sie zuerst die Netzwerkverbindung der Basisstation (Internetzugang reicht, kein
-  eingehender Port nötig) und ob der Agent-Container läuft. Der Alarm "Wohnung meldet sich
-  nicht" löst erst nach drei ausbleibenden Heartbeats (6 Minuten) aus -- ein einzelner
+  eingehender Port nötig) und ob der Agent-Container läuft. Der Alarm „Wohnung meldet sich
+  nicht“ löst erst nach drei ausbleibenden Heartbeats (6 Minuten) aus – ein einzelner
   verpasster Heartbeat ist noch kein Grund zur Sorge.</p>
 
   <h2>Ich habe den Entschlüsselungsschlüssel für ein Backup verloren.</h2>
-  <p>Dann ist dieses Backup unwiederbringlich verloren -- das ist der bewusste Preis des
+  <p>Dann ist dieses Backup unwiederbringlich verloren – das ist der bewusste Preis des
   Designs (Abschnitt 15.1): der Schlüssel gehört dem Vermieter, nicht der Cloud, und wird
   nirgends anders aufbewahrt. Bewahren Sie ihn in einem Passwort-Manager und zusätzlich
   ausgedruckt auf.</p>
 
   <h2>Warum rejected die Cloud meinen eigenen Befehl?</h2>
   <p>Jeder Befehl hat eine Ablaufzeit (standardmäßig 15 Minuten). Kommt eine Wohnung erst
-  Tage später wieder online, wird ein alter Befehl bewusst nicht mehr ausgeführt --
+  Tage später wieder online, wird ein alter Befehl bewusst nicht mehr ausgeführt –
   sonst startet ein Gerät neu, weil vor zwei Wochen ein Knopf gedrückt wurde.</p>
 
   <h2>Kann die Cloud ein beliebiges Container-Image starten lassen?</h2>
@@ -74,10 +74,10 @@
 
   <h2>Wie ziehe ich ein verlorenes Zweitgerät (TOTP) ab?</h2>
   <p><code>python -m fleet.admin reset-totp &lt;username&gt;</code> erzeugt ein neues
-  TOTP-Secret -- das alte Gerät verliert damit den Zugriff.</p>
+  TOTP-Secret – das alte Gerät verliert damit den Zugriff.</p>
 
   <h2>Wo läuft der Dienst am besten?</h2>
-  <p>Auf einem Server in der EU -- sonst öffnet sich die Datenschutzüberlegung aus
+  <p>Auf einem Server in der EU – sonst öffnet sich die Datenschutzüberlegung aus
   Abschnitt 6 erneut. Betreibt ein Anbieter den Server, braucht es einen
   Auftragsverarbeitungsvertrag.</p>
 </div>

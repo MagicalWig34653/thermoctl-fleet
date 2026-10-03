@@ -1,16 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
-  <!-- Thermometer-with-flame glyph, the "landlord's own heating overview" motif.
-       Centered node of the icon, drawn solid white so Icon Composer can tint
-       and light it against the warm-to-cool gradient fill. -->
+  <!-- Bold, simple thermometer with a small flame on top: the "heating
+       overview" motif, centered inside the house glyph above it. Sized to
+       read cleanly at 32px: thick stem, large bulb, no fine detail. -->
   <g fill="#ffffff">
-    <rect x="472" y="300" width="80" height="330" rx="40" />
-    <circle cx="512" cy="660" r="90" />
-    <rect x="492" y="330" width="40" height="300" rx="20" fill-opacity="0.001"/>
+    <rect x="462" y="420" width="100" height="260" rx="50" />
+    <circle cx="512" cy="700" r="100" />
   </g>
-  <g fill="#ffffff" opacity="0.001">
-    <!-- inner mercury column cut-out kept fully transparent on purpose: Icon
-         Composer's specular pass reads the base shape, not this detail -->
-  </g>
-  <path d="M512 300 C460 250 452 190 500 150 C486 200 520 220 520 260 C548 230 548 190 524 150
-           C584 190 584 260 540 300 Z" fill="#ffffff" />
+  <path d="M512 330 C470 290 464 250 498 215 C490 252 516 266 516 296
+           C540 272 540 244 522 215 C566 250 566 296 532 330 Z" fill="#ffffff" />
 </svg>

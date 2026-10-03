@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wohnung hinzufügen -- thermoctl-fleet</title>
+<title>Wohnung hinzufügen – thermoctl-fleet</title>
 <meta name="description" content="Basisstation vorbereiten und eine Wohnung in thermoctl-fleet in Betrieb nehmen: Registrierungscode, Verifizierungscode, Zuordnung.">
 <link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
@@ -40,7 +40,7 @@
     Ziel (Spezifikation, Abschnitt 15.3): Gerät kaputt → Ersatzgerät aus dem Regal →
     einstecken → wenige Minuten später ist die Wohnung wieder unter Kontrolle. Derselbe
     Ablauf gilt für die Erstinstallation. Die Id einer Wohnung allein reicht dabei
-    bewusst nicht, um an ihre Konfiguration zu kommen -- sonst bekäme, wer eine Id errät,
+    bewusst nicht, um an ihre Konfiguration zu kommen – sonst bekäme, wer eine Id errät,
     gleich die Zugangsdaten dazu.
   </p>
 
@@ -51,7 +51,7 @@
       Debian 13, Raspberry Pi OS oder amd64) wird auf Karte oder Datenträger geschrieben.
       Auf der Boot-Partition liegt zusätzlich <code>agent-registration.json</code> mit der
       Adresse des Fleet-Dienstes, seinem Zertifikats-Fingerabdruck und einem einmaligen
-      Registrierungscode -- keiner dieser Werte ist ein dauerhaftes Geheimnis.
+      Registrierungscode – keiner dieser Werte ist ein dauerhaftes Geheimnis.
     </li>
     <li>
       <strong>Einstecken.</strong> Beim ersten Start erzeugt der Agent sein eigenes
@@ -62,17 +62,17 @@
     <li>
       <strong>Zuordnen.</strong> In der Fleet-Oberfläche, unter Inventar, erscheint das
       Gerät mit demselben Verifizierungscode. Erst diese Bestätigung gibt die
-      Konfiguration frei -- gebunden an den Schlüssel genau dieses Geräts.
+      Konfiguration frei – gebunden an den Schlüssel genau dieses Geräts.
     </li>
     <li>
       <strong>Einrichten.</strong> Der Agent holt die Gerätekonfiguration und, bei einem
       Gerätetausch, die verschlüsselten Betriebsdaten. Der Entschlüsselungsschlüssel wird
-      einmalig in der Fleet-Oberfläche eingegeben -- er wird dort nur durchgereicht, nie
+      einmalig in der Fleet-Oberfläche eingegeben – er wird dort nur durchgereicht, nie
       gespeichert (siehe <a href="sicherheit.html#backups">Sicherheit</a>).
     </li>
     <li>
       <strong>Fertig.</strong> Der Agent startet die vier Container im gesicherten
-      Zustand und meldet den ersten Heartbeat -- die Wohnung ist wieder unter Kontrolle.
+      Zustand und meldet den ersten Heartbeat – die Wohnung ist wieder unter Kontrolle.
     </li>
   </ol>
   <p>Realistische Dauer für einen Gerätetausch: 10 bis 20 Minuten, der meiste davon
@@ -81,9 +81,9 @@
 
   <h2 id="in-der-oberflaeche">Vorbereiten in der Fleet-Oberfläche</h2>
   <p>
-    Unter Inventar wählen Sie ein Gerät und klicken "Vorbereiten". Die Oberfläche erzeugt
+    Unter Inventar wählen Sie ein Gerät und klicken „Vorbereiten“. Die Oberfläche erzeugt
     dabei einen frischen, einmaligen Registrierungscode und zeigt ihn <strong>genau
-    einmal</strong> an -- er wird nirgends protokolliert und nie im Klartext gespeichert,
+    einmal</strong> an – er wird nirgends protokolliert und nie im Klartext gespeichert,
     nur sein Hash. Sind <code>FLEET_PUBLIC_URL</code> und <code>FLEET_CERT_FINGERPRINT</code>
     gesetzt (siehe <a href="einstieg.html#env">Einstieg</a>), erzeugt die Seite direkt den
     fertigen Inhalt für <code>agent-registration.json</code> zum Herunterladen. Fehlt eine
@@ -91,7 +91,7 @@
     Platzhalterwerts.
   </p>
   <p>Für ein Gerät, das vorher in einer anderen Wohnung lief, verlangt das Formular die
-  Bestätigung "Gerät wurde zurückgesetzt" -- nur für Geräte im Status "auf Lager".</p>
+  Bestätigung „Gerät wurde zurückgesetzt“ – nur für Geräte im Status „auf Lager“.</p>
   <figure class="shot">
     <img class="screenshot" src="../assets/img/inventory-light.png" alt="Inventaransicht mit Immobilien, Wohnungen und Geräten" loading="lazy">
     <figcaption>Die Inventaransicht mit den Demo-Wohnungen.</figcaption>
