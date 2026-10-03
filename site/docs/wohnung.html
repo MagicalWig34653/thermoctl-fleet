@@ -102,20 +102,146 @@
   WLAN-Passwort auf einem anderen Weg ankommen:</p>
   <table>
     <tr><th>Weg</th><th>Bewertung</th></tr>
-    <tr><td>WLAN-Zugangsdaten schon beim Schreiben des Images mitgeben</td><td><strong>Empfohlen.</strong> Kein Funkfenster, keine Oberfläche, nichts, das offenbleiben kann.</td></tr>
+    <tr><td>WLAN-Zugangsdaten schon beim Schreiben des Images mitgeben</td><td>Das Flash-Werkzeug legt sie ab. Ein Startdienst liest die Datei derzeit noch nicht ein; die WLAN-Verbindung muss separat eingerichtet werden.</td></tr>
     <tr><td>Eigener Einrichtungs-Zugangspunkt des Geräts, <strong>mit</strong> Passwort</td><td>Akzeptabel, wenn das Passwort zufällig erzeugt wird, der Zugangspunkt nach der Einrichtung verschwindet und sich spätestens nach 30 Minuten von selbst schließt.</td></tr>
     <tr><td><strong>Offenes</strong> WLAN zur Einrichtung</td><td><strong>Nein.</strong> Wer in Reichweite ist, liest das Mieter-WLAN-Passwort mit und übernimmt das Gerät, bevor es zugeordnet ist.</td></tr>
   </table>
 
   <h2 id="image-bauen">Image bauen, SD-Karte flashen, Test-VM auf dem Mac</h2>
-  <div class="callout soon">
-    <span class="tag">Kommt in Kürze</span>
-    <p>Dieser Abschnitt wird gefüllt, sobald der Image-Build samt Flash-Werkzeug und die
-    Test-VM unter <code>tools/</code> aus einem parallel laufenden Entwicklungszweig in
-    <code>main</code> gemergt sind. Bis dahin: <code>image/README.md</code> im
-    Quellcode beschreibt den aktuellen Stand.</p>
+  <p>Für ein echtes Gerät verwenden Sie ein vorbereitetes Image aus einem GitHub-Release.
+  Die gemeinsame Anleitung in <code>image/README.md</code> beschreibt zwei Varianten:
+  Raspberry Pi OS Lite 64 Bit für Pi 4/5 und Debian 13 amd64 für einen Mini-PC.
+  Beide bekommen beim Bauen dieselbe Einrichtung aus <code>image/common/install.sh</code>
+  – unter anderem Docker, Watchdog, Agent-Konfiguration und eine leere
+  Registrierungsvorlage. Der Workflow <code>.github/workflows/image.yml</code> baut
+  mit <code>pi-gen</code> beziehungsweise <code>mkosi</code> nur bei einem Tag mit
+  <code>v</code> am Anfang und hängt beide <code>.img.xz</code>-Dateien sowie
+  <code>SHA256SUMS</code> an dessen GitHub-Release.</p>
+
+  <h3>1. Image laden und Prüfsumme vergleichen</h3>
+  <ol>
+    <li>Öffnen Sie die <a href="https://github.com/MagicalWig34653/thermoctl-fleet/releases">GitHub-Releases</a>
+      des Projekts und wählen Sie ein Release eines <code>v*</code>-Tags.</li>
+    <li>Laden Sie das <code>.img.xz</code> für Ihr Gerät und <code>SHA256SUMS</code>
+      in denselben Ordner. Verwenden Sie den genauen Dateinamen aus dem Release.</li>
+    <li>Öffnen Sie auf dem Mac im Download-Ordner ein Terminal und berechnen Sie die
+      Prüfsumme. Vergleichen Sie die 64 Hex-Zeichen mit der Zeile für genau diese Datei
+      in <code>SHA256SUMS</code>. Bei einer Abweichung die Datei nicht flashen.</li>
+  </ol>
+  <pre><code>shasum -a 256 thermoctl-base-station.img.xz
+cat SHA256SUMS</code></pre>
+  <p>Der Name oben steht beispielhaft für das Pi-Image; beim amd64-Image nehmen Sie
+  dessen Dateinamen aus dem Release. Für das Flashen auf macOS ist kein weiteres
+  Flash-Programm nötig: <code>tools/flash_image.py</code> nutzt <code>diskutil</code>
+  und Python. Führen Sie die Befehle im ausgecheckten Projekt mit dessen Python-Umgebung aus.</p>
+
+  <h3>2. Datenträger auswählen und schreiben</h3>
+  <p>Stecken Sie die SD-Karte oder das externe Laufwerk ein. Lassen Sie sich die zulässigen
+  Datenträger anzeigen und übernehmen Sie den Pfad des <strong>richtigen</strong> Geräts.
+  Der folgende Ablauf zeigt erst einen Probelauf und dann den Schreibvorgang. Ersetzen
+  Sie <code>/dev/disk4</code>, Dateiname und sämtliche als Platzhalter markierten Werte
+  durch Ihre eigenen Angaben aus der Fleet-Oberfläche; der Zertifikats-Fingerabdruck
+  stammt vom verwendeten Fleet-Zertifikat. Die Beispiele enthalten keine echten
+  Zugangsdaten.</p>
+  <pre><code>python -m tools.flash_image list-disks
+
+python -m tools.flash_image flash \
+  --image thermoctl-base-station.img.xz --disk /dev/disk4 \
+  --fleet-address https://fleet.example.invalid \
+  --certificate-fingerprint sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  --registration-code NUR-PLATZHALTER-CODE \
+  --backup-recipient age1NUR-PLATZHALTER \
+  --wifi-ssid "NUR-PLATZHALTER-SSID" --wifi-password "NUR-PLATZHALTER-PASSWORT" \
+  --dry-run
+
+python -m tools.flash_image flash \
+  --image thermoctl-base-station.img.xz --disk /dev/disk4 \
+  --fleet-address https://fleet.example.invalid \
+  --certificate-fingerprint sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  --registration-code NUR-PLATZHALTER-CODE \
+  --backup-recipient age1NUR-PLATZHALTER \
+  --wifi-ssid "NUR-PLATZHALTER-SSID" --wifi-password "NUR-PLATZHALTER-PASSWORT"</code></pre>
+  <p><code>--backup-recipient</code> kann für weitere öffentliche age-Empfänger
+  wiederholt werden. <code>--wifi-ssid</code> und <code>--wifi-password</code> sind optional;
+  lassen Sie beide bei einer Kabelverbindung weg. Der Probelauf mit <code>--dry-run</code>
+  entpackt und hasht das ganze Image, schreibt aber nichts auf die Karte und zeigt
+  Registrierungscode und WLAN-Passwort nur maskiert an. <code>--boot-mount-point</code>
+  erlaubt bei <code>flash</code> einen abweichenden Einhängepunkt der Boot-Partition;
+  normalerweise erkennt das Werkzeug ihn selbst.</p>
+  <div class="callout warn">
+    <p><strong>Achtung – alle Daten auf dem Ziel gehen verloren.</strong> Das Werkzeug
+    bietet nur externe, physische ganze Datenträger an und weist Systemlaufwerke sowie
+    APFS-Datenträger zurück. Über 256&nbsp;GB ist zusätzlich
+    <code>--allow-large-disk</code> nötig. Vor dem Schreiben müssen Sie den angezeigten
+    Gerätepfad exakt eintippen. <code>--yes</code> überspringt diese Eingabe nur
+    zusammen mit <code>--i-know-this-erases-the-disk</code> (oder im Probelauf).
+    Das Werkzeug prüft die Datenträgeridentität erneut, hängt ihn aus, prüft noch
+    einmal und schreibt erst dann. Anschließend liest es die geschriebenen Bytes
+    zurück und vergleicht ihre Prüfsumme; auch vor dem Lesen wird die Identität
+    erneut geprüft. Ein eigener CLI-Unterbefehl <code>verify</code> existiert derzeit
+    nicht – die Prüfung gehört zu <code>flash</code>.</p>
   </div>
-  <!-- TODO: filled after merge -->
+  <p>Nach erfolgreicher Prüfung schreibt das Werkzeug in die Boot-Partition
+  <code>agent-registration.json</code> mit Fleet-Adresse, Zertifikats-Fingerabdruck und
+  einmaligem Registrierungscode. Mit <code>--backup-recipient</code> entsteht außerdem
+  <code>thermoctl/backup-recipients.txt</code> (ein öffentlicher age-Empfänger je Zeile);
+  mit WLAN-Angaben entsteht <code>thermoctl/wifi.env</code> mit SSID und Passwort
+  im Klartext.</p>
+  <div class="callout warn">
+    <p>Die WLAN-Datei wird zwar geschrieben, aber <code>image/common/install.sh</code>
+    und die bisherigen Startdienste lesen sie noch nicht ein. Prüfen Sie für ein Gerät
+    ohne Netzwerkkabel die WLAN-Einrichtung separat; die Datei allein stellt noch
+    keine Verbindung her.</p>
+  </div>
+
+  <h3>3. Registrierung ohne echte Hardware auf dem Mac testen</h3>
+  <p>Für die Test-VM brauchen Sie einen Mac mit Apple Silicon und die Homebrew-Pakete
+  <code>lima</code> und <code>qemu</code>. Die VM verwendet Debian 13 arm64 und führt
+  dieselbe <code>image/common/install.sh</code>-Einrichtung aus. Die Befehle laufen
+  aus dem Projektverzeichnis:</p>
+  <pre><code>brew install lima qemu
+tools/mac-test-vm create
+tools/mac-test-vm start
+tools/mac-test-vm status
+tools/mac-test-vm enroll</code></pre>
+  <p><code>create</code> legt die VM an; <code>start</code> startet und richtet sie ein.
+  <code>enroll</code> startet auf dem Mac einen lokalen Fleet-Dienst über TLS mit
+  selbst signiertem Zertifikat. <code>tools/mac_test_vm/fleet_local.py</code> legt dafür
+  eine Testwohnung und ein Testgerät an, erzeugt einen einmaligen Registrierungscode
+  und die passende Datei. Das Skript kopiert sie in die VM, baut dort das Agent-Image
+  aus dem Projekt und meldet das Gerät an. Es gibt den Zertifikats-Fingerabdruck und
+  den Verifizierungscode aus; die Registrierung wartet im Hintergrund auf Ihre
+  Bestätigung.</p>
+  <ol>
+    <li>Öffnen Sie <code>https://127.0.0.1:8443/ui/inventory</code> im Browser.
+      Der Browser warnt wegen des lokalen, selbst signierten Zertifikats. Melden Sie
+      sich mit einem Fleet-Oberflächenkonto an (siehe
+      <a href="benutzer.html">Benutzer anlegen</a>).</li>
+    <li>Suchen Sie unter „Bestätigen“ das Testgerät <code>mac-test-vm-device1</code>.
+      Vergleichen Sie den Verifizierungscode mit der Ausgabe von <code>enroll</code>
+      beziehungsweise <code>tools/mac-test-vm logs</code> und bestätigen Sie das Gerät.</li>
+    <li>Starten Sie danach mit <code>tools/mac-test-vm finish</code> den eigentlichen
+      Agenten. Mit <code>tools/mac-test-vm logs</code> verfolgen Sie seine Meldungen;
+      im Fleet-Inventar sehen Sie das registrierte Gerät.</li>
+  </ol>
+  <pre><code>tools/mac-test-vm logs
+# Nach dem Lesen der Logs mit Ctrl+C zurück zum Terminal
+tools/mac-test-vm finish
+tools/mac-test-vm logs
+# Wieder mit Ctrl+C zurück zum Terminal
+tools/mac-test-vm ssh
+tools/mac-test-vm stop
+tools/mac-test-vm delete --yes</code></pre>
+  <p><code>ssh</code> öffnet eine Shell in der VM, <code>stop</code> hält sie an und
+  <code>delete --yes</code> löscht sie samt ihrem Inhalt. <code>status</code> zeigt
+  jederzeit ihren Zustand.</p>
+  <div class="callout warn">
+    <p>Die VM verwendet ein lokal gebautes Agent-Image ohne Registry-Digest und
+    startet es über eine eigene Test-Compose-Datei. Der echte Digest-Tausch durch
+    den Watchdog wird damit <strong>nicht</strong> getestet. Die erlaubten Image-Quellen
+    in <code>agent/sources.py</code> bleiben unverändert; Registrierung,
+    Schlüsselprüfung und Agentenkommunikation laufen mit dem echten Code.</p>
+  </div>
 
   <h2 id="naechste-schritte">Nächste Schritte</h2>
   <p>Mit der ersten Wohnung in Betrieb, weiter mit
