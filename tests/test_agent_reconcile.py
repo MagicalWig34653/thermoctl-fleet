@@ -860,6 +860,14 @@ def test_reconcile_agent_service_never_recreates_itself_hands_off_to_watchdog(
     images = _baseline_images()
     images[f"{REPO_AGENT}@{NEW_AGENT}"] = {"RepoDigests": [f"{REPO_AGENT}@{NEW_AGENT}"]}
 
+    # Section 22.5: a real device never starts with an empty `proven` --
+    # the image recipe pre-sets `desired == proven` at build time. This
+    # test's state file stands in for exactly that already-shipped state,
+    # one agent generation behind the one about to be handed off.
+    paths["watchdog"].write_text(
+        f"desired={OLD_AGENT}\nproven={OLD_AGENT}\nsince=1000\n", encoding="utf-8"
+    )
+
     with run_fake_docker_api_with_app(inspect=_baseline_inspect(), images=images) as (
         socket_path,
         app,
@@ -880,6 +888,7 @@ def test_reconcile_agent_service_never_recreates_itself_hands_off_to_watchdog(
 
         assert outcome.successful is True
         assert outcome.service == "agent"
+        assert outcome.self_stop_required is True
         assert "watchdog" in outcome.reason
         # Never stopped/recreated its own container.
         assert all(
@@ -889,7 +898,161 @@ def test_reconcile_agent_service_never_recreates_itself_hands_off_to_watchdog(
 
     watchdog_state = paths["watchdog"].read_text(encoding="utf-8")
     assert f"desired={NEW_AGENT}" in watchdog_state
+    # Full-review fix: `proven` is carried forward from the state file
+    # that was already there, not omitted -- the watchdog's rollback
+    # target must survive the handoff.
+    assert f"proven={OLD_AGENT}" in watchdog_state
     assert not paths["pending"].exists()
+
+
+def test_reconcile_agent_service_refuses_handoff_when_watchdog_state_unreadable(
+    tmp_path: Path,
+) -> None:
+    """Full-review fix: handing a fresh `desired` to the watchdog with no
+    known-good `proven` to carry forward would be strictly worse than not
+    handing off this pass -- fails closed instead, no state file is
+    written at all, and the image pulled this pass is simply pulled again
+    next time (cheap, already verified against the hard-coded sources)."""
+
+    desired = _desired_state(agent_digest=NEW_AGENT)
+    paths = _paths(tmp_path)
+    images = _baseline_images()
+    images[f"{REPO_AGENT}@{NEW_AGENT}"] = {"RepoDigests": [f"{REPO_AGENT}@{NEW_AGENT}"]}
+    # No pre-existing watchdog state file at all.
+    assert not paths["watchdog"].exists()
+
+    with run_fake_docker_api_with_app(inspect=_baseline_inspect(), images=images) as (
+        socket_path,
+        _app,
+    ):
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW,
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+
+    assert outcome.successful is False
+    assert outcome.service == "agent"
+    assert outcome.self_stop_required is False
+    assert not paths["watchdog"].exists()
+
+
+def test_reconcile_agent_service_refuses_to_rehandoff_an_already_rolled_back_digest(
+    tmp_path: Path,
+) -> None:
+    """Main-session read-back fix: a swap/rollback loop. The watchdog
+    already started `NEW_AGENT` once (the state file's own `desired`),
+    it never became healthy, and the watchdog rolled back to `OLD_AGENT`
+    on its own (`proven`) -- entirely outside this process, which only
+    learns about it indirectly: a freshly restarted agent process is
+    actually running `OLD_AGENT` (this test's own `_baseline_inspect`),
+    while the state file still names `NEW_AGENT` as `desired` from the
+    earlier, already-failed attempt. If the fleet still wants `NEW_AGENT`
+    (unchanged desired state, same revision), handing it off again would
+    just repeat the exact same pull/swap/wait/rollback cycle forever."""
+
+    desired = _desired_state(agent_digest=NEW_AGENT)
+    paths = _paths(tmp_path)
+    images = _baseline_images()
+    images[f"{REPO_AGENT}@{NEW_AGENT}"] = {"RepoDigests": [f"{REPO_AGENT}@{NEW_AGENT}"]}
+
+    # The state file already reflects the earlier, failed handoff: a
+    # watchdog rollback never rewrites it (section 17's own division of
+    # labor -- the watchdog restarts a container, it does not touch the
+    # agent's own contract file), so `desired` is still `NEW_AGENT` and
+    # `proven` is still `OLD_AGENT`.
+    paths["watchdog"].write_text(
+        f"desired={NEW_AGENT}\nproven={OLD_AGENT}\nsince=1000\n", encoding="utf-8"
+    )
+
+    with run_fake_docker_api_with_app(inspect=_baseline_inspect(), images=images) as (
+        socket_path,
+        app,
+    ):
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW,
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+
+        assert outcome.successful is False
+        assert outcome.service == "agent"
+        assert outcome.rolled_back_unhealthy is True
+        assert outcome.self_stop_required is False
+        # No new handoff -- never stopped/recreated its own container,
+        # same assertion the successful-handoff test above makes.
+        assert all(
+            "thermoctl-agent/stop" not in call and "containers/create" not in call
+            for call in app.calls
+        )
+
+    # Unchanged -- no new state file write.
+    watchdog_state = paths["watchdog"].read_text(encoding="utf-8")
+    assert f"desired={NEW_AGENT}" in watchdog_state
+    assert f"proven={OLD_AGENT}" in watchdog_state
+
+
+def test_reconcile_agent_service_hands_off_normally_when_not_a_repeat(
+    tmp_path: Path,
+) -> None:
+    """Sanity check for the guard above: an agent that is already running
+    the *desired* digest never reaches the agent branch at all (nothing
+    for `_select_service_to_update` to pick), and a genuinely first-time
+    handoff (state file's own `desired` still names the *previous*
+    digest, not the new one) must not be mistaken for a repeat -- this is
+    exactly `test_reconcile_agent_service_never_recreates_itself_hands_off_to_watchdog`
+    above, re-asserted here to make the contrast with the repeat-rollback
+    test explicit."""
+
+    desired = _desired_state(agent_digest=NEW_AGENT)
+    paths = _paths(tmp_path)
+    images = _baseline_images()
+    images[f"{REPO_AGENT}@{NEW_AGENT}"] = {"RepoDigests": [f"{REPO_AGENT}@{NEW_AGENT}"]}
+    paths["watchdog"].write_text(
+        f"desired={OLD_AGENT}\nproven={OLD_AGENT}\nsince=1000\n", encoding="utf-8"
+    )
+
+    with run_fake_docker_api_with_app(inspect=_baseline_inspect(), images=images) as (
+        socket_path,
+        _app,
+    ):
+        outcome = reconcile_desired_state(
+            desired,
+            pilot_mode=True,
+            backup_config=_backup_config(tmp_path),
+            watchdog_state_path=paths["watchdog"],
+            pending_swap_path=paths["pending"],
+            local_log_path=paths["log"],
+            now=lambda: NOW,
+            health_reader=lambda: "ok",
+            outdoor_temp_reader=lambda: 10.0,
+            disk_usage_reader=lambda: {"total_bytes": 100, "free_bytes": 50},
+            socket_path=socket_path,
+        )
+
+    assert outcome.successful is True
+    assert outcome.service == "agent"
+    assert outcome.self_stop_required is True
+    assert outcome.rolled_back_unhealthy is False
+    watchdog_state = paths["watchdog"].read_text(encoding="utf-8")
+    assert f"desired={NEW_AGENT}" in watchdog_state
+    assert f"proven={OLD_AGENT}" in watchdog_state
 
 
 # --- the standalone Docker Engine API helpers, directly ---------------------

@@ -636,6 +636,61 @@ def test_reconciler_attempt_does_not_retry_a_digest_already_rolled_back_unhealth
     assert "already rolled back" in client.calls[-1]["json"]["reason"]  # type: ignore[index]
 
 
+def test_reconciler_attempt_does_not_retry_an_agent_digest_already_rolled_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Main-session read-back fix, item 3: the exact same known-bad-digest
+    guard as the test above, but for `service="agent"` -- confirms the
+    guard's own storage layer (`RECONCILE_SERVICE_ORDER`,
+    `_load_failed_rollback`'s own validation) already accepts `"agent"`
+    as a valid service with no change needed there, only
+    `reconcile_desired_state`'s own agent branch had to learn to *feed*
+    it (a repeat swap/rollback loop for the agent's own self-update,
+    `reconcile_desired_state`'s new `current_desired == digest and
+    own_running_digest == current_proven` check)."""
+
+    path = tmp_path / "held"
+    _save_held_desired_state(path, _event(revision=1, pilot_mode=True))
+
+    reconcile_calls: list[object] = []
+
+    def _fake_reconcile(*args: object, **kwargs: object) -> ReconcileOutcome:
+        reconcile_calls.append(1)
+        return ReconcileOutcome(successful=True, reason="already at the desired revision.")
+
+    monkeypatch.setattr(loop_module, "reconcile_desired_state", _fake_reconcile)
+    monkeypatch.setattr(loop_module, "_select_service_to_update", lambda *a, **k: "agent")
+
+    client = _FakeClient()
+    reconciler = _reconciler(
+        tmp_path,
+        client=client,
+        backup_config=_backup_config(tmp_path, client),
+        held_state_path=path,
+    )
+
+    reconciler.attempt()  # converges (fake reconcile above)
+    assert len(reconcile_calls) == 1
+
+    # Simulate the block: an earlier full reconcile already handed this
+    # exact digest to the watchdog, it was rolled back, and this agent
+    # process detected that on its next attempt (`reconcile_desired_state`'s
+    # own agent branch, now returning `rolled_back_unhealthy=True`).
+    _save_failed_rollback(
+        reconciler.failed_rollback_path,
+        _FailedRollback(revision=1, service="agent", digest=_VALID_DIGEST),
+    )
+
+    reconciler.attempt()
+    reconciler.attempt()
+
+    # Never retried -- no new handoff attempt, no re-pull, no self-stop.
+    assert len(reconcile_calls) == 1
+    assert len(client.calls) == 2
+    assert client.calls[-1]["json"]["successful"] is False  # type: ignore[index]
+    assert "already rolled back" in client.calls[-1]["json"]["reason"]  # type: ignore[index]
+
+
 def test_reconciler_attempt_a_different_digest_for_the_blocked_service_is_not_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

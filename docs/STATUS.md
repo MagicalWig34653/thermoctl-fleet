@@ -183,6 +183,225 @@ written.
 (whole suite) results are reported verbatim in the commit this section
 accompanies.
 
+## Main-session read-back: three further fixes on top of the Codex findings (2026-10-03)
+
+Three issues found in the main-session read-back of the branch that fixed
+the Codex findings directly below. **Desired-state reconciliation remains
+inactive in production**, unchanged -- these are further activation
+correctness fixes, not new activation conditions.
+
+**1. `watchdog/watch.go` `AwaitHealthReport`: the 10-minute deadline had
+become a standing expiry on an already-healthy revision.** The Codex-
+finding fix below restructured the loop to check restarts first and
+require freshness relative to `now()` -- but kept the original `for
+now().Before(deadline)` as the loop's own entry condition. Once `now()`
+reached the deadline, the loop body stopped running at all, and the
+function unconditionally returned "no health report ... within the
+deadline" -- `Reconcile` calls this function fresh on *every* tick for as
+long as `desired != proven` (i.e. for up to the full one-hour mark from
+section 17 step 6, not only the first 10 minutes), so a perfectly
+healthy revision, still reporting fresh with zero restarts, would have
+been rolled back on the very first tick past minute 10. Fixed: the
+10-minute check is now only reached *after* the restart check and the
+freshness check have both come back negative for the current tick, never
+as the loop's own entry condition -- `for { ...; if !now().Before(deadline)
+{ return ... }; sleep }`. New tests: `TestAwaitHealthReportFreshPastDeadlineStaysHealthy`
+(now 30 minutes past Since, report still fresh -> no rollback),
+`TestAwaitHealthReportStalePastDeadlineRollsBack` (now 30 minutes past
+Since, report never refreshed -> rollback), and
+`TestAwaitHealthReportThreeRestartsPastDeadlineRollsBack`. Root package:
+**286 statement lines** (same counting method, `grep -v '^\s*//' <file> |
+grep -v '^\s*$' | wc -l`), up from 284.
+
+**2. `agent.loop._maybe_advance_proven` could promote an already-rolled-back
+digest.** `watchdog/watch.go`'s `RollBackToProven` never rewrites the
+state file -- it only restarts the container on `proven`'s digest. After
+a watchdog rollback the file is therefore left exactly as it was before
+the failed swap (`desired=X`, `proven=<the actually running digest>`,
+unchanged `since`), so elapsed-time-since-`since` alone kept growing as
+if `X` were healthy, and an hour later the previous version of this
+function would have promoted the already-rolled-back `X` to `proven`,
+discarding the one known-good rollback target for a digest that was not
+even running. Fixed: a new required check, `own_digest_reader` (default
+`_default_own_digest_reader`, resolving this process's own running
+digest the identical way `run_health_report_loop` already does for the
+health report -- `current_repo_digest` against the agent's own
+container/source, never a second read of the state file this function is
+about to write, which would be circular) -- promotion now additionally
+requires that digest to equal `desired`. `None` (unresolvable) never
+counts as a match. `run_health_report_loop` passes through the digest it
+already resolved for the health report itself on the same tick, so this
+costs no extra Docker call. New tests:
+`test_maybe_advance_proven_false_when_rolled_back_to_proven`,
+`test_maybe_advance_proven_false_when_own_digest_unresolvable`, and the
+end-to-end `test_run_health_report_loop_does_not_promote_a_rolled_back_agent`.
+
+**3. The agent could re-hand-off the same already-failed digest forever.**
+A freshly restarted agent process (started by the watchdog on `proven`
+after a rollback) has no in-memory record that `desired`'s digest was
+already tried -- if the fleet still names that same digest, the next
+reconcile attempt would pull, verify, hand it off, and self-stop again,
+repeating the full pull/swap/wait/rollback cycle every reconcile
+interval, forever. Detected in `reconcile_desired_state`'s own agent
+branch: if the *current* state file's `desired` already equals the
+digest about to be handed off (nothing changed since the last attempt)
+**and** this process's own currently running digest (resolved the same
+way as fix 2) equals `proven`, not `desired` -- the watchdog already
+rolled this exact digest back. Treated as a failed update: no new
+handoff (no state write, no self-stop), reported as a failure with
+`ReconcileOutcome.rolled_back_unhealthy=True`. This deliberately reuses
+`_DesiredStateReconciler.attempt`'s existing known-bad-digest guard --
+the same `_FailedRollback` mechanism `_await_or_rollback_pending_swap`
+already uses for the other three services -- rather than inventing a
+second one: `RECONCILE_SERVICE_ORDER`/`_load_failed_rollback`'s own
+validation already accepted `service="agent"`, so no change to that
+guard was needed, only feeding it from this new call site. New tests:
+`test_reconcile_agent_service_refuses_to_rehandoff_an_already_rolled_back_digest`,
+`test_reconcile_agent_service_hands_off_normally_when_not_a_repeat` (the
+contrasting, genuinely-first-attempt case), and
+`test_reconciler_attempt_does_not_retry_an_agent_digest_already_rolled_back`
+(the guard blocking a subsequent attempt end to end, at the
+`_DesiredStateReconciler` layer).
+
+**Verification:** `ruff check .` clean; `mypy .` (161 files) and `mypy
+protocol fleet agent tools` (78 files) clean; pytest (`--junitxml`):
+`<testsuite ... errors="0" failures="0" skipped="1" tests="2076" .../>`,
+coverage TOTAL 8084 stmts / 30 missed / 99%; Go: `go vet ./...` clean,
+`go test -count=1 ./...` all four packages ok, `gofmt -l .` empty,
+`watchdog/check_contract.sh` passing.
+
+**Files:** `agent/loop.py` (`reconcile_desired_state`'s agent branch,
+`_default_own_digest_reader`, `_maybe_advance_proven`,
+`run_health_report_loop`), `watchdog/watch.go` (`AwaitHealthReport`),
+`watchdog/watch_test.go`, `tests/test_agent_reconcile.py`,
+`tests/test_agent_health_report.py`,
+`tests/test_agent_desired_state_reconciler.py`.
+
+## Codex full review findings 2, 5 -- desired-state reconciliation activation blockers (2026-10-03)
+
+Fixes four confirmed findings from an external ("Codex") full review of
+`agent/loop.py`'s desired-state reconciliation and `watchdog/watch.go`'s
+own health-report check. **Desired-state reconciliation remains inactive
+in production**, unchanged from every P5.4/P5.4b/P5.4d entry above/below
+this one: the fail-closed pre-check (`_reconcile_precheck`) still rejects
+on `pilot_mode`/the "unavailable" health and outdoor-temperature readers
+exactly as before. These are activation *blockers*, not a reason this
+stays inactive any longer than it already was -- fixed now anyway, per
+the work order, so the path is actually correct the day both owner
+conditions are lifted, not only inactive-and-therefore-unnoticed.
+
+**Finding 2 (A): the agent-handoff branch wrote a state file with no
+`proven`, and never asked the process to stop.** `reconcile_desired_state`'s
+`service == "agent"` branch used to call `report_watchdog_state(watchdog_state_path,
+desired=digest)` with no `proven` argument at all -- that function only
+writes `proven=` "if present" (`proven is not None`), so this call
+produced a state file with `desired` and **no `proven` whatsoever**,
+exactly the "faulty delivery" shape `watchdog/state.go`'s own doc comment
+says should never occur (section 22.5). The watchdog would then have had
+no rollback target at all if the handed-off revision never became
+healthy. Fixed: the branch now reads the *current* state file first
+(`_read_watchdog_state`) and carries its `proven` forward unchanged into
+the new write; if the current state file cannot be read at all, the
+handoff is refused outright (fails closed, nothing written, nothing
+pulled this pass is lost -- just not handed off yet) rather than writing
+a `proven`-less file. Section 17 step 3 ("it stops itself") is now also
+honored: a successful handoff sets a new, structural
+`ReconcileOutcome.self_stop_required` flag (never inferred from `service`/
+`reason` text, the same "no string matching" discipline
+`rolled_back_unhealthy` already documents), which
+`_DesiredStateReconciler.attempt` acts on via a new, injectable
+`self_stop: Callable[[], None]` field -- production default `os._exit(0)`,
+deliberately not `sys.exit`: this runs on the reconciler's own background
+thread, where `SystemExit` would only end that one daemon thread, never
+the process the watchdog is waiting to see stop. Called strictly after
+the outcome is reported to the fleet (same ordering `_handle_agent_restart`
+already uses for `agent_restart`, same reason).
+
+**Finding 2 (B): `report_health` was never called anywhere in the
+runtime -- step 5 did not exist.** New `agent.loop.run_health_report_loop`,
+started unconditionally as its own daemon thread by `run` whenever
+`agent_version` is given (a new, optional parameter -- `agent.__main__`
+passes `AGENT_VERSION`; existing callers that omit it get no thread and
+no fabricated version, the same "honest absence" pattern `backup_config
+is None` already follows). Every `DEFAULT_HEALTH_REPORT_INTERVAL_S`
+(30s, comfortably under the watchdog's own 120-second staleness bound,
+section 22.3) it resolves this exact container's own running digest via
+`current_repo_digest` against `SERVICE_CONTAINER_NAMES["agent"]`/
+`agent_sources.ALLOWED_SOURCES["agent"]` -- **not** read back from the
+state file's own `desired`, which would only prove "I can read what I
+wrote", not "I am the revision I claim to be" -- and writes it via
+`report_health`. `None` (Docker unreachable, or no matching `RepoDigests`
+entry) skips the write for that tick rather than fabricating a digest.
+New CLI flag `--health-report-file` (default
+`/run/thermoctl-agent/health.env`, matching both
+`watchdog/thermoctl-watchdog.service`'s and `watchdog/cmd/thermoctl-leds`'s
+own `-health-file` default).
+
+**Finding 2 (C): step 6, advancing `proven`, did not exist either.** New
+`agent.loop._maybe_advance_proven`, called from the same health-report
+tick (sharing one background thread/tick with step 5 above, since both
+are "look at the agent's relationship to the watchdog state file on a
+regular cadence"): once `desired != proven` has held for at least
+`PROVEN_ADVANCE_AFTER_S` (3600s, i.e. one hour, section 17 step 6) since
+the state file's own `since` (section 22.2's own meaning, read via a new
+`_read_watchdog_state_full`, returning `since` alongside `(desired,
+proven)` -- `_read_watchdog_state` itself is now a thin wrapper over it,
+unchanged return shape, no existing caller touched), it advances `proven`
+to `desired`. "Fault-free" is read as "nothing has rolled this revision
+back in the meantime" -- the only signal that actually exists in this
+scaffold (no richer per-revision fault tracking exists yet, the same
+honest limitation `_default_health_reader` already documents): a
+rollback would itself have rewritten the state file with a fresh
+`since`, which this check would then see. Fails closed like every other
+reader in this module: a missing/unreadable state file, `desired ==
+proven` already, or the hour not yet elapsed, is a no-op. Tested with an
+injected clock (`tests/test_agent_health_report.py`), never a real wait.
+
+**Finding 5 (D): `watchdog/watch.go`'s `AwaitHealthReport` accepted any
+matching report and returned before ever checking restarts again --
+once healthy, always healthy, even mid-crash-loop.** Two fixes, both
+needed together: (1) the restart count is now checked **first**, on every
+poll, not only before the first health report was ever seen -- three
+restarts roll back immediately regardless of what the health file still
+says; (2) a report must now also be fresh **relative to `now()`**, not
+only relative to `s.Since` -- `healthStaleAfter`, 120 seconds, reusing
+section 22.3's own documented bound verbatim, not a separately invented
+one. Without (2), a report written once right after the swap and never
+updated again (the writing process died without the *container*
+restarting, so (1) alone would never fire either) would have gone on
+satisfying "healthy" forever, since `AwaitHealthReport` is called fresh
+on every `Reconcile` tick for as long as `desired != proven`. New Go
+tests: `TestAwaitHealthReportCrashLoopAfterOneGoodReportRollsBack` (one
+good report, then three restarts -> rollback) and
+`TestAwaitHealthReportStaleRelativeToNowTreatedAsMissing` (digest/Since
+both still match, but the report itself is old relative to now -> not
+healthy). One existing test
+(`TestReconcileResumedMidSwapWithTimeRemainingFindsHealthy`) updated to
+write its health report fresh relative to the test's own "now", since
+the old fixture (fresh only relative to `Since`, 8.5 minutes stale
+relative to "now") is exactly the shape fix (2) now correctly rejects.
+
+**Watchdog line count**: root package (`main.go`, `watch.go`, `state.go`,
+`health.go`, `linefile.go`, `runtime.go`) now **284 statement lines**
+(same counting method as every earlier entry: `grep -v '^\s*//' <file> |
+grep -v '^\s*$' | wc -l`, summed -- up from 280, the `healthStaleAfter`
+constant and the restructured restart-then-health check), still under
+the 300-line budget (section 18.3) with headroom to spare. `go.mod`
+unchanged, still zero `require` lines.
+
+**Files:** `agent/loop.py` (`reconcile_desired_state`'s agent branch,
+`ReconcileOutcome.self_stop_required`, `_DesiredStateReconciler.self_stop`/
+`attempt`, `_read_watchdog_state_full`, `_maybe_advance_proven`,
+`run_health_report_loop`, `DEFAULT_HEALTH_REPORT_FILE`,
+`DEFAULT_HEALTH_REPORT_INTERVAL_S`, `run`'s new `health_report_path`/
+`agent_version`/`health_report_interval_s` parameters), `agent/__main__.py`
+(`--health-report-file`, wiring `AGENT_VERSION` through),
+`watchdog/watch.go` (`AwaitHealthReport`, `healthStaleAfter`),
+`tests/test_agent_reconcile.py` (agent-handoff carries `proven` forward;
+new fail-closed-without-a-readable-state-file test),
+`tests/test_agent_health_report.py` (new), `watchdog/watch_test.go`
+(two new tests, one existing test's fixture corrected).
+
 ## P6.2 -- UI login hardening: TOTP encryption at rest + passkeys (WebAuthn)
 
 Implements the two P6.2 items from the project owner's section 12 decision

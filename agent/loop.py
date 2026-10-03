@@ -162,6 +162,23 @@ DEFAULT_WATCHDOG_STATE_FILE = Path("/var/lib/thermoctl-watchdog/state.env")
 # `report_led_status` -- default matches
 # `watchdog/cmd/thermoctl-leds/main.go`'s own `-agent-status-file` default.
 DEFAULT_LED_STATUS_FILE = Path("/run/thermoctl-agent/led-status.env")
+# The health report `report_health`/`run_health_report_loop` write (section
+# 17 step 5, section 22.3) -- default matches both
+# `watchdog/thermoctl-watchdog.service`'s own `-health-file` and
+# `watchdog/cmd/thermoctl-leds/main.go`'s own `-health-file` default:
+# `/run/` deliberately, so an old report can never survive a reboot to
+# cover for a freshly started, not-yet-healthy agent (section 22.3).
+DEFAULT_HEALTH_REPORT_FILE = Path("/run/thermoctl-agent/health.env")
+# Section 22.3: the watchdog treats a health report older than 120 seconds
+# as silent -- this interval must stay comfortably under that bound so one
+# merely slow tick does not already look like silence. Also doubles as how
+# often `_maybe_advance_proven` gets a chance to notice the one-hour mark
+# from section 17 step 6 -- both concerns share one tick, see
+# `run_health_report_loop`'s own docstring for why. Defined here (not next
+# to that function, further down) so `run`'s own default parameter value
+# can reference it -- a plain `=` default is evaluated at function
+# definition time, which runs long before the rest of this module's body.
+DEFAULT_HEALTH_REPORT_INTERVAL_S = 30.0
 
 # A bounded, line-based local log (section 7: "every command and every
 # rejection lands in the apartment's local log"), rotated once it would
@@ -1443,6 +1460,30 @@ def _read_watchdog_state(path: Path) -> tuple[str, str] | None:
     do not guess.
     """
 
+    full = _read_watchdog_state_full(path)
+    if full is None:
+        return None
+    desired, proven, _since = full
+    return desired, proven
+
+
+def _read_watchdog_state_full(path: Path) -> tuple[str, str, int] | None:
+    """Like `_read_watchdog_state` above (same fail-closed semantics,
+    same docstring reasoning -- `None` for a missing file, an unreadable
+    file, or a missing/blank `desired`/`proven`), but also returns
+    `since` as a plain `int` (`0` if the line is absent or not a valid
+    integer -- the same tolerance `watchdog/state.go`'s own
+    `parseOptionalTimestamp` applies, section 18.2 applied analogously).
+
+    Needed only by `_maybe_advance_proven` (section 17 step 6), which
+    must know how long `desired` has already applied to decide whether
+    the one-hour mark has passed -- `_read_watchdog_state`'s own
+    `(desired, proven)` return shape is unchanged (and not widened) so
+    every existing caller of *that* function keeps working byte for
+    byte; this is a second, explicit reader for the one caller that
+    actually needs the third field, not a breaking change to the first.
+    """
+
     if not path.exists():
         return None
     try:
@@ -1451,15 +1492,21 @@ def _read_watchdog_state(path: Path) -> tuple[str, str] | None:
         return None
     desired: str | None = None
     proven: str | None = None
+    since = 0
     for line in raw.splitlines():
         key, _, value = line.partition("=")
         if key == "desired":
             desired = value
         elif key == "proven":
             proven = value
+        elif key == "since":
+            try:
+                since = int(value)
+            except ValueError:
+                since = 0
     if not desired or not proven:
         return None
-    return desired, proven
+    return desired, proven, since
 
 
 # P5.4d: how long `_handle_agent_restart` waits for `ctx.agent_lock` before
@@ -2166,6 +2213,23 @@ class _DesiredStateReconciler:
     poll_interval_s: float = field(default_factory=lambda: RECONCILE_HEALTH_POLL_INTERVAL_S)
     now: Callable[[], datetime] = field(default=lambda: datetime.now().astimezone())
     sleep: Callable[[float], None] = time.sleep
+    # Section 17 step 3: what `attempt()` calls, exactly once, when an
+    # outcome comes back with `self_stop_required` -- i.e. the agent
+    # branch above just handed a checked digest to the watchdog and must
+    # now stop itself, doing nothing more. `os._exit` (not `sys.exit`) is
+    # the production default **deliberately**: this runs on this class's
+    # own background thread (the reconciler thread, not `run`'s main
+    # thread, see `run`'s own `exit_fn` for the different, main-thread-only
+    # mechanism `agent_restart` uses), where a plain `sys.exit`/`SystemExit`
+    # would only end this one daemon thread, never the process -- the
+    # watchdog is waiting for the whole process to actually stop (step 4:
+    # "the watchdog starts the revision named in desired"), not for one
+    # thread inside it to quietly disappear. `os._exit` ends the process
+    # immediately, from any thread, skipping Python-level cleanup -- exactly
+    # "it stops itself, it does nothing more", not a graceful shutdown.
+    # Injectable so a test can assert this was *called*, without actually
+    # ending the test process.
+    self_stop: Callable[[], None] = field(default=lambda: os._exit(0))
     # `(revision, successful, reason, service)` of the last outcome actually
     # reported to the fleet -- `None` until the first attempt ever reports
     # anything. An identical tuple on a later attempt is never re-reported
@@ -2330,6 +2394,17 @@ class _DesiredStateReconciler:
                 self.last_converged_revision = revision
 
             self._report_if_changed(revision, outcome)
+
+            if outcome.self_stop_required:
+                # Report first, stop second -- the same ordering
+                # `_handle_agent_restart`/`run` use for `agent_restart`,
+                # and for the same reason: the fleet must see the "handed
+                # off to the watchdog" result before this process can
+                # possibly disappear. `self.self_stop` ends the whole
+                # process (production: `os._exit`, see that field's own
+                # docstring for why), so nothing below this call ever
+                # runs in production.
+                self.self_stop()
 
     def _report_if_changed(self, revision: int, outcome: ReconcileOutcome) -> None:
         """`_report_desired_state_outcome`, deduplicated against
@@ -2497,6 +2572,9 @@ def run(
     desired_state_held_state_path: Path = DEFAULT_DESIRED_STATE_HELD_STATE_FILE,
     desired_state_failed_rollback_path: Path = DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE,
     desired_state_reconcile_interval_s: float = DEFAULT_DESIRED_STATE_RECONCILE_INTERVAL_S,
+    health_report_path: Path = DEFAULT_HEALTH_REPORT_FILE,
+    agent_version: str | None = None,
+    health_report_interval_s: float = DEFAULT_HEALTH_REPORT_INTERVAL_S,
     exit_fn: Callable[[int], None] = lambda code: sys.exit(code),
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
@@ -2688,6 +2766,34 @@ def run(
             restore_thread_client,
         )
 
+    # Section 17 steps 5/6 (full-review fix, findings B/C): the same
+    # "own thread, not a branch of the command loop" reasoning as the two
+    # schedulers above. Conditional on `agent_version` being given, for
+    # the same "honest absence, not a fabricated default" reasoning
+    # `backup_config is None` already follows above -- a caller that
+    # cannot name its own version (most of this module's own existing
+    # tests) gets no background thread and no health report at all,
+    # rather than one written with a made-up version string.
+    # No `httpx.Client` of its own: unlike the two schedulers above, this
+    # loop never talks to the fleet at all -- only the local Docker socket
+    # and local files (`run_health_report_loop`'s own docstring) -- so
+    # there is no `client_factory()`/per-thread client to build or close
+    # here.
+    health_report_stop_event = threading.Event()
+    if agent_version is not None:
+        _start_background_thread(
+            "thermoctl-agent-health-report",
+            lambda: run_health_report_loop(
+                health_report_path,
+                watchdog_state_path,
+                agent_version,
+                interval_s=health_report_interval_s,
+                sleep=sleep,
+                stop_event=health_report_stop_event,
+            ),
+            None,
+        )
+
     # P5.4b (cross-review fix): one `_DesiredStateReconciler` for the
     # whole lifetime of this call, shared by the immediate attempt below
     # and the periodic background thread -- see that class's own
@@ -2783,6 +2889,7 @@ def run(
         commands.close()
         backup_stop_event.set()
         restore_stop_event.set()
+        health_report_stop_event.set()
         desired_state_stop_event.set()
 
 
@@ -3007,6 +3114,16 @@ class ReconcileOutcome:
     reason: str
     service: str | None = None
     rolled_back_unhealthy: bool = False
+    # `True` only for the one specific outcome of the `service == "agent"`
+    # branch above: the digest was pulled, verified, and handed to the
+    # watchdog via `report_watchdog_state`. Section 17 step 3 ("it stops
+    # itself. It does nothing more.") then requires the *process* to exit
+    # -- a structural signal, the same "never a string match on `reason`"
+    # reasoning `rolled_back_unhealthy`'s own docstring gives, so
+    # `_DesiredStateReconciler.attempt` can act on it without re-deriving
+    # "was this the agent handoff" from `service`/`reason` text a second
+    # time.
+    self_stop_required: bool = False
 
 
 def _time_within_update_window(
@@ -3342,12 +3459,108 @@ def reconcile_desired_state(
         # performs the actual two-step self-swap (start the new revision,
         # remove the old one only after a successful heartbeat,
         # `watchdog/runtime.go`).
-        report_watchdog_state(watchdog_state_path, desired=digest)
+        #
+        # **Cross-review fix (full review 2): `proven` must be carried
+        # forward, not omitted.** An earlier version of this branch called
+        # `report_watchdog_state(watchdog_state_path, desired=digest)`
+        # with no `proven` at all -- that function's own docstring already
+        # says `proven` is only written "if present" (`if proven is not
+        # None`), so the state file this wrote had a `desired` and no
+        # `proven` whatsoever: `watchdog/state.go`'s own doc comment is
+        # explicit that an empty `Proven` is "a sign of a faulty delivery,
+        # not the normal state" (section 22.5) -- this call would have
+        # manufactured exactly that faulty-looking state on every single
+        # agent update, leaving the watchdog with no rollback target at
+        # all if the new revision never becomes healthy.
+        #
+        # The fix reads the *current* state file first and carries its
+        # `proven` forward unchanged -- that is the one digest already
+        # known-good, the correct rollback target for whatever `desired`
+        # is about to become. **Fails closed** (refuses the handoff
+        # entirely, no file is written, nothing pulled is wasted-but-also-
+        # not-discarded) if the current state file cannot be read at all:
+        # the same "a state file this module cannot read is an anomaly,
+        # not a blank slate to wave through" reasoning `_read_watchdog_state`
+        # itself already documents for `_handle_agent_restart`, applied
+        # here for the same reason -- handing the watchdog a `desired`
+        # with no known-good `proven` to fall back to would be strictly
+        # worse than not handing it off this pass and retrying later, once
+        # the state file is readable again.
+        current_state = _read_watchdog_state(watchdog_state_path)
+        if current_state is None:
+            reason = (
+                f"{service}: the current watchdog state file is missing or "
+                "incomplete -- refusing to hand off a new digest without a "
+                "known-good 'proven' to carry forward (fail closed, section "
+                "22.5)."
+            )
+            _append_local_log(local_log_path, f"reconcile_desired_state rejected: {reason}")
+            return ReconcileOutcome(successful=False, reason=reason, service=service)
+        current_desired, current_proven = current_state
+
+        # **Main-session read-back fix: do not re-hand-off a digest the
+        # watchdog has already rolled back.** This process never learns
+        # directly that a watchdog rollback happened -- that is step 4/5
+        # of section 17, entirely outside this process's own lifetime
+        # (it already stopped itself, section 17 step 3, before the
+        # watchdog ever acts). What a *freshly restarted* agent process
+        # can observe instead, on its very next reconcile attempt: the
+        # state file's own `desired` already names the exact digest this
+        # call is about to hand off *again* (nothing has changed it since
+        # the last attempt), while this process's own currently running
+        # digest is `current_proven`, not that `desired` -- i.e. the
+        # watchdog started `desired`, it never became healthy, and the
+        # watchdog rolled back to `proven` on its own, exactly as
+        # intended. Hands off the same already-failed digest in that
+        # situation again would simply repeat the whole pull/swap/wait/
+        # rollback cycle forever, every reconcile interval, as long as the
+        # fleet keeps naming the same (broken) digest as desired.
+        #
+        # `rolled_back_unhealthy=True` here reuses
+        # `_DesiredStateReconciler.attempt`'s existing known-bad-digest
+        # guard (the same mechanism `_await_or_rollback_pending_swap`
+        # already uses for the other three services, see
+        # `ReconcileOutcome.rolled_back_unhealthy`'s own docstring) --
+        # `RECONCILE_SERVICE_ORDER`/`_load_failed_rollback`'s own
+        # validation already accept `service="agent"`, so no change to
+        # that guard itself was needed, only to feed it from here too.
+        own_running_digest = current_repo_digest(
+            SERVICE_CONTAINER_NAMES["agent"],
+            agent_sources.ALLOWED_SOURCES["agent"],
+            socket_path=socket_path,
+        )
+        if (
+            current_desired == digest
+            and own_running_digest is not None
+            and own_running_digest == current_proven
+            and current_proven != digest
+        ):
+            reason = (
+                f"{service}: digest {digest} was already handed to the "
+                f"watchdog and rolled back to {current_proven} (this process "
+                "is running that rollback target, not the still-desired "
+                "digest) -- not retried automatically; a new revision is "
+                "required."
+            )
+            _append_local_log(local_log_path, f"reconcile_desired_state rejected: {reason}")
+            return ReconcileOutcome(
+                successful=False, reason=reason, service=service, rolled_back_unhealthy=True
+            )
+
+        report_watchdog_state(watchdog_state_path, desired=digest, proven=current_proven)
         _append_local_log(
             local_log_path, f"agent: handed digest {digest} to the watchdog for self-swap."
         )
+        # Section 17 step 3: "it stops itself. It does nothing more." --
+        # the watchdog (step 4) is the one that starts `desired` next; see
+        # `ReconcileOutcome.self_stop_required`'s own docstring for why
+        # this is a structural field here, not something the caller has
+        # to infer from `service == "agent"` a second time.
         return ReconcileOutcome(
-            successful=True, reason="pulled, verified, handed off to the watchdog.", service=service
+            successful=True,
+            reason="pulled, verified, handed off to the watchdog.",
+            service=service,
+            self_stop_required=True,
         )
 
     container = SERVICE_CONTAINER_NAMES[service]
@@ -3487,6 +3700,201 @@ def report_health(path: Path, digest: str, version: str) -> None:
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     temp.replace(path)
+
+
+# Section 17 step 6: "after one hour of fault-free operation, the agent
+# itself advances the new digest to proven." Matches `report_health`'s own
+# plain-seconds style -- an hour, not a `timedelta`, so `_maybe_advance_proven`
+# stays a single, obvious subtraction against `since`.
+PROVEN_ADVANCE_AFTER_S = 3600.0
+
+
+def _default_own_digest_reader() -> str | None:
+    """Production default for `_maybe_advance_proven`'s `own_digest_reader`
+    -- resolves this exact process's own running digest the identical way
+    `run_health_report_loop` already does for the health report itself
+    (`current_repo_digest` against `SERVICE_CONTAINER_NAMES["agent"]`/
+    `agent_sources.ALLOWED_SOURCES["agent"]`, the default Docker socket).
+    Kept as its own module-level function (rather than an inline lambda)
+    so a direct call to `_maybe_advance_proven` -- outside
+    `run_health_report_loop`, e.g. a future caller or a test that wants
+    the real resolution path -- gets the same honest behaviour, not a
+    narrower one."""
+
+    return current_repo_digest(
+        SERVICE_CONTAINER_NAMES["agent"], agent_sources.ALLOWED_SOURCES["agent"]
+    )
+
+
+def _maybe_advance_proven(
+    watchdog_state_path: Path,
+    *,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    own_digest_reader: Callable[[], str | None] = _default_own_digest_reader,
+) -> bool:
+    """Section 17 step 6, section 22.2's own `since` semantics: once
+    `desired` has applied for at least `PROVEN_ADVANCE_AFTER_S` (one
+    hour), the agent -- not the watchdog, which only ever rolls back,
+    never declares something trustworthy -- advances `proven` to
+    `desired` in the state file, so a *future* swap's rollback target is
+    the now-trusted revision, not whatever came before it.
+
+    **Main-session read-back fix: elapsed time alone is not "fault-free".**
+    An earlier version of this function reasoned that `desired != proven`
+    with a *stale* `since` could not happen silently after a rollback,
+    because `report_watchdog_state` always refreshes `since` on every
+    write. That reasoning was wrong: `watchdog/watch.go`'s own
+    `RollBackToProven` **never writes the state file at all** -- it only
+    restarts the container on `proven`'s digest (section 17: the
+    watchdog's whole point is that it swaps and rolls back without any
+    further write to the one contract file the agent itself owns). After
+    a watchdog rollback, the state file is therefore left exactly as it
+    was before the failed swap: `desired=X`, `proven=<the old, actually
+    running digest>`, `since=<the original swap time>` -- elapsed time
+    since `since` keeps growing exactly as if `X` were healthy, and an
+    hour later this function would have promoted the already-rolled-back
+    `X` to `proven`, discarding the one known-good rollback target for a
+    digest that is not even running.
+
+    **The fix: also require that this process's own currently running
+    digest equals `desired`** -- resolved via `own_digest_reader` (default
+    `_default_own_digest_reader`, the identical `current_repo_digest`
+    lookup `run_health_report_loop` already performs for the health
+    report itself, so this is "ask the container runtime", never a second
+    read of the very state file this function is about to write, which
+    would just be circular). A rolled-back agent is, by construction,
+    running `proven`, not `desired` -- so this check alone already covers
+    the rollback case above without needing to special-case it. `None`
+    (Docker unreachable, or no matching `RepoDigests` entry -- the same
+    honest "cannot tell" case `_default_health_reader` documents) is
+    **never** treated as a match: an unresolvable digest must never
+    promote.
+
+    Fails closed, the same way `_read_watchdog_state`/`_read_watchdog_state_full`
+    already do: a missing or unreadable state file, `desired == proven`
+    already (nothing to advance), the hour not yet elapsed, or the own
+    digest not resolving to exactly `desired`, is a no-op returning
+    `False`. Returns `True` only when it actually wrote a new state (for
+    logging/tests).
+
+    **Deliberately does not touch `since`** (unlike every other call site
+    of `report_watchdog_state`, which refreshes it unconditionally): once
+    this call returns, `desired == proven`, and `watchdog/watch.go`'s own
+    `Reconcile` short-circuits on exactly that equality before it ever
+    looks at `Since` again (see `Reconcile`'s own comment, "desired ==
+    proven means there is nothing to swap between") -- `since` no longer
+    steers anything for this revision, so resetting it to "now" here is
+    harmless, not a second meaning smuggled into the same field.
+    """
+
+    state = _read_watchdog_state_full(watchdog_state_path)
+    if state is None:
+        return False
+    desired, proven, since = state
+    if desired == proven:
+        return False
+    if since <= 0:
+        return False
+    elapsed = now().timestamp() - since
+    if elapsed < PROVEN_ADVANCE_AFTER_S:
+        return False
+    own_digest = own_digest_reader()
+    if own_digest is None or own_digest != desired:
+        return False
+    report_watchdog_state(watchdog_state_path, desired=desired, proven=desired)
+    return True
+
+
+def run_health_report_loop(
+    health_report_path: Path,
+    watchdog_state_path: Path,
+    agent_version: str,
+    *,
+    socket_path: Path = DEFAULT_DOCKER_SOCKET,
+    interval_s: float = DEFAULT_HEALTH_REPORT_INTERVAL_S,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    sleep: Callable[[float], None] = time.sleep,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Runs forever (production) or until `stop_event` is set (tests) --
+    the same "own daemon thread, started unconditionally by `run`" shape
+    as `run_daily_backup_scheduler`/`run_desired_state_reconcile_loop`.
+    Implements section 17 steps 5 and 6 together, since both are "a
+    regular tick that looks at the agent's own relationship to the
+    watchdog state file" and sharing one tick/thread costs nothing a
+    second thread would not also cost:
+
+    - **Step 5**: writes this process's own health report
+      (`report_health`) every `interval_s`, naming the digest this exact
+      running container actually has -- resolved via `current_repo_digest`
+      against this agent's own container name/source
+      (`SERVICE_CONTAINER_NAMES["agent"]`/`agent_sources.ALLOWED_SOURCES
+      ["agent"]`), **not** read back from the state file's own `desired`.
+      Re-reading the state file this very process (or an earlier one)
+      wrote would only prove "I can read what I wrote", not "I am the
+      revision I claim to be" -- asking the container runtime what image
+      this container was actually started from is the one check that is
+      not circular, the same source `watchdog/runtime.go`'s own
+      `repoDigest` uses from the other side of the contract. `None`
+      (no Docker socket reachable, or no matching `RepoDigests` entry --
+      the same honest "cannot tell" case `_default_health_reader`
+      documents) skips writing a report for that tick rather than writing
+      a fabricated digest; the watchdog then simply sees one more silent
+      tick, which is the honest outcome.
+    - **Step 6**: `_maybe_advance_proven` -- see that function's own
+      docstring.
+
+    Every exception from one tick is logged and swallowed, the same
+    "a single failed attempt must not stop every later one" reasoning
+    `run_daily_backup_scheduler`/`run_desired_state_reconcile_loop`
+    already document -- this loop has no caller to report a failure to
+    at all; a thermoctl-agent that goes silent on its health report for
+    one tick because of a transient error is exactly the case the
+    watchdog's own 120-second tolerance (section 22.3) already exists to
+    absorb, not a reason to give up on every later tick as well.
+    """
+
+    while stop_event is None or not stop_event.is_set():
+        # Resolved once per tick, shared by both steps below -- step 6's
+        # own "is this process actually running `desired`" check
+        # (`_maybe_advance_proven`'s `own_digest_reader`) needs exactly
+        # the same lookup step 5 already performs for the health report,
+        # so this avoids asking the Docker Engine API the same question
+        # twice every tick. `None` if it could not be resolved at all
+        # (Docker unreachable, no matching `RepoDigests` entry) -- passed
+        # through as-is, never replaced with a guess.
+        own_digest: str | None = None
+        try:
+            own_digest = current_repo_digest(
+                SERVICE_CONTAINER_NAMES["agent"],
+                agent_sources.ALLOWED_SOURCES["agent"],
+                socket_path=socket_path,
+            )
+            if own_digest is not None:
+                report_health(health_report_path, digest=own_digest, version=agent_version)
+        except Exception:
+            logger.warning(
+                "run_health_report_loop: writing the health report failed.", exc_info=True
+            )
+
+        try:
+            # A tiny named closure, not an inline lambda over the loop
+            # variable (B023/mypy): `_this_tick_digest` binds `own_digest`
+            # as a default argument, capturing *this* iteration's value
+            # immediately rather than whatever the outer name holds if
+            # this were ever called later.
+            def _this_tick_digest(own_digest: str | None = own_digest) -> str | None:
+                return own_digest
+
+            _maybe_advance_proven(
+                watchdog_state_path, now=now, own_digest_reader=_this_tick_digest
+            )
+        except Exception:
+            logger.warning(
+                "run_health_report_loop: checking/advancing 'proven' failed.", exc_info=True
+            )
+
+        sleep(interval_s)
 
 
 @dataclass(frozen=True)

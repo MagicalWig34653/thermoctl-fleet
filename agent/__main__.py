@@ -191,6 +191,8 @@ def _run_agent(args: argparse.Namespace) -> int:
                         local_log_path=data_dir / loop.DEFAULT_LOCAL_LOG_FILE,
                         watchdog_state_path=Path(args.watchdog_state_file),
                         led_status_path=Path(args.led_status_file),
+                        health_report_path=Path(args.health_report_file),
+                        agent_version=AGENT_VERSION,
                         backup_config=backup_config,
                         restore_targets=restore_targets,
                         restore_poll_interval_s=args.restore_poll_interval_s,
@@ -296,6 +298,16 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     run_parser.add_argument("--watchdog-state-file", default=str(loop.DEFAULT_WATCHDOG_STATE_FILE))
     run_parser.add_argument("--led-status-file", default=str(loop.DEFAULT_LED_STATUS_FILE))
+    run_parser.add_argument(
+        "--health-report-file",
+        default=str(loop.DEFAULT_HEALTH_REPORT_FILE),
+        help=(
+            "P5.4/P5.4b full-review fix (section 17 step 5, section 22.3): "
+            "where this process regularly writes its own health report for "
+            f"the watchdog, default {loop.DEFAULT_HEALTH_REPORT_FILE} -- "
+            "matches watchdog/thermoctl-watchdog.service's own -health-file."
+        ),
+    )
     # P5.5a (sections 15.1, 15.2): backups are only created/uploaded if
     # `--apartment-id` is given -- every other backup-related argument
     # below has a sensible default (matching `image/common/agent-compose

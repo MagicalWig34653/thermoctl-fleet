@@ -28,6 +28,18 @@ const healthDeadline = 10 * time.Minute
 // 5), independent of the deadline above.
 const maxRestarts = 3
 
+// healthStaleAfter: how old a health report may be, relative to *now*, and
+// still count as proof of life (section 22.3: "the watchdog checks its
+// age, older than 120 seconds counts as silent" -- reused here verbatim,
+// not a separately invented bound). Full-review fix: a single health
+// report that once matched s.Desired/s.Since used to satisfy
+// AwaitHealthReport forever, on every later Reconcile tick, even once the
+// revision that wrote it had since crash-looped and gone silent -- this
+// bound is what makes "the report is still fresh" an actual, repeated
+// check against the clock, not a one-time fact recorded at the moment it
+// first appeared.
+const healthStaleAfter = 120 * time.Second
+
 // Runtime is the seam onto the container runtime (section 18.3): addressed
 // only through this interface, never a library -- tests substitute a fake,
 // never Docker.
@@ -48,12 +60,41 @@ type Runtime interface {
 // resuming mid-window (the watchdog itself restarted) waits only the
 // remainder, never a fresh 10 minutes. now/sleep are injected so tests
 // never wait on a real clock -- production passes time.Now/time.Sleep.
+//
+// **Full-review fix, three parts, all needed together:**
+//
+//  1. **The restart count is checked first, on every iteration, not only
+//     before the first health report was ever seen.** The previous order
+//     returned "healthy" the moment any single matching report was found,
+//     before ever looking at restarts again -- so a revision that wrote
+//     one good report and then started crash-looping was never rolled
+//     back. Checking restarts first means three restarts roll back
+//     immediately, regardless of what the health file still says.
+//  2. **The report must also be fresh relative to *now*, not only
+//     relative to s.Since** (healthStaleAfter, section 22.3's own 120
+//     seconds). Without this, a report written once, right after the
+//     swap, and never updated again (the writing process died without
+//     restarting the container -- so part 1 alone would never fire
+//     either) would go on satisfying "healthy" forever. A report older
+//     than healthStaleAfter is treated exactly like a missing one.
+//  3. **The 10-minute deadline is only checked *after* steps 1/2 have
+//     both come back negative for the current tick, never as the loop's
+//     own entry condition.** The previous `for now().Before(deadline)`
+//     meant that once `now()` reached the deadline, the loop body never
+//     ran again at all -- `Reconcile` calls this function fresh on
+//     *every* tick as long as s.Desired != s.Proven (i.e. on every tick
+//     until the agent itself promotes `proven` after the full one-hour
+//     mark from section 17 step 6), so a perfectly healthy revision,
+//     still reporting fresh and with no restarts, would have been rolled
+//     back on the very first tick past minute 10 -- the deadline is a
+//     bound on how long it may take to *first* become healthy, not an
+//     expiry on staying healthy afterward. Restructured so the deadline
+//     is only the reason given when nothing else has resolved the tick:
+//     restarts win, a fresh matching report wins, and only then is "have
+//     we run out of time to ever see one" asked.
 func AwaitHealthReport(rt Runtime, healthPath string, s State, now func() time.Time, sleep func(time.Duration)) (reason string, err error) {
 	deadline := time.Unix(s.Since, 0).Add(healthDeadline)
-	for now().Before(deadline) {
-		if h, readErr := ReadHealth(healthPath); readErr == nil && h.Digest == s.Desired && h.Timestamp >= s.Since {
-			return "", nil
-		}
+	for {
 		_, _, restarts, statusErr := rt.Status()
 		if statusErr != nil {
 			return "", fmt.Errorf("checking restart count: %w", statusErr)
@@ -61,9 +102,17 @@ func AwaitHealthReport(rt Runtime, healthPath string, s State, now func() time.T
 		if restarts >= maxRestarts {
 			return "the container restarted three times in a row", nil
 		}
+		if h, readErr := ReadHealth(healthPath); readErr == nil &&
+			h.Digest == s.Desired &&
+			h.Timestamp >= s.Since &&
+			now().Sub(time.Unix(h.Timestamp, 0)) <= healthStaleAfter {
+			return "", nil
+		}
+		if !now().Before(deadline) {
+			return "no health report for the new digest within the deadline", nil
+		}
 		sleep(healthPollInterval)
 	}
-	return "no health report for the new digest within the deadline", nil
 }
 
 // RollBackToProven falls back to s.Proven when the health report fails to
