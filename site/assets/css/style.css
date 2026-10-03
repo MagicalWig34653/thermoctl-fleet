@@ -268,44 +268,64 @@ th {
 
 .hero {
   position: relative;
-  padding: 64px 0 20px;
+  margin: -32px calc(50% - 50vw) 110px;
+  padding: 72px 20px 0;
   text-align: center;
   isolation: isolate;
-  overflow: hidden;
+  background: linear-gradient(125deg, #081629 0%, #12224b 52%, #302b70 100%);
+  color: #fff;
 }
 .hero::before {
   content: "";
   position: absolute;
-  inset: -20% -10% auto -10%;
-  height: 480px;
+  inset: 0;
   z-index: -1;
   background:
-    radial-gradient(circle at 20% 20%, var(--glow-1), transparent 55%),
-    radial-gradient(circle at 80% 10%, var(--glow-2), transparent 55%);
-  filter: blur(10px);
+    radial-gradient(ellipse at 74% 65%, rgba(255, 155, 84, .21), transparent 43%),
+    radial-gradient(ellipse at 22% 15%, rgba(93, 128, 255, .18), transparent 52%);
   pointer-events: none;
 }
 .hero img.hero-icon {
-  width: 72px;
-  height: 72px;
-  border-radius: 18px;
-  box-shadow: var(--shadow);
-  margin-bottom: 18px;
+  width: 96px;
+  height: 96px;
+  border-radius: 22px;
+  box-shadow: 0 14px 38px rgba(2, 9, 29, .32);
+  margin-bottom: 22px;
 }
 .hero h1 {
-  font-size: clamp(1.9rem, 4.4vw, 2.7rem);
+  font-size: clamp(2.1rem, 4.4vw, 3.2rem);
   max-width: 820px;
   margin: 0 auto 0.4em;
+  color: #fff;
 }
 .hero p.lead {
   font-size: 1.15rem;
-  color: var(--text-muted);
+  color: #e0e7fa;
   max-width: 640px;
   margin: 0.6em auto 0;
 }
+.hero p.lead a { color: #ffcb9d; }
 .hero-shot {
-  margin: 44px auto 0;
+  margin: 48px auto 0;
   max-width: 920px;
+  transform: translateY(82px);
+}
+.hero-shot figcaption {
+  color: var(--text-muted);
+  margin-top: 10px;
+}
+.home header.site-header {
+  background: rgba(13, 24, 48, .82);
+  border-color: rgba(255, 255, 255, .12);
+}
+.home header.site-header .brand,
+.home header.site-header nav a { color: #f3f5ff; }
+.home header.site-header nav a:hover,
+.home header.site-header nav a:focus { color: #ffcb9d; }
+.hero .btn.secondary {
+  color: #fff;
+  border-color: rgba(255, 255, 255, .55);
+  background: rgba(255, 255, 255, .1);
 }
 .browser-frame {
   background: var(--bg-elevated);
@@ -735,6 +755,14 @@ dl.glossary dd {
   margin: 0;
   padding-left: 1.3em;
 }
+.story-counter {
+  margin: 0 0 10px;
+  color: var(--accent-2);
+  font-size: .82rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
 .story-steps li {
   margin-bottom: 6px;
   font-size: 0.93rem;
@@ -809,6 +837,12 @@ dl.glossary dd {
   rx: 10;
   transition: stroke 0.15s ease, filter 0.15s ease;
 }
+#diagram-svg .node[data-node="agent"] .node-rect,
+#diagram-svg .node[data-node="fleet"] .node-rect {
+  stroke: var(--accent-2);
+  stroke-width: 2;
+  filter: drop-shadow(0 3px 8px var(--glow-2));
+}
 #diagram-svg .node {
   cursor: pointer;
 }
@@ -821,13 +855,7 @@ dl.glossary dd {
   font-size: 10.5px;
   fill: var(--text-muted);
 }
-#diagram-svg .node.is-dim .node-rect {
-  opacity: 0.35;
-}
-#diagram-svg .node.is-dim .node-title,
-#diagram-svg .node.is-dim .node-sub {
-  opacity: 0.35;
-}
+#diagram-svg .node.is-dim { opacity: .2; }
 #diagram-svg .node.is-active .node-rect {
   stroke: var(--accent);
   stroke-width: 2.5;
@@ -839,38 +867,64 @@ dl.glossary dd {
 }
 #diagram-svg .edge-line {
   fill: none;
-  stroke: var(--border);
-  stroke-width: 1.6;
-  opacity: 0.55;
+  stroke: var(--accent-2);
+  stroke-width: 1.8;
+  opacity: .8;
+  stroke-linejoin: round;
+  stroke-linecap: round;
 }
-#diagram-svg .edge-label {
-  font-size: 9.5px;
-  fill: var(--text-muted);
+#diagram-svg .edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  pointer-events: stroke;
 }
 #diagram-svg .edge.is-active .edge-line {
   stroke: var(--accent);
-  stroke-width: 2.4;
+  stroke-width: 2.8;
   opacity: 1;
+  stroke-dasharray: 8 5;
+  animation: edge-flow .9s linear infinite;
+  marker-end: url(#d-arrow-active);
 }
-#diagram-svg .edge.is-active .edge-label {
+#diagram-svg .edge.is-dim { opacity: .2; }
+#diagram-svg .edge:focus-visible .edge-line { stroke-width: 3; }
+#diagram-svg.is-narrow .edge:not(.is-active) { display: none; }
+@keyframes edge-flow { to { stroke-dashoffset: -13; } }
+@media (prefers-reduced-motion: reduce) {
+  #diagram-svg .edge.is-active .edge-line { animation: none; }
+}
+#diagram-svg .channel-band {
+  fill: var(--zone-apartment);
+  stroke: var(--accent-2);
+  stroke-width: 1.5;
+  stroke-dasharray: 6 5;
+}
+#diagram-svg .internet-channel.is-dim { opacity: .2; }
+#diagram-svg .channel-title,
+#diagram-svg .channel-sub {
+  text-anchor: middle;
+  fill: var(--accent-2);
+  pointer-events: none;
+}
+#diagram-svg .channel-title { font-size: 15px; font-weight: 800; }
+#diagram-svg .channel-sub { font-size: 14px; font-weight: 600; }
+#diagram-svg.is-narrow .channel-sub { font-size: 12px; }
+#diagram-svg .story-pill rect,
+#diagram-svg .hover-pill rect {
+  fill: var(--bg-elevated);
+  stroke: var(--accent);
+  stroke-width: 1.3;
+  filter: drop-shadow(0 2px 5px var(--glow-1));
+}
+#diagram-svg .pill-text {
   fill: var(--text);
+  font-size: 10.5px;
   font-weight: 600;
+  pointer-events: none;
 }
-#diagram-svg .edge.is-dim .edge-line {
-  opacity: 0.18;
-}
-#diagram-svg .edge.is-dim .edge-label {
-  opacity: 0.25;
-}
-/* Mobile: too little width for every edge label at once -- show lines
-   only by default, reveal a label when its edge is part of the active
-   story step (see architecture.js, .is-active). */
-#diagram-svg.is-narrow .edge-label {
-  opacity: 0;
-}
-#diagram-svg.is-narrow .edge.is-active .edge-label {
-  opacity: 1;
-}
+#diagram-svg .hover-pill,
+#diagram-svg .story-pill { pointer-events: none; }
 
 .side-panel {
   position: fixed;
@@ -957,4 +1011,36 @@ dl.glossary dd {
 }
 .fallback-list h3 {
   margin-top: 1.4em;
+}
+
+/* Narrow phones: the icon already names the site; keep the header to one
+   line by dropping the wordmark and tightening the nav. */
+@media (max-width: 480px) {
+  header.site-header .brand {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  header.site-header {
+    padding: 12px 12px;
+    gap: 10px;
+  }
+  header.site-header nav {
+    margin-left: auto;
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 0.7rem;
+  }
+  header.site-header nav a {
+    margin-left: 0;
+    font-size: 0.84rem;
+    white-space: nowrap;
+  }
+}
+@media (max-width: 359px) {
+  header.site-header nav { gap: 0.5rem; }
+  header.site-header nav a { font-size: 0.76rem; }
 }

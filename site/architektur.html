@@ -46,6 +46,7 @@
     <div class="story-bar" id="story-bar" role="group" aria-label="Ablauf auswählen"></div>
 
     <div class="story-steps" id="story-steps" hidden>
+      <p class="story-counter" id="story-counter" role="status" aria-live="polite"></p>
       <ol id="story-steps-list"></ol>
       <div class="story-nav">
         <button type="button" id="story-prev">← Zurück</button>
@@ -57,13 +58,17 @@
     <div class="diagram-wrap">
       <svg id="diagram-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Interaktives Architekturdiagramm. Knoten sind per Tab erreichbar, Enter öffnet Details, Escape schließt sie.">
         <defs>
-          <marker id="d-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          <marker id="d-arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent-2)"/>
+          </marker>
+          <marker id="d-arrow-active" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
           </marker>
         </defs>
         <g id="layer-zones"></g>
-        <g id="layer-edges"></g>
         <g id="layer-nodes"></g>
+        <g id="layer-edges"></g>
+        <g id="layer-labels"></g>
       </svg>
     </div>
   </div>

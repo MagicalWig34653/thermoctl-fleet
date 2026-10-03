@@ -3,12 +3,12 @@
  * docs/specification.md (sections 2-9, 13-17, 19-22) and the code in
  * fleet/, agent/, watchdog/, protocol/, image/.
  *
- * ARCH_NODES: one entry per component. `zone` decides which trust
- * boundary it is drawn in and therefore its column in the computed
- * layout (see architecture.js:computeLayout). `order` decides the
- * vertical position within that zone.
+ * ARCH_NODES: wide SVG coordinates x/y/w/h (viewBox 1200 × 735).
+ * Cards are hand placed inside four trust zones. `order` is retained
+ * from the source data; the renderer sorts the visual rows for tab order.
  *
- * ARCH_EDGES: one entry per labelled flow between two nodes.
+ * ARCH_EDGES: one flow per entry. labelX/labelY are fixed anchors in
+ * nearby clear gaps. Narrow anchors are supplied by the renderer.
  *
  * ARCH_STORIES: the selectable "storys" from the owner's request. Each
  * step names the nodes/edges to highlight and the explanation text
@@ -17,7 +17,7 @@
 
 const ARCH_NODES = [
   {
-    id: "thermoctl", zone: "apt", order: 0,
+    id: "thermoctl", zone: "apt", order: 0, x: 46, y: 165, w: 252, h: 64,
     title: "thermoctl", sub: "lokale REST-API, read-only Token",
     panel: {
       what: "Die eigentliche Heizungssteuerung der Wohnung -- unverändertes thermoctl, das auch ohne thermoctl-fleet voll nutzbar bleibt.",
@@ -28,7 +28,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "z2m", zone: "apt", order: 1,
+    id: "z2m", zone: "apt", order: 1, x: 322, y: 165, w: 252, h: 64,
     title: "Zigbee2MQTT & Mosquitto", sub: "Funknetz, Broker nur lokal",
     panel: {
       what: "Verwaltet die Zigbee-Sensoren und -Aktoren der Wohnung; Mosquitto ist der lokale MQTT-Broker dazwischen.",
@@ -39,7 +39,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "agent", zone: "apt", order: 2,
+    id: "agent", zone: "apt", order: 2, x: 46, y: 268, w: 528, h: 70,
     title: "Agent", sub: "einzige Verbindung nach außen",
     panel: {
       what: "Das einzige Programm der Wohnung, das die Cloud überhaupt erreicht -- nur ausgehend, kein offener Port, keine Portweiterleitung nötig.",
@@ -50,7 +50,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "watchdog", zone: "apt", order: 3,
+    id: "watchdog", zone: "apt", order: 3, x: 46, y: 377, w: 252, h: 64,
     title: "Watchdog", sub: "Go, kennt kein Netz, keine Registry",
     panel: {
       what: "Ein paar hundert Zeilen Go, statisch gebaut, eigener systemd-Dienst. Die einzige Aufgabe: beobachtet den Agenten, tauscht zwischen zwei lokal bereits geprüften Digests.",
@@ -61,7 +61,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "restore_mover", zone: "apt", order: 4,
+    id: "restore_mover", zone: "apt", order: 4, x: 322, y: 377, w: 252, h: 64,
     title: "Restore-Mover", sub: "Go, bloßes System, kein Netz",
     panel: {
       what: "Ein kleines, separates Go-Programm neben dem Watchdog (gleiches Modul, keine Abhängigkeit, kein Netzwerk).",
@@ -72,7 +72,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "state_files", zone: "apt", order: 5,
+    id: "state_files", zone: "apt", order: 5, x: 46, y: 486, w: 252, h: 64,
     title: "State- & Health-Dateien", sub: "/run/, zeilenbasiert",
     panel: {
       what: "Der Vertrag zwischen Agent und Watchdog: eine State-Datei (desired/proven/since) und ein Health-Report (timestamp/digest/version), beide zeilenbasiert statt JSON.",
@@ -83,7 +83,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "led", zone: "apt", order: 6,
+    id: "led", zone: "apt", order: 6, x: 322, y: 595, w: 252, h: 64,
     title: "LED-Status", sub: "nur Raspberry Pi",
     panel: {
       what: "Zwei LEDs am Gerät zeigen den Systemzustand an -- ganz ohne Netzwerk oder Display.",
@@ -94,7 +94,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "docker", zone: "apt", order: 7,
+    id: "docker", zone: "apt", order: 7, x: 322, y: 486, w: 252, h: 64,
     title: "Lokaler Docker", sub: "vier Container, kein Fernzugriff",
     panel: {
       what: "Der Container-Laufzeit auf der Basisstation -- thermoctl, Zigbee2MQTT, Mosquitto, Agent.",
@@ -105,7 +105,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "boot", zone: "apt", order: 8,
+    id: "boot", zone: "apt", order: 8, x: 46, y: 595, w: 252, h: 64,
     title: "Boot-Partition", sub: "agent-registration.json",
     panel: {
       what: "Die FAT32-Boot-Partition des vorbereiteten Images, beschrieben vom kleinen Vorbereitungswerkzeug.",
@@ -116,7 +116,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "registry", zone: "reg", order: 0,
+    id: "registry", zone: "reg", order: 0, x: 527, y: 46, w: 146, h: 64,
     title: "Registry (ghcr.io u. a.)", sub: "Präfixliste fest im Agenten",
     panel: {
       what: "Die externen Container-Registrierungen, aus denen Images für die vier Dienste geladen werden.",
@@ -127,7 +127,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "fleet", zone: "cloud", order: 0,
+    id: "fleet", zone: "cloud", order: 0, x: 780, y: 268, w: 374, h: 70,
     title: "Fleet-Dienst", sub: "FastAPI",
     panel: {
       what: "Der zentrale Cloud-Dienst: nimmt Heartbeats und Ereignisse an, verteilt Befehle über SSE, bedient das Web-UI.",
@@ -138,7 +138,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "db", zone: "cloud", order: 1,
+    id: "db", zone: "cloud", order: 1, x: 780, y: 385, w: 172, h: 64,
     title: "SQLite", sub: "Inventar, Zustände, Audit-Log",
     panel: {
       what: "Die Datenhaltung des Fleet-Dienstes: Apartments, Geräte, Zuordnungen, Alarme, Audit-Log.",
@@ -149,7 +149,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "blob", zone: "cloud", order: 2,
+    id: "blob", zone: "cloud", order: 2, x: 976, y: 385, w: 178, h: 64,
     title: "Backup-Blobspeicher", sub: "nur opake Blöcke",
     panel: {
       what: "Speichert die hochgeladenen Betriebsdaten-Backups -- als auf dem Gerät bereits verschlüsselten, für die Cloud nicht lesbaren Block.",
@@ -160,7 +160,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "webui", zone: "cloud", order: 3,
+    id: "webui", zone: "cloud", order: 3, x: 780, y: 487, w: 172, h: 64,
     title: "Web-UI", sub: "Haus, Wohnung, Aufgaben, Inventar",
     panel: {
       what: "Die drei Ansichten aus Abschnitt 9 (Haus, Wohnung, Aufgaben) plus Inventar (Abschnitt 20.4).",
@@ -171,7 +171,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "notifier", zone: "cloud", order: 4,
+    id: "notifier", zone: "cloud", order: 4, x: 976, y: 487, w: 178, h: 64,
     title: "Alarm-Kanäle", sub: "Webhook, SMTP, Log",
     panel: {
       what: "Konfigurierbare Benachrichtigungskanäle; mehrere gleichzeitig möglich, jeder wird einzeln versucht.",
@@ -182,7 +182,7 @@ const ARCH_NODES = [
     },
   },
   {
-    id: "browser", zone: "browser", order: 0,
+    id: "browser", zone: "browser", order: 0, x: 780, y: 628, w: 374, h: 64,
     title: "Vermieter-Browser", sub: "Passkey/TOTP, age-Verschlüsselung lokal",
     panel: {
       what: "Der Browser, in dem der Vermieter das Web-UI bedient -- der einzige Ort, an dem der Restore-Schlüssel jemals im Klartext erscheint.",
@@ -195,28 +195,28 @@ const ARCH_NODES = [
 ];
 
 const ARCH_EDGES = [
-  { id: "e-thermoctl-agent", from: "thermoctl", to: "agent", label: "REST GET, read-only", lane: 0 },
-  { id: "e-z2m-agent", from: "z2m", to: "agent", label: "lokale Dateien (Backup)", lane: 1 },
-  { id: "e-agent-state", from: "agent", to: "state_files", label: "schreibt Health-Report", lane: 0 },
-  { id: "e-watchdog-state", from: "watchdog", to: "state_files", label: "liest State & Health", lane: 1 },
-  { id: "e-agent-watchdog", from: "agent", to: "watchdog", label: "State-Datei (desired/proven)", lane: 2 },
-  { id: "e-watchdog-docker", from: "watchdog", to: "docker", label: "startet/tauscht Agent-Container", lane: 0 },
-  { id: "e-agent-docker", from: "agent", to: "docker", label: "Docker-Socket, 3 Dienste", lane: 1 },
-  { id: "e-agent-led", from: "agent", to: "led", label: "schreibt Status", lane: 2 },
-  { id: "e-agent-restoremover", from: "agent", to: "restore_mover", label: "Staging-Verzeichnis (read-only)", lane: 3 },
-  { id: "e-boot-agent", from: "boot", to: "agent", label: "Registrierungscode, einmalig", lane: 4 },
-  { id: "e-agent-registry", from: "agent", to: "registry", label: "HTTPS, Image + Digest-Prüfung", lane: 0 },
-  { id: "e-agent-fleet-heartbeat", from: "agent", to: "fleet", label: "POST /v1/heartbeat (120 s)", lane: 0 },
-  { id: "e-agent-fleet-backup", from: "agent", to: "fleet", label: "POST /v1/backups (opak)", lane: 1 },
-  { id: "e-agent-fleet-result", from: "agent", to: "fleet", label: "POST /v1/commands/{id}/result", lane: 2 },
-  { id: "e-fleet-agent-sse", from: "fleet", to: "agent", label: "GET /v1/commands (SSE)", lane: 3 },
-  { id: "e-fleet-db", from: "fleet", to: "db", label: "Inventar, Zustände, Audit", lane: 0 },
-  { id: "e-fleet-blob", from: "fleet", to: "blob", label: "speichert opaken Block", lane: 1 },
-  { id: "e-fleet-notifier", from: "fleet", to: "notifier", label: "ruft konfigurierte Kanäle", lane: 2 },
-  { id: "e-fleet-webui", from: "fleet", to: "webui", label: "stellt Daten bereit", lane: 3 },
-  { id: "e-webui-browser", from: "webui", to: "browser", label: "HTTPS, Anmeldung", lane: 0 },
-  { id: "e-browser-fleet-key", from: "browser", to: "fleet", label: "verschlüsselter Schlüssel-Block", lane: 1 },
-  { id: "e-fleet-browser-recipient", from: "fleet", to: "browser", label: "age-Public-Key + Skript-sha256", lane: 2 },
+  { id: "e-thermoctl-agent", from: "thermoctl", to: "agent", label: "REST GET, read-only", lane: 0, labelX: 172, labelY: 251 },
+  { id: "e-z2m-agent", from: "z2m", to: "agent", label: "lokale Dateien (Backup)", lane: 1, labelX: 448, labelY: 251 },
+  { id: "e-agent-state", from: "agent", to: "state_files", label: "schreibt Health-Report", lane: 0, labelX: 166, labelY: 464 },
+  { id: "e-watchdog-state", from: "watchdog", to: "state_files", label: "liest State & Health", lane: 1, labelX: 170, labelY: 464 },
+  { id: "e-agent-watchdog", from: "agent", to: "watchdog", label: "State-Datei (desired/proven)", lane: 2, labelX: 170, labelY: 360 },
+  { id: "e-watchdog-docker", from: "watchdog", to: "docker", label: "startet/tauscht Agent-Container", lane: 0, labelX: 448, labelY: 464 },
+  { id: "e-agent-docker", from: "agent", to: "docker", label: "Docker-Socket, 3 Dienste", lane: 1, labelX: 436, labelY: 464 },
+  { id: "e-agent-led", from: "agent", to: "led", label: "schreibt Status", lane: 2, labelX: 445, labelY: 573 },
+  { id: "e-agent-restoremover", from: "agent", to: "restore_mover", label: "Staging-Verzeichnis (read-only)", lane: 3, labelX: 442, labelY: 360 },
+  { id: "e-boot-agent", from: "boot", to: "agent", label: "Registrierungscode, einmalig", lane: 4, labelX: 161, labelY: 573 },
+  { id: "e-agent-registry", from: "agent", to: "registry", label: "HTTPS, Image + Digest-Prüfung", lane: 0, labelX: 637, labelY: 151 },
+  { id: "e-agent-fleet-heartbeat", from: "agent", to: "fleet", label: "POST /v1/heartbeat (120 s)", lane: 0, labelX: 677, labelY: 284 },
+  { id: "e-agent-fleet-backup", from: "agent", to: "fleet", label: "POST /v1/backups (opak)", lane: 1, labelX: 677, labelY: 300 },
+  { id: "e-agent-fleet-result", from: "agent", to: "fleet", label: "POST /v1/commands/{id}/result", lane: 2, labelX: 677, labelY: 316 },
+  { id: "e-fleet-agent-sse", from: "fleet", to: "agent", label: "GET /v1/commands (SSE)", lane: 3, labelX: 677, labelY: 332 },
+  { id: "e-fleet-db", from: "fleet", to: "db", label: "Inventar, Zustände, Audit", lane: 0, labelX: 855, labelY: 365 },
+  { id: "e-fleet-blob", from: "fleet", to: "blob", label: "speichert opaken Block", lane: 1, labelX: 1064, labelY: 365 },
+  { id: "e-fleet-notifier", from: "fleet", to: "notifier", label: "ruft konfigurierte Kanäle", lane: 2, labelX: 1063, labelY: 471 },
+  { id: "e-fleet-webui", from: "fleet", to: "webui", label: "stellt Daten bereit", lane: 3, labelX: 849, labelY: 471 },
+  { id: "e-webui-browser", from: "webui", to: "browser", label: "HTTPS, Anmeldung", lane: 0, labelX: 870, labelY: 576 },
+  { id: "e-browser-fleet-key", from: "browser", to: "fleet", label: "verschlüsselter Schlüssel-Block", lane: 1, labelX: 1057, labelY: 586 },
+  { id: "e-fleet-browser-recipient", from: "fleet", to: "browser", label: "age-Public-Key + Skript-sha256", lane: 2, labelX: 1060, labelY: 471 },
 ];
 
 /* Storys: ordered steps, each naming the nodes/edges active in that
