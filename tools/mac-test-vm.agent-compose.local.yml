@@ -1,0 +1,62 @@
+# Test-VM-only override of image/common/agent-compose.yml (section 19,
+# owner-only local enrollment test -- see tools/mac-test-vm's own
+# top-of-file docstring and image/README.md's usage section).
+#
+# **Security principle 2 (CLAUDE.md): a locally built image has no
+# registry digest, so it can never go through the real watchdog-driven
+# swap path (`docker tag <digest> thermoctl-agent:current`,
+# `watchdog/runtime.go`).** This file exists SPECIFICALLY so the test VM
+# can run that locally built image directly via `docker compose`,
+# bypassing the digest check and the watchdog entirely -- the same escape
+# hatch `/etc/thermoctl-agent/compose.yml` (the real one, shipped
+# unmodified by image/common/install.sh) deliberately does NOT provide.
+# Nothing in agent/ or watchdog/ is changed or weakened to make this
+# possible; this is a second, parallel compose file, used only by
+# `tools/mac-test-vm enroll`, that a real device image never ships at all.
+#
+# Differences from image/common/agent-compose.yml, and why:
+#   - `image: thermoctl-agent:local` (not `:current`) -- the tag
+#     `tools/mac-test-vm` gives the image it builds locally from
+#     docker/Dockerfile.agent.
+#   - `pull_policy: never` kept (same reasoning as the real file: never
+#     reach for a registry).
+#   - The thermoctl/Zigbee2MQTT bind mounts are dropped: this test VM
+#     never runs thermoctl or Zigbee2MQTT at all, so those two real
+#     devices' data directories do not exist here, and the backup/restore
+#     code paths they feed are not part of what this enrollment test
+#     exercises (registration + the command/heartbeat channel only).
+#   - `group_add`'s `DOCKER_GID` still comes from
+#     /etc/thermoctl-agent/.env, written by image/common/install.sh at VM
+#     provisioning time exactly as on a real device -- unchanged.
+services:
+  agent:
+    image: thermoctl-agent:local
+    container_name: thermoctl-agent
+    pull_policy: never
+    restart: "no"
+    # The image's own CMD (docker/Dockerfile.agent: `python -m agent`, no
+    # subcommand) prints usage and exits -- registration itself happens
+    # as a separate one-shot `docker run ... python -m agent register`
+    # (`tools/mac-test-vm enroll`'s own first step, before this compose
+    # file is ever brought up), so by the time `docker compose up` for
+    # *this* file runs, a token already exists under
+    # /var/lib/thermoctl-agent and `run` finds it.
+    command: ["python", "-m", "agent", "run"]
+    group_add:
+      - "${DOCKER_GID:?DOCKER_GID is missing -- see image/common/README.md}"
+    volumes:
+      - /var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog
+      - /run/thermoctl-agent:/run/thermoctl-agent
+      - /var/lib/thermoctl-agent:/var/lib/thermoctl-agent
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro
+      # Same CA-bundle mount tools/mac-test-vm's own one-shot `docker run
+      # ... register` uses, for the exact same reason and the exact same
+      # path (see that script's own comment: `ssl.get_default_verify_paths
+      # ()` run inside this image, not guessed) -- the container's
+      # filesystem is independent of the VM host's, so trusting the local
+      # fleet's throwaway CA on the VM host does not by itself make the
+      # already-built image trust it too. A real device's agent container
+      # never needs this -- its CA is a publicly trusted one, already in
+      # the image's default bundle.
+      - /etc/ssl/certs/ca-certificates.crt:/usr/lib/ssl/cert.pem:ro
