@@ -19,6 +19,7 @@ import pytest
 from tools.flash_image import (
     FlashError,
     RemovableDisk,
+    _diskutil,
     _diskutil_plist,
     _stable_id,
     _volume_summary,
@@ -519,6 +520,7 @@ def test_volume_summary_includes_names_and_sizes() -> None:
                 "Partitions": [
                     {"VolumeName": "BACKUP", "Size": 12345},
                     {"DeviceIdentifier": "disk4s2", "Size": 6789},
+                    "malformed partition",
                 ]
             }
         ]
@@ -660,3 +662,326 @@ def test_main_flash_rechecks_before_write_and_readback(tmp_path: Path) -> None:
         "probe",
         "verify",
     ]
+
+
+def _flash_args(image_path: Path, *extra: str) -> list[str]:
+    return [
+        "flash", "--image", str(image_path), "--disk", "/dev/disk4",
+        "--fleet-address", "https://fleet.example.invalid",
+        "--certificate-fingerprint", "sha256:" + "a" * 64,
+        "--registration-code", "code", *extra,
+    ]
+
+
+def _safe_disk() -> RemovableDisk:
+    return RemovableDisk("/dev/disk4", "/dev/rdisk4", "USB", 1000, "original-uuid")
+
+
+def _safe_info() -> dict[str, object]:
+    return {
+        "DeviceIdentifier": "disk4", "MediaName": "USB", "TotalSize": 1000,
+        "DiskUUID": "original-uuid", "Internal": False,
+        "VirtualOrPhysical": "Physical", "WholeDisk": True,
+    }
+
+
+def _probe_results(*values: dict[str, object]) -> list[MagicMock]:
+    return [MagicMock(returncode=0, stdout=_plist_bytes(value)) for value in values]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"DeviceIdentifier": "disk5"}, {"MediaName": "swapped USB"},
+        {"TotalSize": 2000}, {"DiskUUID": "replacement-uuid"},
+        {"Internal": True}, {"VirtualOrPhysical": "Virtual"},
+        {"WholeDisk": False},
+    ],
+    ids=["identifier", "media-name", "size", "disk-uuid", "internal", "virtual", "partition"],
+)
+def test_flash_refuses_changed_disk_before_unmount_or_write(
+    tmp_path: Path, changed: dict[str, object]
+) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    info = {**_safe_info(), **changed}
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[_safe_disk()]),
+        patch("tools.flash_image.subprocess.run", side_effect=_probe_results(info)) as run,
+        patch("tools.flash_image.subprocess.Popen") as popen,
+        patch("tools.flash_image.unmount_disk") as unmount,
+        patch("tools.flash_image.flash_image") as write,
+    ):
+        assert main(_flash_args(image_path, "--yes", "--i-know-this-erases-the-disk")) == 1
+    run.assert_called_once()
+    unmount.assert_not_called()
+    write.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_flash_refuses_invalid_raw_path_before_probing_or_writing(tmp_path: Path) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    disk = RemovableDisk("/dev/disk4", "/dev/rdisk5", "USB", 1000)
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[disk]),
+        patch("tools.flash_image.subprocess.run") as run,
+        patch("tools.flash_image.subprocess.Popen") as popen,
+        patch("tools.flash_image.unmount_disk") as unmount,
+        patch("tools.flash_image.flash_image") as write,
+    ):
+        assert main(_flash_args(image_path, "--yes", "--i-know-this-erases-the-disk")) == 1
+    run.assert_not_called()
+    unmount.assert_not_called()
+    write.assert_not_called()
+    popen.assert_not_called()
+
+
+@pytest.mark.parametrize("boot_key", ["DeviceIdentifier", "ParentWholeDisk", "APFSPhysicalStore"])
+def test_flash_refuses_system_disk_alias_before_unmount_or_write(
+    tmp_path: Path, boot_key: str
+) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[_safe_disk()]),
+        patch("tools.flash_image.subprocess.run", side_effect=_probe_results(
+            _safe_info(), {boot_key: "disk4"}
+        )),
+        patch("tools.flash_image.subprocess.Popen") as popen,
+        patch("tools.flash_image.unmount_disk") as unmount,
+        patch("tools.flash_image.flash_image") as write,
+    ):
+        assert main(_flash_args(image_path, "--yes", "--i-know-this-erases-the-disk")) == 1
+    unmount.assert_not_called()
+    write.assert_not_called()
+    popen.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tree",
+    [
+        {"WholeDisks": [], "AllDisksAndPartitions": []},
+        {"WholeDisks": ["disk4"], "AllDisksAndPartitions": [{"APFSContainer": "disk7"}]},
+        {"WholeDisks": ["disk4"], "AllDisksAndPartitions": [
+            {"Partitions": [{"VolumeName": "APFS Volume"}]}
+        ]},
+        {"WholeDisks": ["disk4"], "AllDisksAndPartitions": [
+            {"Partitions": [{"MountPoint": "/"}]}
+        ]},
+    ],
+    ids=["no-longer-whole", "apfs-container", "apfs-volume", "root-mount"],
+)
+def test_flash_refuses_unsafe_partition_tree_before_unmount_or_write(
+    tmp_path: Path, tree: dict[str, object]
+) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[_safe_disk()]),
+        patch("tools.flash_image.subprocess.run", side_effect=_probe_results(
+            _safe_info(), {"DeviceIdentifier": "disk1"}, tree
+        )),
+        patch("tools.flash_image.subprocess.Popen") as popen,
+        patch("tools.flash_image.unmount_disk") as unmount,
+        patch("tools.flash_image.flash_image") as write,
+    ):
+        assert main(_flash_args(image_path, "--yes", "--i-know-this-erases-the-disk")) == 1
+    unmount.assert_not_called()
+    write.assert_not_called()
+    popen.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "size,flags", [(256_000_000_001, ("--yes",)), (1000, ("--yes",))],
+    ids=["over-256-gb", "yes-without-erase-acknowledgment"],
+)
+def test_flash_cli_guards_abort_before_unmount_or_write(
+    tmp_path: Path, size: int, flags: tuple[str, ...]
+) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    disk = RemovableDisk("/dev/disk4", "/dev/rdisk4", "USB", size)
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[disk]),
+        patch("tools.flash_image.subprocess.run") as run,
+        patch("tools.flash_image.subprocess.Popen") as popen,
+        patch("tools.flash_image.unmount_disk") as unmount,
+        patch("tools.flash_image.flash_image") as write,
+    ):
+        assert main(_flash_args(image_path, *flags)) == 1
+    run.assert_not_called()
+    unmount.assert_not_called()
+    write.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_flash_rejected_confirmation_aborts_before_unmount_or_write(tmp_path: Path) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[_safe_disk()]),
+        patch("tools.flash_image.confirm_disk", return_value=False),
+        patch("tools.flash_image.subprocess.run") as run,
+        patch("tools.flash_image.subprocess.Popen") as popen,
+        patch("tools.flash_image.unmount_disk") as unmount,
+        patch("tools.flash_image.flash_image") as write,
+    ):
+        assert main(_flash_args(image_path)) == 1
+    run.assert_not_called()
+    unmount.assert_not_called()
+    write.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_flash_unmount_failure_aborts_before_write(tmp_path: Path) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[_safe_disk()]),
+        patch("tools.flash_image.subprocess.run", side_effect=[
+            *_probe_results(_safe_info(), {"DeviceIdentifier": "disk1"},
+                            {"WholeDisks": ["disk4"]}),
+            MagicMock(returncode=1),
+        ]) as run,
+        patch("tools.flash_image.subprocess.Popen") as popen,
+        patch("tools.flash_image.flash_image") as write,
+    ):
+        assert main(_flash_args(image_path, "--yes", "--i-know-this-erases-the-disk")) == 1
+    assert run.call_count == 4
+    write.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_flash_verification_failure_skips_registration_files(tmp_path: Path) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[_safe_disk()]),
+        patch("tools.flash_image.validate_disk_identity"),
+        patch("tools.flash_image.unmount_disk"),
+        patch("tools.flash_image.flash_image", return_value="digest") as write,
+        patch("tools.flash_image.verify_disk", return_value=False) as verify,
+        patch("tools.flash_image.mount_boot_partition") as mount,
+        patch("tools.flash_image.write_registration_file") as registration,
+        patch("tools.flash_image.subprocess.run") as run,
+        patch("tools.flash_image.subprocess.Popen") as popen,
+    ):
+        assert main(_flash_args(image_path, "--yes", "--i-know-this-erases-the-disk")) == 1
+    write.assert_called_once()
+    verify.assert_called_once_with("/dev/rdisk4", "digest", 5)
+    mount.assert_not_called()
+    registration.assert_not_called()
+    run.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_diskutil_plist_rejects_non_dictionary_and_malformed_data() -> None:
+    for payload in (plistlib.dumps(["disk4"]), b"broken plist"):
+        with (
+            patch("tools.flash_image.subprocess.run", return_value=MagicMock(
+                returncode=0, stdout=payload
+            )),
+            pytest.raises(FlashError, match="invalid diskutil .* plist"),
+        ):
+            _diskutil_plist("info", "-plist", "/dev/disk4")
+
+
+def test_diskutil_missing_fails_with_clear_error() -> None:
+    with (
+        patch("tools.flash_image.shutil.which", return_value=None),
+        pytest.raises(FlashError, match="diskutil not found"),
+    ):
+        _diskutil()
+
+
+def test_list_disks_skips_malformed_info_and_reports_valid_disk(
+    capsys: pytest.CaptureFixture[str]
+) -> None:
+    with patch("tools.flash_image.subprocess.run", side_effect=[
+        *_probe_results({"WholeDisks": ["disk3", "disk4"]}),
+        MagicMock(returncode=0, stdout=b"broken plist"),
+        *_probe_results({"MediaName": "USB", "TotalSize": 1024},
+                        {"AllDisksAndPartitions": ["bad entry", {"Partitions": []}]}),
+    ]):
+        assert main(["list-disks"]) == 0
+    output = capsys.readouterr().out
+    assert "/dev/disk4" in output
+    assert "USB" in output
+    assert "/dev/disk3" not in output
+
+
+def test_mount_boot_partition_rejects_malformed_plist() -> None:
+    with (
+        patch("tools.flash_image.subprocess.run", side_effect=[
+            MagicMock(returncode=0), MagicMock(returncode=0, stdout=b"broken plist")
+        ]),
+        pytest.raises(FlashError, match="could not parse diskutil info"),
+    ):
+        mount_boot_partition("/dev/disk4")
+
+
+def test_verify_disk_uses_exact_block_count_for_aligned_image() -> None:
+    payload = b"x" * (4 * 1024 * 1024)
+    process = MagicMock()
+    process.stdout = io.BytesIO(payload)
+    process.wait.return_value = 0
+    process.__enter__.return_value = process
+    with patch("tools.flash_image.subprocess.Popen", return_value=process) as popen:
+        assert verify_disk("/dev/rdisk4", hashlib.sha256(payload).hexdigest(), len(payload))
+    assert "count=1" in popen.call_args.args[0]
+
+
+def test_main_flash_writes_optional_configuration_after_verification(tmp_path: Path) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[_safe_disk()]),
+        patch("tools.flash_image.validate_disk_identity"),
+        patch("tools.flash_image.unmount_disk"),
+        patch("tools.flash_image.flash_image", return_value="digest"),
+        patch("tools.flash_image.verify_disk", return_value=True),
+        patch("tools.flash_image.mount_boot_partition", return_value=tmp_path),
+        patch("tools.flash_image.subprocess.run") as run,
+        patch("tools.flash_image.subprocess.Popen") as popen,
+    ):
+        assert main(_flash_args(
+            image_path, "--yes", "--i-know-this-erases-the-disk",
+            "--backup-recipient", "age1example", "--wifi-ssid", "test-network",
+            "--wifi-password", "test-password"
+        )) == 0
+    assert (tmp_path / "thermoctl" / "backup-recipients.txt").read_text() == "age1example\n"
+    assert (tmp_path / "thermoctl" / "wifi.env").read_text() == (
+        "SSID=test-network\nPASSWORD=test-password\n"
+    )
+    run.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_validate_disk_identity_ignores_malformed_non_boot_entries() -> None:
+    tree: dict[str, object] = {
+        "WholeDisks": ["disk4"],
+        "AllDisksAndPartitions": [
+            "malformed whole entry",
+            {"Partitions": ["malformed partition", {"MountPoint": "/Volumes/USB"}]},
+        ],
+    }
+    with patch("tools.flash_image.subprocess.run", side_effect=_probe_results(
+        _safe_info(), {"DeviceIdentifier": "disk1"}, tree
+    )):
+        validate_disk_identity(_safe_disk())
+
+
+def test_main_flash_dry_run_without_wifi_never_writes(tmp_path: Path) -> None:
+    image_path = tmp_path / "image.img.xz"
+    _write_image(image_path, b"image")
+    with (
+        patch("tools.flash_image.list_removable_disks", return_value=[_safe_disk()]),
+        patch("tools.flash_image.subprocess.run") as run,
+        patch("tools.flash_image.subprocess.Popen") as popen,
+        patch("tools.flash_image.unmount_disk") as unmount,
+    ):
+        assert main(_flash_args(image_path, "--dry-run", "--yes")) == 0
+    run.assert_not_called()
+    popen.assert_not_called()
+    unmount.assert_not_called()

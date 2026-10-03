@@ -4,6 +4,10 @@ Last updated: 2026-10-03.
 
 ## Cross-review fixes: image build, flash tool (2026-10-03)
 
+- Added mocked flash safety tests for changed disk identity, boot/APFS and
+  mounted root refusals, size and unattended-erase guards, unmount/readback
+  failures, and malformed diskutil data. Added local VM serve and enrollment
+  error-path tests without starting a server.
 - mkosi now uses `mkosi.postinst.chroot` and stages `image/common/`,
   `watchdog/`, and built binaries through `mkosi.extra` before the hook.
   `install.sh` only invokes host `systemd-tmpfiles --create` for a live root.
