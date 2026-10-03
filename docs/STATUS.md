@@ -2,6 +2,161 @@
 
 Last updated: 2026-10-03.
 
+## Image build pipeline, macOS flash tool, Mac test VM (section 19, 2026-10-03)
+
+Three pieces, sharing one recipe (section 19.3's own "one recipe, two
+targets" extended to a third consumer):
+
+1. **`image/common/install.sh`** -- the shared recipe applier, idempotent,
+   taking `--root` (so the same script applies to a chroot/pi-gen stage
+   directory, an mkosi build root, or a live system's own `/`) and
+   `--arch` (cross-compiles the three watchdog binaries with
+   `GOOS=linux GOARCH=$ARCH CGO_ENABLED=0 go build`). Installs
+   `packages.txt`, Docker's apt repository (exact step order from
+   `image/common/README.md`), the udev rule, `unattended-upgrades`,
+   `tmpfiles.d`, the agent compose file, the empty registration template
+   (never overwritten once a real one exists), `/etc/thermoctl-agent/.env`
+   with the real `DOCKER_GID`, the pre-set watchdog state file (section
+   22.5, `PROVEN=false`), and enables all the systemd units. Tested in
+   `tests/test_image_install_sh.py` (dry-run file-layout checks, plus one
+   test gated on a local `go` toolchain that cross-compiles the real
+   binaries and checks them with `file`) and, as of this entry, by an
+   actual end-to-end run inside a Lima VM (see point 3) -- a real `apt-get
+   install docker-ce ...` against Debian's and Docker's real repositories,
+   a real `go build`, real `systemctl enable`, not a simulation.
+   **Found and fixed by that real run:** `go build`'s own build cache
+   needs `$HOME`/`$XDG_CACHE_HOME`/`GOCACHE` set, and Lima's (and
+   plausibly a bare pi-gen/mkosi chroot's) `mode: system` provisioning
+   execs as root with no environment at all -- `install.sh` now sets
+   `GOCACHE` explicitly to a path under its own `--root` before building.
+2. **`.github/workflows/image.yml`** -- the "validate only" job is
+   unchanged; new `v*`-tag-gated jobs build the three watchdog binaries
+   once (reused by both image jobs), then `pi-gen` (arm64, a custom stage
+   at `image/pi/pi-gen-stage/01-thermoctl/00-run.sh` that applies
+   `install.sh` via pi-gen's own `on_chroot`) and `mkosi` (amd64,
+   `image/x86/mkosi.conf` + `mkosi.postinst`, same `install.sh` call) in
+   parallel, compress+checksum, and attach both `.img.xz` + a combined
+   `SHA256SUMS` to the tag's release. **mkosi chosen over debos** --
+   reasoning in the workflow file and in `image/x86/README.md`'s own
+   update section (systemd alignment). **Not run end to end**: a real
+   pi-gen/mkosi build needs privileged loop-device mounts this
+   development sandbox does not have. Verified instead with `actionlint`
+   (clean, including the deliberately path-filter-free `push:` trigger --
+   GitHub ANDs a tag filter with a path filter against a tag's own,
+   usually-empty diff, which would otherwise silently skip every release
+   build) and by reviewing each tool's own documented CLI/script-discovery
+   convention. `install.sh` itself, the one piece both jobs actually run,
+   **was** verified for real (point 1 above).
+3. **`tools/flash_image.py`** -- the macOS preparation tool (section
+   19.5): `list-disks` (`diskutil list -plist external physical` --
+   structurally excludes internal/system disks, not merely checks for
+   them), `flash` (streams a `.img.xz` through stdlib `lzma` into `dd`,
+   hashing as it goes; requires typing the disk's own device path back,
+   not just "y"; `--dry-run` hashes the whole image without touching a
+   disk), verify (reads the same byte range back and compares), and
+   writes `agent-registration.json` (exactly
+   `protocol.registration.AgentRegistrationFile`'s three fields),
+   `thermoctl/backup-recipients.txt`, and an optional
+   `thermoctl/wifi.env` (section 15.4's recommended path -- format
+   documented in the module, not yet consumed by `install.sh` or any
+   boot-time service, tracked here like `agent-compose.yml` was before
+   P5.4). 29 tests (`tests/test_flash_image.py`), every disk-facing call
+   through mocked `subprocess` -- no test ever touches a real disk.
+4. **`tools/mac-test-vm`** -- the Lima test VM (Debian 13 arm64,
+   `tools/mac-test-vm.lima.yaml`), applying `install.sh` as a real
+   provisioning step on VM start. `tools/mac_test_vm/fleet_local.py`
+   starts a real `fleet.app.app` over a real (self-signed) TLS
+   certificate and drives the real `Storage.prepare_device` to mint a
+   registration code for a fixed fixture apartment/device (idempotent --
+   a second `enroll` resets the fixture device `prepared -> in_storage`
+   via the same manual transition the fleet UI itself offers, then
+   re-prepares it). `enroll` builds `thermoctl-agent:local` **inside** the
+   VM from `docker/Dockerfile.agent`, then launches `python -m agent
+   register` **detached** (`docker run -d`, not `--rm`) -- found by
+   running this for real: `agent.registration.register` deliberately
+   *blocks*, polling the fleet, until a human confirms the device in the
+   fleet UI (section 15.3 step 3), so the dispatcher script must not wait
+   on it inline. `finish` starts the real agent container afterward, via
+   `tools/mac-test-vm.agent-compose.local.yml` -- a TEST-VM-ONLY compose
+   override (image: `thermoctl-agent:local`, not `:current`; no
+   thermoctl/Zigbee2MQTT mounts) that exists *because* a locally built
+   image has no registry digest and the real
+   `/etc/thermoctl-agent/compose.yml` would simply refuse to start it
+   (CLAUDE.md security principle 2 -- neither `agent/sources.py` nor
+   `watchdog/` were touched to make this possible; the watchdog-driven
+   digest swap itself is the one thing this test genuinely cannot
+   exercise). Both `finish` and the registration `docker run` mount the
+   VM host's own CA-trust bundle into the container at
+   `/usr/lib/ssl/cert.pem` (`python3 -c "import ssl;
+   print(ssl.get_default_verify_paths())"` run inside the real image is
+   where that exact path comes from, not a guess) -- the container's own
+   filesystem is independent of the VM host's, so trusting the local
+   fleet's throwaway CA on the host alone does not make the already-built
+   image trust it too; a real device's agent container never needs this,
+   its CA is a publicly trusted one already in the image's default
+   bundle.
+
+   **Actually run end to end on this machine, not merely written**: VM
+   created and provisioned for real (`limactl`/`qemu-system-aarch64`,
+   already installed), `install.sh` ran for real inside it, the agent
+   image was built for real inside the VM, and a full registration ran
+   for real -- `POST /v1/registration` (201), the verification code
+   printed, confirmed via the real `Storage.confirm_device` (the exact
+   method the fleet UI's own "Bestätigen" button calls), the registration
+   container's own blocking poll then completing the signed-challenge
+   token exchange and exiting 0, and the real agent container's `python
+   -m agent run` loop coming up afterward and reaching the fleet (one
+   log line, `SSE command stream unavailable ...; falling back to
+   polling` -- the polling fallback itself working as designed, not a
+   failure). Three real bugs were found and fixed by this run, none of
+   which static review had caught:
+   - `install.sh`'s `go build` needs `GOCACHE` set -- Lima's (and
+     plausibly a bare pi-gen/mkosi chroot's) `mode: system` provisioning
+     execs as root with no `$HOME` at all.
+   - The throwaway CA/leaf pair (`tools/mac_test_vm/fleet_local.py`) was
+     missing `SubjectKeyIdentifier`/`AuthorityKeyIdentifier` -- modern
+     OpenSSL (3.x) refuses an otherwise-valid chain with "Missing
+     Authority Key Identifier" without them, even though both extensions
+     are formally optional in the X.509 spec.
+   - `image/common/install.sh` placed `/etc/tmpfiles.d/thermoctl-agent
+     .conf` but never applied it immediately -- harmless on a real image
+     build (the rootfs has not booted yet, so the *next* boot's
+     `systemd-tmpfiles-setup.service` creates `/run/thermoctl-agent`
+     correctly the first time either way), but the Lima VM has already
+     booted once by the time this provisioning script runs, so Docker
+     itself silently auto-created a **root-owned**
+     `/run/thermoctl-agent` the first time a bind mount referenced it,
+     which the agent (uid 10002) then could not write into at all
+     (`PermissionError`, in `agent.loop.report_led_status`). Fixed by
+     calling `systemd-tmpfiles --create` on both `tmpfiles.d` files
+     immediately after placing them.
+
+   `tests/test_mac_test_vm_fleet_local.py` (8 tests) exercises the
+   Python side (real Alembic migrations, real `Storage`, a throwaway
+   SQLite file) without starting a server or touching the VM.
+5. **Found along the way, not fixed (out of scope for this task, tracked
+   here for whoever picks it up next):** `image/common/agent-compose.yml`
+   (the real one the image ships) has no bind mount at all for
+   `/boot/firmware/agent-registration.json` itself -- only for the
+   `thermoctl/` subdirectory under `/boot/firmware` (the backup
+   recipients file). `agent/__main__.py`'s `_run_agent` reads
+   `--registration-file` (defaulting to that exact path) on every `run`
+   invocation, not only at `register` time, so the real agent container
+   as currently shipped cannot read it at all once started via that
+   compose file. `tools/mac-test-vm.agent-compose.local.yml` adds the
+   missing single-file mount (safe there specifically: nothing rewrites
+   that file via rename while the container runs) -- the real file needs
+   the same fix, or a documented reason it does not.
+
+Verification run for this entry: `ruff check .` and `mypy protocol fleet
+agent tools` both clean; full `pytest` (`--junitxml`): 2138 tests, 0
+failures, 0 errors, 1 skipped; `go vet ./...`/`go test ./...` in
+`watchdog/` unaffected (no Go source changed, only the build invocation
+in `install.sh`); `shellcheck` clean on `install.sh`,
+`image/pi/pi-gen-stage/01-thermoctl/00-run.sh`, `image/x86/mkosi.postinst`,
+and `tools/mac-test-vm`; `actionlint` clean on `.github/workflows/image.yml`
+and every other workflow in the repository.
+
 ## Codex full review findings 1, 6, 7: SSE bookmark ordering, record-before-
 ## execute, restore-report retry (2026-10-03)
 
