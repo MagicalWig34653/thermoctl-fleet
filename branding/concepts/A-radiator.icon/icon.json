@@ -1,8 +1,8 @@
 {
   "fill" : {
     "linear-gradient" : [
-      "srgb:0.07059,0.10196,0.28235,1.00000",
-      "srgb:0.00000,0.50196,0.47059,1.00000"
+      "srgb:0.05490,0.10588,0.23922,1.00000",
+      "srgb:0.05882,0.43529,0.45098,1.00000"
     ]
   },
   "groups" : [
@@ -16,8 +16,27 @@
       ],
       "name" : "Pulse",
       "shadow" : {
-        "kind" : "neutral",
-        "opacity" : 0.3
+        "kind" : "layer-color",
+        "opacity" : 0.7
+      },
+      "specular" : false,
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "Shimmer.svg",
+          "name" : "Shimmer"
+        }
+      ],
+      "name" : "Shimmer",
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0.5
       },
       "specular" : false,
       "translucency" : {
@@ -41,7 +60,26 @@
       "specular" : true,
       "translucency" : {
         "enabled" : true,
-        "value" : 0.25
+        "value" : 0.18
+      }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "Glow.svg",
+          "name" : "Glow"
+        }
+      ],
+      "name" : "Glow",
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0.5
+      },
+      "specular" : false,
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
       }
     }
   ],

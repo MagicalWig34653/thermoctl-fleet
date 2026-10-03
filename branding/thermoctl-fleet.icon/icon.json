@@ -1,8 +1,8 @@
 {
   "fill" : {
     "linear-gradient" : [
-      "srgb:0.98039,0.56078,0.25098,1.00000",
-      "srgb:0.12941,0.37647,0.60784,1.00000"
+      "srgb:0.05490,0.10588,0.23922,1.00000",
+      "srgb:0.05882,0.43529,0.45098,1.00000"
     ]
   },
   "groups" : [
@@ -10,16 +10,16 @@
       "layers" : [
         {
           "glass" : false,
-          "image-name" : "Network.svg",
-          "name" : "Network"
+          "image-name" : "Pulse.svg",
+          "name" : "Pulse"
         }
       ],
-      "name" : "Network",
+      "name" : "Pulse",
       "shadow" : {
         "kind" : "layer-color",
-        "opacity" : 0.35
+        "opacity" : 0.7
       },
-      "specular" : true,
+      "specular" : false,
       "translucency" : {
         "enabled" : false,
         "value" : 0.5
@@ -29,14 +29,14 @@
       "layers" : [
         {
           "glass" : false,
-          "image-name" : "Flame.svg",
-          "name" : "Flame"
+          "image-name" : "Shimmer.svg",
+          "name" : "Shimmer"
         }
       ],
-      "name" : "Flame",
+      "name" : "Shimmer",
       "shadow" : {
-        "kind" : "neutral",
-        "opacity" : 0.4
+        "kind" : "none",
+        "opacity" : 0.5
       },
       "specular" : false,
       "translucency" : {
@@ -48,11 +48,11 @@
       "layers" : [
         {
           "glass" : true,
-          "image-name" : "Glass.svg",
-          "name" : "Glass"
+          "image-name" : "Radiator.svg",
+          "name" : "Radiator"
         }
       ],
-      "name" : "Glass",
+      "name" : "Radiator",
       "shadow" : {
         "kind" : "none",
         "opacity" : 0.5
@@ -60,7 +60,26 @@
       "specular" : true,
       "translucency" : {
         "enabled" : true,
-        "value" : 0.2
+        "value" : 0.18
+      }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "Glow.svg",
+          "name" : "Glow"
+        }
+      ],
+      "name" : "Glow",
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0.5
+      },
+      "specular" : false,
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
       }
     }
   ],
