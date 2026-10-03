@@ -246,6 +246,65 @@ def test_login_webauthn_begin_lists_a_registered_credential(
     assert credential_id in allow_ids
 
 
+def test_login_webauthn_begin_is_rate_limited_per_ip(
+    client: TestClient, user_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cross-review fix (2026-10-03): nothing throttled this endpoint
+    before, so an unauthenticated caller could flood it with requests,
+    each one inserting an unbounded `webauthn_challenges` row. It now
+    shares `login_submit`'s existing per-IP throttle
+    (`Storage.reserve_ip_login_attempt`) -- same budget, same `429` once
+    the threshold is exceeded, no new table or counter."""
+
+    monkeypatch.setenv("FLEET_UI_IP_THROTTLE_THRESHOLD", "2")
+
+    for _ in range(2):
+        pre_csrf, _ = _get_login_form(client)
+        response = client.post(
+            "/ui/login/webauthn/begin", data={"username": USERNAME, "pre_csrf": pre_csrf}
+        )
+        assert response.status_code == 200
+
+    pre_csrf, _ = _get_login_form(client)
+    blocked_response = client.post(
+        "/ui/login/webauthn/begin", data={"username": USERNAME, "pre_csrf": pre_csrf}
+    )
+    assert blocked_response.status_code == 429
+
+
+def test_login_webauthn_begin_throttle_shares_budget_with_login_submit(
+    client: TestClient,
+    user_id: int,
+    password: str,
+    totp_secret: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proves this is genuinely the *same* per-IP counter `login_submit`
+    already writes to, not a lookalike second one -- exhausting the budget
+    via `/ui/login/webauthn/begin` also blocks that same IP's subsequent
+    `/ui/login` attempt."""
+
+    monkeypatch.setenv("FLEET_UI_IP_THROTTLE_THRESHOLD", "1")
+
+    pre_csrf, _ = _get_login_form(client)
+    first = client.post(
+        "/ui/login/webauthn/begin", data={"username": USERNAME, "pre_csrf": pre_csrf}
+    )
+    assert first.status_code == 200
+
+    pre_csrf2, _ = _get_login_form(client)
+    blocked_login = client.post(
+        "/ui/login",
+        data={
+            "username": USERNAME,
+            "password": password,
+            "totp_code": _totp_now(totp_secret, datetime.now(UTC)),
+            "pre_csrf": pre_csrf2,
+        },
+    )
+    assert blocked_login.status_code == 401
+
+
 # -- /ui/account/webauthn (page + register + delete) -----------------------------
 
 

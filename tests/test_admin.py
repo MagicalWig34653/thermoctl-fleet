@@ -531,3 +531,101 @@ def test_rotate_totp_key_requires_both_keys(
         admin_module.main(["rotate-totp-key"])
 
     assert excinfo.value.code == 2
+
+
+def test_rotate_totp_key_resumes_after_partial_failure_on_rerun(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates exactly the partial-failure scenario the bug report
+    describes: one row already re-encrypted under the new key (as if an
+    earlier `rotate-totp-key` run got partway through before being killed),
+    one row still on the old key. Re-running the command with the *same,
+    unchanged* `FLEET_TOTP_KEY`/`FLEET_TOTP_KEY_NEW` pair must resume
+    cleanly -- not fail on either row -- and leave every user decryptable
+    under the new key afterward."""
+
+    import base64
+    import os as os_module
+
+    from fleet.totp_crypto import decrypt_totp_secret, encrypt_totp_secret, load_totp_key
+
+    old_key = load_totp_key(os_module.environ["FLEET_TOTP_KEY"])
+    new_key_raw = os_module.urandom(32)
+    new_key_b64 = base64.urlsafe_b64encode(new_key_raw).decode()
+    monkeypatch.setenv("FLEET_TOTP_KEY_NEW", new_key_b64)
+
+    storage = create_storage(database_url)
+    secrets_by_user: dict[int, str] = {}
+    already_rotated_record = storage.create_ui_user(
+        username="landlord-already-rotated",
+        password_hash=hash_password(secrets.token_urlsafe(16)),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+    )
+    plaintext_a = secrets.token_hex(10)
+    # Written with the *new* key already -- as if a previous, interrupted
+    # run had already processed this row.
+    already_rotated_ciphertext = encrypt_totp_secret(
+        plaintext_a, already_rotated_record.id, new_key_raw
+    )
+    storage.set_ui_user_totp_secret(already_rotated_record.id, already_rotated_ciphertext)
+    secrets_by_user[already_rotated_record.id] = plaintext_a
+
+    still_old_record = storage.create_ui_user(
+        username="landlord-still-old",
+        password_hash=hash_password(secrets.token_urlsafe(16)),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+    )
+    plaintext_b = secrets.token_hex(10)
+    storage.set_ui_user_totp_secret(
+        still_old_record.id, encrypt_totp_secret(plaintext_b, still_old_record.id, old_key)
+    )
+    secrets_by_user[still_old_record.id] = plaintext_b
+
+    exit_code = admin_module.main(["rotate-totp-key"])
+    assert exit_code == 0
+
+    # The already-rotated row was not needlessly re-encrypted -- same
+    # ciphertext bytes as before this run.
+    storage_after = create_storage(database_url)
+    unchanged_user = storage_after.get_ui_user_by_id(already_rotated_record.id)
+    assert unchanged_user is not None
+    assert unchanged_user.totp_secret == already_rotated_ciphertext
+
+    # Every user's secret decrypts correctly under the new key.
+    for user_id, plaintext_secret in secrets_by_user.items():
+        user = storage_after.get_ui_user_by_id(user_id)
+        assert user is not None
+        assert decrypt_totp_secret(user.totp_secret, user_id, new_key_raw) == plaintext_secret
+
+
+def test_rotate_totp_key_row_decryptable_by_neither_key_still_fails_loudly(
+    database_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A row that neither the old nor the new key can decrypt (e.g. real
+    data corruption, not just "already rotated") must still stop the
+    command with the existing loud error -- the resumability fix must not
+    silently swallow a genuine failure."""
+
+    import base64
+    import os as os_module
+
+    storage = create_storage(database_url)
+    storage.create_ui_user(
+        username="landlord-corrupted",
+        password_hash=hash_password(secrets.token_urlsafe(16)),
+        totp_secret="not-valid-ciphertext-for-any-key",
+        created_at=datetime.now(UTC),
+    )
+    monkeypatch.setenv(
+        "FLEET_TOTP_KEY_NEW", base64.urlsafe_b64encode(os_module.urandom(32)).decode()
+    )
+
+    exit_code = admin_module.main(["rotate-totp-key"])
+
+    assert exit_code == 1
+    captured_err = capsys.readouterr().err
+    assert "landlord-corrupted" in captured_err
+    assert "FLEET_TOTP_KEY" in captured_err
+    assert "FLEET_TOTP_KEY_NEW" in captured_err

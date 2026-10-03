@@ -43,6 +43,7 @@ from fleet.storage import (
     RecordCommandResultOutcome,
     Storage,
     StoreLogExcerptOutcome,
+    WebauthnChallengeRecord,
     _alembic_config,
     create_engine_from_url,
     create_storage,
@@ -3780,10 +3781,10 @@ def test_rotate_epoch_creates_a_row_if_the_table_is_empty(storage: Storage) -> N
     assert len(rotated) == 32
 
 
-# -- migration 0017: TOTP encryption + webauthn tables (P6.2) --------------------
+# -- migration 0019: TOTP encryption + webauthn tables (P6.2) --------------------
 
 
-def test_migration_0017_upgrade_creates_webauthn_tables(tmp_path: object) -> None:
+def test_migration_0019_upgrade_creates_webauthn_tables(tmp_path: object) -> None:
     url = _database_url(tmp_path)
     upgrade(url)
 
@@ -3945,7 +3946,7 @@ def test_migration_0019_downgrade_fails_loudly_without_a_totp_key(
     with pytest.raises(RuntimeError, match="FLEET_TOTP_KEY"):
         downgrade(url, "0018")
 
-    # Nothing was left half-migrated: still at 0017's schema, still the
+    # Nothing was left half-migrated: still at 0019's schema, still the
     # same ciphertext.
     engine = create_storage(url).engine
     assert "webauthn_credentials" in set(inspect(engine).get_table_names())
@@ -4001,3 +4002,80 @@ def test_migration_0019_downgrade_drops_webauthn_tables(tmp_path: object) -> Non
     tables = set(inspect(engine).get_table_names())
     assert "webauthn_credentials" not in tables
     assert "webauthn_challenges" not in tables
+
+
+# -- `create_webauthn_challenge` opportunistic purge (2026-10-03 cross-review fix) --
+
+
+def test_create_webauthn_challenge_purges_expired_and_consumed_rows_but_keeps_pending_ones(
+    tmp_path: object,
+) -> None:
+    """Nothing else ever deletes from `webauthn_challenges` (cross-review
+    finding: unbounded growth otherwise) -- `create_webauthn_challenge`
+    opportunistically purges every already-expired or already-consumed row
+    on each call, before inserting the new one. A still-pending, unexpired
+    row must survive the purge and must still be consumable afterward."""
+
+    url = _database_url(tmp_path)
+    upgrade(url)
+    storage = create_storage(url)
+
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+    # Row A: will have expired by the time the purge-triggering call below
+    # runs (1s lifetime, purge happens 10s later).
+    storage.create_webauthn_challenge(
+        purpose="login", user_id=None, challenge=b"a", binding="binding-a", now=t0, lifetime_s=1
+    )
+    # Row B: long-lived, but consumed right away -- purged on the very next
+    # `create_webauthn_challenge` call regardless of how far from expiry it
+    # still is, since `consumed` alone is enough to purge a row.
+    challenge_b_id = storage.create_webauthn_challenge(
+        purpose="login",
+        user_id=None,
+        challenge=b"b",
+        binding="binding-b",
+        now=t0,
+        lifetime_s=1000,
+    )
+    assert storage.consume_webauthn_challenge(challenge_b_id, "login", "binding-b", t0) == b"b"
+    # Row C: long-lived, still pending -- must survive every purge below.
+    storage.create_webauthn_challenge(
+        purpose="login",
+        user_id=None,
+        challenge=b"c",
+        binding="binding-c",
+        now=t0,
+        lifetime_s=1000,
+    )
+
+    t_later = t0 + timedelta(seconds=10)  # past row A's expiry, before C's
+    storage.create_webauthn_challenge(
+        purpose="login",
+        user_id=None,
+        challenge=b"d",
+        binding="binding-d",
+        now=t_later,
+        lifetime_s=1000,
+    )
+
+    # Identified by `binding`, not by raw autoincrement id: SQLite's plain
+    # `INTEGER PRIMARY KEY` (no `AUTOINCREMENT` keyword) reuses a deleted
+    # row's id for the very next insert, so a once-consumed/expired row's
+    # old id can reappear on an unrelated later row -- asserting on ids
+    # directly would be asserting on an implementation detail, not on
+    # "which rows are actually still there."
+    with storage.session() as session:
+        remaining_bindings = {row.binding for row in session.query(WebauthnChallengeRecord).all()}
+    assert remaining_bindings == {"binding-c", "binding-d"}
+
+    # The pending row that survived every purge still works exactly as any
+    # other pending challenge would.
+    with storage.session() as session:
+        pending_id = (
+            session.query(WebauthnChallengeRecord)
+            .filter(WebauthnChallengeRecord.binding == "binding-c")
+            .one()
+            .id
+        )
+    assert storage.consume_webauthn_challenge(pending_id, "login", "binding-c", t_later) == b"c"

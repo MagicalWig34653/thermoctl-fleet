@@ -34,7 +34,7 @@ def store_encrypted_totp_secret(storage: Storage, user_id: int, secret: str) -> 
     """Encrypts `secret` for `user_id` with the session's `FLEET_TOTP_KEY`
     and writes it -- the one extra step every `user_id` fixture across the
     test suite now needs after `Storage.create_ui_user` (P6.2: that column
-    holds ciphertext, not the plaintext base32 secret, from migration 0017
+    holds ciphertext, not the plaintext base32 secret, from migration 0019
     onward)."""
 
     key = base64.urlsafe_b64decode(os.environ.get("FLEET_TOTP_KEY", _TEST_TOTP_KEY))

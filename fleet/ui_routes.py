@@ -249,18 +249,31 @@ def login_webauthn_begin(
     be offered exactly this username's own registered credentials (an
     authenticator/browser filters its UI by `allowCredentials`).
 
-    **Deliberately does not check the password, and does not touch the
-    per-IP throttle or the account lock** -- unlike `login_submit`, which
-    performs the actual, throttled, lockout-relevant authentication
-    decision. A WebAuthn credential id is not a secret (it identifies a
-    public key; standard practice, mirrored by every major WebAuthn relying
-    party, is to resolve `allowCredentials` from the username alone). What
-    *is* kept generic here is exactly what the task and P3.0 both already
-    require of a login-adjacent endpoint: an unknown username and a known
-    username with zero registered passkeys produce the identical response
-    shape (`allowCredentials: []`), so this endpoint cannot be used to test
-    "does this username exist" any more precisely than it could already be
-    tested by how a submitted TOTP code behaves.
+    **Deliberately does not check the password or touch the account
+    lock** -- unlike `login_submit`, which performs the actual, throttled,
+    lockout-relevant authentication decision. A WebAuthn credential id is
+    not a secret (it identifies a public key; standard practice, mirrored
+    by every major WebAuthn relying party, is to resolve `allowCredentials`
+    from the username alone). What *is* kept generic here is exactly what
+    the task and P3.0 both already require of a login-adjacent endpoint: an
+    unknown username and a known username with zero registered passkeys
+    produce the identical response shape (`allowCredentials: []`), so this
+    endpoint cannot be used to test "does this username exist" any more
+    precisely than it could already be tested by how a submitted TOTP code
+    behaves.
+
+    **Does share `login_submit`'s per-IP throttle** (2026-10-03
+    cross-review fix): each call creates a new `webauthn_challenges` row
+    via `Storage.create_webauthn_challenge`, and nothing ever required a
+    successful login first -- an unauthenticated caller could otherwise
+    flood this endpoint to grow that table without bound. Reusing
+    `reserve_ip_login_attempt` (the same atomic reserve-then-verify
+    mechanism `login_submit` already uses, see its own comment there) caps
+    that at the same per-IP budget rather than inventing a second table or
+    counter for this one endpoint; a throttled IP gets a `429` here, no
+    challenge row is created, and -- same as `login_submit` -- this never
+    calls `release_ip_login_attempt`, since a "begin" call never actually
+    authenticates anything the way a successful `login_submit` does.
     """
 
     if not pre_csrf_cookie or not check_csrf(pre_csrf_cookie, pre_csrf):
@@ -268,8 +281,17 @@ def login_webauthn_begin(
     if not webauthn_auth.is_configured():
         raise HTTPException(status_code=404, detail="WebAuthn is not configured.")
 
-    del request
     now = datetime.now(UTC)
+    client_ip = resolve_client_ip(request)
+    if not storage.reserve_ip_login_attempt(
+        client_ip,
+        now,
+        ip_throttle_threshold(),
+        ip_throttle_window_s(),
+        ip_throttle_duration_s(),
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests.")
+
     user = storage.get_ui_user_by_username(normalize_username(username))
     options_json = webauthn_auth.begin_login_authentication(storage, user, pre_csrf, now)
     return JSONResponse(content=json.loads(options_json))
