@@ -7440,7 +7440,8 @@ class Storage:
             row = session.execute(statement).first()
             if row is None:
                 return None
-            return row[0]
+            challenge: bytes = row[0]
+            return challenge
 
 
 def create_engine_from_url(url: str) -> Engine:
