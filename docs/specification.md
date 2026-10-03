@@ -311,6 +311,13 @@ protocol code.
   Encrypted backups stay, under their own retention.
 - **UI login:** passkeys (WebAuthn) are added as a second factor next to TOTP; TOTP secrets
   are stored encrypted with a key from the environment, never in the database.
+- **Passwordless from known networks (2026-10-03):** from the landlord's own external
+  addresses -- a list of IPs/networks set only in the server environment
+  (`FLEET_UI_PASSWORDLESS_NETWORKS`), never editable in the UI -- a user-verifying passkey
+  alone is enough to log in, without password and without TOTP. Everywhere else the rules
+  above stay. A typed password is always checked; a TOTP code alone is never enough;
+  lockout and throttling apply unchanged. Only globally routable networks are accepted, so
+  a reverse proxy's private address can never switch the feature on for everyone.
 - **Faults can be acknowledged** in the UI; an acknowledgement applies to the current
   occurrence only -- if the same fault recurs, it shows again.
 - **Retention reading (2026-10-02):** "faults 365 days" refers to the stored event
