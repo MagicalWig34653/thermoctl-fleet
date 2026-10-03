@@ -120,9 +120,9 @@ against a throwaway, locally seeded demo fleet by
 real apartment or tenant data.
 
 The app icon lives at [`branding/thermoctl-fleet.icon`](branding/thermoctl-fleet.icon)
-(an Xcode Icon Composer bundle: a panel-radiator silhouette with a bold
-orange heartbeat/ECG line crossing it, the heartbeat being the absence
-the service actually watches for) and is also used as the site's favicon.
+(an Xcode Icon Composer bundle: a thermometer whose scale is the fleet --
+four glass segments, warm at the bottom and cool at the top, rising from a
+warm bulb) and is also used as the site's favicon.
 Rendered with Icon Composer's own `ictool` (`Default`/`Dark`/`ClearLight`
 renditions, `branding/renders/`):
 

@@ -1,35 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="thermoctl-fleet">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Flat version of branding/thermoctl-fleet.icon: a thermometer whose
+       scale is the fleet. Same geometry, no glass effects. -->
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0e1b3d" />
-      <stop offset="1" stop-color="#0f6f73" />
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0F1626" />
+      <stop offset="1" stop-color="#1B2740" />
     </linearGradient>
-    <linearGradient id="pulse" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#ff8a3d" />
-      <stop offset="1" stop-color="#ffc24d" />
+    <radialGradient id="glow" cx="50%" cy="73%" r="36%">
+      <stop offset="0" stop-color="#FF8A3D" stop-opacity="0.28" />
+      <stop offset="1" stop-color="#FF8A3D" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="bulb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FF9F43" />
+      <stop offset="1" stop-color="#FF6A2A" />
     </linearGradient>
   </defs>
-  <rect width="1024" height="1024" rx="224" fill="url(#bg)" />
-
-  <!-- Flat, simplified version of branding/thermoctl-fleet.icon: a
-       panel-radiator silhouette (header pipe, four fins, footer pipe,
-       two feet) with a bold ECG heartbeat line crossing in front, ending
-       in a live-monitor dot. No glass/translucency/blur, just flat
-       shapes, for use as a scalable favicon that renders identically
-       everywhere. -->
-  <g fill="#ffffff">
-    <rect x="281" y="199" width="462" height="90" rx="45" />
-    <rect x="281" y="712" width="462" height="90" rx="45" />
-    <rect x="301" y="199" width="86" height="603" rx="43" />
-    <rect x="413" y="199" width="86" height="603" rx="43" />
-    <rect x="525" y="199" width="86" height="603" rx="43" />
-    <rect x="637" y="199" width="86" height="603" rx="43" />
-    <rect x="340" y="802" width="40" height="40" rx="12" />
-    <rect x="644" y="802" width="40" height="40" rx="12" />
-  </g>
-
-  <path d="M 198 512 L 345 512 L 400 592 L 452 240 L 500 650 L 552 512 L 780 512"
-        fill="none" stroke="url(#pulse)" stroke-width="50"
-        stroke-linecap="round" stroke-linejoin="round" />
-  <circle cx="806" cy="512" r="30" fill="#ffc24d" />
+  <rect width="1024" height="1024" rx="229" fill="url(#bg)" />
+  <rect width="1024" height="1024" rx="229" fill="url(#glow)" />
+  <rect x="402" y="150" width="220" height="82" rx="38" fill="#4AA8FF" />
+  <rect x="402" y="252" width="220" height="82" rx="38" fill="#6FD6C8" />
+  <rect x="402" y="354" width="220" height="82" rx="38" fill="#FFD36E" />
+  <rect x="402" y="456" width="220" height="82" rx="38" fill="#FFB347" />
+  <path d="M402,596 A38,38 0 0 1 440,558 L584,558 A38,38 0 0 1 622,596 L622,646 A150,150 0 1 1 402,646 Z" fill="url(#bulb)" />
 </svg>

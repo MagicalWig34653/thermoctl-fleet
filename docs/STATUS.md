@@ -2,6 +2,28 @@
 
 Last updated: 2026-10-03.
 
+## App icon: "thermometer made of apartments" (2026-10-03)
+
+The owner rejected the radiator + pulse icon as well ("anderer Ansatz") and
+approved the main session's new concept: **one** metaphor instead of two
+combined symbols -- a thermometer whose scale segments are the apartments.
+Four glass segments (top to bottom `#4AA8FF`, `#6FD6C8`, `#FFD36E`,
+`#FFB347`) above a warm bulb whose neck and bulb are a single outline
+(`#FF9F43` -> `#FF6A2A`), on a graphite-navy background with a faint warm
+bloom. Final geometry and the seamless bulb/neck path were drawn in the
+main session after the drafting agent hit its usage limit.
+
+- `branding/thermoctl-fleet.icon` replaced by it (also kept as
+  `branding/concepts/T-thermometer.icon`; earlier drafts stay under
+  `branding/concepts/` for history, including `T-thermometer-v1.icon`).
+- Renders via Icon Composer's `ictool`: `branding/renders/` (1024 px,
+  Default/Dark/ClearLight); `site/assets/icon/apple-touch-icon.png`
+  (180 px) and `favicon-32.png` from the Default rendition;
+  `site/assets/icon/favicon.svg` is the flat version of the same geometry
+  (also used as the site's header and hero logo).
+- Checked at 1024/64/32 px in all three renditions: reads as a segmented
+  thermometer down to 32 px.
+
 ## App icon: production-quality radiator + pulse (2026-10-03)
 
 The owner rejected the house/thermometer/dots icon (see the entry below) as
