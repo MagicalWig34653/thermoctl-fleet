@@ -40,28 +40,46 @@ loudly, mentioning both env vars.
 ever deleted an expired or consumed one -- unbounded growth, and (unlike
 every other login-adjacent endpoint) no throttle at all on an
 unauthenticated caller hammering it. **Fix, both halves:**
-(a) `login_webauthn_begin` now reserves against the exact same per-IP
-budget `login_submit` already uses
-(`Storage.reserve_ip_login_attempt`/`ip_throttle_threshold`/`_window_s`/
-`_duration_s`, `fleet.ui_auth`), returning `429` once exceeded -- no new
-table or counter, genuinely the same budget (proven directly:
-exhausting it via repeated `begin` calls also blocks that IP's next
-`/ui/login`). Deliberately never calls `release_ip_login_attempt` --
-a "begin" call authenticates nothing the way a successful `login_submit`
-does, so there is nothing to give back. (b) `Storage
-.create_webauthn_challenge` now opportunistically deletes every row in
-the table that is already expired or already consumed, in the same
-transaction, right before inserting the new one -- piggybacking the purge
-onto a write every challenge-creating call already performs rather than
-adding a dedicated cleanup table or background loop for one more table.
-A still-pending, unexpired row (including one a concurrent request just
-created) is never touched. Tests: `tests/test_ui_webauthn_routes.py`
-(throttle triggers a `429`; shares the literal same per-IP budget as
-`login_submit`); `tests/test_storage.py` (expired and consumed rows are
-purged on the next `create_webauthn_challenge` call, a pending unexpired
-row survives the purge and is still consumable afterward -- asserted by
-`binding`, not by raw autoincrement id, since SQLite's plain `INTEGER
-PRIMARY KEY` can reuse a deleted row's id for an unrelated later insert).
+(a) `login_webauthn_begin` now reserves against its **own, separate**
+per-IP budget (`FLEET_UI_WEBAUTHN_BEGIN_THRESHOLD`, default 30, via
+`fleet.ui_auth.webauthn_begin_throttle_threshold`/
+`webauthn_begin_throttle_key`), using the identical
+`Storage.reserve_ip_login_attempt` mechanism `login_submit` already uses
+but keyed under a distinct string (`webauthn-begin:{ip}`, not the bare
+`ip` `login_submit` itself keys by) -- same table, same atomic
+reserve-then-verify semantics, genuinely separate counter row. **First
+version of this fix (same day) reserved against `login_submit`'s own
+counter and was corrected in main-session review**: sharing it was a
+usability regression, not just a tightening -- at `login_submit`'s much
+smaller default (5 per 15 minutes), one passkey login already spends two
+reservations (`begin`, then `login_submit` presenting the assertion) and
+`begin` never releases its reservation (it authenticates nothing, so
+there is nothing to give back), so an office NAT's shared IP could reach
+that shared budget after two or three ordinary passkey logins plus one
+mistyped password -- locking out *password* logins from that IP too, for
+the full throttle duration. The corrected version's much higher default
+(30, vs. `login_submit`'s 5) reflects that a bare `begin` call alone
+proves nothing (no password, no assertion), so it is far cheaper to allow
+generously than an actual login attempt; window/duration are still the
+exact same (`ip_throttle_window_s`/`ip_throttle_duration_s`), only the
+threshold and the counter key differ. Deliberately never calls
+`release_ip_login_attempt` -- a "begin" call authenticates nothing the
+way a successful `login_submit` does, so there is nothing to give back.
+(b) `Storage.create_webauthn_challenge` now opportunistically deletes
+every row in the table that is already expired or already consumed, in
+the same transaction, right before inserting the new one -- piggybacking
+the purge onto a write every challenge-creating call already performs
+rather than adding a dedicated cleanup table or background loop for one
+more table. A still-pending, unexpired row (including one a concurrent
+request just created) is never touched. Tests:
+`tests/test_ui_webauthn_routes.py` (`begin`'s own threshold triggers a
+`429`; exhausting `begin`'s budget leaves `login_submit`'s own budget
+untouched and vice versa -- proven in both directions, not just one);
+`tests/test_storage.py` (expired and consumed rows are purged on the next
+`create_webauthn_challenge` call, a pending unexpired row survives the
+purge and is still consumable afterward -- asserted by `binding`, not by
+raw autoincrement id, since SQLite's plain `INTEGER PRIMARY KEY` can
+reuse a deleted row's id for an unrelated later insert).
 
 **Finding 9 (wrong migration number in messages, `fleet/migrations/versions
 /0019_totp_encryption_and_webauthn.py`, this file's P6.2 section).** Two

@@ -66,6 +66,8 @@ from fleet.ui_auth import (
     session_absolute_lifetime_s,
     totp_key,
     verify_totp,
+    webauthn_begin_throttle_key,
+    webauthn_begin_throttle_threshold,
 )
 from fleet.ui_house import build_house_overview
 from fleet.ui_inventory import (
@@ -262,18 +264,31 @@ def login_webauthn_begin(
     precisely than it could already be tested by how a submitted TOTP code
     behaves.
 
-    **Does share `login_submit`'s per-IP throttle** (2026-10-03
-    cross-review fix): each call creates a new `webauthn_challenges` row
-    via `Storage.create_webauthn_challenge`, and nothing ever required a
-    successful login first -- an unauthenticated caller could otherwise
-    flood this endpoint to grow that table without bound. Reusing
-    `reserve_ip_login_attempt` (the same atomic reserve-then-verify
-    mechanism `login_submit` already uses, see its own comment there) caps
-    that at the same per-IP budget rather than inventing a second table or
-    counter for this one endpoint; a throttled IP gets a `429` here, no
-    challenge row is created, and -- same as `login_submit` -- this never
-    calls `release_ip_login_attempt`, since a "begin" call never actually
-    authenticates anything the way a successful `login_submit` does.
+    **Throttled under its own, separate budget** (2026-10-03 fix, main-
+    session review of an earlier version of this fix): each call creates a
+    new `webauthn_challenges` row via `Storage.create_webauthn_challenge`,
+    and nothing ever required a successful login first -- an
+    unauthenticated caller could otherwise flood this endpoint to grow that
+    table without bound. **Deliberately does *not* reserve against
+    `login_submit`'s own per-IP counter** -- an earlier version of this fix
+    did exactly that and turned out to be a usability regression: at the
+    login throttle's default (5 per 15 minutes), a passkey login spends
+    *two* reservations (`begin`, then the `login_submit` call presenting
+    the assertion) and `begin` never releases its reservation (it
+    authenticates nothing, so there is nothing to give back) -- an office
+    NAT's shared IP could reach the shared budget after two or three
+    ordinary passkey logins plus one mistyped password, locking out
+    *password* logins from that IP too, for the full throttle duration.
+    Instead, this reserves under `webauthn_begin_throttle_key(client_ip)`
+    (a distinct string, not `client_ip` itself) via the identical
+    `reserve_ip_login_attempt` mechanism `login_submit` uses -- the same
+    table, the same atomic reserve-then-verify semantics, but a genuinely
+    separate counter row with its own, much more generous threshold
+    (`webauthn_begin_throttle_threshold`, default 30 -- a bare `begin` call
+    alone proves nothing, no password or assertion, so it is far cheaper to
+    allow generously than an actual login attempt). A throttled IP gets a
+    `429` here, no challenge row is created; `begin` calls never spend
+    `login_submit`'s budget, and `login_submit` never spends this one.
     """
 
     if not pre_csrf_cookie or not check_csrf(pre_csrf_cookie, pre_csrf):
@@ -284,9 +299,9 @@ def login_webauthn_begin(
     now = datetime.now(UTC)
     client_ip = resolve_client_ip(request)
     if not storage.reserve_ip_login_attempt(
-        client_ip,
+        webauthn_begin_throttle_key(client_ip),
         now,
-        ip_throttle_threshold(),
+        webauthn_begin_throttle_threshold(),
         ip_throttle_window_s(),
         ip_throttle_duration_s(),
     ):

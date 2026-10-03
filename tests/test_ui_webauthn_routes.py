@@ -250,13 +250,15 @@ def test_login_webauthn_begin_is_rate_limited_per_ip(
     client: TestClient, user_id: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Cross-review fix (2026-10-03): nothing throttled this endpoint
-    before, so an unauthenticated caller could flood it with requests,
-    each one inserting an unbounded `webauthn_challenges` row. It now
-    shares `login_submit`'s existing per-IP throttle
-    (`Storage.reserve_ip_login_attempt`) -- same budget, same `429` once
-    the threshold is exceeded, no new table or counter."""
+    before, so an unauthenticated caller could flood it with requests, each
+    one inserting an unbounded `webauthn_challenges` row. It now reserves
+    against its own budget (`FLEET_UI_WEBAUTHN_BEGIN_THRESHOLD`, via the
+    same `Storage.reserve_ip_login_attempt` mechanism `login_submit` uses,
+    but under a distinct key -- see `test_login_webauthn_begin_throttle_is_
+    independent_of_login_submit` below) -- `429` once *this* threshold is
+    exceeded, no new table."""
 
-    monkeypatch.setenv("FLEET_UI_IP_THROTTLE_THRESHOLD", "2")
+    monkeypatch.setenv("FLEET_UI_WEBAUTHN_BEGIN_THRESHOLD", "2")
 
     for _ in range(2):
         pre_csrf, _ = _get_login_form(client)
@@ -272,19 +274,25 @@ def test_login_webauthn_begin_is_rate_limited_per_ip(
     assert blocked_response.status_code == 429
 
 
-def test_login_webauthn_begin_throttle_shares_budget_with_login_submit(
+def test_login_webauthn_begin_throttle_does_not_spend_login_submits_budget(
     client: TestClient,
     user_id: int,
     password: str,
     totp_secret: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Proves this is genuinely the *same* per-IP counter `login_submit`
-    already writes to, not a lookalike second one -- exhausting the budget
-    via `/ui/login/webauthn/begin` also blocks that same IP's subsequent
-    `/ui/login` attempt."""
+    """Main-session review finding (2026-10-03): an earlier version of this
+    fix reserved `begin` calls against `login_submit`'s own per-IP counter,
+    which -- since `begin` never releases its reservation -- meant a
+    legitimate passkey login (one `begin` call plus one `login_submit`
+    call) could exhaust `login_submit`'s much smaller default budget (5 per
+    15 minutes) on its own, locking that IP out of *password* logins too.
+    Proven here: exhausting `/ui/login/webauthn/begin`'s own (separate,
+    larger) budget leaves `login_submit`'s budget completely untouched --
+    a correct-password-and-TOTP login still succeeds afterward."""
 
-    monkeypatch.setenv("FLEET_UI_IP_THROTTLE_THRESHOLD", "1")
+    monkeypatch.setenv("FLEET_UI_WEBAUTHN_BEGIN_THRESHOLD", "1")
+    monkeypatch.setenv("FLEET_UI_IP_THROTTLE_THRESHOLD", "5")
 
     pre_csrf, _ = _get_login_form(client)
     first = client.post(
@@ -292,17 +300,71 @@ def test_login_webauthn_begin_throttle_shares_budget_with_login_submit(
     )
     assert first.status_code == 200
 
+    # `begin`'s own budget (threshold 1) is now exhausted...
     pre_csrf2, _ = _get_login_form(client)
-    blocked_login = client.post(
+    blocked_begin = client.post(
+        "/ui/login/webauthn/begin", data={"username": USERNAME, "pre_csrf": pre_csrf2}
+    )
+    assert blocked_begin.status_code == 429
+
+    # ...but `login_submit`'s own, separate budget (threshold 5) is
+    # completely unaffected -- a real login still succeeds.
+    pre_csrf3, _ = _get_login_form(client)
+    successful_login = client.post(
         "/ui/login",
         data={
             "username": USERNAME,
             "password": password,
             "totp_code": _totp_now(totp_secret, datetime.now(UTC)),
+            "pre_csrf": pre_csrf3,
+        },
+        follow_redirects=False,
+    )
+    assert successful_login.status_code == 303
+
+
+def test_login_submit_failures_do_not_spend_webauthn_begins_budget(
+    client: TestClient, user_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reverse direction of the independence proven above: repeated
+    `login_submit` failures (spending *that* endpoint's own budget) leave
+    `/ui/login/webauthn/begin`'s separate budget untouched."""
+
+    monkeypatch.setenv("FLEET_UI_IP_THROTTLE_THRESHOLD", "1")
+    monkeypatch.setenv("FLEET_UI_WEBAUTHN_BEGIN_THRESHOLD", "5")
+
+    pre_csrf, _ = _get_login_form(client)
+    first_failure = client.post(
+        "/ui/login",
+        data={
+            "username": USERNAME,
+            "password": "wrong",
+            "totp_code": "000000",
+            "pre_csrf": pre_csrf,
+        },
+    )
+    assert first_failure.status_code == 401
+
+    # `login_submit`'s own budget (threshold 1) is now exhausted...
+    pre_csrf2, _ = _get_login_form(client)
+    blocked_login = client.post(
+        "/ui/login",
+        data={
+            "username": USERNAME,
+            "password": "wrong-again",
+            "totp_code": "000000",
             "pre_csrf": pre_csrf2,
         },
     )
     assert blocked_login.status_code == 401
+
+    # ...but `/ui/login/webauthn/begin`'s own, separate budget (threshold
+    # 5) is completely unaffected.
+    pre_csrf3, _ = _get_login_form(client)
+    begin_still_works = client.post(
+        "/ui/login/webauthn/begin", data={"username": USERNAME, "pre_csrf": pre_csrf3}
+    )
+    assert begin_still_works.status_code == 200
 
 
 # -- /ui/account/webauthn (page + register + delete) -----------------------------
