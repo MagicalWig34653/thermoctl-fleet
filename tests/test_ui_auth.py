@@ -1508,3 +1508,25 @@ def test_authenticate_passwordless_flag_never_waives_the_password_for_totp(
         storage, USERNAME, "", _totp_now(totp_secret, now), now, passwordless=True
     )
     assert user is None
+
+
+def test_passwordless_networks_refuses_overly_broad_entries(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fleet.ui_auth import passwordless_networks
+
+    monkeypatch.setenv(
+        "FLEET_UI_PASSWORDLESS_NETWORKS", "0.0.0.0/0, ::/0, 8.0.0.0/8, 8.8.0.0/16, 2001:4860::/31"
+    )
+    assert [str(n) for n in passwordless_networks()] == ["8.8.0.0/16"]
+    assert "overly broad" in caplog.text
+
+
+def test_is_passwordless_network_matches_an_ipv4_mapped_ipv6_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fleet.ui_auth import is_passwordless_network
+
+    monkeypatch.setenv("FLEET_UI_PASSWORDLESS_NETWORKS", "8.8.8.0/24")
+    assert is_passwordless_network("::ffff:8.8.8.8") is True
+    assert is_passwordless_network("::ffff:9.9.9.9") is False

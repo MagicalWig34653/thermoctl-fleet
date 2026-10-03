@@ -172,6 +172,9 @@ _TRUSTED_PROXIES_ENV = "FLEET_UI_TRUSTED_PROXIES"
 # feature off entirely. Only configurable on the server, never in the UI:
 # a stolen session must not be able to whitelist its own network.
 _PASSWORDLESS_NETWORKS_ENV = "FLEET_UI_PASSWORDLESS_NETWORKS"
+# Narrowest sensible bound for "the landlord's own external address(es)":
+# anything broader (up to `0.0.0.0/0`, which `is_global` accepts) is refused.
+_PASSWORDLESS_MIN_PREFIX = {4: 16, 6: 32}
 
 _SESSION_ABSOLUTE_LIFETIME_S_ENV = "FLEET_UI_SESSION_ABSOLUTE_LIFETIME_S"
 _DEFAULT_SESSION_ABSOLUTE_LIFETIME_S = 12 * 60 * 60.0
@@ -292,7 +295,15 @@ def passwordless_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Networ
 
     accepted: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for network in _parse_trusted_proxies(os.environ.get(_PASSWORDLESS_NETWORKS_ENV, "")):
-        if _network_is_global(network):
+        if network.prefixlen < _PASSWORDLESS_MIN_PREFIX[network.version]:
+            logger.warning(
+                "Ignoring overly broad entry in %s: %s -- at most /%d (IPv4) or /%d (IPv6).",
+                _PASSWORDLESS_NETWORKS_ENV,
+                network,
+                _PASSWORDLESS_MIN_PREFIX[4],
+                _PASSWORDLESS_MIN_PREFIX[6],
+            )
+        elif _network_is_global(network):
             accepted.append(network)
         else:
             logger.warning(
@@ -308,7 +319,17 @@ def is_passwordless_network(client_ip: str) -> bool:
     in one of `passwordless_networks()`. Empty configuration -> `False`."""
 
     networks = passwordless_networks()
-    return bool(networks) and _ip_in_networks(client_ip, networks)
+    if not networks:
+        return False
+    # A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`;
+    # compare it as the IPv4 address it is, so an IPv4 entry still matches.
+    try:
+        mapped = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    if isinstance(mapped, ipaddress.IPv6Address) and mapped.ipv4_mapped is not None:
+        client_ip = str(mapped.ipv4_mapped)
+    return _ip_in_networks(client_ip, networks)
 
 
 def _ip_in_networks(

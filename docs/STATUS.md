@@ -12,7 +12,7 @@ alone suffices -- no password, no TOTP. Implemented in the main session
 - **Configuration:** `FLEET_UI_PASSWORDLESS_NETWORKS` -- comma-separated
   IPs/CIDRs, same syntax as `FLEET_UI_TRUSTED_PROXIES`; empty (default) =
   off. Server environment only, deliberately not editable in the UI.
-- **Only global networks** (`fleet.ui_auth.passwordless_networks`): private,
+- **Only global, narrow networks** (`fleet.ui_auth.passwordless_networks`): entries broader than /16 (IPv4) or /32 (IPv6) are refused (`0.0.0.0/0` would otherwise pass `is_global`); an IPv4-mapped IPv6 client (`::ffff:a.b.c.d`) is compared as IPv4. Private,
   loopback, link-local and malformed entries are dropped with a warning.
   Behind a reverse proxy *without* `FLEET_UI_TRUSTED_PROXIES` every request
   appears to come from the proxy's private address -- a private entry would
