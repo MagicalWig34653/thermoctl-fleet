@@ -79,7 +79,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from datetime import time as time_of_day
 from pathlib import Path
@@ -390,6 +390,26 @@ def _as_aware_utc(value: datetime) -> datetime:
 # function gets a test" would otherwise force every test onto a real
 # container.
 LogReader = Callable[[str, int], list[str]]
+
+# `run`'s own `client_factory` parameter (cross-review of the flaky-test
+# investigation, main session, 2026-10-02, `docs/STATUS.md`'s "Open point"
+# section): a callable that builds a brand-new, independently pooled
+# `httpx.Client` -- the same way `agent.transport.build_client` built the
+# one `run` itself was handed, same base URL, same pinned-TLS transport,
+# same auth header/token source, same timeouts. Used so each background
+# thread (restore poll, daily backup scheduler, desired-state reconciler)
+# gets its *own* connection, never the one `receive_commands`/
+# `report_result` use on this function's own calling thread -- a `500` or
+# a dropped connection on one thread's client can then never tear down a
+# connection a different, concurrent request on a different thread is
+# using (the exact failure the investigation observed: a restore-poll
+# `GET` and an `agent_restart` result-report `POST` sharing one
+# `httpx.Client`/connection pool). `None` (the default) keeps every
+# existing caller that does not pass one -- most of this module's own
+# tests, which do not care about thread-to-thread connection isolation --
+# on the previous, single-shared-client behaviour byte for byte;
+# `agent.__main__._run_agent` always passes a real one.
+ClientFactory = Callable[[], httpx.Client]
 
 
 def _demultiplex_docker_log_stream(raw: bytes) -> list[str]:
@@ -2400,6 +2420,32 @@ def _handle_desired_state_received(
     trigger_event.set()
 
 
+def _start_background_thread(
+    name: str, body: Callable[[], None], owned_client: httpx.Client | None
+) -> threading.Thread:
+    """Starts `body` as a `daemon=True` thread named `name`, closing
+    `owned_client` (if any) once `body` itself returns -- i.e. once the
+    thread notices its own `stop_event` and its `while` loop exits, not
+    from `run`'s own `finally` (which never joins these threads, on
+    purpose, so a stuck one can never block process exit -- closing a
+    client from outside the thread that is still using it would risk
+    exactly that kind of hang/crash). `owned_client` is `None` whenever
+    `run` was not given a `client_factory` (this thread is then still
+    using the one `httpx.Client` `run` itself was called with, which this
+    function must not close -- `run`'s caller owns that one's lifetime)."""
+
+    def _body() -> None:
+        try:
+            body()
+        finally:
+            if owned_client is not None:
+                owned_client.close()
+
+    thread = threading.Thread(target=_body, daemon=True, name=name)
+    thread.start()
+    return thread
+
+
 def run(
     client: httpx.Client,
     *,
@@ -2412,6 +2458,7 @@ def run(
     backup_config: BackupConfig | None = None,
     restore_targets: RestoreTargets | None = None,
     restore_poll_interval_s: float = DEFAULT_RESTORE_POLL_INTERVAL_S,
+    client_factory: ClientFactory | None = None,
     pending_swap_path: Path = DEFAULT_PENDING_SWAP_FILE,
     desired_state_held_state_path: Path = DEFAULT_DESIRED_STATE_HELD_STATE_FILE,
     desired_state_failed_rollback_path: Path = DEFAULT_DESIRED_STATE_FAILED_ROLLBACK_FILE,
@@ -2507,6 +2554,33 @@ def run(
     every successful poll/stream reconnect, not only when a *new* result
     happens to be reported (cross-review: "idle flush of the result
     outbox").
+
+    **`client_factory` (flaky-test investigation follow-up,
+    `docs/STATUS.md`'s "Open point", main session 2026-10-02): each
+    background thread gets its own `httpx.Client`, never `client` above.**
+    Before this, the backup scheduler, the restore-poll loop, and the
+    desired-state reconciler's own fleet-result report all shared the one
+    `client` this function was called with -- the same connection pool
+    `receive_commands`/`report_result` use on this function's own calling
+    thread. A `500` (or any response that makes `httpx`/`httpcore` decide
+    to close a pooled connection) on one of those background requests
+    could tear down a connection a *different*, concurrent request on a
+    different thread was using, observed directly as an `agent_restart`
+    result-report POST failing with "Server disconnected without sending
+    a response" and the result never reaching the fleet at all (see
+    `report_result`'s own docstring for why that specific failure is still
+    buffered and retried rather than lost -- it is -- but losing the
+    connection at all was never supposed to be possible from an unrelated
+    thread's request). When `client_factory` is given, a fresh, separate
+    client is built for each of the three background threads (closed by
+    `_start_background_thread` once that thread's own loop notices its
+    `stop_event` and returns -- not from this function's own `finally`,
+    which never joins these daemon threads on purpose); `backup_config`/
+    `ExecutionContext` are given their own, thread-scoped copy
+    (`dataclasses.replace`) pointing at that thread's client instead of
+    the original. `None` (the default) keeps every existing caller that
+    does not pass one on the previous, single-shared-client behaviour
+    byte for byte -- `agent.__main__._run_agent` always passes a real one.
     """
 
     state = load_agent_state(executed_ids_path)
@@ -2535,18 +2609,30 @@ def run(
     # given) gets no background thread at all, not one that immediately
     # fails on every iteration.
     backup_stop_event = threading.Event()
-    backup_thread: threading.Thread | None = None
     if backup_config is not None:
-        backup_thread = threading.Thread(
-            target=run_daily_backup_scheduler,
-            args=(backup_config,),
-            # P5.4d: shares `ctx.agent_lock` with every other container/
-            # backup operation -- see that field's own docstring.
-            kwargs={"stop_event": backup_stop_event, "agent_lock": ctx.agent_lock},
-            daemon=True,
-            name="thermoctl-agent-daily-backup",
+        # See `run`'s own docstring ("client_factory") for why this thread
+        # gets its own client/`BackupConfig` copy instead of the one
+        # `backup_config` was constructed with -- that original keeps
+        # being used, unaffected, by `_handle_backup_now` on this
+        # function's own calling thread.
+        backup_thread_client = client_factory() if client_factory is not None else None
+        thread_backup_config = (
+            replace(backup_config, client=backup_thread_client)
+            if backup_thread_client is not None
+            else backup_config
         )
-        backup_thread.start()
+        _start_background_thread(
+            "thermoctl-agent-daily-backup",
+            lambda: run_daily_backup_scheduler(
+                thread_backup_config,
+                # P5.4d: shares `ctx.agent_lock` with every other
+                # container/backup operation -- see that field's own
+                # docstring.
+                stop_event=backup_stop_event,
+                agent_lock=ctx.agent_lock,
+            ),
+            backup_thread_client,
+        )
 
     # P5.5b: the same "own thread, not a branch of the command loop"
     # reasoning as the backup scheduler above, applied to "is a restore
@@ -2555,16 +2641,18 @@ def run(
     # of this module's own existing tests never pass one, and get no
     # background thread at all).
     restore_stop_event = threading.Event()
-    restore_thread: threading.Thread | None = None
     if restore_targets is not None:
-        restore_thread = threading.Thread(
-            target=run_restore_poll_loop,
-            args=(client, restore_targets),
-            kwargs={"interval_s": restore_poll_interval_s, "stop_event": restore_stop_event},
-            daemon=True,
-            name="thermoctl-agent-restore-poll",
+        restore_thread_client = client_factory() if client_factory is not None else None
+        _start_background_thread(
+            "thermoctl-agent-restore-poll",
+            lambda: run_restore_poll_loop(
+                restore_thread_client if restore_thread_client is not None else client,
+                restore_targets,
+                interval_s=restore_poll_interval_s,
+                stop_event=restore_stop_event,
+            ),
+            restore_thread_client,
         )
-        restore_thread.start()
 
     # P5.4b (cross-review fix): one `_DesiredStateReconciler` for the
     # whole lifetime of this call, shared by the immediate attempt below
@@ -2577,8 +2665,29 @@ def run(
     # every tick -- report, once, that reconciliation is disabled
     # (`_DesiredStateReconciler.attempt`'s own `backup_config is None`
     # branch), not silently do nothing forever.
+    # See `run`'s own docstring ("client_factory") -- the reconciler's own
+    # background thread gets its own client (and, if `backup_config` is
+    # configured, its own `BackupConfig` copy pointing at that same
+    # client, since `reconcile_desired_state`'s own `run_before_update_backup`
+    # call uploads through it too) instead of `ctx`/`client` above, which
+    # stay used, unaffected, by `execute_command` on this function's own
+    # calling thread.
+    desired_state_thread_client = client_factory() if client_factory is not None else None
+    reconciler_ctx = (
+        replace(
+            ctx,
+            client=desired_state_thread_client,
+            backup_config=(
+                replace(ctx.backup_config, client=desired_state_thread_client)
+                if ctx.backup_config is not None
+                else None
+            ),
+        )
+        if desired_state_thread_client is not None
+        else ctx
+    )
     desired_state_reconciler = _DesiredStateReconciler(
-        ctx=ctx,
+        ctx=reconciler_ctx,
         held_state_path=desired_state_held_state_path,
         pending_swap_path=pending_swap_path,
         failed_rollback_path=desired_state_failed_rollback_path,
@@ -2589,19 +2698,17 @@ def run(
     # immediately for a freshly received revision -- see both that
     # function's and `run_desired_state_reconcile_loop`'s own docstrings.
     desired_state_trigger_event = threading.Event()
-    desired_state_thread = threading.Thread(
-        target=run_desired_state_reconcile_loop,
-        args=(desired_state_reconciler,),
-        kwargs={
-            "interval_s": desired_state_reconcile_interval_s,
-            "sleep": sleep,
-            "stop_event": desired_state_stop_event,
-            "trigger_event": desired_state_trigger_event,
-        },
-        daemon=True,
-        name="thermoctl-agent-desired-state-reconcile",
+    _start_background_thread(
+        "thermoctl-agent-desired-state-reconcile",
+        lambda: run_desired_state_reconcile_loop(
+            desired_state_reconciler,
+            interval_s=desired_state_reconcile_interval_s,
+            sleep=sleep,
+            stop_event=desired_state_stop_event,
+            trigger_event=desired_state_trigger_event,
+        ),
+        desired_state_thread_client,
     )
-    desired_state_thread.start()
 
     commands = receive_commands(
         client, last_event_id_path, sleep=sleep, on_contact=_on_contact

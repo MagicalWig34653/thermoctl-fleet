@@ -162,6 +162,24 @@ def _run_agent(args: argparse.Namespace) -> int:
             # at `reauth_backoff.MAX_BACKOFF_S`), a success clears it
             # (`record_success`) so the next, unrelated failure streak (if
             # any) starts fresh.
+            # Cross-review fix (flaky-test investigation, `docs/STATUS.md`'s
+            # "Open point", main session 2026-10-02): `loop.run`'s own
+            # background threads (restore poll, daily backup scheduler,
+            # desired-state reconciler) each get their own `httpx.Client`
+            # now, built this same way -- same pinned-TLS transport
+            # (`build_client`), same base URL, same timeout, same bearer
+            # token -- instead of sharing the one `client` above with
+            # `receive_commands`/`report_result`. Reads `token` from this
+            # function's own enclosing scope at call time (not a value
+            # captured once): a successful re-authentication below
+            # reassigns `token` before the next `loop.run` call, and every
+            # client this factory builds for *that* call must carry the
+            # new one, not the one this process started with.
+            def _client_factory() -> httpx.Client:
+                thread_client = build_client(config.fleet_address, config.certificate_fingerprint)
+                thread_client.headers["Authorization"] = f"Bearer {token}"
+                return thread_client
+
             reauthenticated = False
             while True:
                 try:
@@ -176,6 +194,7 @@ def _run_agent(args: argparse.Namespace) -> int:
                         backup_config=backup_config,
                         restore_targets=restore_targets,
                         restore_poll_interval_s=args.restore_poll_interval_s,
+                        client_factory=_client_factory,
                         pending_swap_path=data_dir / loop.DEFAULT_PENDING_SWAP_FILE,
                         desired_state_held_state_path=(
                             data_dir / loop.DEFAULT_DESIRED_STATE_HELD_STATE_FILE

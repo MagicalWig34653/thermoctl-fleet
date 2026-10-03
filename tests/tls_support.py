@@ -274,3 +274,89 @@ def run_recording_tls_server(
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+@contextmanager
+def run_disconnecting_tls_server(
+    tmp_path: Path,
+    *,
+    common_name: str = "127.0.0.1",
+) -> Iterator[tuple[str, str, str]]:
+    """A minimal, real TLS server that completes the handshake, reads
+    exactly one real request, and then closes the connection **without
+    writing a single response byte** -- the real-TLS counterpart of
+    `agent.commands_channel.report_result`'s own "Server disconnected
+    without sending a response" case (`httpx.RemoteProtocolError`, a
+    `httpx.TransportError` subclass), used by
+    `tests/test_agent_commands_channel.py` to prove that exact failure is
+    buffered to the outbox and retried, not lost -- without mocking
+    `httpx`/TLS/the server to produce it, the same "no mock of TLS, of
+    `httpx_sse`, or of the real fleet app's behaviour" standard this
+    module's other helpers already hold themselves to (this one just
+    isn't the real fleet app, since the fleet app itself never behaves
+    this way -- the failure mode under test is strictly a client-side
+    one: how `report_result` reacts to any peer, well-behaved or not,
+    dropping the connection).
+
+    Yields `(base_url, ca_file, certificate_fingerprint)`.
+    """
+
+    ca_cert, ca_key = generate_ca()
+    cert_pem, key_pem, cert_der = generate_leaf(ca_cert, ca_key, common_name)
+
+    ca_file = tmp_path / "disconnecting-ca.pem"
+    ca_file.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    cert_file = tmp_path / "disconnecting-cert.pem"
+    cert_file.write_bytes(cert_pem)
+    key_file = tmp_path / "disconnecting-key.pem"
+    key_file.write_bytes(key_pem)
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert_file), str(key_file))
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+    stop = threading.Event()
+
+    def _serve() -> None:
+        listener.settimeout(0.1)
+        while not stop.is_set():
+            try:
+                raw_conn, _addr = listener.accept()
+            except TimeoutError:
+                continue
+            try:
+                tls_conn = context.wrap_socket(raw_conn, server_side=True)
+                try:
+                    # Read whatever the client sends (method line,
+                    # headers, and, for a POST, its body -- all small
+                    # enough here to arrive in one `recv`) so the
+                    # client's own write completes normally; only the
+                    # *response* side is ever withheld.
+                    tls_conn.settimeout(5.0)
+                    tls_conn.recv(65536)
+                except Exception:  # noqa: S110 -- a read timeout/reset here
+                    # changes nothing: this server was never going to send
+                    # a response either way, see `finally` below.
+                    pass
+                finally:
+                    # No response bytes, ever -- just an immediate,
+                    # unceremonious close, real TLS teardown and all.
+                    tls_conn.close()
+            except Exception:
+                raw_conn.close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    base_url = f"https://127.0.0.1:{port}"
+    fingerprint = fingerprint_for_certificate(cert_der)
+    try:
+        yield base_url, str(ca_file), fingerprint
+    finally:
+        stop.set()
+        listener.close()
+        thread.join(timeout=5)
