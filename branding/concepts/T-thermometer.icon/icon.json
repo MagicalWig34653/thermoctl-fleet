@@ -1,0 +1,91 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "srgb:0.05882,0.08627,0.14902,1.00000",
+      "srgb:0.10588,0.15294,0.25098,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "Segment4.svg",
+          "name" : "Segment4"
+        }
+      ],
+      "name" : "Segment4",
+      "shadow" : { "kind" : "none", "opacity" : 0.5 },
+      "specular" : true,
+      "translucency" : { "enabled" : true, "value" : 0.12 }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "Segment3.svg",
+          "name" : "Segment3"
+        }
+      ],
+      "name" : "Segment3",
+      "shadow" : { "kind" : "none", "opacity" : 0.5 },
+      "specular" : true,
+      "translucency" : { "enabled" : true, "value" : 0.12 }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "Segment2.svg",
+          "name" : "Segment2"
+        }
+      ],
+      "name" : "Segment2",
+      "shadow" : { "kind" : "none", "opacity" : 0.5 },
+      "specular" : true,
+      "translucency" : { "enabled" : true, "value" : 0.12 }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "Segment1.svg",
+          "name" : "Segment1"
+        }
+      ],
+      "name" : "Segment1",
+      "shadow" : { "kind" : "none", "opacity" : 0.5 },
+      "specular" : true,
+      "translucency" : { "enabled" : true, "value" : 0.12 }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "Bulb.svg",
+          "name" : "Bulb"
+        }
+      ],
+      "name" : "Bulb",
+      "shadow" : { "kind" : "none", "opacity" : 0.5 },
+      "specular" : true,
+      "translucency" : { "enabled" : true, "value" : 0.12 }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "Glow.svg",
+          "name" : "Glow"
+        }
+      ],
+      "name" : "Glow",
+      "shadow" : { "kind" : "none", "opacity" : 0.5 },
+      "specular" : false,
+      "translucency" : { "enabled" : false, "value" : 0.5 }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : "shared"
+  }
+}
