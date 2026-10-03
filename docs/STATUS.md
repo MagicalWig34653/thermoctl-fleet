@@ -2,6 +2,21 @@
 
 Last updated: 2026-10-03.
 
+## Architekturdiagramm und Startseiten-Hero (2026-10-03)
+
+Das Architekturdiagramm nutzt feste Kartenkoordinaten im SVG-Raster (1200 ×
+780): Wohnung links als Zweispaltenraster mit breitem Agenten, Registry oben,
+Cloud rechts mit breitem Fleet-Dienst und Browser darunter. Verbindungen
+laufen durch freie Kartenabstände; der Internetkanal bündelt vier getrennte
+Agent–Fleet-Spuren. Kantenbeschriftungen erscheinen bei Fokus, Hover und im
+aktiven Story-Schritt als Pillen in einem freien Beschriftungsstreifen.
+Unter 760 px stehen die Zonen untereinander mit zweispaltigen Karten und
+sichtbaren Story-Kanten. Der Startseiten-Hero hat nun einen dunklen
+Navy-Indigo-Verlauf, warmes Licht und eine überlappende Dashboard-Vorschau.
+Runde 2 ersetzt den Beschriftungsstreifen durch Kantenanker, begradigt vier Internetspuren und strafft das SVG auf 1200 × 735.
+Runde 3 trennt kollidierende Pfeilspitzen, führt Browser-Kanten am Zonennamen vorbei, verkürzt die Cloud-Zone und setzt den hellen Internetkanal mobil als volle Breite mit ViewBox-Selbstprüfung.
+Runde 4 führt Wohnungs- und Browser-Kanten durch freie Gassen, prüft Zonenabstände und ordnet mobil Internet, Cloud, Browser und Registry hinter der Wohnung an.
+
 ## `tools/docs_screenshots.py` test coverage, cross-review follow-up (2026-10-03)
 
 Cross-review (Codex) on the package below found two issues, fixed in a

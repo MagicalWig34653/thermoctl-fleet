@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architektur – thermoctl-fleet</title>
+<meta name="description" content="Interaktives Architekturdiagramm von thermoctl-fleet: alle Komponenten in Wohnung, Cloud und Browser, alle Abläufe als durchklickbare Storys – Heartbeat, Störungen, Wartungsbefehle, Backup, Restore, Updates, Rollouts, Enrollment, Mieterwechsel, Anmeldung.">
+<link rel="icon" href="assets/icon/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/icon/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="assets/icon/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Zum Inhalt springen</a>
+<header class="site-header">
+  <img class="logo" src="assets/icon/favicon.svg" alt="">
+  <a class="brand" href="index.html">thermoctl-fleet</a>
+  <nav>
+    <a href="docs/index.html">Dokumentation</a>
+    <a href="architektur.html">Architektur</a>
+    <a href="docs/sicherheit.html">Sicherheit</a>
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet">GitHub</a>
+  </nav>
+</header>
+
+<main id="main" class="wide">
+  <h1>Architektur – jede Komponente, jeder Ablauf</h1>
+  <p>
+    Drei Vertrauenszonen – <strong>Wohnung</strong>, <strong>Cloud</strong> und
+    <strong>Browser des Vermieters</strong> – plus die Registry, aus der Images
+    kommen. Diese Seite zeigt alle Bausteine aus der
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a>
+    und dem Code und macht jeden Ablauf als Story Schritt für Schritt durchklickbar.
+    Ein Klick auf einen Knoten öffnet Details: was er darf, was er sieht, welcher
+    Sicherheitsgrundsatz gilt.
+  </p>
+
+  <div class="diagram-legend">
+    <span><span class="swatch" style="background:var(--zone-apartment-border)"></span>Wohnung / Basisstation</span>
+    <span><span class="swatch" style="background:var(--zone-cloud-border)"></span>Cloud (Vermieter)</span>
+    <span><span class="swatch" style="background:var(--zone-browser-border)"></span>Browser des Vermieters</span>
+    <span><span class="swatch" style="background:var(--border)"></span>Registry (extern)</span>
+  </div>
+
+  <div id="js-diagram">
+    <div class="story-bar" id="story-bar" role="group" aria-label="Ablauf auswählen"></div>
+
+    <div class="story-steps" id="story-steps" hidden>
+      <p class="story-counter" id="story-counter" role="status" aria-live="polite"></p>
+      <ol id="story-steps-list"></ol>
+      <div class="story-nav">
+        <button type="button" id="story-prev">← Zurück</button>
+        <button type="button" id="story-next">Weiter →</button>
+        <button type="button" id="story-clear">Story schließen</button>
+      </div>
+    </div>
+
+    <div class="diagram-wrap">
+      <svg id="diagram-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Interaktives Architekturdiagramm. Knoten sind per Tab erreichbar, Enter öffnet Details, Escape schließt sie.">
+        <defs>
+          <marker id="d-arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent-2)"/>
+          </marker>
+          <marker id="d-arrow-active" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+        <g id="layer-zones"></g>
+        <g id="layer-nodes"></g>
+        <g id="layer-edges"></g>
+        <g id="layer-labels"></g>
+      </svg>
+    </div>
+  </div>
+
+  <noscript>
+    <div class="callout warn">
+      <p><strong>JavaScript ist deaktiviert.</strong> Das interaktive Diagramm braucht es
+      für die Story-Steuerung. Statt des Diagramms die vereinfachte Übersicht von der
+      Startseite, darunter alle Komponenten und Abläufe als Text.</p>
+    </div>
+    <div class="diagram-wrap">
+      <svg viewBox="0 0 1180 440" xmlns="http://www.w3.org/2000/svg" role="img"
+           aria-label="Architekturübersicht: In der Wohnung sprechen thermoctl und Zigbee2MQTT lokal mit dem Agenten, der Agent übergibt geprüfte Digests an den Watchdog. Der Agent sendet per HTTPS einen Heartbeat an den Fleet-Dienst in der Cloud und hält eine SSE-Verbindung für Befehle offen.">
+        <defs>
+          <marker id="ns-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+          <style>
+            .ns-box { fill: #fff; stroke: #ccc; stroke-width: 1.5; rx: 10; }
+            .ns-lbl { font: 600 15px -apple-system, sans-serif; fill: #111; }
+            .ns-sub { font: 12px -apple-system, sans-serif; fill: #666; }
+            .ns-edge { stroke: #21609b; stroke-width: 2; fill: none; marker-end: url(#ns-arrow); color: #21609b; }
+            .ns-edge2 { stroke: #c25a1a; stroke-width: 2; fill: none; marker-end: url(#ns-arrow); color: #c25a1a; }
+            .ns-edgelbl { font: 12px -apple-system, sans-serif; fill: #666; text-anchor: middle; }
+            .ns-frame { fill: none; stroke: #ccc; stroke-width: 1; stroke-dasharray: 5 4; }
+            .ns-framelbl { font: 700 12px -apple-system, sans-serif; fill: #666; letter-spacing: .04em; text-transform: uppercase; }
+          </style>
+        </defs>
+        <rect class="ns-frame" x="20" y="20" width="470" height="400" rx="14"/>
+        <text class="ns-framelbl" x="36" y="44">Wohnung / Basisstation</text>
+        <rect class="ns-box" x="50" y="64" width="410" height="60" rx="10"/>
+        <text class="ns-lbl" x="62" y="89">thermoctl &amp; Zigbee2MQTT</text>
+        <text class="ns-sub" x="62" y="108">lokale REST-API (read-only) · lokaler Broker</text>
+        <rect class="ns-box" x="50" y="164" width="410" height="60" rx="10"/>
+        <text class="ns-lbl" x="62" y="189">Agent</text>
+        <text class="ns-sub" x="62" y="208">einzige Verbindung nach außen, nur ausgehend</text>
+        <rect class="ns-box" x="50" y="264" width="410" height="60" rx="10"/>
+        <text class="ns-lbl" x="62" y="289">Watchdog</text>
+        <text class="ns-sub" x="62" y="308">Go, ohne Abhängigkeiten, kennt kein Netz</text>
+        <line class="ns-edge" x1="255" y1="124" x2="255" y2="164"/>
+        <line class="ns-edge" x1="255" y1="224" x2="255" y2="264"/>
+        <rect class="ns-frame" x="690" y="20" width="470" height="400" rx="14"/>
+        <text class="ns-framelbl" x="706" y="44">Cloud (Vermieter)</text>
+        <rect class="ns-box" x="720" y="64" width="410" height="60" rx="10"/>
+        <text class="ns-lbl" x="732" y="89">Fleet-Dienst</text>
+        <text class="ns-sub" x="732" y="108">Heartbeat- &amp; Ereignisannahme, Befehlsversand</text>
+        <rect class="ns-box" x="720" y="164" width="410" height="60" rx="10"/>
+        <text class="ns-lbl" x="732" y="189">Web-UI &amp; Alarme</text>
+        <text class="ns-sub" x="732" y="208">TOTP + Passkey · Alarm bei Ausbleiben</text>
+        <rect class="ns-box" x="720" y="264" width="410" height="60" rx="10"/>
+        <text class="ns-lbl" x="732" y="289">Verschlüsselte Backups</text>
+        <text class="ns-sub" x="732" y="308">Cloud sieht nur den opaken Block, nie den Schlüssel</text>
+        <line class="ns-edge" x1="925" y1="124" x2="925" y2="164"/>
+        <line class="ns-edge" x1="925" y1="224" x2="925" y2="264"/>
+        <path class="ns-edge2" d="M460,194 L580,194 L580,89 L720,89" />
+        <text class="ns-edgelbl" x="610" y="76">HTTPS POST /v1/heartbeat</text>
+        <path class="ns-edge" d="M720,194 L610,194 L610,350 L460,350" />
+        <text class="ns-edgelbl" x="610" y="337">SSE GET /v1/commands</text>
+      </svg>
+    </div>
+  </noscript>
+
+  <div class="panel-backdrop" id="panel-backdrop"></div>
+  <aside class="side-panel" id="side-panel" role="dialog" aria-modal="true" aria-labelledby="panel-title" hidden>
+    <button type="button" class="panel-close" id="panel-close" aria-label="Schließen">✕</button>
+    <h2 id="panel-title"></h2>
+    <p id="panel-sub"></p>
+    <dl id="panel-body"></dl>
+  </aside>
+
+  <h2 id="ohne-js">Komponenten &amp; Abläufe als Text</h2>
+  <p>Dieselben Informationen wie im Diagramm, falls Lesen leichter ist als Klicken.</p>
+
+  <h3>Komponenten</h3>
+  <ul>
+    <li><strong>thermoctl</strong> – Wohnung. Die eigentliche Heizungssteuerung; liefert dem Agenten eine lokale, read-only REST-API.</li>
+    <li><strong>Zigbee2MQTT &amp; Mosquitto</strong> – Wohnung. Funknetz der Sensoren/Aktoren, Broker ausschließlich lokal, nie im Internet.</li>
+    <li><strong>Agent</strong> – Wohnung. Einzige Verbindung nach außen, nur ausgehend; Sicherheitsgrenze für jeden Befehl.</li>
+    <li><strong>Watchdog</strong> – Wohnung. Go, ohne Abhängigkeiten, kennt kein Netz und keine Registry; tauscht nur zwischen zwei lokal bereits geprüften Digests.</li>
+    <li><strong>Restore-Mover</strong> – Wohnung. Kleines Go-Programm auf dem bloßen System; schreibt entschlüsselte Betriebsdaten nur, wenn das Live-Verzeichnis noch leer ist.</li>
+    <li><strong>State- &amp; Health-Dateien</strong> – Wohnung. Zeilenbasierte Dateien unter <code>/run/</code>; Vertrag zwischen Agent und Watchdog.</li>
+    <li><strong>LED-Status</strong> – Wohnung, nur Raspberry Pi. Zwei LEDs zeigen Systemzustand ohne Netzwerkzugriff.</li>
+    <li><strong>Lokaler Docker</strong> – Wohnung. Vier Container (thermoctl, Zigbee2MQTT, Mosquitto, Agent); kein Compose-Fernzugriff, keine Shell-Befehle von außen.</li>
+    <li><strong>Boot-Partition</strong> – Wohnung. Trägt <code>agent-registration.json</code> mit Fleet-Adresse, Fingerprint und einmaligem Registrierungscode.</li>
+    <li><strong>Registry (ghcr.io u. a.)</strong> – extern. Quellliste ist im Agenten fest hinterlegt, nicht in der Cloud; kein Digest, kein Start.</li>
+    <li><strong>Fleet-Dienst</strong> – Cloud. FastAPI; nimmt Heartbeats und Ereignisse an, verteilt Befehle, bedient die Web-UI.</li>
+    <li><strong>SQLite</strong> – Cloud. Inventar, Zustände, Audit-Log – keine Rohdaten der Wohnung.</li>
+    <li><strong>Backup-Blobspeicher</strong> – Cloud. Nur opake, auf dem Gerät verschlüsselte Blöcke; die Cloud kann sie nicht lesen.</li>
+    <li><strong>Web-UI</strong> – Cloud. Haus, Wohnung, Aufgaben, Inventar; keine Temperaturkurven, keine Mieterdaten.</li>
+    <li><strong>Alarm-Kanäle</strong> – Cloud. Webhook, SMTP oder Log – konfigurierbar, mehrere gleichzeitig möglich.</li>
+    <li><strong>Browser des Vermieters</strong> – eigene Zone. Passkey/TOTP-Anmeldung; verschlüsselt den Restore-Schlüssel lokal, bevor er die Cloud erreicht.</li>
+  </ul>
+
+  <h3>Abläufe</h3>
+  <div id="story-text-list">
+    <details>
+      <summary><strong>Heartbeat &amp; Ausfall-Alarm</strong></summary>
+      <ol>
+        <li>Agent liest thermoctls lokale REST-API alle 120 Sekunden (read-only Token).</li>
+        <li>Agent sendet <code>POST /v1/heartbeat</code> an den Fleet-Dienst.</li>
+        <li>Fleet-Dienst schreibt den Zeitstempel in SQLite und prüft auf Lücken.</li>
+        <li>Fehlen drei Heartbeats hintereinander (6 Minuten), meldet der Fleet-Dienst über die konfigurierten Alarm-Kanäle – der Wert liegt im Ausbleiben, nicht im Empfang.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Störung melden &amp; quittieren</strong></summary>
+      <ol>
+        <li>thermoctl erkennt eine der sechs Störungsarten und trägt sie in <code>open_faults</code> des nächsten Heartbeats ein.</li>
+        <li>Agent überträgt die Störung unverändert, ohne Klartext aus thermoctls eigenem Text.</li>
+        <li>Fleet-Dienst erzeugt ein Envelope aus <code>kind</code>/<code>key</code> und zeigt es in der Aufgabenliste.</li>
+        <li>Der Vermieter quittiert im Web-UI – die Quittierung gilt nur für das aktuelle Auftreten; tritt die Störung erneut auf, erscheint sie wieder.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Wartungsbefehl (SSE, at-most-once, Ablaufzeit)</strong></summary>
+      <ol>
+        <li>Der Vermieter löst im Web-UI einen Befehl aus (z. B. <code>fetch_logs</code>).</li>
+        <li>Fleet-Dienst erzeugt eine Id und eine Ablaufzeit (Standard 15 Minuten) und liefert den Befehl über <code>GET /v1/commands</code> (SSE).</li>
+        <li>Der Agent prüft lokal: Id schon gesehen? Ablaufzeit überschritten? Beide Prüfungen sitzen im Agenten, nicht in der Cloud.</li>
+        <li>Agent führt aus oder verweigert, protokolliert lokal und meldet das Ergebnis über <code>POST /v1/commands/{id}/result</code>.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Backup (Verschlüsselung auf dem Gerät, opaker Block)</strong></summary>
+      <ol>
+        <li>Agent liest die thermoctl-Datenbank sowie Zigbee2MQTTs Geräte-Tabelle und <code>coordinator_backup.json</code>.</li>
+        <li>Agent verschlüsselt lokal mit dem Schlüssel des Vermieters – der Schlüssel selbst liegt nie auf dem Gerät und nie in der Cloud.</li>
+        <li>Der verschlüsselte Block geht per HTTPS an den Fleet-Dienst und landet im Blobspeicher; die Cloud kann ihn nicht lesen.</li>
+        <li>Aufbewahrung: die letzten 14 Tagessicherungen plus eine Wochensicherung für jede der letzten acht Wochen.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Restore (Browser verschlüsselt den Schlüssel neu, Staging, Go-Mover)</strong></summary>
+      <ol>
+        <li>Das Ersatzgerät registriert bei der Inbetriebnahme sein eigenes age-Schlüsselpaar; nur der öffentliche Teil geht an die Cloud.</li>
+        <li>Der Vermieter gibt den Schlüssel einmalig im Browser ein; der Browser verschlüsselt ihn lokal an genau dieses Gerät, bevor irgendetwas die Cloud erreicht.</li>
+        <li>Der Fleet-Dienst speichert und leitet nur den opaken Block weiter und löscht ihn nach Abruf oder Ablauf; der Agent entschlüsselt in ein eigenes Staging-Verzeichnis (keine Schreibrechte auf die Live-Daten).</li>
+        <li>Der Restore-Mover, ein kleines Go-Programm auf dem bloßen System, verschiebt die Daten nur dann in die Live-Verzeichnisse, wenn dort noch keine Betriebsdaten liegen.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Container-Update &amp; Rollback <span class="tag">derzeit abgeschaltet</span></strong></summary>
+      <ol>
+        <li>Der Fleet-Dienst nennt eine neue gewünschte Revision (Version, Digest) im Soll-Zustand; wirksam wird sie nur mit <code>pilot_mode</code> und einer fail-closed Vorprüfung.</li>
+        <li>Agent prüft lokal (Platz, Zeitfenster, Außentemperatur, Regelbetrieb), lädt das Image aus einer der fest hinterlegten Quellen und prüft den Digest.</li>
+        <li>Agent schreibt die State-Datei (<code>desired</code>/<code>proven</code>/<code>since</code>) und stoppt sich selbst; der Watchdog startet die neue Revision ohne Netzzugriff.</li>
+        <li>Meldet sich der Gesundheitsbericht nicht innerhalb von 10 Minuten, fällt der Watchdog selbständig auf <code>proven</code> zurück; nach einer Stunde fehlerfreiem Betrieb rückt die neue Revision zu <code>proven</code> auf.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Rollout über mehrere Wohnungen</strong></summary>
+      <ol>
+        <li>Ein Rollout wird einmal angelegt: ein Dienst, eine Version, eine Liste von Wohnungen.</li>
+        <li>Die Pilot- oder Testwohnung wird zuerst aktualisiert (siehe Container-Update).</li>
+        <li>Erst 48 Stunden nachdem diese Wohnung als gesund zurückgemeldet ist (Revision reconciled plus erreichbarer Heartbeat), geht es weiter.</li>
+        <li>Die restliche Liste wird eine Wohnung nach der anderen abgearbeitet; die Warteschlange stoppt beim ersten Problem.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Enrollment einer neuen Basisstation</strong></summary>
+      <ol>
+        <li>Der Vermieter legt die Wohnung an, erzeugt einen einmaligen Registrierungscode und schreibt das fertige Image samt <code>agent-registration.json</code> auf die Boot-Partition.</li>
+        <li>Nach dem Einstecken erzeugt der Agent sein Ed25519- und sein age-Schlüsselpaar und registriert sich mit dem Code und seinem öffentlichen Schlüssel.</li>
+        <li>Das Gerät zeigt einen Verifizierungscode; der Vermieter wählt im Web-UI die Wohnung, sieht denselben Code und bestätigt – erst das bindet die Konfiguration an genau dieses Gerät.</li>
+        <li>Der Agent holt die Gerätekonfiguration, startet die vier Container und sendet den ersten Heartbeat.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Mieterwechsel (Token-Rotation, Datenlöschung)</strong></summary>
+      <ol>
+        <li>Der Vermieter löst <code>factory_reset</code> aus; die Bestätigung nennt die Wohnung ausdrücklich, nicht nur „wirklich?“.</li>
+        <li>Der Agent lädt zuerst noch eine letzte verschlüsselte Sicherung hoch, stoppt dann die Container und löscht die Datenspeicher von thermoctl und Zigbee2MQTT.</li>
+        <li>Agent verwirft eigene Schlüssel, Token und <code>agent-registration.json</code> und erzeugt ein neues WireGuard-Schlüsselpaar; der Fleet-Dienst widerruft den Token und schließt die Zuordnung mit einem <code>until</code>-Zeitstempel ab.</li>
+        <li>Das Gerät registriert sich mit einem neuen Verifizierungscode erneut – derselbe Weg wie bei der Erstinbetriebnahme.</li>
+      </ol>
+    </details>
+    <details>
+      <summary><strong>Anmeldung (Passwort+TOTP, Passkey, passwortlos aus bekannten Netzen)</strong></summary>
+      <ol>
+        <li>Der Vermieter meldet sich am Web-UI mit Passwort und TOTP an, oder mit einem Passkey (WebAuthn) als zweitem Faktor.</li>
+        <li>Aus einem eigenen, bereits bekannten Netz genügt optional ein Passkey allein, ohne Passwort.</li>
+        <li>TOTP-Secrets liegen in SQLite nur verschlüsselt, mit einem Schlüssel aus der Umgebung – nie im Klartext in der Datenbank.</li>
+        <li>Jede erfolgreiche und jede fehlgeschlagene Anmeldung geht an die konfigurierten Alarm-Kanäle.</li>
+      </ol>
+    </details>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <p>
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a> ·
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/STATUS.md">Projektstatus</a>
+  </p>
+</footer>
+
+<script src="assets/js/architecture-data.js"></script>
+<script src="assets/js/architecture.js"></script>
+</body>
+</html>
