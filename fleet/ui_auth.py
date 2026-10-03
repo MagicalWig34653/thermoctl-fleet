@@ -141,6 +141,28 @@ _DEFAULT_IP_THROTTLE_WINDOW_S = 15 * 60.0
 _IP_THROTTLE_DURATION_S_ENV = "FLEET_UI_IP_THROTTLE_DURATION_S"
 _DEFAULT_IP_THROTTLE_DURATION_S = 15 * 60.0
 
+# `/ui/login/webauthn/begin`'s own, separate budget (2026-10-03 fix, main
+# session review): sharing `login_submit`'s per-IP throttle counter was a
+# usability regression, not just a security tightening -- at the default
+# threshold of 5 per 15 minutes, a passkey login spends *two* reservations
+# (one for `begin`, one for the `login_submit` call that actually presents
+# the assertion) and is never released (`begin` authenticates nothing, so
+# there is nothing to give back the way a successful `login_submit` gives
+# its own reservation back) -- an office NAT's shared IP could hit the
+# shared budget after two or three ordinary passkey logins plus a single
+# mistyped password, locking out *password* logins from that IP for a full
+# `_DEFAULT_IP_THROTTLE_DURATION_S`, not just passkey ones. Same mechanism
+# (`Storage.reserve_ip_login_attempt`), but keyed under a distinct string
+# (`webauthn_begin_throttle_key`) so it is a genuinely separate counter row
+# -- `begin` calls never spend `login_submit`'s budget and vice versa. A
+# much higher default (30, vs. 5) reflects that a `begin` call alone proves
+# nothing (no password, no assertion) and is far cheaper to allow generously
+# than an actual login attempt; the window/duration are intentionally the
+# *same* as the login throttle's own (`ip_throttle_window_s`/
+# `ip_throttle_duration_s`), only the threshold and the counter differ.
+_WEBAUTHN_BEGIN_THROTTLE_THRESHOLD_ENV = "FLEET_UI_WEBAUTHN_BEGIN_THRESHOLD"
+_DEFAULT_WEBAUTHN_BEGIN_THROTTLE_THRESHOLD = 30
+
 _TRUSTED_PROXIES_ENV = "FLEET_UI_TRUSTED_PROXIES"
 
 _SESSION_ABSOLUTE_LIFETIME_S_ENV = "FLEET_UI_SESSION_ABSOLUTE_LIFETIME_S"
@@ -201,6 +223,24 @@ def ip_throttle_window_s() -> float:
 
 def ip_throttle_duration_s() -> float:
     return float(os.environ.get(_IP_THROTTLE_DURATION_S_ENV, _DEFAULT_IP_THROTTLE_DURATION_S))
+
+
+def webauthn_begin_throttle_threshold() -> int:
+    return int(
+        os.environ.get(
+            _WEBAUTHN_BEGIN_THROTTLE_THRESHOLD_ENV, _DEFAULT_WEBAUTHN_BEGIN_THROTTLE_THRESHOLD
+        )
+    )
+
+
+def webauthn_begin_throttle_key(client_ip: str) -> str:
+    """The reservation key `login_webauthn_begin` reserves under --
+    deliberately *not* `client_ip` itself (that is `login_submit`'s own key
+    into the identical `Storage.reserve_ip_login_attempt` table), so the two
+    endpoints' budgets are genuinely independent rows, never the same
+    counter under two names."""
+
+    return f"webauthn-begin:{client_ip}"
 
 
 def _parse_trusted_proxies(
@@ -719,4 +759,6 @@ __all__ = [
     "totp_key",
     "totp_provisioning_uri",
     "verify_totp",
+    "webauthn_begin_throttle_key",
+    "webauthn_begin_throttle_threshold",
 ]

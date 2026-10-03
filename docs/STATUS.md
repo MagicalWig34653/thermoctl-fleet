@@ -83,6 +83,106 @@ clean pass/fail signal without the report tail) all pass clean; the whole
 suite was run three times with an identical dot count and exit code 0
 each time.
 
+## 2026-10-03 -- Codex full review findings 3, 4, 9
+
+Fixes three confirmed findings from a Codex full review of `fleet/`, all in
+P6.2 territory (TOTP encryption/webauthn, see that section just below for
+the feature itself).
+
+**Finding 3 (resumable TOTP key rotation, `fleet/admin.py::rotate_totp_key`,
+P6.2).** The previous implementation decrypted every row with
+`FLEET_TOTP_KEY` (old) only and stopped loudly on the first row it could
+not decrypt -- correct for a *clean* run, but not actually resumable the
+way its own docstring and this file's "Key rotation" paragraph claimed: a
+partial run left some rows re-encrypted under `FLEET_TOTP_KEY_NEW` and the
+rest still on `FLEET_TOTP_KEY`, a genuinely mixed state neither single key
+alone could get through on its own -- re-running with the old key failed
+on the already-rotated rows, and there was no way to set the old key to
+the new value without also breaking the rows that had not been rotated
+yet. **Fix:** per row, try `FLEET_TOTP_KEY` first; if that fails, try
+`FLEET_TOTP_KEY_NEW` -- a row the *new* key decrypts was already rotated by
+an earlier, interrupted run, so it is skipped (counted separately, never
+re-encrypted again); only a row neither key can decrypt is the genuine
+failure, which still stops the command and reports exactly which username,
+unchanged from before. Re-running with the exact same, unchanged
+`FLEET_TOTP_KEY`/`FLEET_TOTP_KEY_NEW` pair now always resumes a partial run
+to completion. The "Key rotation" paragraph in the P6.2 section below and
+`rotate_totp_key`'s own docstring are updated to describe this. Tests
+(`tests/test_admin.py`): a partial-failure-then-resume scenario (one row
+already on the new key, one still on the old one, same env vars,
+asserting the already-rotated row's ciphertext is byte-identical
+afterward -- not re-encrypted needlessly -- and every row decrypts under
+the new key at the end); a row decryptable by neither key still fails
+loudly, mentioning both env vars.
+
+**Finding 4 (unbounded WebAuthn challenge rows, `fleet/storage.py`
+/`fleet/ui_routes.py`, P6.2).** `POST /ui/login/webauthn/begin` inserted a
+`webauthn_challenges` row on every call with no rate limit and nothing
+ever deleted an expired or consumed one -- unbounded growth, and (unlike
+every other login-adjacent endpoint) no throttle at all on an
+unauthenticated caller hammering it. **Fix, both halves:**
+(a) `login_webauthn_begin` now reserves against its **own, separate**
+per-IP budget (`FLEET_UI_WEBAUTHN_BEGIN_THRESHOLD`, default 30, via
+`fleet.ui_auth.webauthn_begin_throttle_threshold`/
+`webauthn_begin_throttle_key`), using the identical
+`Storage.reserve_ip_login_attempt` mechanism `login_submit` already uses
+but keyed under a distinct string (`webauthn-begin:{ip}`, not the bare
+`ip` `login_submit` itself keys by) -- same table, same atomic
+reserve-then-verify semantics, genuinely separate counter row. **First
+version of this fix (same day) reserved against `login_submit`'s own
+counter and was corrected in main-session review**: sharing it was a
+usability regression, not just a tightening -- at `login_submit`'s much
+smaller default (5 per 15 minutes), one passkey login already spends two
+reservations (`begin`, then `login_submit` presenting the assertion) and
+`begin` never releases its reservation (it authenticates nothing, so
+there is nothing to give back), so an office NAT's shared IP could reach
+that shared budget after two or three ordinary passkey logins plus one
+mistyped password -- locking out *password* logins from that IP too, for
+the full throttle duration. The corrected version's much higher default
+(30, vs. `login_submit`'s 5) reflects that a bare `begin` call alone
+proves nothing (no password, no assertion), so it is far cheaper to allow
+generously than an actual login attempt; window/duration are still the
+exact same (`ip_throttle_window_s`/`ip_throttle_duration_s`), only the
+threshold and the counter key differ. Deliberately never calls
+`release_ip_login_attempt` -- a "begin" call authenticates nothing the
+way a successful `login_submit` does, so there is nothing to give back.
+(b) `Storage.create_webauthn_challenge` now opportunistically deletes
+every row in the table that is already expired or already consumed, in
+the same transaction, right before inserting the new one -- piggybacking
+the purge onto a write every challenge-creating call already performs
+rather than adding a dedicated cleanup table or background loop for one
+more table. A still-pending, unexpired row (including one a concurrent
+request just created) is never touched. Tests:
+`tests/test_ui_webauthn_routes.py` (`begin`'s own threshold triggers a
+`429`; exhausting `begin`'s budget leaves `login_submit`'s own budget
+untouched and vice versa -- proven in both directions, not just one);
+`tests/test_storage.py` (expired and consumed rows are purged on the next
+`create_webauthn_challenge` call, a pending unexpired row survives the
+purge and is still consumable afterward -- asserted by `binding`, not by
+raw autoincrement id, since SQLite's plain `INTEGER PRIMARY KEY` can
+reuse a deleted row's id for an unrelated later insert).
+
+**Finding 9 (wrong migration number in messages, `fleet/migrations/versions
+/0019_totp_encryption_and_webauthn.py`, this file's P6.2 section).** Two
+`RuntimeError` messages inside the migration said "Migration 0017" --
+leftover from before the main-merge renumbering (the fault-acknowledgement
+migration legitimately kept `0017` for itself; this migration is `0019`).
+This file's own P6.2 section repeated the same wrong number three times
+(the column-widening note, the schema paragraph's migration reference, and
+the "`tests/test_storage.py` gained six migration-0017 tests" sentence).
+**Fix:** corrected both messages in the migration file, the three spots in
+the P6.2 section below, and the matching test function name/comments in
+`tests/test_storage.py`/`tests/conftest.py` that still said `0017` for this
+same migration -- every other `0017` reference in this file and the test
+suite (the legitimate `0017_fault_acknowledgements.py` migration, and the
+pre-merge `0017_retention_and_tenant_change.py` references that were
+themselves renumbered to `0018`) is untouched, since those are correct as
+written.
+
+**Verification:** `ruff check .`, `mypy .`, and `python -m pytest -q`
+(whole suite) results are reported verbatim in the commit this section
+accompanies.
+
 ## P6.2 -- UI login hardening: TOTP encryption at rest + passkeys (WebAuthn)
 
 Implements the two P6.2 items from the project owner's section 12 decision
@@ -102,7 +202,7 @@ ciphertext to its user, so a ciphertext copied/swapped onto a *different*
 user's row fails decryption (`InvalidTag` -> `TotpDecryptionError`) instead
 of silently handing one account's code-verification path another's secret.
 Wire format: `nonce(12) || ciphertext+tag`, base64, stored in `ui_users
-.totp_secret` (`Text`, widened from `String(64)` by migration `0017`).
+.totp_secret` (`Text`, widened from `String(64)` by migration `0019`).
 `fleet.ui_auth.authenticate` decrypts transiently, once per login attempt,
 never persisting plaintext; a decrypt failure (wrong/missing key, tampered
 ciphertext) is logged and treated as an ordinary failed login, never raised
@@ -127,10 +227,16 @@ a `pyotp.random_base32()` secret is far under 64 characters).
 **Key rotation** (`python -m fleet.admin rotate-totp-key`): reads
 `FLEET_TOTP_KEY` (old) and `FLEET_TOTP_KEY_NEW`, decrypts every row with
 the old key and re-encrypts with the new one, one row at a time, each
-written immediately (not one big implicit transaction) -- a decrypt failure
-partway through stops and reports exactly which username, already-rotated
-rows stay correctly on the new key, safe to fix the key and re-run. Operator
-then sets `FLEET_TOTP_KEY` to the new value and restarts.
+written immediately (not one big implicit transaction). **Resumable under
+the unchanged pair of env vars** (2026-10-03 fix, see dated section below):
+for each row it tries the old key first, then -- only if that fails -- the
+new key; a row the new key already decrypts was rotated by an earlier,
+interrupted run and is skipped (counted separately), never re-encrypted
+needlessly. Only a row neither key can decrypt stops the command and
+reports exactly which username. Re-running with `FLEET_TOTP_KEY` and
+`FLEET_TOTP_KEY_NEW` left exactly as they were therefore always resumes a
+partial run to completion. Operator then sets `FLEET_TOTP_KEY` to the new
+value and restarts.
 
 **2. Passkeys (WebAuthn) as a second factor alternative to TOTP**
 (`fleet/webauthn_auth.py`, using `webauthn` aka `py_webauthn`, pinned
@@ -192,7 +298,7 @@ TOTP code at login -- "next to TOTP", not replacing it.
   inline script, no CDN. Only talks to this app's own endpoints and
   `navigator.credentials`.
 
-**Schema (migration `0017`, same file as the TOTP-encryption change):**
+**Schema (migration `0019`, same file as the TOTP-encryption change):**
 `webauthn_credentials` (credential id as primary key -- the natural key a
 login assertion actually presents; public key; sign count; label;
 timestamps) and `webauthn_challenges` (purpose, optional user id,
@@ -213,7 +319,7 @@ assertion JSON, CSRF/login-required on every state-changing endpoint.
 `webauthn>=3.0.1` -- `fido2` caps `cryptography<45`, `webauthn>=3.0.1`
 needs `cryptography>=49`, a real `pip install` `ResolutionImpossible`, not
 a style choice (documented in `tests/webauthn_fixtures.py`'s own
-docstring). `tests/test_storage.py` gained six migration-0017 tests
+docstring). `tests/test_storage.py` gained six migration-0019 tests
 (encrypts existing plaintext, fails loudly without a key, a key-less
 upgrade with zero `ui_users` rows, downgrade decrypts back, webauthn
 tables created/dropped). `tests/test_admin.py` gained encryption/rotation

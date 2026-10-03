@@ -66,6 +66,8 @@ from fleet.ui_auth import (
     session_absolute_lifetime_s,
     totp_key,
     verify_totp,
+    webauthn_begin_throttle_key,
+    webauthn_begin_throttle_threshold,
 )
 from fleet.ui_house import build_house_overview
 from fleet.ui_inventory import (
@@ -249,18 +251,44 @@ def login_webauthn_begin(
     be offered exactly this username's own registered credentials (an
     authenticator/browser filters its UI by `allowCredentials`).
 
-    **Deliberately does not check the password, and does not touch the
-    per-IP throttle or the account lock** -- unlike `login_submit`, which
-    performs the actual, throttled, lockout-relevant authentication
-    decision. A WebAuthn credential id is not a secret (it identifies a
-    public key; standard practice, mirrored by every major WebAuthn relying
-    party, is to resolve `allowCredentials` from the username alone). What
-    *is* kept generic here is exactly what the task and P3.0 both already
-    require of a login-adjacent endpoint: an unknown username and a known
-    username with zero registered passkeys produce the identical response
-    shape (`allowCredentials: []`), so this endpoint cannot be used to test
-    "does this username exist" any more precisely than it could already be
-    tested by how a submitted TOTP code behaves.
+    **Deliberately does not check the password or touch the account
+    lock** -- unlike `login_submit`, which performs the actual, throttled,
+    lockout-relevant authentication decision. A WebAuthn credential id is
+    not a secret (it identifies a public key; standard practice, mirrored
+    by every major WebAuthn relying party, is to resolve `allowCredentials`
+    from the username alone). What *is* kept generic here is exactly what
+    the task and P3.0 both already require of a login-adjacent endpoint: an
+    unknown username and a known username with zero registered passkeys
+    produce the identical response shape (`allowCredentials: []`), so this
+    endpoint cannot be used to test "does this username exist" any more
+    precisely than it could already be tested by how a submitted TOTP code
+    behaves.
+
+    **Throttled under its own, separate budget** (2026-10-03 fix, main-
+    session review of an earlier version of this fix): each call creates a
+    new `webauthn_challenges` row via `Storage.create_webauthn_challenge`,
+    and nothing ever required a successful login first -- an
+    unauthenticated caller could otherwise flood this endpoint to grow that
+    table without bound. **Deliberately does *not* reserve against
+    `login_submit`'s own per-IP counter** -- an earlier version of this fix
+    did exactly that and turned out to be a usability regression: at the
+    login throttle's default (5 per 15 minutes), a passkey login spends
+    *two* reservations (`begin`, then the `login_submit` call presenting
+    the assertion) and `begin` never releases its reservation (it
+    authenticates nothing, so there is nothing to give back) -- an office
+    NAT's shared IP could reach the shared budget after two or three
+    ordinary passkey logins plus one mistyped password, locking out
+    *password* logins from that IP too, for the full throttle duration.
+    Instead, this reserves under `webauthn_begin_throttle_key(client_ip)`
+    (a distinct string, not `client_ip` itself) via the identical
+    `reserve_ip_login_attempt` mechanism `login_submit` uses -- the same
+    table, the same atomic reserve-then-verify semantics, but a genuinely
+    separate counter row with its own, much more generous threshold
+    (`webauthn_begin_throttle_threshold`, default 30 -- a bare `begin` call
+    alone proves nothing, no password or assertion, so it is far cheaper to
+    allow generously than an actual login attempt). A throttled IP gets a
+    `429` here, no challenge row is created; `begin` calls never spend
+    `login_submit`'s budget, and `login_submit` never spends this one.
     """
 
     if not pre_csrf_cookie or not check_csrf(pre_csrf_cookie, pre_csrf):
@@ -268,8 +296,17 @@ def login_webauthn_begin(
     if not webauthn_auth.is_configured():
         raise HTTPException(status_code=404, detail="WebAuthn is not configured.")
 
-    del request
     now = datetime.now(UTC)
+    client_ip = resolve_client_ip(request)
+    if not storage.reserve_ip_login_attempt(
+        webauthn_begin_throttle_key(client_ip),
+        now,
+        webauthn_begin_throttle_threshold(),
+        ip_throttle_window_s(),
+        ip_throttle_duration_s(),
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests.")
+
     user = storage.get_ui_user_by_username(normalize_username(username))
     options_json = webauthn_auth.begin_login_authentication(storage, user, pre_csrf, now)
     return JSONResponse(content=json.loads(options_json))

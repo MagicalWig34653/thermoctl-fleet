@@ -7394,7 +7394,30 @@ class Storage:
         now: datetime,
         lifetime_s: float,
     ) -> int:
+        """Inserts a new pending challenge row -- and, opportunistically, in
+        the same transaction, deletes every *other* row in this table that
+        is already expired or already consumed (cross-review finding: this
+        table otherwise only ever grows -- nothing deletes from it, not
+        even the background retention loops `fleet.app` runs for every
+        other P6.1-era table, so an unthrottled or long-lived deployment
+        accumulates one row per challenge forever). Piggybacking the purge
+        onto the write every challenge-creating request already makes is
+        simpler than adding a dedicated cleanup table/loop for one more
+        table, and keeps the table's steady-state size bounded by "pending,
+        unexpired challenges right now" rather than "every challenge ever
+        issued." A still-pending, unexpired row (including one created by a
+        concurrent request) is never touched."""
+
+        normalized_now = _naive_utc(now)
         with self.session() as session:
+            session.execute(
+                delete(WebauthnChallengeRecord).where(
+                    or_(
+                        WebauthnChallengeRecord.expires_at <= normalized_now,
+                        WebauthnChallengeRecord.consumed.is_(True),
+                    )
+                )
+            )
             record = WebauthnChallengeRecord(
                 purpose=purpose,
                 user_id=user_id,

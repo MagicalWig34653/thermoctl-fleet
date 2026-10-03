@@ -171,39 +171,58 @@ def rotate_totp_key() -> int:
     row with `FLEET_TOTP_KEY` (the *old* key) and re-encrypts it with
     `FLEET_TOTP_KEY_NEW` (the new one), one row at a time.
 
-    **Fails loudly and stops on the first row it cannot decrypt** -- a
-    wrong old key would otherwise silently corrupt every subsequent
-    account's login. Each row's re-encryption is written immediately (not
-    batched into one implicit transaction across *all* rows) so a failure
-    partway through leaves every already-processed row correctly on the
-    *new* key and reports exactly which username it stopped at -- re-running
-    the command with `FLEET_TOTP_KEY` set to the new key (now correct for
-    the already-rotated rows) and `FLEET_TOTP_KEY_NEW` unchanged resumes
-    from there; it is not all-or-nothing the way the one-time migration
-    (`0019_totp_encryption_and_webauthn.py`) is, because unlike that
-    migration this is an operator-driven, re-runnable maintenance command,
-    not a single irreversible schema transition.
+    **Resumable under the unchanged pair of environment variables.** Each
+    row's re-encryption is written immediately (not batched into one
+    implicit transaction across *all* rows), so a failure partway through
+    (crash, killed process, a row this process cannot reach) leaves some
+    rows already re-encrypted under `FLEET_TOTP_KEY_NEW` and the rest still
+    on `FLEET_TOTP_KEY` -- a genuinely mixed state. Re-running the
+    command with **the exact same, unchanged** `FLEET_TOTP_KEY`/
+    `FLEET_TOTP_KEY_NEW` pair must therefore work on either kind of row:
+    for each one, this tries the old key first; if that fails, it tries
+    the new key -- if the *new* key decrypts it, the row was already
+    rotated by an earlier, interrupted run, and is left untouched (counted
+    separately, not re-encrypted again, though doing so would also be
+    harmless since the plaintext is unchanged). Only when **neither** key
+    decrypts a row does this stop and report exactly which username, the
+    same loud failure as before. This is the opposite of the one-time
+    migration (`0019_totp_encryption_and_webauthn.py`), which is
+    all-or-one-transaction because it is not operator-re-runnable the way
+    this maintenance command is.
     """
 
     old_key = _require_totp_key(TOTP_KEY_ENV)
     new_key = _require_totp_key(_TOTP_KEY_NEW_ENV)
     storage = create_storage(_require_database_url())
     rotated = 0
+    already_rotated = 0
     for user in storage.list_ui_users():
         try:
             plaintext = decrypt_totp_secret(user.totp_secret, user.id, old_key)
-        except TotpDecryptionError as exc:
-            print(
-                f"Could not decrypt TOTP secret for user {user.username!r} with "
-                f"{TOTP_KEY_ENV}: {exc} Rotated {rotated} user(s) before this failure; "
-                f"{TOTP_KEY_ENV} already covers those -- fix the key and re-run to "
-                "resume from here.",
-                file=sys.stderr,
-            )
-            return 1
+        except TotpDecryptionError:
+            # Not decryptable with the old key -- either this row was
+            # already rotated by an earlier, interrupted run (the new key
+            # decrypts it) or neither key works at all (a genuine failure).
+            try:
+                decrypt_totp_secret(user.totp_secret, user.id, new_key)
+            except TotpDecryptionError as exc:
+                print(
+                    f"Could not decrypt TOTP secret for user {user.username!r} with "
+                    f"either {TOTP_KEY_ENV} or {_TOTP_KEY_NEW_ENV}: {exc} Rotated "
+                    f"{rotated} user(s) before this failure ({already_rotated} more "
+                    "were already on the new key) -- fix the key(s) and re-run with "
+                    "the same, unchanged pair to resume from here.",
+                    file=sys.stderr,
+                )
+                return 1
+            already_rotated += 1
+            continue
         storage.set_ui_user_totp_secret(user.id, encrypt_totp_secret(plaintext, user.id, new_key))
         rotated += 1
-    print(f"Rotated {rotated} user(s) to the new TOTP key.")
+    print(
+        f"Rotated {rotated} user(s) to the new TOTP key"
+        + (f" ({already_rotated} already on it, skipped)." if already_rotated else ".")
+    )
     print(f"Now set {TOTP_KEY_ENV} to the value of {_TOTP_KEY_NEW_ENV} and restart the service.")
     return 0
 

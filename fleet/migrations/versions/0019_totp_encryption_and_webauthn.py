@@ -90,7 +90,7 @@ def _load_key_for_migration() -> bytes:
         return load_totp_key(os.environ.get(_TOTP_KEY_ENV))
     except TotpKeyError as exc:
         raise RuntimeError(
-            "Migration 0017 cannot encrypt existing TOTP secrets: "
+            "Migration 0019 cannot encrypt existing TOTP secrets: "
             f"{exc} Set {_TOTP_KEY_ENV} in the environment this migration "
             "runs in before retrying."
         ) from exc
@@ -176,7 +176,7 @@ def downgrade() -> None:
                 plaintext_secret = decrypt_totp_secret(ciphertext, user_id, key)
             except TotpDecryptionError as exc:
                 raise RuntimeError(
-                    "Migration 0017 downgrade cannot decrypt ui_users.id="
+                    "Migration 0019 downgrade cannot decrypt ui_users.id="
                     f"{user_id}'s TOTP secret with the configured "
                     f"{_TOTP_KEY_ENV}: {exc}"
                 ) from exc
