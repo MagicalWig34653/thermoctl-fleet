@@ -1,0 +1,26 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "srgb:0.05882,0.08627,0.14902,1.00000",
+      "srgb:0.10588,0.15294,0.25098,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "Grid.svg",
+          "name" : "Grid"
+        }
+      ],
+      "name" : "Grid",
+      "shadow" : { "kind" : "none", "opacity" : 0.5 },
+      "specular" : true,
+      "translucency" : { "enabled" : true, "value" : 0.12 }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : "shared"
+  }
+}

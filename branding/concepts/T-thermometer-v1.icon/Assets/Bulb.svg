@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Thermometer bulb: the heat source the stem rises from. -->
+  <defs>
+    <linearGradient id="bulbGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF7A2F" />
+      <stop offset="1" stop-color="#FF9F43" />
+    </linearGradient>
+  </defs>
+  <circle cx="512" cy="676" r="184" fill="url(#bulbGradient)" />
+</svg>

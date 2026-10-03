@@ -75,6 +75,94 @@ Was 0% covered (144 statements, no test file at all). Added
 Result: `tools/docs_screenshots.py` is now at 100% line coverage; full
 suite still green (`ruff check .`, `mypy .`, `python -m pytest`).
 
+## App icon: "thermometer made of apartments" (2026-10-03)
+
+The owner rejected the radiator + pulse icon as well ("anderer Ansatz") and
+approved the main session's new concept: **one** metaphor instead of two
+combined symbols -- a thermometer whose scale segments are the apartments.
+Four glass segments (top to bottom `#4AA8FF`, `#6FD6C8`, `#FFD36E`,
+`#FFB347`) above a warm bulb whose neck and bulb are a single outline
+(`#FF9F43` -> `#FF6A2A`), on a graphite-navy background with a faint warm
+bloom. Final geometry and the seamless bulb/neck path were drawn in the
+main session after the drafting agent hit its usage limit.
+
+- `branding/thermoctl-fleet.icon` replaced by it (also kept as
+  `branding/concepts/T-thermometer.icon`; earlier drafts stay under
+  `branding/concepts/` for history, including `T-thermometer-v1.icon`).
+- Renders via Icon Composer's `ictool`: `branding/renders/` (1024 px,
+  Default/Dark/ClearLight); `site/assets/icon/apple-touch-icon.png`
+  (180 px) and `favicon-32.png` from the Default rendition;
+  `site/assets/icon/favicon.svg` is the flat version of the same geometry
+  (also used as the site's header and hero logo).
+- Checked at 1024/64/32 px in all three renditions: reads as a segmented
+  thermometer down to 32 px.
+
+## App icon: production-quality radiator + pulse (2026-10-03)
+
+The owner rejected the house/thermometer/dots icon (see the entry below) as
+not looking "really beautiful". Three alternative concepts were drawn up
+under `branding/concepts/` (radiator+pulse, apartment-facade, flame-in-a-
+ring-of-dots); the owner picked the radiator+pulse concept but asked for a
+production-quality pass, not the rough draft.
+
+`branding/thermoctl-fleet.icon` is now that polished concept: a classic
+panel-radiator silhouette -- four solid, stroke-free pill fins joined by a
+rounded header/footer pipe and two small feet, flat white -- with a single
+confident orange-to-amber ECG line (flat, small dip, tall sharp peak, deep
+dip, flat, ending in a live-monitor dot) in its own group in front of the
+radiator, with a soft colour-matched glow. Background is a deep-navy-to-
+teal diagonal gradient plus a warm radial glow rising from the bottom
+centre; three faint heat-shimmer wisps sit above the header (kept because
+they still read at 64px; would have been dropped otherwise).
+
+Iterated five rounds against `ictool` renders (`Default`/`Dark`/
+`ClearLight`, checked at 1024px and downscaled to 64px/32px each round)
+before settling:
+
+1. First pass: chunky fins read well immediately, but the ECG line's small
+   deltas were swallowed by its own 58px stroke width -- it rendered as a
+   near-flat blob, not a heartbeat.
+2. Widened the excursions and centred the baseline on the radiator's
+   centre for left/right symmetry -- the zigzag became legible, but it was
+   still only visible inside the fin gaps, never crossing the white fins.
+2b. Root-caused: Icon Composer's `groups` array in this `icon.json` format
+   renders **first-listed = front, last-listed = back** -- the opposite of
+   this bundle's original (unverified) layering comment. The glass flag on
+   a group does not itself force it to the front; array position does.
+3. Reordering the pulse group to the front of the array (ahead of the
+   glass radiator group) fixed it at the root: the ECG now draws cleanly
+   over the fins, exactly as the art direction asked for ("in front", not
+   glowing through glass).
+4. Added an in-SVG blurred duplicate of the ECG stroke (a second, wider,
+   low-opacity copy behind the crisp line) for a reliable warm glow in
+   every rendition, independent of the `icon.json` shadow setting's
+   behaviour; added the optional heat-shimmer wisps and checked they still
+   read at 64px.
+5. Final subtlety pass on the shimmer opacity/width; re-checked all three
+   renditions at 1024/64/32px -- kept as final.
+
+`Dark` tints the glass radiator itself navy/teal (matching the background)
+rather than staying plain white -- a legitimate, attractive stylistic
+choice for that rendition, not a defect (the pulse stays warm orange in
+all three renditions as required). `ClearLight` desaturates colour
+entirely per the system style for that rendition; the silhouette and
+heartbeat shape still read cleanly in monochrome.
+
+Production artifacts:
+- `branding/thermoctl-fleet.icon` -- the replaced bundle.
+- `branding/renders/thermoctl-fleet-icon-{Default,Dark,ClearLight}-1024.png`
+  -- replaced 1024px renders, embedded in `README.md`.
+- `site/assets/icon/apple-touch-icon.png` (180px) and `favicon-32.png`
+  (32px) -- regenerated directly from the `Default` rendition via `ictool`.
+- `site/assets/icon/favicon.svg` -- redrawn flat (no glass/blur/shimmer,
+  since SVG favicons must render identically everywhere) with the same
+  radiator and ECG-line geometry and the same background gradient colours.
+- `branding/concepts/A-radiator.icon` updated in place to the same final
+  design, kept alongside the B/C drafts for history.
+- `branding/concepts/renders/A-before-after.png` -- before/after
+  comparison sheet (initial draft vs. final, all three renditions x
+  1024/64/32px).
+
 ## Documentation website review follow-up: icon redesign via ictool, passwordless section filled, typography, SVG diagram fix (2026-10-03)
 
 Main-session review of the documentation-website task below asked for six

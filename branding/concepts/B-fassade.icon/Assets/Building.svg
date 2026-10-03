@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Apartment-building facade: a tall, almost-square-cornered wall in
+       white glass with a thin edge (not a thick device bezel), topped by
+       a flat overhanging roof slab. Taller than wide so it reads as a
+       multi-storey building, not a phone screen. The window grid shows
+       through the wall's translucency. -->
+  <rect x="292" y="160" width="440" height="38" rx="8" fill="#ffffff" fill-opacity="0.55" />
+  <g fill="#ffffff" fill-opacity="0.2" stroke="#ffffff" stroke-width="8"
+     stroke-linejoin="round">
+    <rect x="322" y="198" width="380" height="652" rx="18" />
+  </g>
+</svg>

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- One confident ECG line in front of the radiator: flat, a small
+       dip, a tall sharp peak, a deep dip, flat again, ending in a small
+       live-monitor dot on the right. Warm orange-to-amber gradient,
+       thick rounded stroke, extends a little past the radiator's edges
+       on both sides. -->
+  <defs>
+    <linearGradient id="pulseGradient" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff8a3d" />
+      <stop offset="1" stop-color="#ffc24d" />
+    </linearGradient>
+    <filter id="pulseGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="20" />
+    </filter>
+  </defs>
+  <path d="M 198 512 L 345 512 L 400 592 L 452 240 L 500 650 L 552 512 L 780 512"
+        fill="none" stroke="#ff9a42" stroke-width="86" stroke-opacity="0.45"
+        stroke-linecap="round" stroke-linejoin="round" filter="url(#pulseGlow)" />
+  <circle cx="806" cy="512" r="46" fill="#ffb84d" opacity="0.4" filter="url(#pulseGlow)" />
+  <path d="M 198 512 L 345 512 L 400 592 L 452 240 L 500 650 L 552 512 L 780 512"
+        fill="none" stroke="url(#pulseGradient)" stroke-width="50"
+        stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="806" cy="512" r="30" fill="#ffc24d" />
+</svg>
