@@ -2,6 +2,15 @@
 
 Last updated: 2026-10-03.
 
+## CI fix: flash-tool tests no longer need macOS (2026-10-03)
+
+CI (Linux) failed 56 tests in `tests/test_flash_image.py` since the image/
+flash/VM merge: every test resolved the real `diskutil` via
+`shutil.which` before reaching its mocked `subprocess` call, and Linux has
+no `diskutil`. An autouse fixture now pins `shutil.which` to a fixed macOS
+path for every test except the one that tests the missing-binary error.
+Verified locally with `diskutil` removed from `PATH`.
+
 ## Architekturdiagramm und Startseiten-Hero (2026-10-03)
 
 Das Architekturdiagramm nutzt feste Kartenkoordinaten im SVG-Raster (1200 ×
