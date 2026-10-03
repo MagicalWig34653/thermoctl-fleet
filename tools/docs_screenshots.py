@@ -19,13 +19,17 @@ the parts that are worth covering for real: `seed()` against a real,
 migrated temporary SQLite database (read back through the actual
 `fleet.storage`/UI view-builder API -- this is the part that breaks when
 either changes shape), `create_ui_user()` against the real
-`python -m fleet.admin create-user` subprocess, and every pure helper
-(`_free_port`, `_parse_totp_secret`, `_seconds_until_next_totp_step`,
-`_webp_path_for`). The parts that genuinely need a real browser or a real
-`uvicorn` server (`capture()`, `start_server()`, `main()`) are
-`# pragma: no cover` there, with a reason each -- a unit test for those
-would only re-mock Playwright and `subprocess`, not exercise anything this
-script doesn't already exercise for real.
+`python -m fleet.admin create-user` subprocess, `main()`'s own
+orchestration (every function it calls monkeypatched to a recorder,
+asserting call order/arguments and that the server subprocess is always
+torn down), `optimize_images()` against a real tiny PNG (skipped where
+Pillow, an ad-hoc-only dependency for this script, is absent), and every
+pure helper (`_free_port`, `_parse_totp_secret`,
+`_seconds_until_next_totp_step`, `_webp_path_for`). Only `capture()` and
+`start_server()` stay `# pragma: no cover`, each with its own reason --
+they need a real browser (Playwright/Chromium) or a real, long-running
+`uvicorn` server subprocess, which a unit test would only re-mock, not
+exercise for real.
 """
 
 from __future__ import annotations
@@ -424,12 +428,13 @@ def capture(  # pragma: no cover
         browser.close()
 
 
-# Needs Pillow, which is only installed ad hoc for this script (pyproject
-# .toml's own mypy override comment above says so) -- not a project
-# dependency, so not guaranteed present in the test environment. The actual
-# per-file path decision it relies on is `_webp_path_for`, tested on its own.
-def optimize_images() -> None:  # pragma: no cover
-    """Re-saves every captured PNG optimized, and adds a WebP copy next to it."""
+def optimize_images() -> None:
+    """Re-saves every captured PNG optimized, and adds a WebP copy next to
+    it. Needs Pillow, which is only installed ad hoc for this script
+    (pyproject.toml's own mypy override comment above says so) -- not a
+    project dependency, so `tests/test_docs_screenshots.py` skips its one
+    real test here (`pytest.importorskip("PIL")`) in an environment where
+    it is absent, rather than mocking it."""
 
     from PIL import Image
 
@@ -440,11 +445,14 @@ def optimize_images() -> None:  # pragma: no cover
 
 
 # Orchestrates seed() -> create_ui_user() -> start_server() -> capture() ->
-# optimize_images() against a real throwaway temp directory and a real
-# server/browser -- each of those pieces is tested on its own; this glue
-# function is exactly what the module docstring and `if __name__ ==
-# "__main__"` guard below already exclude for the same reason.
-def main() -> int:  # pragma: no cover
+# optimize_images() -- every one of those names is itself a module-level
+# function this module's own call sites use unqualified, so
+# `tests/test_docs_screenshots.py` exercises this function for real by
+# monkeypatching each of them to a recorder and asserting the call order,
+# arguments, and that the server subprocess is always torn down (even when
+# `capture` raises, and killed if a clean `wait()` times out) -- no pragma
+# needed, nothing here is actually untestable.
+def main() -> int:
     import base64
     import secrets as _secrets
 

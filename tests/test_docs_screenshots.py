@@ -1,5 +1,5 @@
 """`tools/docs_screenshots.py` (was 0% covered -- see that module's own
-docstring). Two kinds of tests:
+docstring). Three kinds of tests:
 
 - `seed()` against a real, migrated temporary SQLite database, read back
   through the real `fleet.storage`/UI view-builder API -- the part that
@@ -7,27 +7,38 @@ docstring). Two kinds of tests:
   `tests/test_storage_rollouts.py`/`tests/test_fleet_desired_state.py`
   already use: `tmp_path`, `fleet.storage.upgrade`, `fleet.storage
   .create_storage`).
-- The module's pure helpers (`_free_port`, `_wait_for_server`,
+- `main()`'s own orchestration, exercised for real with every function it
+  calls (`seed`, `create_ui_user`, `_free_port`, `start_server`,
+  `_wait_for_server`, `capture`, `optimize_images`) monkeypatched to a
+  recorder -- asserting call order, arguments, and that the server
+  subprocess is always shut down (terminated normally, or killed if
+  `wait()` times out, including when `capture` itself raises).
+  `optimize_images()` gets its own, separate real test against an actual
+  tiny PNG (`pytest.importorskip("PIL")` -- Pillow is installed ad hoc for
+  this script, not a project dependency, so that test skips where it is
+  absent instead of mocking it).
+- The module's remaining pure helpers (`_free_port`, `_wait_for_server`,
   `_parse_totp_secret`, `_seconds_until_next_totp_step`,
   `_wait_for_fresh_totp_window`, `_webp_path_for`) and the real
   `create_ui_user` subprocess call against `python -m fleet.admin
   create-user`.
 
-`capture`, `start_server`, `main`, and `optimize_images` are not exercised
-here -- see their own `# pragma: no cover` comments in
-`tools/docs_screenshots.py` for why (a real browser, a real long-running
-server subprocess, and Pillow, which is not a project dependency).
+Only `capture` and `start_server` are not exercised here -- see their own
+`# pragma: no cover` comments in `tools/docs_screenshots.py` for why (a
+real browser, a real long-running `uvicorn` server subprocess).
 """
 
 from __future__ import annotations
 
-import socket
+import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 
+import tools.docs_screenshots as docs_screenshots
 from fleet.storage import Storage, create_storage, upgrade
 from protocol.heartbeat import FaultKind
 from tools.docs_screenshots import (
@@ -236,12 +247,15 @@ def test_seed_is_idempotent_in_shape_but_not_rerunnable_on_the_same_db(tmp_path:
 # --------------------------------------------------------------------------
 
 
-def test_free_port_returns_a_bindable_port_number() -> None:
+def test_free_port_returns_a_bindable_int() -> None:
+    # Not "still free after being released" -- releasing it and rebinding
+    # it in a second `socket()` call is an inherent (if narrow) race
+    # against anything else on the machine; `_free_port`'s own contract is
+    # only ever "an OS-assigned port, free at the moment it was read",
+    # which binding *within* `_free_port` itself already proves.
     port = _free_port()
+    assert isinstance(port, int)
     assert 0 < port < 65536
-    # The port really is free right after being handed back.
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", port))
 
 
 def test_wait_for_server_raises_when_nothing_is_listening() -> None:
@@ -252,7 +266,6 @@ def test_wait_for_server_raises_when_nothing_is_listening() -> None:
 
 def test_wait_for_server_returns_once_a_server_answers() -> None:
     import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 -- http.server's own method name
@@ -458,3 +471,226 @@ def test_apartments_demo_data_has_fictional_addresses_only() -> None:
 
     for entry in APARTMENTS:
         assert "Musterstraße" in entry.label or "Beispielweg" in entry.label
+
+
+# --------------------------------------------------------------------------
+# optimize_images() -- a real (tiny) PNG, skipped if Pillow is absent.
+# --------------------------------------------------------------------------
+
+
+def test_optimize_images_writes_a_webp_next_to_each_png(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """Pillow is installed ad hoc for this script (pyproject.toml's own
+    mypy override comment says so), not a project dependency -- this test
+    skips, rather than mocks, where it is absent."""
+
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    monkeypatch.setattr(docs_screenshots, "IMG_DIR", tmp_path)  # type: ignore[attr-defined]
+
+    png_path = tmp_path / "login-light.png"
+    Image.new("RGB", (4, 4), color=(10, 20, 30)).save(png_path)
+
+    docs_screenshots.optimize_images()
+
+    webp_path = _webp_path_for(png_path)
+    assert webp_path.exists()
+    with Image.open(webp_path) as webp_img:
+        assert webp_img.size == (4, 4)
+
+
+def test_optimize_images_does_nothing_for_an_empty_directory(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    pytest.importorskip("PIL")
+
+    monkeypatch.setattr(docs_screenshots, "IMG_DIR", tmp_path)  # type: ignore[attr-defined]
+    docs_screenshots.optimize_images()  # Must not raise.
+    assert list(tmp_path.glob("*.webp")) == []
+
+
+# --------------------------------------------------------------------------
+# main() -- every function it calls is itself a module-level name this
+# module's own call sites use unqualified, so each is monkeypatched to a
+# recorder here; no pragma needed on `main` itself (see its own comment).
+# --------------------------------------------------------------------------
+
+
+class _FakeServerProcess:
+    def __init__(self, calls: list[tuple[str, ...]], wait_raises: BaseException | None = None):
+        self._calls = calls
+        self._wait_raises = wait_raises
+        self.terminated = False
+        self.killed = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self._calls.append(("terminate",))
+
+    def wait(self, timeout: float | None = None) -> None:
+        self._calls.append(("wait", str(timeout)))
+        if self._wait_raises is not None:
+            raise self._wait_raises
+
+    def kill(self) -> None:
+        self.killed = True
+        self._calls.append(("kill",))
+
+
+def _patch_main_collaborators(
+    monkeypatch: object,
+    calls: list[tuple[str, ...]],
+    *,
+    capture_raises: BaseException | None = None,
+    server_wait_raises: BaseException | None = None,
+) -> _FakeServerProcess:
+    fake_server = _FakeServerProcess(calls, wait_raises=server_wait_raises)
+
+    def fake_seed(database_url: str) -> None:
+        calls.append(("seed", database_url))
+
+    def fake_create_ui_user(database_url: str, totp_key: str, username: str, password: str) -> str:
+        # The env var `main` itself sets must already be visible here --
+        # proves `main` sets it *before* calling this, not after.
+        import os as _os
+
+        assert _os.environ["FLEET_TOTP_KEY"] == totp_key
+        calls.append(("create_ui_user", database_url, totp_key, username, password))
+        return "FAKE-TOTP-SECRET"
+
+    def fake_free_port() -> int:
+        calls.append(("free_port",))
+        return 54321
+
+    def fake_start_server(database_url: str, port: int) -> _FakeServerProcess:
+        calls.append(("start_server", database_url, str(port)))
+        return fake_server
+
+    def fake_wait_for_server(url: str, timeout_s: float = 20.0) -> None:
+        calls.append(("wait_for_server", url))
+
+    def fake_capture(base_url: str, username: str, password: str, totp_secret: str) -> None:
+        calls.append(("capture", base_url, username, password, totp_secret))
+        if capture_raises is not None:
+            raise capture_raises
+
+    def fake_optimize_images() -> None:
+        calls.append(("optimize_images",))
+
+    monkeypatch.setattr(docs_screenshots, "seed", fake_seed)  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        docs_screenshots, "create_ui_user", fake_create_ui_user
+    )
+    monkeypatch.setattr(docs_screenshots, "_free_port", fake_free_port)  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        docs_screenshots, "start_server", fake_start_server
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        docs_screenshots, "_wait_for_server", fake_wait_for_server
+    )
+    monkeypatch.setattr(docs_screenshots, "capture", fake_capture)  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        docs_screenshots, "optimize_images", fake_optimize_images
+    )
+    return fake_server
+
+
+def test_main_orchestrates_every_step_in_order_with_consistent_arguments(
+    monkeypatch: object,
+) -> None:
+    # `main()` overwrites `FLEET_TOTP_KEY` directly via `os.environ[...] =`
+    # (not `setdefault`), which would otherwise leak into every later test
+    # in this session (`tests/conftest.py`'s own session-wide default).
+    # `monkeypatch.setenv` here still restores the *pre-test* value at
+    # teardown regardless of what `main()` sets it to in between.
+    monkeypatch.setenv("FLEET_TOTP_KEY", "placeholder-overwritten-by-main")  # type: ignore[attr-defined]
+
+    calls: list[tuple[str, ...]] = []
+    _patch_main_collaborators(monkeypatch, calls)
+
+    result = docs_screenshots.main()
+
+    assert result == 0
+    names = [call[0] for call in calls]
+    assert names == [
+        "seed",
+        "create_ui_user",
+        "free_port",
+        "start_server",
+        "wait_for_server",
+        "capture",
+        "terminate",
+        "wait",
+        "optimize_images",
+    ]
+
+    seed_call, create_call, _free_port_call, start_call, wait_for_server_call, capture_call = (
+        calls[0],
+        calls[1],
+        calls[2],
+        calls[3],
+        calls[4],
+        calls[5],
+    )
+
+    database_url = seed_call[1]
+    assert database_url.startswith("sqlite:///")
+    assert database_url.endswith("/fleet-docs-demo.db")
+    # The same database_url is threaded through seed/create_ui_user/start_server.
+    assert create_call[1] == database_url
+    assert start_call[1] == database_url
+
+    assert create_call[3] == "demo"
+    assert create_call[4] == "demo-password-not-real-123"
+
+    assert start_call[2] == "54321"
+    assert wait_for_server_call[1] == "http://127.0.0.1:54321/healthz"
+    assert capture_call[1:] == (
+        "http://127.0.0.1:54321",
+        "demo",
+        "demo-password-not-real-123",
+        "FAKE-TOTP-SECRET",
+    )
+
+    wait_call = calls[7]
+    assert wait_call[1] == "10"
+
+
+def test_main_still_shuts_down_the_server_when_capture_fails(monkeypatch: object) -> None:
+    monkeypatch.setenv("FLEET_TOTP_KEY", "placeholder-overwritten-by-main")  # type: ignore[attr-defined]
+
+    calls: list[tuple[str, ...]] = []
+    fake_server = _patch_main_collaborators(
+        monkeypatch, calls, capture_raises=RuntimeError("capture blew up")
+    )
+
+    with pytest.raises(RuntimeError, match="capture blew up"):
+        docs_screenshots.main()
+
+    assert fake_server.terminated is True
+    assert fake_server.killed is False
+    # optimize_images is only reached after the `finally` block, which is
+    # itself only reached after the exception has already propagated past
+    # the `with tempfile.TemporaryDirectory(...)` block -- never called.
+    assert ("optimize_images",) not in calls
+
+
+def test_main_kills_the_server_if_a_clean_wait_times_out(monkeypatch: object) -> None:
+    monkeypatch.setenv("FLEET_TOTP_KEY", "placeholder-overwritten-by-main")  # type: ignore[attr-defined]
+
+    calls: list[tuple[str, ...]] = []
+    fake_server = _patch_main_collaborators(
+        monkeypatch,
+        calls,
+        server_wait_raises=subprocess.TimeoutExpired(cmd="uvicorn", timeout=10),
+    )
+
+    result = docs_screenshots.main()
+
+    assert result == 0
+    assert fake_server.terminated is True
+    assert fake_server.killed is True
+    names = [call[0] for call in calls]
+    assert names.index("wait") < names.index("kill") < names.index("optimize_images")

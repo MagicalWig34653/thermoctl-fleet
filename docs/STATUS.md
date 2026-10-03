@@ -2,6 +2,41 @@
 
 Last updated: 2026-10-03.
 
+## `tools/docs_screenshots.py` test coverage, cross-review follow-up (2026-10-03)
+
+Cross-review (Codex) on the package below found two issues, fixed in a
+follow-up commit on the same branch:
+
+1. **`main()` and `optimize_images()` had a blanket `# pragma: no
+   cover`**, hiding testable behaviour. Both are now tested for real:
+   `main()` by monkeypatching every function it calls (`seed`,
+   `create_ui_user`, `_free_port`, `start_server`, `_wait_for_server`,
+   `capture`, `optimize_images`) to a recorder and asserting call order,
+   arguments, and that the server subprocess is always torn down --
+   terminated normally, or killed if a clean `wait()` times out, including
+   when `capture` itself raises; `optimize_images()` against a real tiny
+   PNG (`pytest.importorskip("PIL")`, so it skips rather than mocks where
+   Pillow -- ad hoc only, not a project dependency -- is absent; installed
+   ad hoc in this worktree's own `.venv` to actually run it instead of
+   skipping). Only `capture()` and `start_server()` keep the pragma now
+   (real browser / real long-running server subprocess).
+2. **A `_free_port`/`_wait_for_server` test had a release-then-rebind
+   race** (ask the OS for a free port, close the socket, then open a new
+   one on the same port number). Fixed: the "returns a bindable int" test
+   no longer rebinds at all (that was never `_free_port`'s own contract),
+   and the "server answers" test already bound a real `HTTPServer` to
+   port 0 directly rather than going through `_free_port` first.
+
+Also caught in the same pass: `main()` test needed `monkeypatch.setenv`
+on `FLEET_TOTP_KEY` before calling it -- `main()` overwrites that env var
+directly (`os.environ[...] =`, not `setdefault`), which would otherwise
+leak into every later test in the session past `tests/conftest.py`'s own
+session-wide default.
+
+Verified again after the fix: `ruff check .` and `mypy .` both exit 0;
+full suite 2143 tests, 0 failures/errors, 1 pre-existing/unrelated skip;
+`tools/docs_screenshots.py` at 100% line coverage.
+
 ## `tools/docs_screenshots.py` test coverage (2026-10-03)
 
 Was 0% covered (144 statements, no test file at all). Added
