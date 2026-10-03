@@ -176,47 +176,108 @@ func (sr *StagingRoot) resolveEntry(relPath string) (root *os.Root, name string,
 // lstatEntryNoFollow Lstats one manifest entry through the correct root
 // and refuses anything that is not a lone-linked regular file --
 // errNotRegular/errHardLinked (safeopen.go) are reused here so callers
-// can share openStagedFileNoFollow's own error handling.
-func (sr *StagingRoot) lstatEntryNoFollow(relPath string) (root *os.Root, name string, size int64, err error) {
+// can share openStagedFileNoFollow's own error handling. The full
+// os.FileInfo is returned too (not only the size), so a caller that later
+// opens the same name can compare the two with os.SameFile -- see
+// openEntryNoFollow below for why that comparison matters.
+func (sr *StagingRoot) lstatEntryNoFollow(relPath string) (root *os.Root, name string, info os.FileInfo, err error) {
 	root, name, present, err := sr.resolveEntry(relPath)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", nil, err
 	}
 	if !present {
-		return nil, "", 0, os.ErrNotExist
+		return nil, "", nil, os.ErrNotExist
 	}
-	info, err := root.Lstat(name)
+	info, err = root.Lstat(name)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, "", nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, "", 0, errNotRegular
+		return nil, "", nil, errNotRegular
 	}
+	if err := requireSingleLink(info); err != nil {
+		return nil, "", nil, err
+	}
+	return root, name, info, nil
+}
+
+// requireSingleLink extracts the platform link count from info and
+// refuses anything but exactly one hard link -- shared between the
+// pre-open Lstat check and the post-open Fstat re-check below, so both
+// apply the identical rule.
+func requireSingleLink(info os.FileInfo) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return nil, "", 0, errors.New("could not determine link count on this platform")
+		return errors.New("could not determine link count on this platform")
 	}
 	if stat.Nlink != 1 {
-		return nil, "", 0, errHardLinked
+		return errHardLinked
 	}
-	return root, name, info.Size(), nil
+	return nil
 }
+
+// testPostLstatHook, when non-nil, runs immediately after an Lstat and
+// immediately before the matching root.OpenFile call -- in both
+// openEntryNoFollow (below) and readManifestBytes (further down), the two
+// read paths in this file that go through os.Root and therefore cannot
+// rely on O_NOFOLLOW. Test-only (set in stagingroot_test.go), used to
+// deterministically reproduce the race an attacker would otherwise need
+// precise timing for: swapping the entry for an in-root symlink (or a
+// second hard link) in the narrow window between the two calls. Left nil
+// in production, where it costs nothing.
+var testPostLstatHook func()
 
 // openEntryNoFollow Lstat-checks (lstatEntryNoFollow above), then opens,
 // one manifest entry for reading -- the read-side counterpart of
 // prepareFile's own validated-open, routed through the held root(s) so
 // neither "zigbee2mqtt" nor the staging directory itself is ever
 // re-resolved by name partway through a run.
+//
+// **Post-open re-check (P5.5d cross-review follow-up, docs/STATUS.md).**
+// os.Root's own OpenFile does not honor O_NOFOLLOW (stagingroot.go's own
+// top docstring) and, unlike a plain os.OpenFile on a real path, has no
+// equivalent of the kernel refusing to open a symlink outright -- an
+// entry Lstat-confirmed to be a lone-linked regular file can still be
+// swapped for an in-root symlink (which Root silently follows) in the
+// window between that Lstat and this Open. Closed the same way
+// openRegularNoFollow already closes the analogous window on a plain
+// path: Fstat the *returned descriptor* (never re-Lstat the name, which
+// would just re-open the identical race one call later) and refuse
+// unless it is still a lone-linked regular file *and* os.SameFile against
+// the original Lstat's info holds -- the latter is what actually catches
+// a swap-for-a-same-shaped-decoy that an Fstat-only check would miss (a
+// symlink target that happens to also be a lone-linked regular file would
+// otherwise pass the type/link-count checks alone).
 func (sr *StagingRoot) openEntryNoFollow(relPath string) (*os.File, int64, error) {
-	root, name, size, err := sr.lstatEntryNoFollow(relPath)
+	root, name, lst, err := sr.lstatEntryNoFollow(relPath)
 	if err != nil {
 		return nil, 0, err
+	}
+	if testPostLstatHook != nil {
+		testPostLstatHook()
 	}
 	file, err := root.OpenFile(name, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, 0, err
 	}
-	return file, size, nil
+	fstat, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, 0, err
+	}
+	if fstat.Mode()&os.ModeSymlink != 0 || !fstat.Mode().IsRegular() {
+		file.Close()
+		return nil, 0, errNotRegular
+	}
+	if err := requireSingleLink(fstat); err != nil {
+		file.Close()
+		return nil, 0, err
+	}
+	if !os.SameFile(lst, fstat) {
+		file.Close()
+		return nil, 0, errUnsafe(DetailUnsafeStaging)
+	}
+	return file, fstat.Size(), nil
 }
 
 // topLevelNames lists every entry directly inside the staging directory
@@ -334,22 +395,48 @@ func (sr *StagingRoot) removeManifest() error {
 // checked (symlink/non-regular refused) and capped at MaxManifestBytes
 // via io.LimitReader, exactly like the rest of this program's staged-file
 // reads. present is false only if manifest.json does not exist at all.
+//
+// **Post-open re-check (P5.5d cross-review follow-up)**: the same gap
+// openEntryNoFollow closes above applies here verbatim -- manifest.json
+// is itself agent-controlled and read through the same os.Root, which
+// does not honor O_NOFOLLOW and silently follows an in-root symlink. The
+// Fstat/Nlink/os.SameFile re-check on the opened descriptor is identical.
 func (sr *StagingRoot) readManifestBytes() (data []byte, present bool, err error) {
-	info, err := sr.root.Lstat(ManifestFilename)
+	lst, err := sr.root.Lstat(ManifestFilename)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, nil
 		}
 		return nil, true, err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+	if lst.Mode()&os.ModeSymlink != 0 || !lst.Mode().IsRegular() {
 		return nil, true, errNotRegular
+	}
+	if err := requireSingleLink(lst); err != nil {
+		return nil, true, err
+	}
+	if testPostLstatHook != nil {
+		testPostLstatHook()
 	}
 	file, err := sr.root.OpenFile(ManifestFilename, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, true, err
 	}
 	defer file.Close()
+
+	fstat, err := file.Stat()
+	if err != nil {
+		return nil, true, err
+	}
+	if fstat.Mode()&os.ModeSymlink != 0 || !fstat.Mode().IsRegular() {
+		return nil, true, errNotRegular
+	}
+	if err := requireSingleLink(fstat); err != nil {
+		return nil, true, err
+	}
+	if !os.SameFile(lst, fstat) {
+		return nil, true, errUnsafe(DetailUnsafeStaging)
+	}
 
 	data, err = io.ReadAll(io.LimitReader(file, MaxManifestBytes+1))
 	if err != nil {

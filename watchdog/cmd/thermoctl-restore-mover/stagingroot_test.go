@@ -428,6 +428,157 @@ func TestStagingRootOpenEntryNoFollowMissingEntry(t *testing.T) {
 	}
 }
 
+// -- Post-open re-check (P5.5d cross-review follow-up, docs/STATUS.md):
+// openEntryNoFollow's Lstat and os.Root's own OpenFile are two separate
+// calls, and Root -- unlike a plain os.OpenFile with O_NOFOLLOW -- follows
+// an in-root symlink. These tests use testPostLstatHook (stagingroot.go)
+// to deterministically land the swap in the exact window between the two
+// calls, which real timing could otherwise only hit by luck. -------------
+
+// withPostLstatHook installs hook as testPostLstatHook for the duration
+// of the calling test and restores nil afterwards -- every test below
+// uses this so a failure never leaks the hook into a later, unrelated
+// test.
+func withPostLstatHook(t *testing.T, hook func()) {
+	t.Helper()
+	testPostLstatHook = hook
+	t.Cleanup(func() { testPostLstatHook = nil })
+}
+
+func TestStagingRootOpenEntryNoFollowRefusesSymlinkSwappedInBetweenLstatAndOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "thermoctl.db")
+	writeFile(t, path, []byte("real-staged-bytes"))
+	// decoy lives INSIDE staging, at a relative target -- os.Root follows
+	// this (it never leaves the root), which is exactly the gap being
+	// closed: Root's own escape protection does not help here.
+	writeFile(t, filepath.Join(dir, "decoy.db"), []byte("decoy-bytes"))
+	sr := openTestStagingRoot(t, dir)
+
+	withPostLstatHook(t, func() {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove real entry before swap: %v", err)
+		}
+		if err := os.Symlink("decoy.db", path); err != nil {
+			t.Fatalf("symlink swap: %v", err)
+		}
+	})
+
+	file, _, err := sr.openEntryNoFollow("thermoctl.db")
+	if err == nil {
+		file.Close()
+		t.Fatalf("expected openEntryNoFollow to refuse an entry swapped for an in-root symlink between its Lstat and its Open")
+	}
+}
+
+func TestStagingRootOpenEntryNoFollowRefusesHardLinkSwappedInBetweenLstatAndOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "thermoctl.db")
+	writeFile(t, path, []byte("real-staged-bytes"))
+	decoy := filepath.Join(dir, "decoy.db")
+	writeFile(t, decoy, []byte("decoy-bytes"))
+	sr := openTestStagingRoot(t, dir)
+
+	withPostLstatHook(t, func() {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove real entry before swap: %v", err)
+		}
+		if err := os.Link(decoy, path); err != nil {
+			t.Skipf("hard links not supported on this filesystem: %v", err)
+		}
+	})
+
+	file, _, err := sr.openEntryNoFollow("thermoctl.db")
+	if err == nil {
+		file.Close()
+		t.Fatalf("expected openEntryNoFollow to refuse an entry swapped for a second hard link between its Lstat and its Open")
+	}
+}
+
+func TestStagingRootOpenEntryNoFollowAcceptsAnUnswappedFileEvenWithHookInstalled(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "thermoctl.db"), []byte("hello"))
+	sr := openTestStagingRoot(t, dir)
+
+	hookRan := false
+	withPostLstatHook(t, func() { hookRan = true })
+
+	file, size, err := sr.openEntryNoFollow("thermoctl.db")
+	if err != nil {
+		t.Fatalf("unexpected error for a normal, unswapped file: %v", err)
+	}
+	defer file.Close()
+	if size != 5 {
+		t.Fatalf("size = %d, want 5", size)
+	}
+	if !hookRan {
+		t.Fatalf("testPostLstatHook was never invoked -- test would not actually exercise the race window")
+	}
+}
+
+func TestReadManifestBytesRefusesSymlinkSwappedInBetweenLstatAndOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ManifestFilename)
+	writeFile(t, path, []byte(`{"backup_id":"x","staged_at":"x","files":[]}`))
+	writeFile(t, filepath.Join(dir, "decoy-manifest.json"), []byte(`{"backup_id":"decoy","staged_at":"x","files":[]}`))
+	sr := openTestStagingRoot(t, dir)
+
+	withPostLstatHook(t, func() {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove real manifest before swap: %v", err)
+		}
+		if err := os.Symlink("decoy-manifest.json", path); err != nil {
+			t.Fatalf("symlink swap: %v", err)
+		}
+	})
+
+	if _, _, err := sr.readManifestBytes(); err == nil {
+		t.Fatalf("expected readManifestBytes to refuse manifest.json swapped for an in-root symlink between its Lstat and its Open")
+	}
+}
+
+func TestReadManifestBytesRefusesHardLinkSwappedInBetweenLstatAndOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ManifestFilename)
+	writeFile(t, path, []byte(`{"backup_id":"x","staged_at":"x","files":[]}`))
+	decoy := filepath.Join(dir, "decoy-manifest.json")
+	writeFile(t, decoy, []byte(`{"backup_id":"decoy","staged_at":"x","files":[]}`))
+	sr := openTestStagingRoot(t, dir)
+
+	withPostLstatHook(t, func() {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove real manifest before swap: %v", err)
+		}
+		if err := os.Link(decoy, path); err != nil {
+			t.Skipf("hard links not supported on this filesystem: %v", err)
+		}
+	})
+
+	if _, _, err := sr.readManifestBytes(); err == nil {
+		t.Fatalf("expected readManifestBytes to refuse manifest.json swapped for a second hard link between its Lstat and its Open")
+	}
+}
+
+func TestReadManifestBytesAcceptsAnUnswappedManifestEvenWithHookInstalled(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ManifestFilename), []byte(`{"backup_id":"x","staged_at":"x","files":[]}`))
+	sr := openTestStagingRoot(t, dir)
+
+	hookRan := false
+	withPostLstatHook(t, func() { hookRan = true })
+
+	data, present, err := sr.readManifestBytes()
+	if err != nil || !present {
+		t.Fatalf("unexpected result for a normal, unswapped manifest: present=%v err=%v", present, err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("expected non-empty manifest bytes")
+	}
+	if !hookRan {
+		t.Fatalf("testPostLstatHook was never invoked -- test would not actually exercise the race window")
+	}
+}
+
 func TestStagingRootZigbeeRootRefusesAFileNamedZigbee2mqtt(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "zigbee2mqtt"), []byte("not a directory"))
