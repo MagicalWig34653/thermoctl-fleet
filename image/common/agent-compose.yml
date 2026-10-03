@@ -138,6 +138,8 @@ services:
       # reasoning and the exact file format/path
       # (`/boot/firmware/thermoctl/backup-recipients.txt`).
       - /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro
+      # Registration is read on every agent run, including after reboot.
+      - /boot/firmware/agent-registration.json:/boot/firmware/agent-registration.json:ro
       # P5.5a, section 15.2: thermoctl's own SQLite database, read-only --
       # `agent.loop.create_backup` only ever opens it via SQLite's own
       # online backup API in a read-only-URI connection (never writes

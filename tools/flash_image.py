@@ -38,9 +38,8 @@ the caller chose -- in tests, a `tmp_path`, never a real `/Volumes/...`.
 
 **`--dry-run`** skips `flash_image`'s and `verify_disk`'s actual
 `subprocess` calls entirely (prints what it would have run) -- the
-registration/backup-recipients/Wi-Fi writes still happen, against whatever
-path `--boot-mount-point` names, so a dry run can still be used to inspect
-the files this tool would have written without ever touching a disk.
+registration/backup-recipients/Wi-Fi writes are previewed with secrets masked;
+no target mount point is opened or written.
 """
 
 from __future__ import annotations
@@ -55,6 +54,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from protocol.registration import AgentRegistrationFile
 
@@ -116,6 +116,8 @@ class RemovableDisk:
     raw_device: str
     name: str
     size_bytes: int
+    stable_id: str = ""
+    volumes: tuple[tuple[str, int], ...] = ()
 
     @property
     def size_human(self) -> str:
@@ -172,9 +174,103 @@ def list_removable_disks() -> list[RemovableDisk]:
                 raw_device=f"/dev/r{disk_id}",
                 name=str(info.get("MediaName", disk_id)),
                 size_bytes=int(info.get("TotalSize", 0)),
+                stable_id=_stable_id(info),
+                volumes=_volume_summary(disk_id),
             )
         )
     return disks
+
+
+def _stable_id(info: dict[str, object]) -> str:
+    """Choose a persistent media identifier when diskutil provides one."""
+    return next(
+        (
+            str(info[key])
+            for key in ("DiskUUID", "MediaUUID", "IORegistryEntryName")
+            if info.get(key)
+        ),
+        "",
+    )
+
+
+def _diskutil_plist(*arguments: str) -> dict[str, Any]:
+    """Read one diskutil plist, failing closed on errors or malformed output."""
+    result = subprocess.run(  # noqa: S603 -- fixed executable and argument list
+        [_diskutil(), *arguments], capture_output=True, check=False
+    )
+    if result.returncode:
+        raise FlashError(f"diskutil {' '.join(arguments)} failed (exit {result.returncode}).")
+    try:
+        value = plistlib.loads(result.stdout)
+        if not isinstance(value, dict):
+            raise ValueError("expected dictionary")
+        return value
+    except Exception as error:  # noqa: BLE001 -- malformed disk data must fail closed
+        raise FlashError(f"invalid diskutil {' '.join(arguments)} plist: {error}") from error
+
+
+def _volume_summary(disk_id: str) -> tuple[tuple[str, int], ...]:
+    """Show mounted or unmounted partition names and sizes to the operator."""
+    tree = _diskutil_plist("list", "-plist", disk_id)
+    volumes = []
+    for whole in tree.get("AllDisksAndPartitions", []):
+        if not isinstance(whole, dict):
+            continue
+        for part in whole.get("Partitions", []):
+            if isinstance(part, dict):
+                volumes.append(
+                    (
+                        str(part.get("VolumeName") or part.get("DeviceIdentifier") or "unknown"),
+                        int(part.get("Size", 0)),
+                    )
+                )
+    return tuple(volumes)
+
+
+def validate_disk_identity(disk: RemovableDisk) -> None:
+    """Re-probe the selected media and reject changed, system, or APFS disks."""
+    disk_id = disk.device.removeprefix("/dev/")
+    if disk.device != f"/dev/{disk_id}" or disk.raw_device != f"/dev/r{disk_id}":
+        raise FlashError("invalid disk path")
+    info = _diskutil_plist("info", "-plist", disk.device)
+    if (
+        info.get("DeviceIdentifier") != disk_id
+        or info.get("MediaName") != disk.name
+        or info.get("TotalSize") != disk.size_bytes
+        or (disk.stable_id and _stable_id(info) != disk.stable_id)
+        or info.get("Internal") is not False
+        or info.get("VirtualOrPhysical") != "Physical"
+        or info.get("WholeDisk") is not True
+    ):
+        raise FlashError("disk identity or external physical whole-disk status changed")
+    boot = _diskutil_plist("info", "-plist", "/")
+    if disk_id in {
+        boot.get("DeviceIdentifier"),
+        boot.get("ParentWholeDisk"),
+        boot.get("APFSPhysicalStore"),
+    }:
+        raise FlashError("refusing macOS boot/system disk")
+    tree = _diskutil_plist("list", "-plist", disk_id)
+    if disk_id not in tree.get("WholeDisks", []):
+        raise FlashError("target is no longer a whole disk")
+    # A physical APFS store can underlie a synthesized boot disk. Reject
+    # every APFS container or volume, regardless of its current mount state.
+    if b"apfs" in plistlib.dumps(tree).lower():
+        raise FlashError("refusing disk carrying an APFS container or volume")
+    for whole in tree.get("AllDisksAndPartitions", []):
+        if isinstance(whole, dict):
+            for part in whole.get("Partitions", []):
+                if isinstance(part, dict) and part.get("MountPoint") == "/":
+                    raise FlashError("refusing macOS boot volume")
+
+
+def unmount_disk(disk: RemovableDisk) -> None:
+    """Unmount all target volumes before opening its raw device for writing."""
+    result = subprocess.run(  # noqa: S603 -- validated disk path
+        [_diskutil(), "unmountDisk", disk.device], capture_output=True, check=False
+    )
+    if result.returncode:
+        raise FlashError(f"diskutil unmountDisk failed (exit {result.returncode}).")
 
 
 def confirm_disk(
@@ -192,6 +288,8 @@ def confirm_disk(
     `input_func` is injectable so tests never block on real stdin."""
 
     print(f"About to overwrite {disk.device} ({disk.name}, {disk.size_human}).")  # noqa: T201
+    for name, size in disk.volumes:
+        print(f"  Volume: {name} ({size} bytes)")  # noqa: T201
     print(f"Type '{type_to_confirm}' to continue, anything else to abort:")  # noqa: T201
     typed = input_func(f"{type_to_confirm}> ")
     return typed.strip() == type_to_confirm
@@ -270,15 +368,28 @@ def verify_disk(
     else:
         command.append(f"count={full_blocks}")
 
-    result = subprocess.run(  # noqa: S603 -- fixed argument list, no untrusted input
-        command, capture_output=True, check=False
-    )
-    if result.returncode != 0:
-        raise FlashError(
-            f"dd exited with status {result.returncode} while reading back {raw_device}."
-        )
-    actual = hashlib.sha256(result.stdout[:byte_count]).hexdigest()
-    return actual == expected_sha256
+    hasher = hashlib.sha256()
+    remaining = byte_count
+    with subprocess.Popen(  # noqa: S603 -- fixed argument list
+        command, stdout=subprocess.PIPE
+    ) as dd_process:
+        if dd_process.stdout is None:  # pragma: no cover -- PIPE supplies stdout
+            raise FlashError("dd process has no stdout pipe")
+        while remaining:
+            chunk = dd_process.stdout.read(min(CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            hasher.update(chunk)
+            remaining -= len(chunk)
+        # Drain the at-most-one partial final block so dd cannot block.
+        while dd_process.stdout.read(CHUNK_SIZE):
+            pass
+        returncode = dd_process.wait()
+    if returncode:
+        raise FlashError(f"dd exited with status {returncode} while reading back {raw_device}.")
+    if remaining:
+        raise FlashError(f"dd readback short by {remaining} bytes")
+    return hasher.hexdigest() == expected_sha256
 
 
 def mount_boot_partition(
@@ -405,6 +516,8 @@ def _add_flash_arguments(parser: argparse.ArgumentParser) -> None:
         help="Skip the interactive confirmation prompt (for scripted/CI use only).",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-large-disk", action="store_true")
+    parser.add_argument("--i-know-this-erases-the-disk", action="store_true")
 
 
 def _run_flash(args: argparse.Namespace) -> int:
@@ -423,27 +536,45 @@ def _run_flash(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if disk.size_bytes > 256_000_000_000 and not args.allow_large_disk:
+        raise FlashError("disk exceeds 256 GB; pass --allow-large-disk to select it")
+    if args.yes and not (args.dry_run or args.i_know_this_erases_the_disk):
+        raise FlashError("--yes requires --dry-run or --i-know-this-erases-the-disk")
     if not args.yes and not args.dry_run and not confirm_disk(disk, type_to_confirm=disk.device):
         print("tools/flash_image.py: aborted, confirmation did not match.", file=sys.stderr)  # noqa: T201, E501
         return 1
 
-    digest = flash_image(image_path, disk.raw_device, dry_run=args.dry_run)
-    byte_count = image_path.stat().st_size  # overwritten below with the real decompressed size
+    if args.dry_run:
+        print("[dry-run] registration: code=<redacted>")  # noqa: T201
+        print(f"[dry-run] fleet address: {args.fleet_address}")  # noqa: T201
+        print(f"[dry-run] backup recipients: {len(args.backup_recipients)}")  # noqa: T201
+        if args.wifi_ssid:
+            print(f"[dry-run] Wi-Fi SSID: {args.wifi_ssid}; password=<redacted>")  # noqa: T201
+        flash_image(image_path, disk.raw_device, dry_run=True)
+        return 0
+
+    validate_disk_identity(disk)
+    unmount_disk(disk)
+    validate_disk_identity(disk)
+    digest = flash_image(image_path, disk.raw_device)
     with lzma.open(image_path, "rb") as source:
         byte_count = 0
         while chunk := source.read(CHUNK_SIZE):
             byte_count += len(chunk)
 
-    if not args.dry_run:
-        if not verify_disk(disk.raw_device, digest, byte_count):
-            print("tools/flash_image.py: verification FAILED -- disk does not match image.", file=sys.stderr)  # noqa: T201, E501
-            return 1
-        print("tools/flash_image.py: verification OK.")  # noqa: T201
+    validate_disk_identity(disk)
+    if not verify_disk(disk.raw_device, digest, byte_count):
+        print(
+            "tools/flash_image.py: verification FAILED -- disk does not match image.",
+            file=sys.stderr,
+        )  # noqa: T201, E501
+        return 1
+    print("tools/flash_image.py: verification OK.")  # noqa: T201
 
     boot_mount_point = (
         Path(args.boot_mount_point)
         if getattr(args, "boot_mount_point", None)
-        else (image_path.parent if args.dry_run else mount_boot_partition(disk.device))
+        else mount_boot_partition(disk.device)
     )
     write_registration_file(
         boot_mount_point,
@@ -481,7 +612,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{disk.device}  {disk.size_human:>10}  {disk.name}")  # noqa: T201
         return 0
     if args.command == "flash":
-        return _run_flash(args)
+        try:
+            return _run_flash(args)
+        except FlashError as exc:
+            print(f"tools/flash_image.py: {exc}", file=sys.stderr)  # noqa: T201
+            return 1
 
     parser.print_help(sys.stderr)
     return 1

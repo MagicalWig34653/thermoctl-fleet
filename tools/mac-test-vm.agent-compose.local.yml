@@ -50,14 +50,6 @@ services:
       - /var/lib/thermoctl-agent:/var/lib/thermoctl-agent
       - /var/run/docker.sock:/var/run/docker.sock
       - /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro
-      # agent/__main__.py reads this file on every `run` invocation, not
-      # only at `register` time -- a single-file bind mount is fine here
-      # specifically (unlike the directory mounts above, see
-      # image/common/agent-compose.yml's own comment on that): nothing
-      # ever rewrites this file via rename while the container is up, only
-      # `tools/flash_image.py`/`tools/mac-test-vm enroll` write it once,
-      # before the container starts.
-      - /boot/firmware/agent-registration.json:/boot/firmware/agent-registration.json:ro
       # Same CA-bundle mount tools/mac-test-vm's own one-shot `docker run
       # ... register` uses, for the exact same reason and the exact same
       # path (see that script's own comment: `ssl.get_default_verify_paths

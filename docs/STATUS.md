@@ -2,6 +2,23 @@
 
 Last updated: 2026-10-03.
 
+## Cross-review fixes: image build, flash tool (2026-10-03)
+
+- mkosi now uses `mkosi.postinst.chroot` and stages `image/common/`,
+  `watchdog/`, and built binaries through `mkosi.extra` before the hook.
+  `install.sh` only invokes host `systemd-tmpfiles --create` for a live root.
+- The macOS flasher re-probes device identity and whole, physical, external
+  status before writing and readback; it rejects boot/APFS media and disks
+  above 256 GiB without an explicit override, then unmounts before `dd`.
+  Readback hashes bounded streaming output. Dry run previews masked secrets
+  without writing any files; unattended erase requires an explicit flag.
+- The Pi build disables pi-gen ZIP output so its `.img` can be xz-compressed.
+  Release artifacts arrive in separate directories; checksums are merged
+  and checked against both images. Workflow actions are pinned to published
+  full commit SHAs.
+- The production compose file mounts the registration JSON read-only. The
+  Lima-only duplicate mount was removed; the config check enforces it.
+
 ## Image build pipeline, macOS flash tool, Mac test VM (section 19, 2026-10-03)
 
 Three pieces, sharing one recipe (section 19.3's own "one recipe, two

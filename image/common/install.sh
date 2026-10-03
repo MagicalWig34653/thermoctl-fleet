@@ -287,7 +287,7 @@ install -m 0644 "$COMMON_DIR/tmpfiles.d/thermoctl-restore-mover.conf" \
 # or --skip-apt): systemd-tmpfiles-setup.service already covers a real
 # first boot regardless, this call only closes the gap for a system that
 # provisions after it has already booted once.
-if command -v systemd-tmpfiles >/dev/null 2>&1 && [ "$SKIP_APT" -eq 0 ]; then
+if [ -z "$ROOT" ] && command -v systemd-tmpfiles >/dev/null 2>&1 && [ "$SKIP_APT" -eq 0 ]; then
   systemd-tmpfiles --create \
     "$(root_path /etc/tmpfiles.d)/thermoctl-agent.conf" \
     "$(root_path /etc/tmpfiles.d)/thermoctl-restore-mover.conf"

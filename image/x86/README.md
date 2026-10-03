@@ -12,79 +12,23 @@ The same base as `image/pi/` (Debian 13), just without the Raspberry Pi
 kernel and with EFI boot instead of a FAT32 `/boot/firmware`. The reasoning
 for "Debian instead of Alpine" is in `image/README.md`.
 
-## State of this scaffold
+## State of the image recipe
 
-No image is built here. Intended build path (section 19.4): **`mkosi`** or
-**`debos`** -- both produce a finished Debian image from a declarative
-configuration, without rebuilding a custom installation process. Which of
-the two tools is not yet decided (see docs/STATUS.md) -- `mkosi` is more
-closely aligned with systemd (fitting for the watchdog), `debos` is older
-and packaged in Debian itself.
+The release workflow builds this target with mkosi from `mkosi.conf`, places
+the built watchdog binaries in the image, and runs the shared installer.
+The image still needs an end-to-end build and boot test on a Linux runner.
+The agent container image is not preloaded by this recipe yet.
 
-Entirely missing:
+## Build hook and source staging
 
-- an `mkosi.conf`/`debos` recipe file that carries out the same shared
-  steps as `image/pi/`, in order (see `image/common/README.md`, "Docker's
-  official apt repository", for the full reasoning): installs
-  `ca-certificates` first; runs `image/common/apt/fetch-docker-key.sh` to
-  fetch and fingerprint-verify Docker's signing key; places
-  `image/common/apt/docker.sources` at
-  `/etc/apt/sources.list.d/docker.sources` and
-  `image/common/apt/preferences.d/docker` at
-  `/etc/apt/preferences.d/docker` (pins everything else from that
-  repository to `Pin-Priority: -1`, never merely a low positive value --
-  see `image/common/README.md`); runs `apt-get update`; installs `docker-ce
-  docker-ce-cli containerd.io docker-compose-plugin` from that repository
-  with `apt-get install --no-install-recommends` (required, not optional --
-  `docker-ce` itself Recommends `docker-buildx-plugin` and
-  `docker-ce-rootless-extras`, neither of which this image ships); then
-  installs the rest of `image/common/packages.txt` the normal way --
-  applies the udev rule and the `unattended-upgrades` configuration,
-  installing
-  `image/common/tmpfiles.d/thermoctl-agent.conf` (P5.7 hot-fix, needed on
-  this target too -- `/run/thermoctl-agent` is required by the agent
-  container's own bind mount regardless of whether the LED display is
-  present), copying and enabling the watchdog unit from
-  `../../watchdog/thermoctl-watchdog.service`, placing
-  `agent-registration.empty.json` on the boot partition as
-  `agent-registration.json`,
-  (the status-LED program's own unit, section 23/P5.7, is *not* enabled on
-  this target -- a mini PC has no 40-pin header, section 23.3, and the
-  program itself exits cleanly at startup if it were ever installed
-  anyway, so simply not shipping it here is the tidier choice),
-- creates `/var/lib/thermoctl-watchdog` owned by the agent's own uid/gid
-  (P5.7 hot-fix round 2, `docs/STATUS.md`), e.g. `install -d -m 0755 -o
-  10002 -g 10002 /var/lib/thermoctl-watchdog`, and places the build-time
-  state file there (section 17, "Fallback without a proven revision") --
-  needed on this target too, regardless of the LED display's own absence,
-- writes `/etc/thermoctl-agent/.env` with `DOCKER_GID=$(getent group
-  docker | cut -d: -f3)` **after** `docker-ce` (from Docker's official apt
-  repository, see `image/common/README.md`) is installed (P5.7 hot-fix
-  round 2) -- the `docker` group does not exist before that package is
-  installed, so this step must run after the whole apt sequence above --
-  `agent-compose.yml`'s `group_add: ["${DOCKER_GID:?...}"]` reads this
-  file automatically and fails loud if it is missing,
-- the EFI boot partition and bootloader configuration,
-- preloading the agent container image,
-- compression, checksumming, connection to `v*` tags -- as with `image/pi/`.
+[`mkosi.conf`](mkosi.conf) uses mkosi's `mkosi.postinst.chroot` hook. The
+`.chroot` suffix is essential: upstream mkosi runs plain `mkosi.postinst`
+outside the image. The release workflow copies `image/common/`, `watchdog/`,
+and the amd64 watchdog binaries to
+`image/x86/mkosi.extra/opt/thermoctl-build/` before `mkosi build`.
+mkosi copies `mkosi.extra` into the image after package installation and
+before the post-install hook. The hook calls the shared installer with
+`--root /` from inside that image, then removes the staged source tree.
 
-## Update: mkosi over debos, and why
-
-[`mkosi.conf`](mkosi.conf) + [`mkosi.postinst`](mkosi.postinst) now exist,
-decided for `mkosi` over `debos`: this repository's one bare-metal
-component (the watchdog) is driven entirely by systemd units, and `mkosi`
-is itself a systemd-upstream project with first-class support for the same
-boot/partition conventions systemd-boot expects -- `debos` has no
-particular alignment with systemd beyond being able to debootstrap a
-chroot. `mkosi.postinst` runs `../common/install.sh --root /` inside the
-finished chroot, exactly like `image/pi/`'s custom stage and
-`tools/mac-test-vm` all three do with the same script, with the three
-watchdog binaries placed at `watchdog-bin/` beforehand by
-`.github/workflows/image.yml`'s `build-watchdog-binaries` job (amd64).
-**Not run end to end in this development sandbox** (needs a Linux
-loop-device/systemd-nspawn environment a macOS worktree does not have) --
-validated with `actionlint` (the workflow invoking it) and reviewed
-against mkosi's own documented CLI and script-discovery convention
-instead. `install.sh` itself **was** run for real end to end on this
-machine, inside a Lima VM (`tools/mac-test-vm`) -- see `../README.md`'s
-usage section and this task's final report.
+This build has not been run end to end on this macOS worktree, which lacks
+Linux loop devices and a mkosi build environment.
