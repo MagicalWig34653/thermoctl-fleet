@@ -17,6 +17,7 @@
   <a class="brand" href="index.html">thermoctl-fleet</a>
   <nav>
     <a href="docs/index.html">Dokumentation</a>
+    <a href="architektur.html">Architektur</a>
     <a href="docs/sicherheit.html">Sicherheit</a>
     <a href="https://github.com/MagicalWig34653/thermoctl-fleet">GitHub</a>
   </nav>
@@ -37,6 +38,20 @@
       <a class="btn primary" href="docs/einstieg.html">Dokumentation starten</a>
       <a class="btn secondary" href="docs/sicherheit.html">Sicherheitsmodell lesen</a>
     </div>
+    <figure class="hero-shot">
+      <div class="browser-frame">
+        <div class="browser-chrome">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="url-pill">fleet.beispiel.de/</span>
+        </div>
+        <picture>
+          <source srcset="assets/img/dashboard-dark.webp" media="(prefers-color-scheme: dark)" type="image/webp">
+          <source srcset="assets/img/dashboard-light.webp" type="image/webp">
+          <img src="assets/img/dashboard-light.png" alt="Das Haus im Fleet-Dashboard: eine Kachel pro Wohnung mit Name, letztem Kontakt, Modus, offenen Störungen und Version, sortiert nach Handlungsbedarf.">
+        </picture>
+      </div>
+      <figcaption>Das Haus: eine Kachel pro Wohnung, sortiert nach Handlungsbedarf – nicht nach Nummer.</figcaption>
+    </figure>
   </section>
 
   <h2 id="ist-nicht">Was das hier nicht ist</h2>
@@ -63,94 +78,104 @@
     umkehren, deshalb steht sie von Anfang an fest.
   </p>
 
+  <h2 id="funktionsweise">So funktioniert's</h2>
+  <div class="steps">
+    <div class="step">
+      <h3>Basisstation vorbereiten</h3>
+      <p>Fertiges Image schreiben, Registrierungscode auf die Boot-Partition legen –
+      kein individuelles Betriebssystem, keine offene WLAN-Phase.</p>
+    </div>
+    <div class="step">
+      <h3>Einstecken &amp; bestätigen</h3>
+      <p>Das Gerät meldet sich mit einem Verifizierungscode; erst die Bestätigung in der
+      UI gibt die Konfiguration frei.</p>
+    </div>
+    <div class="step">
+      <h3>Herzschlag &amp; Störungen</h3>
+      <p>Alle 120 Sekunden ein Lebenszeichen mit Gesundheitsdaten; Alarm, wenn es
+      ausbleibt – nicht, wenn es ankommt.</p>
+    </div>
+    <div class="step">
+      <h3>Wartung nach Bedarf</h3>
+      <p>Ein kurzer, geschlossener Befehlskatalog mit Id, Ablaufzeit und lokalem
+      Protokoll – ausgeführt und geprüft in der Wohnung selbst.</p>
+    </div>
+  </div>
+
   <h2 id="architektur">Wie die Teile zusammenspielen</h2>
   <p>
     Vier Bausteine, jeder mit genau einer Aufgabe. Die Wohnung spricht die Cloud nur über
     den Agenten an – nie direkt, und nur nach außen (keine Portweiterleitung im
-    Mieter-Router nötig).
+    Mieter-Router nötig). Diese Übersicht ist bewusst vereinfacht; das vollständige
+    <a href="architektur.html">interaktive Architekturdiagramm</a> zeigt jede Komponente
+    und jeden Ablauf im Detail.
   </p>
   <div class="diagram-wrap">
-    <svg viewBox="0 0 1150 460" xmlns="http://www.w3.org/2000/svg" role="img"
-         aria-label="Architekturdiagramm: thermoctl und Zigbee2MQTT in der Wohnung sprechen lokal mit dem Agenten; der Agent sendet per HTTPS einen Heartbeat an den Fleet-Dienst in der Cloud und hält eine SSE-Verbindung für Befehle offen; der Watchdog läuft neben dem Agenten auf dem bloßen System und tauscht Container anhand lokal bereits geprüfter Digests.">
+    <svg viewBox="0 0 1180 440" xmlns="http://www.w3.org/2000/svg" role="img"
+         aria-label="Architekturübersicht: In der Wohnung sprechen thermoctl und Zigbee2MQTT lokal mit dem Agenten, der Agent übergibt geprüfte Digests an den Watchdog. Der Agent sendet per HTTPS einen Heartbeat an den Fleet-Dienst in der Cloud und hält eine SSE-Verbindung für Befehle offen. Der Fleet-Dienst betreibt Web-UI, Alarme und verschlüsselte Backups.">
       <defs>
-        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <marker id="ov-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
         </marker>
         <style>
-          .box { fill: var(--bg-elevated, #fff); stroke: var(--border, #ccc); stroke-width: 1.5; rx: 10; }
-          .lbl { font: 600 15px -apple-system, sans-serif; fill: var(--text, #111); }
-          .sub { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); }
-          .edge { stroke: var(--accent-2, #21609b); stroke-width: 2; fill: none; marker-end: url(#arrow); color: var(--accent-2, #21609b); }
-          .edge2 { stroke: var(--accent, #c25a1a); stroke-width: 2; fill: none; marker-end: url(#arrow); color: var(--accent, #c25a1a); }
-          .edgelbl { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); text-anchor: middle; }
-          .frame { fill: none; stroke: var(--border, #ccc); stroke-width: 1; stroke-dasharray: 5 4; }
-          .framelbl { font: 700 12px -apple-system, sans-serif; fill: var(--text-muted, #666); letter-spacing: .04em; text-transform: uppercase; }
+          .ov-box { fill: var(--bg-elevated, #fff); stroke: var(--border, #ccc); stroke-width: 1.5; rx: 10; }
+          .ov-lbl { font: 600 15px -apple-system, sans-serif; fill: var(--text, #111); }
+          .ov-sub { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); }
+          .ov-edge { stroke: var(--accent-2, #21609b); stroke-width: 2; fill: none; marker-end: url(#ov-arrow); color: var(--accent-2, #21609b); }
+          .ov-edge2 { stroke: var(--accent, #c25a1a); stroke-width: 2; fill: none; marker-end: url(#ov-arrow); color: var(--accent, #c25a1a); }
+          .ov-edgelbl { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); text-anchor: middle; }
+          .ov-frame { fill: none; stroke: var(--border, #ccc); stroke-width: 1; stroke-dasharray: 5 4; }
+          .ov-framelbl { font: 700 12px -apple-system, sans-serif; fill: var(--text-muted, #666); letter-spacing: .04em; text-transform: uppercase; }
         </style>
       </defs>
 
-      <!-- Apartment frame -->
-      <rect class="frame" x="20" y="20" width="430" height="420" rx="14"/>
-      <text class="framelbl" x="36" y="44">Wohnung / Basisstation</text>
+      <!-- Apartment zone -->
+      <rect class="ov-frame" x="20" y="20" width="470" height="400" rx="14"/>
+      <text class="ov-framelbl" x="36" y="44">Wohnung / Basisstation</text>
 
-      <rect class="box" x="50" y="70" width="170" height="60" rx="10"/>
-      <text class="lbl" x="60" y="95">thermoctl</text>
-      <text class="sub" x="60" y="114">lokale REST-API, read-only</text>
+      <rect class="ov-box" x="50" y="64" width="410" height="60" rx="10"/>
+      <text class="ov-lbl" x="62" y="89">thermoctl &amp; Zigbee2MQTT</text>
+      <text class="ov-sub" x="62" y="108">lokale REST-API (read-only) · lokaler Broker</text>
 
-      <rect class="box" x="250" y="70" width="170" height="60" rx="10"/>
-      <text class="lbl" x="260" y="95">Zigbee2MQTT</text>
-      <text class="sub" x="260" y="114">+ Mosquitto, nur lokal</text>
+      <rect class="ov-box" x="50" y="164" width="410" height="60" rx="10"/>
+      <text class="ov-lbl" x="62" y="189">Agent</text>
+      <text class="ov-sub" x="62" y="208">einzige Verbindung nach außen, nur ausgehend</text>
 
-      <rect class="box" x="150" y="190" width="200" height="70" rx="10"/>
-      <text class="lbl" x="162" y="217">Agent</text>
-      <text class="sub" x="162" y="236">einzige Verbindung nach außen</text>
-      <text class="sub" x="162" y="251">read-only Token in thermoctl</text>
+      <rect class="ov-box" x="50" y="264" width="410" height="60" rx="10"/>
+      <text class="ov-lbl" x="62" y="289">Watchdog</text>
+      <text class="ov-sub" x="62" y="308">Go, ohne Abhängigkeiten, kennt kein Netz</text>
 
-      <rect class="box" x="150" y="320" width="200" height="80" rx="10"/>
-      <text class="lbl" x="162" y="347">Watchdog</text>
-      <text class="sub" x="162" y="366">Go, ohne Abhängigkeiten</text>
-      <text class="sub" x="162" y="381">kennt kein Netz, keine Registry</text>
-      <text class="sub" x="162" y="396">tauscht nur lokal geprüfte Images</text>
+      <line class="ov-edge" x1="255" y1="124" x2="255" y2="164"/>
+      <line class="ov-edge" x1="255" y1="224" x2="255" y2="264"/>
+      <text class="ov-edgelbl" x="340" y="252">geprüfte Digests</text>
 
-      <line class="edge" x1="135" y1="130" x2="200" y2="190"/>
-      <line class="edge" x1="335" y1="130" x2="280" y2="190"/>
-      <line class="edge" x1="250" y1="260" x2="250" y2="320"/>
-      <text class="edgelbl" x="256" y="296" text-anchor="start">geprüfte Digests</text>
+      <!-- Cloud zone -->
+      <rect class="ov-frame" x="690" y="20" width="470" height="400" rx="14"/>
+      <text class="ov-framelbl" x="706" y="44">Cloud (Vermieter)</text>
 
-      <!-- Cloud frame -->
-      <rect class="frame" x="700" y="20" width="430" height="420" rx="14"/>
-      <text class="framelbl" x="716" y="44">Cloud (Vermieter)</text>
+      <rect class="ov-box" x="720" y="64" width="410" height="60" rx="10"/>
+      <text class="ov-lbl" x="732" y="89">Fleet-Dienst</text>
+      <text class="ov-sub" x="732" y="108">Heartbeat- &amp; Ereignisannahme, Befehlsversand</text>
 
-      <rect class="box" x="730" y="90" width="370" height="60" rx="10"/>
-      <text class="lbl" x="742" y="115">Fleet-Dienst</text>
-      <text class="sub" x="742" y="134">Heartbeat- und Ereignisannahme, Befehlsversand, Web-UI</text>
+      <rect class="ov-box" x="720" y="164" width="410" height="60" rx="10"/>
+      <text class="ov-lbl" x="732" y="189">Web-UI &amp; Alarme</text>
+      <text class="ov-sub" x="732" y="208">TOTP + Passkey · Alarm bei Ausbleiben</text>
 
-      <rect class="box" x="730" y="190" width="170" height="60" rx="10"/>
-      <text class="lbl" x="742" y="215">Alarme</text>
-      <text class="sub" x="742" y="234">bei Ausbleiben</text>
+      <rect class="ov-box" x="720" y="264" width="410" height="60" rx="10"/>
+      <text class="ov-lbl" x="732" y="289">Verschlüsselte Backups</text>
+      <text class="ov-sub" x="732" y="308">Cloud sieht nur den opaken Block, nie den Schlüssel</text>
 
-      <rect class="box" x="930" y="190" width="170" height="60" rx="10"/>
-      <text class="lbl" x="942" y="215">Web-UI</text>
-      <text class="sub" x="942" y="234">TOTP + Passkey</text>
+      <line class="ov-edge" x1="925" y1="124" x2="925" y2="164"/>
+      <line class="ov-edge" x1="925" y1="224" x2="925" y2="264"/>
 
-      <rect class="box" x="730" y="290" width="370" height="60" rx="10"/>
-      <text class="lbl" x="742" y="315">Verschlüsselte Backups</text>
-      <text class="sub" x="742" y="334">Cloud sieht nur den opaken Block, nie den Schlüssel</text>
+      <!-- Cross-boundary lanes -->
+      <path class="ov-edge2" d="M460,194 L580,194 L580,89 L720,89" />
+      <text class="ov-edgelbl" x="610" y="76">HTTPS POST /v1/heartbeat</text>
+      <text class="ov-edgelbl" x="610" y="178" fill="var(--accent,#c25a1a)">alle 120 s</text>
 
-      <line class="edge" x1="915" y1="150" x2="915" y2="190"/>
-      <line class="edge" x1="915" y1="150" x2="1015" y2="190"/>
-      <line class="edge" x1="915" y1="150" x2="915" y2="290"/>
-
-      <!-- Cross-boundary connections, each in its own horizontal lane in
-           the gap between the two frames so the lines never cross each
-           other, and each label sits centered above/below its own lane,
-           clear of both the line and the boxes on either side. -->
-      <path class="edge2" d="M250,190 L250,140 L730,140" />
-      <text class="edgelbl" x="490" y="126">HTTPS POST /v1/heartbeat</text>
-      <text class="edgelbl" x="490" y="157">alle 120 s</text>
-
-      <path class="edge" d="M915,150 L915,210 L350,210" />
-      <text class="edgelbl" x="490" y="196" fill="var(--accent-2,#21609b)">SSE GET /v1/commands</text>
-      <text class="edgelbl" x="490" y="227" fill="var(--accent-2,#21609b)">Befehle</text>
+      <path class="ov-edge" d="M720,194 L610,194 L610,350 L460,350" />
+      <text class="ov-edgelbl" x="610" y="337">SSE GET /v1/commands</text>
+      <text class="ov-edgelbl" x="610" y="368" fill="var(--accent-2,#21609b)">Befehle, Ablaufzeit lokal geprüft</text>
     </svg>
   </div>
   <p>
@@ -159,39 +184,111 @@
     nie eine Verbindung zur Wohnung. Befehle laufen stattdessen über einen offen gehaltenen
     <code>GET /v1/commands</code> (Server-Sent Events) – die Wohnung hält die Verbindung,
     nicht umgekehrt. Kein Port muss im Router des Mieters freigegeben werden.
+    Alle Zusammenhänge, Zonen und Abläufe im Detail:
+    <a href="architektur.html">vollständiges interaktives Diagramm</a>.
   </p>
+
+  <h2 id="lebenszyklus">Der Lebenszyklus einer Wohnung</h2>
+  <p>
+    Von der Einrichtung des Fleet-Servers bis zur Außerbetriebnahme einer Basisstation –
+    die Zustände entsprechen wörtlich denen aus der Spezifikation (Abschnitt 20.1,
+    <code>ApartmentState</code>/<code>DeviceLifecycle</code>) und dem Code in
+    <code>protocol/inventory.py</code>.
+  </p>
+  <div class="lifecycle">
+    <div class="life-step">
+      <span class="life-dot" aria-hidden="true"></span>
+      <h3>Fleet-Server einrichten</h3>
+      <p>Docker-Image, TLS, erster Benutzer.</p>
+      <a href="docs/einstieg.html">Einstieg →</a>
+    </div>
+    <div class="life-step">
+      <span class="life-dot" aria-hidden="true"></span>
+      <h3>Wohnung anlegen &amp; vorbereiten</h3>
+      <p>Image, Registrierungscode.</p>
+      <span class="life-state"><code>prepared</code></span>
+      <a href="docs/wohnung.html">Wohnung hinzufügen →</a>
+    </div>
+    <div class="life-step">
+      <span class="life-dot" aria-hidden="true"></span>
+      <h3>Einstecken &amp; Enrollment</h3>
+      <p>Gerät meldet sich, Bestätigung in der UI.</p>
+      <span class="life-state"><code>reported</code> → <code>in_service</code></span>
+      <a href="architektur.html#story-enrollment">Ablauf im Diagramm →</a>
+    </div>
+    <div class="life-step">
+      <span class="life-dot" aria-hidden="true"></span>
+      <h3>Laufender Betrieb</h3>
+      <p>Heartbeat, Störungen, Alarme, Wartungsbefehle.</p>
+      <span class="life-state"><code>in_service</code></span>
+      <a href="docs/betrieb.html">Täglicher Betrieb →</a>
+    </div>
+    <div class="life-step">
+      <span class="life-dot" aria-hidden="true"></span>
+      <h3>Pflege</h3>
+      <p>Backups, Updates/Rollouts (derzeit abgeschaltet), Restore.</p>
+      <a href="architektur.html#story-backup">Ablauf im Diagramm →</a>
+    </div>
+    <div class="life-step">
+      <span class="life-dot" aria-hidden="true"></span>
+      <h3>Mieterwechsel</h3>
+      <p>Token-Rotation, Löschung der Verlaufsdaten.</p>
+      <span class="life-state"><code>vacant</code></span>
+      <a href="architektur.html#story-mieterwechsel">Ablauf im Diagramm →</a>
+    </div>
+    <div class="life-step">
+      <span class="life-dot" aria-hidden="true"></span>
+      <h3>Gerätetausch</h3>
+      <p>Ersatzgerät aus dem Regal, Backup-Restore.</p>
+      <span class="life-state"><code>faulty</code>/<code>in_storage</code> → <code>in_service</code></span>
+      <a href="architektur.html#story-restore">Ablauf im Diagramm →</a>
+    </div>
+    <div class="life-step">
+      <span class="life-dot" aria-hidden="true"></span>
+      <h3>Außerbetriebnahme</h3>
+      <p>Wohnung nicht gelöscht, sondern stillgelegt.</p>
+      <span class="life-state"><code>retired</code> / <code>decommissioned</code></span>
+      <a href="docs/glossar.html">Glossar →</a>
+    </div>
+  </div>
 
   <h2 id="sicherheit">Sicherheitsmodell in Kürze</h2>
   <p>Sechs Grundsätze, die nicht verhandelbar sind (Details: <a href="docs/sicherheit.html">Sicherheit</a>):</p>
-  <div class="grid-cards">
-    <div class="card">
-      <h3>1. Geschlossener Befehlskatalog</h3>
+  <div class="principle-grid">
+    <div class="principle">
+      <span class="num">1</span>
+      <h3>Geschlossener Befehlskatalog</h3>
       <p>Die Cloud kann einer Wohnung nur das schicken, was in einer kurzen, festen Liste
       steht. Eine Erweiterung ist niemals „nur eine kleine Ergänzung“.</p>
     </div>
-    <div class="card">
-      <h3>2. Image-Quellen fest im Agenten</h3>
+    <div class="principle">
+      <span class="num">2</span>
+      <h3>Image-Quellen fest im Agenten</h3>
       <p>Die erlaubten Registrierungen stehen als Konstante im Agenten, nicht in der Cloud.
       Die Cloud nennt nur Version und Digest – nie die Quelle. Kein Digest, kein Start.</p>
     </div>
-    <div class="card">
-      <h3>3. Keine privaten Schlüssel in der Cloud</h3>
+    <div class="principle">
+      <span class="num">3</span>
+      <h3>Keine privaten Schlüssel in der Cloud</h3>
       <p>WireGuard- und Geräteschlüsselpaare entstehen auf der Basisstation und verlassen
       sie nie. Die Cloud sieht ausschließlich öffentliche Schlüssel.</p>
     </div>
-    <div class="card">
-      <h3>4. Keine Mieterdaten im Klartext</h3>
+    <div class="principle">
+      <span class="num">4</span>
+      <h3>Keine Mieterdaten im Klartext</h3>
       <p>Betriebsdaten-Backups werden auf dem Gerät verschlüsselt, bevor sie hochgeladen
       werden. Die Cloud speichert nur den opaken Block, nie den Schlüssel.</p>
     </div>
-    <div class="card">
-      <h3>5. Der Agent ist die Sicherheitsgrenze</h3>
+    <div class="principle">
+      <span class="num">5</span>
+      <h3>Der Agent ist die Sicherheitsgrenze</h3>
       <p>Jede Prüfung, ob ein Befehl ausgeführt wird, sitzt im Agenten – selbst wenn die
       Cloud etwas anderes sagt. Eine kompromittierte Cloud kann keine Sitzung öffnen, die
       der Agent lokal verweigert.</p>
     </div>
-    <div class="card">
-      <h3>6. Der Watchdog kennt kein Netz</h3>
+    <div class="principle">
+      <span class="num">6</span>
+      <h3>Der Watchdog kennt kein Netz</h3>
       <p>Er tauscht nur zwischen zwei lokal bereits geprüften Digests – in Go, statisch
       gebaut, ohne eine einzige Abhängigkeit. Genau deshalb funktioniert er noch, wenn
       alles andere kaputt ist.</p>
@@ -201,44 +298,52 @@
   <h2 id="features">Was der Dienst konkret kann</h2>
   <div class="grid-cards">
     <div class="card">
+      <span class="feat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 12h4l2 7 4-14 2 7h6"/></svg></span>
       <h3>Heartbeat &amp; Alarm bei Ausbleiben</h3>
       <p>Jede Wohnung meldet sich alle 120 Sekunden. Der eigentliche Wert liegt nicht im
       Empfang, sondern im Alarm, wenn drei Meldungen hintereinander fehlen.</p>
     </div>
     <div class="card">
+      <span class="feat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9 2.6 18a1.8 1.8 0 0 0 1.6 2.6h15.6a1.8 1.8 0 0 0 1.6-2.6L13.7 3.9a1.8 1.8 0 0 0-3.4 0Z"/></svg></span>
       <h3>Störungen mit Quittierung</h3>
       <p>Die sechs thermoctl-Störungsarten laufen in der Cloud zusammen. Eine Quittierung
       gilt nur für das aktuelle Auftreten – tritt die Störung erneut auf, erscheint sie
       wieder.</p>
     </div>
     <div class="card">
+      <span class="feat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="7" y="2" width="8" height="4" rx="1"/><rect x="5" y="6" width="12" height="16" rx="2"/><path d="M9 14h4"/></svg></span>
       <h3>Batterie &amp; Signal pro Gerät</h3>
       <p>Geräte-Id, Batteriestand und Signalqualität – ohne Gerätenamen (die Raumnamen
       enthalten können) und ohne Messwerte.</p>
     </div>
     <div class="card">
+      <span class="feat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v5M16 4v5"/></svg></span>
       <h3>Geschlossener Befehlskatalog</h3>
       <p><code>report_now</code>, <code>fetch_logs</code>, <code>backup_now</code>,
       <code>agent_restart</code>, <code>diagnostic_bundle</code> – mit Id, Ablaufzeit und
       lokalem Protokoll in der Wohnung selbst.</p>
     </div>
     <div class="card">
+      <span class="feat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></span>
       <h3>Verschlüsselte Backups &amp; Restore</h3>
       <p>Betriebsdaten werden auf dem Gerät verschlüsselt. Der Entschlüsselungsschlüssel
       wird im Browser lokal verschlüsselt und nie im Klartext an die Cloud übertragen.</p>
     </div>
     <div class="card">
+      <span class="feat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M6 8.4V15.6M8.3 7.1 15.7 10.8M8.3 16.9 15.7 13.2"/></svg></span>
       <h3>Gestaffelte Rollouts</h3>
       <p>Updates laufen über Soll-Zustand, nie per Fernsteuerung einzelner Befehle –
       kontrolliert, eine Wohnung nach der anderen, mit Rückfallpfad.</p>
     </div>
     <div class="card">
+      <span class="feat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M17 20h4v-2a4 4 0 0 0-3-3.87M9 20H3v-2a6 6 0 0 1 12 0v2Z"/><circle cx="9" cy="8" r="4"/><path d="M16 11a4 4 0 0 0 0-6"/></svg></span>
       <h3>Mieterwechsel</h3>
       <p>Eine ausdrückliche UI-Aktion mit Pflichtgrund rotiert den Gerätetoken und löscht
       die Verlaufsdaten der vorherigen Mietzeit – verschlüsselte Backups bleiben, unter
       eigener Aufbewahrungsfrist.</p>
     </div>
     <div class="card">
+      <span class="feat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/><circle cx="12" cy="16" r="1.5"/></svg></span>
       <h3>Anmeldung mit TOTP &amp; Passkey</h3>
       <p>Zwei-Faktor-Anmeldung der Web-Oberfläche: TOTP-Secrets liegen verschlüsselt mit
       einem Schlüssel aus der Umgebung, Passkeys (WebAuthn) als zweiter Faktor. Aus
@@ -246,15 +351,18 @@
     </div>
   </div>
 
-  <h2 id="weiter">Weiterlesen</h2>
-  <p>
-    Die vollständige <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a>
-    ist die verbindliche Quelle für Details. Diese Website erklärt sie in Alltagssprache.
-    Am besten geht es mit dem <a href="docs/einstieg.html">Einstieg</a> weiter.
-  </p>
-  <div class="cta-row">
-    <a class="btn primary" href="docs/einstieg.html">Zur Dokumentation</a>
-  </div>
+  <section class="cta-footer">
+    <h2 id="weiter">Weiterlesen</h2>
+    <p>
+      Die vollständige <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a>
+      ist die verbindliche Quelle für Details. Diese Website erklärt sie in Alltagssprache.
+      Am besten geht es mit dem <a href="docs/einstieg.html">Einstieg</a> weiter.
+    </p>
+    <div class="cta-row">
+      <a class="btn primary" href="docs/einstieg.html">Zur Dokumentation</a>
+      <a class="btn secondary" href="architektur.html">Architektur erkunden</a>
+    </div>
+  </section>
 </main>
 
 <footer class="site-footer">
