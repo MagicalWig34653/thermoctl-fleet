@@ -180,6 +180,8 @@ install -m 0644 "$WATCHDOG_SRC/cmd/thermoctl-restore-mover/thermoctl-restore-mov
   "$UNIT_DIR/"
 install -m 0644 "$WATCHDOG_SRC/cmd/thermoctl-restore-mover/thermoctl-restore-mover.path" \
   "$UNIT_DIR/"
+install -m 0755 "$COMMON_DIR/firstboot-wifi.sh" "$BIN_DIR/thermoctl-firstboot-wifi"
+install -m 0644 "$COMMON_DIR/thermoctl-firstboot-wifi.service" "$UNIT_DIR/"
 
 # The status-LED unit only applies to the Pi target (image/x86/README.md:
 # "a mini PC has no 40-pin header" -- deliberately not installed there).
@@ -387,6 +389,8 @@ if command -v systemctl >/dev/null 2>&1 && [ "$SKIP_APT" -eq 0 ]; then
   fi
   systemctl "${SYSTEMCTL_ROOT_ARGS[@]}" enable thermoctl-watchdog.service
   systemctl "${SYSTEMCTL_ROOT_ARGS[@]}" enable thermoctl-restore-mover.path
+  systemctl "${SYSTEMCTL_ROOT_ARGS[@]}" enable NetworkManager.service
+  systemctl "${SYSTEMCTL_ROOT_ARGS[@]}" enable thermoctl-firstboot-wifi.service
   if [ "$ARCH" = "arm64" ] || [ "$SKIP_WATCHDOG_BUILD" -eq 1 ]; then
     systemctl "${SYSTEMCTL_ROOT_ARGS[@]}" enable thermoctl-leds.service || true
   fi

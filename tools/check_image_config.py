@@ -616,12 +616,15 @@ def check_all(root: Path = IMAGE_DIR) -> None:
 
     common = root / "common"
     packages = check_package_list(common / "packages.txt")
+    if "network-manager" not in packages:
+        raise ImageError("packages.txt: network-manager is required for Wi-Fi import.")
     check_docker_packages_from_official_repo(packages)
     check_docker_apt_source(common / "apt" / "docker.sources")
     check_docker_apt_preferences(common / "apt" / "preferences.d" / "docker")
     check_docker_key_fetch(common / "apt" / "fetch-docker-key.sh")
     check_udev_rule(common / "udev" / "99-zigbee-stick.rules")
     check_agent_registration_template(common / "agent-registration.empty.json")
+    check_firstboot_wifi_unit(common / "thermoctl-firstboot-wifi.service")
     check_watchdog_unit(root.parent / "watchdog" / "thermoctl-watchdog.service")
     check_leds_unit(root.parent / "watchdog" / "cmd" / "thermoctl-leds" / "thermoctl-leds.service")
     check_restore_mover_units(
@@ -640,6 +643,28 @@ def check_all(root: Path = IMAGE_DIR) -> None:
     check_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-agent.conf")
     check_restore_staging_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-agent.conf")
     check_restore_mover_tmpfiles_entry(common / "tmpfiles.d" / "thermoctl-restore-mover.conf")
+
+
+def check_firstboot_wifi_unit(path: Path) -> None:
+    """Require the credential import to run from the boot mount before online waits."""
+
+    if not path.is_file():
+        raise ImageError(f"{path}: Wi-Fi import unit is missing.")
+    lines = {line.strip() for line in path.read_text(encoding="utf-8").splitlines()}
+    required = {
+        "ConditionPathExists=|/boot/firmware/thermoctl/wifi.env",
+        "ConditionPathExists=|/efi/thermoctl/wifi.env",
+        "RequiresMountsFor=/boot/firmware /efi",
+        "Wants=NetworkManager.service",
+        "After=NetworkManager.service",
+        "Before=NetworkManager-wait-online.service network-online.target",
+        "Type=oneshot",
+        "ExecStart=/usr/local/bin/thermoctl-firstboot-wifi",
+        "WantedBy=multi-user.target",
+    }
+    missing = required - lines
+    if missing:
+        raise ImageError(f"{path}: missing Wi-Fi import setting(s): {sorted(missing)!r}.")
 
 
 def main() -> int:

@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tools.flash_image import (
+    WIFI_CONFIG_RELATIVE_PATH,
     FlashError,
     RemovableDisk,
     _diskutil,
@@ -30,6 +31,7 @@ from tools.flash_image import (
     mount_boot_partition,
     unmount_disk,
     validate_disk_identity,
+    validate_wifi_credentials,
     verify_disk,
     write_backup_recipients,
     write_registration_file,
@@ -309,15 +311,65 @@ def test_write_backup_recipients_rejects_a_private_key(tmp_path: Path) -> None:
 
 
 def test_write_wifi_config_writes_ssid_and_password(tmp_path: Path) -> None:
-    path = write_wifi_config(tmp_path, ssid="MyApartmentWifi", password="s3cr3t")
+    path = write_wifi_config(tmp_path, ssid="MyApartmentWifi", password="placeholder-pass")
     content = path.read_text(encoding="utf-8")
-    assert "SSID=MyApartmentWifi" in content
-    assert "PASSWORD=s3cr3t" in content
+    assert content == "SSID=MyApartmentWifi\nPASSWORD=placeholder-pass\n"
 
 
 def test_write_wifi_config_rejects_empty_ssid(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="ssid must not be empty"):
-        write_wifi_config(tmp_path, ssid="", password="x")
+    with pytest.raises(ValueError, match="ssid must be 1-32 bytes"):
+        write_wifi_config(tmp_path, ssid="", password="placeholder-pass")
+    assert not (tmp_path / WIFI_CONFIG_RELATIVE_PATH).exists()
+
+
+@pytest.mark.parametrize(
+    ("ssid", "password"),
+    [
+        ("x" * 33, "placeholder-pass"),  # SSID longer than 32 bytes
+        ("ä" * 17, "placeholder-pass"),  # 17 characters but 34 UTF-8 bytes
+        ("bad\nssid", "placeholder-pass"),  # control character
+        ("Home", "short"),  # under 8 characters
+        ("Home", "x" * 64 + "!"),  # over 63 and not hex
+        ("Home", "g" * 64),  # 64 characters but not hex
+        ("Home", "pass\twith-tab"),  # non-printable
+        ("Home", "päss-wörd-12"),  # non-ASCII
+    ],
+)
+def test_validate_wifi_credentials_rejects_what_the_device_would_erase(
+    ssid: str, password: str
+) -> None:
+    with pytest.raises(ValueError):
+        validate_wifi_credentials(ssid, password)
+
+
+@pytest.mark.parametrize(
+    "password", ["12345678", "x" * 63, "0123456789abcdefABCDEF" * 2 + "0123456789abcdefABCD"]
+)
+def test_validate_wifi_credentials_accepts_wpa2_passphrases_and_hex_psk(password: str) -> None:
+    validate_wifi_credentials("Home WLAN", password)
+
+
+def test_main_flash_rejects_invalid_wifi_before_touching_any_disk(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    image = tmp_path / "base.img.xz"
+    image.write_bytes(lzma.compress(b"image"))
+    with patch("tools.flash_image.subprocess.run") as run, patch(
+        "tools.flash_image.subprocess.Popen"
+    ) as popen:
+        code = main(
+            [
+                "flash", "--image", str(image), "--disk", "/dev/disk9",
+                "--fleet-address", "https://fleet.example.invalid",
+                "--certificate-fingerprint", "sha256:" + "0" * 64,
+                "--registration-code", "PLATZHALTER",
+                "--wifi-ssid", "Home", "--wifi-password", "short",
+            ]
+        )
+    assert code == 1
+    run.assert_not_called()
+    popen.assert_not_called()
+    assert "password must be 8-63" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +475,7 @@ def test_main_flash_dry_run_end_to_end_is_read_only(
                 "--wifi-ssid",
                 "ApartmentNet",
                 "--wifi-password",
-                "hunter2",
+                "placeholder-pass",
                 "--boot-mount-point",
                 str(boot_mount_point),
                 "--dry-run",
@@ -434,7 +486,7 @@ def test_main_flash_dry_run_end_to_end_is_read_only(
     assert list(boot_mount_point.iterdir()) == []
     preview = capsys.readouterr().out
     assert "code123" not in preview
-    assert "hunter2" not in preview
+    assert "placeholder-pass" not in preview
     assert "<redacted>" in preview
 
 
