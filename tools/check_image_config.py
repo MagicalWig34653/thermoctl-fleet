@@ -443,6 +443,7 @@ def check_agent_compose_file(path: Path) -> None:
         "group_add:",
         "${DOCKER_GID:?",
         "- /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro",
+        "- /boot/firmware/agent-registration.json:/boot/firmware/agent-registration.json:ro",
         "- /var/lib/thermoctl:/var/lib/thermoctl:ro",
         "- /var/lib/zigbee2mqtt:/var/lib/zigbee2mqtt:ro",
         # P5.5c/P5.5d: the mover's status file (and, since P5.5d, its own

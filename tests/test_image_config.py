@@ -253,9 +253,7 @@ def test_restore_mover_tmpfiles_entry_owned_by_the_agent_uid_is_rejected(tmp_pat
     # This directory's only writer is thermoctl-restore-mover itself,
     # which runs as root -- not the agent's own uid/gid.
     path = tmp_path / "thermoctl-restore-mover.conf"
-    path.write_text(
-        "d /var/lib/thermoctl-restore-mover 0755 10002 10002 -\n", encoding="utf-8"
-    )
+    path.write_text("d /var/lib/thermoctl-restore-mover 0755 10002 10002 -\n", encoding="utf-8")
     with pytest.raises(ImageError):
         check_restore_mover_tmpfiles_entry(path)
 
@@ -263,8 +261,7 @@ def test_restore_mover_tmpfiles_entry_owned_by_the_agent_uid_is_rejected(tmp_pat
 def test_restore_mover_tmpfiles_entry_owned_by_root_passes(tmp_path: Path) -> None:
     path = tmp_path / "thermoctl-restore-mover.conf"
     path.write_text(
-        "# a comment before the real entry\n"
-        "d /var/lib/thermoctl-restore-mover 0755 root root -\n",
+        "# a comment before the real entry\nd /var/lib/thermoctl-restore-mover 0755 root root -\n",
         encoding="utf-8",
     )
     check_restore_mover_tmpfiles_entry(path)
@@ -327,8 +324,7 @@ def test_agent_compose_file_without_pull_policy_never_is_rejected(
     # that would let a missing image be fetched from a registry.
     path = tmp_path / "agent-compose.yml"
     path.write_text(
-        "services:\n  agent:\n    image: thermoctl-agent:current\n"
-        "    restart: on-failure\n",
+        "services:\n  agent:\n    image: thermoctl-agent:current\n    restart: on-failure\n",
         encoding="utf-8",
     )
 
@@ -400,6 +396,17 @@ def test_agent_compose_file_with_single_file_mounts_is_rejected(
         check_agent_compose_file(path)
 
 
+def test_agent_compose_requires_registration_mount(tmp_path: Path) -> None:
+    content = (IMAGE_DIR / "common" / "agent-compose.yml").read_text(encoding="utf-8")
+    line = (
+        "      - /boot/firmware/agent-registration.json:/boot/firmware/agent-registration.json:ro\n"
+    )
+    path = tmp_path / "agent-compose.yml"
+    path.write_text(content.replace(line, ""), encoding="utf-8")
+    with pytest.raises(ImageError, match="agent-registration.json"):
+        check_agent_compose_file(path)
+
+
 def test_tmpfiles_entry_missing_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ImageError):
         check_tmpfiles_entry(tmp_path / "does-not-exist.conf")
@@ -444,8 +451,7 @@ def test_tmpfiles_entry_with_mismatched_gid_is_rejected(tmp_path: Path) -> None:
 def test_tmpfiles_entry_owned_by_the_agent_uid_gid_passes(tmp_path: Path) -> None:
     path = tmp_path / "thermoctl-agent.conf"
     path.write_text(
-        "# a comment before the real entry\n"
-        "d /run/thermoctl-agent 0755 10002 10002 -\n",
+        "# a comment before the real entry\nd /run/thermoctl-agent 0755 10002 10002 -\n",
         encoding="utf-8",
     )
 
@@ -535,8 +541,7 @@ def test_docker_apt_preferences_missing_is_rejected(tmp_path: Path) -> None:
 def test_docker_apt_preferences_without_origin_pin_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "docker"
     path.write_text(
-        "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\n"
-        "Pin-Priority: 600\n",
+        "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\nPin-Priority: 600\n",
         encoding="utf-8",
     )
 
@@ -551,10 +556,10 @@ def test_docker_apt_preferences_without_all_four_packages_is_rejected(
     # must still be rejected, not just when the whole stanza is missing.
     path = tmp_path / "docker"
     path.write_text(
-        'Package: *\n'
+        "Package: *\n"
         'Pin: origin "download.docker.com"\n'
         "Pin-Priority: -1\n\n"
-        'Package: docker-ce docker-ce-cli containerd.io\n'
+        "Package: docker-ce docker-ce-cli containerd.io\n"
         'Pin: origin "download.docker.com"\n'
         "Pin-Priority: 600\n",
         encoding="utf-8",
@@ -575,7 +580,7 @@ def test_docker_apt_preferences_with_too_permissive_wildcard_pin_is_rejected(
     # are all present and correctly pinned at 600.
     path = tmp_path / "docker"
     path.write_text(
-        'Package: *\n'
+        "Package: *\n"
         'Pin: origin "download.docker.com"\n'
         "Pin-Priority: 1\n\n"
         "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\n"
@@ -591,7 +596,7 @@ def test_docker_apt_preferences_with_too_permissive_wildcard_pin_is_rejected(
 def test_docker_apt_preferences_naming_the_four_packages_passes(tmp_path: Path) -> None:
     path = tmp_path / "docker"
     path.write_text(
-        'Package: *\n'
+        "Package: *\n"
         'Pin: origin "download.docker.com"\n'
         "Pin-Priority: -1\n\n"
         "Package: docker-ce docker-ce-cli containerd.io docker-compose-plugin\n"
@@ -654,3 +659,15 @@ def test_docker_key_fetch_without_multi_key_rejection_is_rejected(tmp_path: Path
 
     with pytest.raises(ImageError):
         check_docker_key_fetch(path)
+
+
+def test_x86_mkosi_hook_is_chrooted_and_sources_are_staged() -> None:
+    x86 = IMAGE_DIR / "x86"
+    assert not (x86 / "mkosi.postinst").exists()
+    hook = x86 / "mkosi.postinst.chroot"
+    assert hook.is_file()
+    assert hook.stat().st_mode & 0o111
+    workflow = (IMAGE_DIR.parent / ".github/workflows/image.yml").read_text(encoding="utf-8")
+    assert "mkosi.extra/opt/thermoctl-build" in workflow
+    assert "cp -r image/common" in workflow
+    assert "cp -r image/x86/watchdog-bin" in workflow

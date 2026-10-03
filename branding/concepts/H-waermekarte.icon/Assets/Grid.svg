@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- 3x3 heat-map grid: equal rounded-square tiles, a diagonal gradient
+       from cool teal (top-left) to warm orange (bottom-right). -->
+  <g>
+    <rect x="202" y="202" width="180" height="180" rx="36" fill="#2FC7C2" />
+    <rect x="422" y="202" width="180" height="180" rx="36" fill="#7FD9A0" />
+    <rect x="642" y="202" width="180" height="180" rx="36" fill="#FFD166" />
+
+    <rect x="202" y="422" width="180" height="180" rx="36" fill="#7FD9A0" />
+    <rect x="422" y="422" width="180" height="180" rx="36" fill="#FFD166" />
+    <rect x="642" y="422" width="180" height="180" rx="36" fill="#FF9F40" />
+
+    <rect x="202" y="642" width="180" height="180" rx="36" fill="#FFD166" />
+    <rect x="422" y="642" width="180" height="180" rx="36" fill="#FF9F40" />
+    <rect x="642" y="642" width="180" height="180" rx="36" fill="#FF6B2C" />
+  </g>
+</svg>

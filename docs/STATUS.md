@@ -2,6 +2,167 @@
 
 Last updated: 2026-10-03.
 
+## `tools/docs_screenshots.py` test coverage, cross-review follow-up (2026-10-03)
+
+Cross-review (Codex) on the package below found two issues, fixed in a
+follow-up commit on the same branch:
+
+1. **`main()` and `optimize_images()` had a blanket `# pragma: no
+   cover`**, hiding testable behaviour. Both are now tested for real:
+   `main()` by monkeypatching every function it calls (`seed`,
+   `create_ui_user`, `_free_port`, `start_server`, `_wait_for_server`,
+   `capture`, `optimize_images`) to a recorder and asserting call order,
+   arguments, and that the server subprocess is always torn down --
+   terminated normally, or killed if a clean `wait()` times out, including
+   when `capture` itself raises; `optimize_images()` against a real tiny
+   PNG (`pytest.importorskip("PIL")`, so it skips rather than mocks where
+   Pillow -- ad hoc only, not a project dependency -- is absent; installed
+   ad hoc in this worktree's own `.venv` to actually run it instead of
+   skipping). Only `capture()` and `start_server()` keep the pragma now
+   (real browser / real long-running server subprocess).
+2. **A `_free_port`/`_wait_for_server` test had a release-then-rebind
+   race** (ask the OS for a free port, close the socket, then open a new
+   one on the same port number). Fixed: the "returns a bindable int" test
+   no longer rebinds at all (that was never `_free_port`'s own contract),
+   and the "server answers" test already bound a real `HTTPServer` to
+   port 0 directly rather than going through `_free_port` first.
+
+Also caught in the same pass: `main()` test needed `monkeypatch.setenv`
+on `FLEET_TOTP_KEY` before calling it -- `main()` overwrites that env var
+directly (`os.environ[...] =`, not `setdefault`), which would otherwise
+leak into every later test in the session past `tests/conftest.py`'s own
+session-wide default.
+
+Verified again after the fix: `ruff check .` and `mypy .` both exit 0;
+full suite 2143 tests, 0 failures/errors, 1 pre-existing/unrelated skip;
+`tools/docs_screenshots.py` at 100% line coverage.
+
+## `tools/docs_screenshots.py` test coverage (2026-10-03)
+
+Was 0% covered (144 statements, no test file at all). Added
+`tests/test_docs_screenshots.py`:
+
+- **The valuable part:** `seed()` is now exercised against a real,
+  migrated temporary SQLite database (same `tmp_path`/`upgrade`/
+  `create_storage` pattern as `tests/test_storage_rollouts.py`) and read
+  back both through the raw `Storage` API (apartments, the open sensor
+  fault, the `not_reporting` alarm, the operational-data backup, the
+  desired-state revision, the rollout) and through the real UI view
+  builders (`fleet.ui_house.build_house_overview`, `fleet.ui_apartment
+  .build_apartment_detail`, `fleet.ui_rollout.build_rollout_list`/
+  `build_rollout_detail`) -- this is the part that actually breaks if
+  either changes shape, not a re-statement of what the code does.
+- **`create_ui_user()`** is exercised for real against the actual
+  `python -m fleet.admin create-user` subprocess (success, a duplicate
+  username failing loudly, env isolation, and that a shell metacharacter
+  in the username never runs as a shell command -- defending the
+  `# noqa: S603` next to it).
+- **Pure helpers** (`_free_port`, `_wait_for_server`, `_parse_totp_secret`,
+  `_seconds_until_next_totp_step`, `_wait_for_fresh_totp_window`,
+  `_webp_path_for`) each got real assertions, not mocks.
+- **Minimal refactor** to make the TOTP wait testable: the previously
+  nested `_wait_for_fresh_totp_window` inside `capture()` is now a
+  module-level function with injectable `clock`/`sleep` callables (default
+  `time.time`/`time.sleep`), backed by a new pure `_seconds_until_next_totp
+  _step`. `_parse_totp_secret` and `_webp_path_for` were split out of
+  `create_ui_user`/`optimize_images` the same way. `capture`,
+  `start_server`, `main`, and `optimize_images` (needs Pillow, which is
+  only installed ad hoc for this script, not a project dependency) stay
+  `# pragma: no cover`, each with its own reason -- they need a real
+  browser or a real long-running server subprocess, which a unit test
+  would only re-mock, not exercise for real.
+
+Result: `tools/docs_screenshots.py` is now at 100% line coverage; full
+suite still green (`ruff check .`, `mypy .`, `python -m pytest`).
+
+## App icon: "thermometer made of apartments" (2026-10-03)
+
+The owner rejected the radiator + pulse icon as well ("anderer Ansatz") and
+approved the main session's new concept: **one** metaphor instead of two
+combined symbols -- a thermometer whose scale segments are the apartments.
+Four glass segments (top to bottom `#4AA8FF`, `#6FD6C8`, `#FFD36E`,
+`#FFB347`) above a warm bulb whose neck and bulb are a single outline
+(`#FF9F43` -> `#FF6A2A`), on a graphite-navy background with a faint warm
+bloom. Final geometry and the seamless bulb/neck path were drawn in the
+main session after the drafting agent hit its usage limit.
+
+- `branding/thermoctl-fleet.icon` replaced by it (also kept as
+  `branding/concepts/T-thermometer.icon`; earlier drafts stay under
+  `branding/concepts/` for history, including `T-thermometer-v1.icon`).
+- Renders via Icon Composer's `ictool`: `branding/renders/` (1024 px,
+  Default/Dark/ClearLight); `site/assets/icon/apple-touch-icon.png`
+  (180 px) and `favicon-32.png` from the Default rendition;
+  `site/assets/icon/favicon.svg` is the flat version of the same geometry
+  (also used as the site's header and hero logo).
+- Checked at 1024/64/32 px in all three renditions: reads as a segmented
+  thermometer down to 32 px.
+
+## App icon: production-quality radiator + pulse (2026-10-03)
+
+The owner rejected the house/thermometer/dots icon (see the entry below) as
+not looking "really beautiful". Three alternative concepts were drawn up
+under `branding/concepts/` (radiator+pulse, apartment-facade, flame-in-a-
+ring-of-dots); the owner picked the radiator+pulse concept but asked for a
+production-quality pass, not the rough draft.
+
+`branding/thermoctl-fleet.icon` is now that polished concept: a classic
+panel-radiator silhouette -- four solid, stroke-free pill fins joined by a
+rounded header/footer pipe and two small feet, flat white -- with a single
+confident orange-to-amber ECG line (flat, small dip, tall sharp peak, deep
+dip, flat, ending in a live-monitor dot) in its own group in front of the
+radiator, with a soft colour-matched glow. Background is a deep-navy-to-
+teal diagonal gradient plus a warm radial glow rising from the bottom
+centre; three faint heat-shimmer wisps sit above the header (kept because
+they still read at 64px; would have been dropped otherwise).
+
+Iterated five rounds against `ictool` renders (`Default`/`Dark`/
+`ClearLight`, checked at 1024px and downscaled to 64px/32px each round)
+before settling:
+
+1. First pass: chunky fins read well immediately, but the ECG line's small
+   deltas were swallowed by its own 58px stroke width -- it rendered as a
+   near-flat blob, not a heartbeat.
+2. Widened the excursions and centred the baseline on the radiator's
+   centre for left/right symmetry -- the zigzag became legible, but it was
+   still only visible inside the fin gaps, never crossing the white fins.
+2b. Root-caused: Icon Composer's `groups` array in this `icon.json` format
+   renders **first-listed = front, last-listed = back** -- the opposite of
+   this bundle's original (unverified) layering comment. The glass flag on
+   a group does not itself force it to the front; array position does.
+3. Reordering the pulse group to the front of the array (ahead of the
+   glass radiator group) fixed it at the root: the ECG now draws cleanly
+   over the fins, exactly as the art direction asked for ("in front", not
+   glowing through glass).
+4. Added an in-SVG blurred duplicate of the ECG stroke (a second, wider,
+   low-opacity copy behind the crisp line) for a reliable warm glow in
+   every rendition, independent of the `icon.json` shadow setting's
+   behaviour; added the optional heat-shimmer wisps and checked they still
+   read at 64px.
+5. Final subtlety pass on the shimmer opacity/width; re-checked all three
+   renditions at 1024/64/32px -- kept as final.
+
+`Dark` tints the glass radiator itself navy/teal (matching the background)
+rather than staying plain white -- a legitimate, attractive stylistic
+choice for that rendition, not a defect (the pulse stays warm orange in
+all three renditions as required). `ClearLight` desaturates colour
+entirely per the system style for that rendition; the silhouette and
+heartbeat shape still read cleanly in monochrome.
+
+Production artifacts:
+- `branding/thermoctl-fleet.icon` -- the replaced bundle.
+- `branding/renders/thermoctl-fleet-icon-{Default,Dark,ClearLight}-1024.png`
+  -- replaced 1024px renders, embedded in `README.md`.
+- `site/assets/icon/apple-touch-icon.png` (180px) and `favicon-32.png`
+  (32px) -- regenerated directly from the `Default` rendition via `ictool`.
+- `site/assets/icon/favicon.svg` -- redrawn flat (no glass/blur/shimmer,
+  since SVG favicons must render identically everywhere) with the same
+  radiator and ECG-line geometry and the same background gradient colours.
+- `branding/concepts/A-radiator.icon` updated in place to the same final
+  design, kept alongside the B/C drafts for history.
+- `branding/concepts/renders/A-before-after.png` -- before/after
+  comparison sheet (initial draft vs. final, all three renditions x
+  1024/64/32px).
+
 ## Documentation website review follow-up: icon redesign via ictool, passwordless section filled, typography, SVG diagram fix (2026-10-03)
 
 Main-session review of the documentation-website task below asked for six
@@ -192,6 +353,182 @@ alone suffices -- no password, no TOTP. Implemented in the main session
   `mypy .` -> Success: no issues found in 161 source files; full pytest via
   junitxml -> tests="2103" failures="0" errors="0" skipped="1"; TOTAL 8123
   stmts / 30 missed / 99%, `fleet/ui_auth.py` 100%.
+
+## Cross-review fixes: image build, flash tool (2026-10-03)
+
+- Added mocked flash safety tests for changed disk identity, boot/APFS and
+  mounted root refusals, size and unattended-erase guards, unmount/readback
+  failures, and malformed diskutil data. Added local VM serve and enrollment
+  error-path tests without starting a server.
+- mkosi now uses `mkosi.postinst.chroot` and stages `image/common/`,
+  `watchdog/`, and built binaries through `mkosi.extra` before the hook.
+  `install.sh` only invokes host `systemd-tmpfiles --create` for a live root.
+- The macOS flasher re-probes device identity and whole, physical, external
+  status before writing and readback; it rejects boot/APFS media and disks
+  above 256 GiB without an explicit override, then unmounts before `dd`.
+  Readback hashes bounded streaming output. Dry run previews masked secrets
+  without writing any files; unattended erase requires an explicit flag.
+- The Pi build disables pi-gen ZIP output so its `.img` can be xz-compressed.
+  Release artifacts arrive in separate directories; checksums are merged
+  and checked against both images. Workflow actions are pinned to published
+  full commit SHAs.
+- The production compose file mounts the registration JSON read-only. The
+  Lima-only duplicate mount was removed; the config check enforces it.
+
+## Image build pipeline, macOS flash tool, Mac test VM (section 19, 2026-10-03)
+
+Three pieces, sharing one recipe (section 19.3's own "one recipe, two
+targets" extended to a third consumer):
+
+1. **`image/common/install.sh`** -- the shared recipe applier, idempotent,
+   taking `--root` (so the same script applies to a chroot/pi-gen stage
+   directory, an mkosi build root, or a live system's own `/`) and
+   `--arch` (cross-compiles the three watchdog binaries with
+   `GOOS=linux GOARCH=$ARCH CGO_ENABLED=0 go build`). Installs
+   `packages.txt`, Docker's apt repository (exact step order from
+   `image/common/README.md`), the udev rule, `unattended-upgrades`,
+   `tmpfiles.d`, the agent compose file, the empty registration template
+   (never overwritten once a real one exists), `/etc/thermoctl-agent/.env`
+   with the real `DOCKER_GID`, the pre-set watchdog state file (section
+   22.5, `PROVEN=false`), and enables all the systemd units. Tested in
+   `tests/test_image_install_sh.py` (dry-run file-layout checks, plus one
+   test gated on a local `go` toolchain that cross-compiles the real
+   binaries and checks them with `file`) and, as of this entry, by an
+   actual end-to-end run inside a Lima VM (see point 3) -- a real `apt-get
+   install docker-ce ...` against Debian's and Docker's real repositories,
+   a real `go build`, real `systemctl enable`, not a simulation.
+   **Found and fixed by that real run:** `go build`'s own build cache
+   needs `$HOME`/`$XDG_CACHE_HOME`/`GOCACHE` set, and Lima's (and
+   plausibly a bare pi-gen/mkosi chroot's) `mode: system` provisioning
+   execs as root with no environment at all -- `install.sh` now sets
+   `GOCACHE` explicitly to a path under its own `--root` before building.
+2. **`.github/workflows/image.yml`** -- the "validate only" job is
+   unchanged; new `v*`-tag-gated jobs build the three watchdog binaries
+   once (reused by both image jobs), then `pi-gen` (arm64, a custom stage
+   at `image/pi/pi-gen-stage/01-thermoctl/00-run.sh` that applies
+   `install.sh` via pi-gen's own `on_chroot`) and `mkosi` (amd64,
+   `image/x86/mkosi.conf` + `mkosi.postinst`, same `install.sh` call) in
+   parallel, compress+checksum, and attach both `.img.xz` + a combined
+   `SHA256SUMS` to the tag's release. **mkosi chosen over debos** --
+   reasoning in the workflow file and in `image/x86/README.md`'s own
+   update section (systemd alignment). **Not run end to end**: a real
+   pi-gen/mkosi build needs privileged loop-device mounts this
+   development sandbox does not have. Verified instead with `actionlint`
+   (clean, including the deliberately path-filter-free `push:` trigger --
+   GitHub ANDs a tag filter with a path filter against a tag's own,
+   usually-empty diff, which would otherwise silently skip every release
+   build) and by reviewing each tool's own documented CLI/script-discovery
+   convention. `install.sh` itself, the one piece both jobs actually run,
+   **was** verified for real (point 1 above).
+3. **`tools/flash_image.py`** -- the macOS preparation tool (section
+   19.5): `list-disks` (`diskutil list -plist external physical` --
+   structurally excludes internal/system disks, not merely checks for
+   them), `flash` (streams a `.img.xz` through stdlib `lzma` into `dd`,
+   hashing as it goes; requires typing the disk's own device path back,
+   not just "y"; `--dry-run` hashes the whole image without touching a
+   disk), verify (reads the same byte range back and compares), and
+   writes `agent-registration.json` (exactly
+   `protocol.registration.AgentRegistrationFile`'s three fields),
+   `thermoctl/backup-recipients.txt`, and an optional
+   `thermoctl/wifi.env` (section 15.4's recommended path -- format
+   documented in the module, not yet consumed by `install.sh` or any
+   boot-time service, tracked here like `agent-compose.yml` was before
+   P5.4). 29 tests (`tests/test_flash_image.py`), every disk-facing call
+   through mocked `subprocess` -- no test ever touches a real disk.
+4. **`tools/mac-test-vm`** -- the Lima test VM (Debian 13 arm64,
+   `tools/mac-test-vm.lima.yaml`), applying `install.sh` as a real
+   provisioning step on VM start. `tools/mac_test_vm/fleet_local.py`
+   starts a real `fleet.app.app` over a real (self-signed) TLS
+   certificate and drives the real `Storage.prepare_device` to mint a
+   registration code for a fixed fixture apartment/device (idempotent --
+   a second `enroll` resets the fixture device `prepared -> in_storage`
+   via the same manual transition the fleet UI itself offers, then
+   re-prepares it). `enroll` builds `thermoctl-agent:local` **inside** the
+   VM from `docker/Dockerfile.agent`, then launches `python -m agent
+   register` **detached** (`docker run -d`, not `--rm`) -- found by
+   running this for real: `agent.registration.register` deliberately
+   *blocks*, polling the fleet, until a human confirms the device in the
+   fleet UI (section 15.3 step 3), so the dispatcher script must not wait
+   on it inline. `finish` starts the real agent container afterward, via
+   `tools/mac-test-vm.agent-compose.local.yml` -- a TEST-VM-ONLY compose
+   override (image: `thermoctl-agent:local`, not `:current`; no
+   thermoctl/Zigbee2MQTT mounts) that exists *because* a locally built
+   image has no registry digest and the real
+   `/etc/thermoctl-agent/compose.yml` would simply refuse to start it
+   (CLAUDE.md security principle 2 -- neither `agent/sources.py` nor
+   `watchdog/` were touched to make this possible; the watchdog-driven
+   digest swap itself is the one thing this test genuinely cannot
+   exercise). Both `finish` and the registration `docker run` mount the
+   VM host's own CA-trust bundle into the container at
+   `/usr/lib/ssl/cert.pem` (`python3 -c "import ssl;
+   print(ssl.get_default_verify_paths())"` run inside the real image is
+   where that exact path comes from, not a guess) -- the container's own
+   filesystem is independent of the VM host's, so trusting the local
+   fleet's throwaway CA on the host alone does not make the already-built
+   image trust it too; a real device's agent container never needs this,
+   its CA is a publicly trusted one already in the image's default
+   bundle.
+
+   **Actually run end to end on this machine, not merely written**: VM
+   created and provisioned for real (`limactl`/`qemu-system-aarch64`,
+   already installed), `install.sh` ran for real inside it, the agent
+   image was built for real inside the VM, and a full registration ran
+   for real -- `POST /v1/registration` (201), the verification code
+   printed, confirmed via the real `Storage.confirm_device` (the exact
+   method the fleet UI's own "Bestätigen" button calls), the registration
+   container's own blocking poll then completing the signed-challenge
+   token exchange and exiting 0, and the real agent container's `python
+   -m agent run` loop coming up afterward and reaching the fleet (one
+   log line, `SSE command stream unavailable ...; falling back to
+   polling` -- the polling fallback itself working as designed, not a
+   failure). Three real bugs were found and fixed by this run, none of
+   which static review had caught:
+   - `install.sh`'s `go build` needs `GOCACHE` set -- Lima's (and
+     plausibly a bare pi-gen/mkosi chroot's) `mode: system` provisioning
+     execs as root with no `$HOME` at all.
+   - The throwaway CA/leaf pair (`tools/mac_test_vm/fleet_local.py`) was
+     missing `SubjectKeyIdentifier`/`AuthorityKeyIdentifier` -- modern
+     OpenSSL (3.x) refuses an otherwise-valid chain with "Missing
+     Authority Key Identifier" without them, even though both extensions
+     are formally optional in the X.509 spec.
+   - `image/common/install.sh` placed `/etc/tmpfiles.d/thermoctl-agent
+     .conf` but never applied it immediately -- harmless on a real image
+     build (the rootfs has not booted yet, so the *next* boot's
+     `systemd-tmpfiles-setup.service` creates `/run/thermoctl-agent`
+     correctly the first time either way), but the Lima VM has already
+     booted once by the time this provisioning script runs, so Docker
+     itself silently auto-created a **root-owned**
+     `/run/thermoctl-agent` the first time a bind mount referenced it,
+     which the agent (uid 10002) then could not write into at all
+     (`PermissionError`, in `agent.loop.report_led_status`). Fixed by
+     calling `systemd-tmpfiles --create` on both `tmpfiles.d` files
+     immediately after placing them.
+
+   `tests/test_mac_test_vm_fleet_local.py` (8 tests) exercises the
+   Python side (real Alembic migrations, real `Storage`, a throwaway
+   SQLite file) without starting a server or touching the VM.
+5. **Found along the way, not fixed (out of scope for this task, tracked
+   here for whoever picks it up next):** `image/common/agent-compose.yml`
+   (the real one the image ships) has no bind mount at all for
+   `/boot/firmware/agent-registration.json` itself -- only for the
+   `thermoctl/` subdirectory under `/boot/firmware` (the backup
+   recipients file). `agent/__main__.py`'s `_run_agent` reads
+   `--registration-file` (defaulting to that exact path) on every `run`
+   invocation, not only at `register` time, so the real agent container
+   as currently shipped cannot read it at all once started via that
+   compose file. `tools/mac-test-vm.agent-compose.local.yml` adds the
+   missing single-file mount (safe there specifically: nothing rewrites
+   that file via rename while the container runs) -- the real file needs
+   the same fix, or a documented reason it does not.
+
+Verification run for this entry: `ruff check .` and `mypy protocol fleet
+agent tools` both clean; full `pytest` (`--junitxml`): 2138 tests, 0
+failures, 0 errors, 1 skipped; `go vet ./...`/`go test ./...` in
+`watchdog/` unaffected (no Go source changed, only the build invocation
+in `install.sh`); `shellcheck` clean on `install.sh`,
+`image/pi/pi-gen-stage/01-thermoctl/00-run.sh`, `image/x86/mkosi.postinst`,
+and `tools/mac-test-vm`; `actionlint` clean on `.github/workflows/image.yml`
+and every other workflow in the repository.
 
 ## Codex full review findings 1, 6, 7: SSE bookmark ordering, record-before-
 ## execute, restore-report retry (2026-10-03)

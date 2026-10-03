@@ -1,0 +1,102 @@
+# Lima template for the thermoctl-fleet test VM (owner-only end-to-end
+# enrollment test, see image/README.md's usage section). A Debian 13
+# arm64 VM -- the exact same target `image/pi/` builds for, just run under
+# QEMU instead of flashed to a Raspberry Pi -- provisioned with the SAME
+# recipe (image/common/install.sh) the real images use.
+#
+# Images copied from Lima's own bundled "debian-13" template (`limactl
+# start --list-templates`) rather than referenced via `base:` -- this file
+# stays a single, self-contained YAML `tools/mac-test-vm` (the dispatcher
+# script next to this file) can pass to `limactl create <this file>`
+# without depending on Lima's template registry resolving a second file at
+# the same time.
+minimumLimaVersion: "2.0.0"
+
+images:
+  # Pinned release + digest first (matches Lima's own bundled "debian-13"
+  # template, `/opt/homebrew/.../templates/_images/debian-13.yaml` --
+  # reusing the exact same URL/digest means a Mac that already ran any
+  # other Lima Debian-13 VM hits its own download cache instead of
+  # fetching again), the rolling "daily/latest" build as a fallback if
+  # that dated release ever disappears upstream.
+  - location: "https://cloud.debian.org/images/cloud/trixie/20260712-2537/debian-13-genericcloud-arm64-20260712-2537.qcow2"
+    arch: "aarch64"
+    digest: "sha512:8543d795f2fde630eb66c492f245a8c1da19dedc636e0a8e7b3d0f95920e1a05aa911ef2d82d177d41cc53ced5fccbd2a3945d07fa5e15018914c4d864bb07ed"
+    variant: "genericcloud"
+  - location: "https://cloud.debian.org/images/cloud/trixie/20260712-2537/debian-13-genericcloud-amd64-20260712-2537.qcow2"
+    arch: "x86_64"
+    digest: "sha512:7ae53e9dbee282bfc16f289dec483dde3a8598769c38a267948310f7a2a52c662620198603bc52c142627efba379863d16079698a10b34102d55bcedd40e8d32"
+    variant: "genericcloud"
+  - location: "https://cloud.debian.org/images/cloud/trixie/daily/latest/debian-13-genericcloud-arm64-daily.qcow2"
+    arch: "aarch64"
+    variant: "genericcloud"
+  - location: "https://cloud.debian.org/images/cloud/trixie/daily/latest/debian-13-genericcloud-amd64-daily.qcow2"
+    arch: "x86_64"
+    variant: "genericcloud"
+
+cpus: 4
+memory: "4GiB"
+disk: "20GiB"
+
+mounts:
+  # The repository checkout itself. `location` here is a placeholder --
+  # `tools/mac-test-vm create` always overrides it via `limactl create
+  # --set` to the real checkout root at creation time (`{{.Dir}}` is
+  # Lima's *instance* directory, not this template file's own location,
+  # so it cannot be used to derive the checkout path here -- the
+  # dispatcher script already knows its own location and passes the
+  # absolute path explicitly instead; CLAUDE.md: "nothing hard-coded
+  # except the security principles").
+  - location: "/REPLACED-BY-tools-mac-test-vm-create"
+    mountPoint: "/thermoctl-fleet"
+    writable: false
+
+containerd:
+  system: false
+  user: false
+
+# Docker itself comes from image/common/install.sh's own apt step below --
+# Lima's bundled containerd is explicitly disabled (containerd above) so
+# the two container runtimes never fight over the same cgroup/socket.
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      # install.sh itself requires bash, curl, gpg, git (for `go build`'s
+      # module hashing) -- genericcloud Debian images ship all four
+      # already except gpg/git in some minimal variants.
+      apt-get update
+      apt-get install -y --no-install-recommends ca-certificates curl gnupg git golang-go
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      # The exact same recipe image/pi/ and image/x86/ apply at real
+      # image-build time -- ROOT=/ here because this already *is* the
+      # target system, same as a flashed device's own first boot, not a
+      # chroot. --arch matches this VM's own `uname -m`.
+      case "$(uname -m)" in
+        aarch64) ARCH=arm64 ;;
+        x86_64) ARCH=amd64 ;;
+        *) echo "unsupported VM architecture: $(uname -m)" >&2; exit 1 ;;
+      esac
+      bash /thermoctl-fleet/image/common/install.sh --root / --arch "$ARCH"
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      # docker-ce's own group was just created by install.sh's apt step
+      # above -- add the Lima default user to it so `docker build`/`docker
+      # compose` can run unprivileged over SSH, the same way
+      # tools/mac-test-vm's own `ssh`/`enroll` commands reach this VM.
+      usermod -aG docker "{{.User}}"
+
+message: |
+  thermoctl-fleet test VM ready.
+
+  Build the agent image and enroll it with a locally running fleet:
+    tools/mac-test-vm enroll
+
+  Everything else: tools/mac-test-vm --help

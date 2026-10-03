@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# tools/mac-test-vm -- owner-only local end-to-end enrollment test
+# (section 19, docs/STATUS.md). Creates a Debian 13 arm64 Lima VM, applies
+# the SAME recipe (image/common/install.sh) a real image build uses,
+# builds the agent image locally from docker/Dockerfile.agent *inside* the
+# VM, and drives a registration against a fleet service started locally on
+# this Mac -- so the whole section 4/15.3 registration flow can be
+# exercised end to end without ever touching a real Raspberry Pi or a real
+# cloud deployment.
+#
+# **Security principle 2 (CLAUDE.md) is NOT weakened anywhere by this
+# tool.** `agent/sources.py`'s hard-coded registry prefix list and
+# `watchdog/`'s digest-only swap are both left completely untouched. A
+# locally built image has no registry digest to check in the first place,
+# so the one thing this tool genuinely cannot exercise is the real
+# watchdog-driven swap path (`docker tag <digest> ...`,
+# `watchdog/runtime.go`) -- inside the VM, the locally built
+# `thermoctl-agent:local` image is instead run directly via
+# `tools/mac-test-vm.agent-compose.local.yml` (NOT the real
+# `/etc/thermoctl-agent/compose.yml` the image ships, which still demands
+# a digest-tagged `:current` image and would simply refuse to start this
+# one). See that compose file's own comment for the exact differences.
+# Everything upstream of that swap -- registration, the Ed25519 key
+# exchange, the signed-challenge token issuance, the SSE command channel,
+# the heartbeat -- runs completely unmodified, real agent code talking to
+# a real (if locally started) fleet service.
+#
+# Commands: create | start | stop | delete | status | enroll | finish | logs | ssh
+set -euo pipefail
+
+VM_NAME="thermoctl-test-vm"
+# Must match tools/mac_test_vm/fleet_local.py's TEST_DEVICE_ID exactly --
+# that module is the single source of truth (it actually creates the
+# device), this is only for the human-readable message below.
+TEST_DEVICE_ID="mac-test-vm-device1"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+REPO_ROOT="$SCRIPT_DIR/.."
+LIMA_TEMPLATE="$SCRIPT_DIR/mac-test-vm.lima.yaml"
+STATE_DIR="${THERMOCTL_TEST_VM_STATE_DIR:-$HOME/.thermoctl-fleet-test-vm}"
+FLEET_PORT="${THERMOCTL_TEST_VM_FLEET_PORT:-8443}"
+
+usage() {
+  cat <<EOF
+Usage: tools/mac-test-vm <command>
+
+Commands:
+  create   Create the Lima VM (does not start it).
+  start    Start the VM, applying image/common/install.sh via its
+           provisioning scripts.
+  stop     Stop the VM.
+  delete   Delete the VM entirely (requires --yes).
+  status   Show the VM's current status (limactl list).
+  enroll   Start a local fleet (if not already running), build the agent
+           image inside the VM, and submit registration (this does NOT
+           block -- the agent's own registration code deliberately does,
+           waiting for a human to confirm the device in the fleet UI).
+  finish   After confirming the device in the fleet UI, start the agent
+           container for real (the command/heartbeat loop).
+  logs     Follow the agent (or, before 'finish', the registration)
+           container's logs inside the VM.
+  ssh      Open an interactive shell inside the VM.
+EOF
+}
+
+require_limactl() {
+  if ! command -v limactl >/dev/null 2>&1; then
+    echo "tools/mac-test-vm: limactl is required (brew install lima)." >&2
+    exit 1
+  fi
+}
+
+cmd_create() {
+  require_limactl
+  local repo_root_abs
+  repo_root_abs="$(cd -- "$REPO_ROOT" && pwd -P)"
+  limactl create --name "$VM_NAME" --tty=false \
+    --set ".mounts[0].location = \"$repo_root_abs\"" \
+    "$LIMA_TEMPLATE"
+}
+
+cmd_start() {
+  require_limactl
+  limactl start --tty=false "$VM_NAME"
+}
+
+cmd_stop() {
+  require_limactl
+  limactl stop "$VM_NAME"
+}
+
+cmd_delete() {
+  require_limactl
+  if [ "${1:-}" != "--yes" ]; then
+    echo "tools/mac-test-vm: delete is destructive -- pass --yes to confirm." >&2
+    exit 1
+  fi
+  limactl delete --force "$VM_NAME"
+}
+
+cmd_status() {
+  require_limactl
+  limactl list "$VM_NAME"
+}
+
+cmd_ssh() {
+  require_limactl
+  limactl shell "$VM_NAME" "$@"
+}
+
+cmd_logs() {
+  require_limactl
+  if limactl shell "$VM_NAME" -- sudo docker inspect thermoctl-agent >/dev/null 2>&1; then
+    limactl shell "$VM_NAME" -- sudo docker logs -f thermoctl-agent
+  else
+    limactl shell "$VM_NAME" -- sudo docker logs -f thermoctl-agent-register
+  fi
+}
+
+cmd_enroll() {
+  require_limactl
+  mkdir -p "$STATE_DIR"
+
+  # 1. A local fleet, over TLS, with a self-signed certificate -- started
+  #    if not already running (pidfile check, same convention as
+  #    tools/mac_test_vm/fleet_local.py itself).
+  local pid_file="$STATE_DIR/fleet.pid"
+  if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    echo "tools/mac-test-vm: local fleet already running (pid $(cat "$pid_file"))." >&2
+  else
+    echo "tools/mac-test-vm: starting local fleet on 0.0.0.0:$FLEET_PORT ..." >&2
+    (cd "$REPO_ROOT" && python3 -m tools.mac_test_vm.fleet_local serve \
+      --host 0.0.0.0 --port "$FLEET_PORT" --state-dir "$STATE_DIR")
+    sleep 2
+  fi
+
+  # 2. A fresh registration code for the fixture apartment/device, written
+  #    to agent-registration.json under this script's own state dir on
+  #    the HOST side first -- never directly into the VM's read-only
+  #    mount of the repository checkout.
+  local registration_file="$STATE_DIR/agent-registration.json"
+  (cd "$REPO_ROOT" && python3 -m tools.mac_test_vm.fleet_local enroll \
+    --fleet-address "https://host.lima.internal:$FLEET_PORT" \
+    --state-dir "$STATE_DIR" \
+    --output "$registration_file")
+
+  # 3. Copy it into the VM's boot-partition stand-in
+  #    (image/common/install.sh already created
+  #    /boot/firmware/agent-registration.json there as the empty
+  #    template at VM creation time -- this overwrites it with the real
+  #    one, exactly like tools/flash_image.py does for a real device).
+  limactl copy "$registration_file" "$VM_NAME:/tmp/agent-registration.json"
+  limactl shell "$VM_NAME" -- sudo install -m 0644 /tmp/agent-registration.json \
+    /boot/firmware/agent-registration.json
+
+  # 3b. Install the local fleet's CA certificate into the VM's trust
+  #     store. Required, not optional: agent/transport.py's
+  #     build_client never relaxes ordinary TLS verification, even with
+  #     a matching pin (section 4) -- a plain self-signed leaf with no
+  #     trusted issuer fails CERTIFICATE_VERIFY_FAILED outright (found by
+  #     actually running this end to end). ca-certificates
+  #     (image/common/packages.txt) is already installed by
+  #     install.sh, so update-ca-certificates always exists here.
+  limactl copy "$STATE_DIR/fleet-ca.pem" "$VM_NAME:/tmp/thermoctl-test-fleet-ca.pem"
+  limactl shell "$VM_NAME" -- sudo bash -c \
+    'install -m 0644 /tmp/thermoctl-test-fleet-ca.pem \
+       /usr/local/share/ca-certificates/thermoctl-test-fleet-ca.crt && \
+     update-ca-certificates'
+
+  # 4. Build the agent image INSIDE the VM, from the mounted checkout --
+  #    never on the Mac host and pushed in, so this is a genuine same-
+  #    architecture build matching what `image/pi/` ships (section 19.3's
+  #    "preloaded" image, just built locally instead of pulled).
+  echo "tools/mac-test-vm: building thermoctl-agent:local inside the VM ..." >&2
+  limactl shell "$VM_NAME" -- bash -c \
+    "cd /thermoctl-fleet && sudo docker build -f docker/Dockerfile.agent -t thermoctl-agent:local ."
+
+  # 5. Register -- `agent.registration.register` (agent/registration.py)
+  #    deliberately BLOCKS, polling the fleet, until a human confirms the
+  #    device in the fleet UI (section 15.3 step 3 -- "only this
+  #    confirmation releases the configuration", enforced by the real
+  #    agent code, not worked around here). Launched **detached**
+  #    (`docker run -d`, no `--rm`) for exactly that reason: this script
+  #    must not itself block for however long a human takes to open the
+  #    UI and click confirm. Run `tools/mac-test-vm finish` once that
+  #    confirmation has happened.
+  limactl shell "$VM_NAME" -- sudo docker rm -f thermoctl-agent-register >/dev/null 2>&1 || true
+  # The CA bundle mount: the container is `python:3.13-slim`'s own
+  # filesystem, entirely separate from the VM host's -- running
+  # `update-ca-certificates` on the VM host (step 3b above) does not, by
+  # itself, make the already-built image trust that CA too. Mounted at
+  # /usr/lib/ssl/cert.pem specifically, not /etc/ssl/certs/ca-
+  # certificates.crt -- `python3 -c "import ssl;
+  # print(ssl.get_default_verify_paths())"` run inside this exact image
+  # is what this value comes from, found by actually running this, not
+  # guessed. The one change this test tool makes beyond what a real
+  # device's agent container ever needs (a real deployment's CA is a
+  # publicly trusted one, already in every image's default bundle).
+  limactl shell "$VM_NAME" -- sudo docker run -d --name thermoctl-agent-register \
+    -v /boot/firmware/agent-registration.json:/boot/firmware/agent-registration.json:ro \
+    -v /var/lib/thermoctl-agent:/var/lib/thermoctl-agent \
+    -v /etc/ssl/certs/ca-certificates.crt:/usr/lib/ssl/cert.pem:ro \
+    thermoctl-agent:local python -m agent register
+
+  # Give it a moment to log its own verification code (agent/registration
+  # .py's `register`: "Registered, waiting for assignment ... Verification
+  # code: ...") before printing the next-steps message below.
+  sleep 3
+  local verification_line
+  verification_line="$(limactl shell "$VM_NAME" -- sudo docker logs thermoctl-agent-register 2>&1 \
+    | grep -i "verification code" || true)"
+
+  cat <<EOF
+
+tools/mac-test-vm: registration submitted, waiting for confirmation in the
+fleet UI (the agent container is polling in the background -- this does
+NOT block, unlike the agent's own registration code, which deliberately
+does: section 15.3 step 3).
+${verification_line:+$verification_line}
+
+Confirm the device:
+  1. Open https://127.0.0.1:$FLEET_PORT/ui/inventory in your browser
+     (accept the self-signed certificate warning once -- its fingerprint
+     was printed above by 'serve'/'enroll'; compare it if in doubt).
+  2. Log in (see docs/STATUS.md for how to create a first UI account in
+     this scaffold, e.g. 'python -m fleet.admin create-user').
+  3. The device '$TEST_DEVICE_ID' should show up under 'Bestätigen'
+     (P4.2) -- 'tools/mac-test-vm logs' shows the agent's own output,
+     including the line above if it is not showing yet.
+  4. Confirm it there; the agent's own blocking poll then receives its
+     token and the registration container exits 0.
+  5. Run 'tools/mac-test-vm finish' to start the agent's actual
+     command/heartbeat loop with that token.
+EOF
+}
+
+cmd_finish() {
+  require_limactl
+  # Idempotent: a second `finish` (e.g. after restarting the agent
+  # container by hand) must not refuse just because the one-shot
+  # registration container from the first `finish` already removed
+  # itself -- checked first, before the registration-container gate
+  # below.
+  if limactl shell "$VM_NAME" -- sudo docker inspect thermoctl-agent >/dev/null 2>&1; then
+    echo "tools/mac-test-vm: agent container already exists -- recreating it." >&2
+  else
+    local register_status
+    register_status="$(limactl shell "$VM_NAME" -- sudo docker inspect \
+      -f '{{.State.ExitCode}}' thermoctl-agent-register 2>/dev/null || echo "")"
+    if [ "$register_status" != "0" ]; then
+      echo "tools/mac-test-vm: registration has not completed yet (confirm the device in" >&2
+      echo "the fleet UI first -- 'tools/mac-test-vm enroll' printed how)." >&2
+      exit 1
+    fi
+  fi
+  limactl shell "$VM_NAME" -- sudo docker rm -f thermoctl-agent-register thermoctl-agent \
+    >/dev/null 2>&1 || true
+
+  # Start the agent container via the TEST-VM-ONLY compose override
+  # (tools/mac-test-vm.agent-compose.local.yml) -- see that file's own
+  # comment for exactly how and why it differs from the real
+  # /etc/thermoctl-agent/compose.yml the image ships.
+  limactl copy "$SCRIPT_DIR/mac-test-vm.agent-compose.local.yml" \
+    "$VM_NAME:/tmp/agent-compose.local.yml"
+  limactl shell "$VM_NAME" -- sudo docker compose \
+    --env-file /etc/thermoctl-agent/.env \
+    -f /tmp/agent-compose.local.yml up -d
+  echo "tools/mac-test-vm: agent started -- 'tools/mac-test-vm logs' to follow it."
+}
+
+main() {
+  if [ $# -eq 0 ]; then
+    usage
+    exit 1
+  fi
+  local command="$1"
+  shift
+  case "$command" in
+    create) cmd_create "$@" ;;
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    delete) cmd_delete "$@" ;;
+    status) cmd_status "$@" ;;
+    enroll) cmd_enroll "$@" ;;
+    finish) cmd_finish "$@" ;;
+    logs) cmd_logs "$@" ;;
+    ssh) cmd_ssh "$@" ;;
+    -h | --help) usage ;;
+    *)
+      echo "tools/mac-test-vm: unknown command: $command" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

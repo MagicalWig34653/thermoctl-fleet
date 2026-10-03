@@ -67,6 +67,27 @@ Entirely missing:
   only a comment there, no build run.
 
 A full pi-gen run takes 30-60 minutes depending on the runner and, per the
-task, does **not** belong in every commit --
-`.github/workflows/image.yml` for now only checks that the configuration
-is plausible for such a run.
+task, does **not** belong in every commit -- `.github/workflows/image.yml`
+checks that the configuration is plausible for such a run on every commit,
+and only runs the real pi-gen build above on a `v*` tag.
+
+## Update: the custom stage now exists
+
+[`pi-gen-stage/01-thermoctl/00-run.sh`](pi-gen-stage/01-thermoctl/00-run.sh)
+is the custom stage listed as missing above -- it applies
+[`../common/install.sh`](../common/install.sh) (the same script
+[`../x86/`](../x86/) and
+[`../../tools/mac-test-vm`](../../tools/mac-test-vm) use) inside the
+pi-gen chroot via pi-gen's own `on_chroot` helper, after
+`.github/workflows/image.yml`'s `build-watchdog-binaries` job has already
+cross-compiled the three watchdog binaries for arm64 (pi-gen's chroot has
+no network access of its own to fetch a Go toolchain or build anything).
+**Not run end to end in this development sandbox** (pi-gen needs
+privileged loop-device/QEMU-user-mode access a macOS worktree does not
+have) -- validated with `shellcheck` and `actionlint`
+(`.github/workflows/image.yml`) and by reviewing it against pi-gen's own
+documented stage layout instead. `install.sh` itself, including the exact
+watchdog-binary cross-compile step this stage relies on, **was** run for
+real end to end on this machine, inside a Lima VM
+(`tools/mac-test-vm`) -- see that tool's own section in
+`../README.md` and this task's final report for what that confirmed.

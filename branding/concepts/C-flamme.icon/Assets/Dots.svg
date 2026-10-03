@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- The fleet: six small dots evenly spaced on a ring around the flame,
+       well clear of the glyph so they stay distinct even at 32px. -->
+  <g fill="#ffffff" fill-opacity="0.75">
+    <circle cx="512" cy="212" r="38" />
+    <circle cx="772" cy="362" r="38" />
+    <circle cx="772" cy="662" r="38" />
+    <circle cx="512" cy="812" r="38" />
+    <circle cx="252" cy="662" r="38" />
+    <circle cx="252" cy="362" r="38" />
+  </g>
+</svg>
