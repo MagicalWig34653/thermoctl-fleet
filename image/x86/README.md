@@ -67,3 +67,24 @@ Entirely missing:
 - the EFI boot partition and bootloader configuration,
 - preloading the agent container image,
 - compression, checksumming, connection to `v*` tags -- as with `image/pi/`.
+
+## Update: mkosi over debos, and why
+
+[`mkosi.conf`](mkosi.conf) + [`mkosi.postinst`](mkosi.postinst) now exist,
+decided for `mkosi` over `debos`: this repository's one bare-metal
+component (the watchdog) is driven entirely by systemd units, and `mkosi`
+is itself a systemd-upstream project with first-class support for the same
+boot/partition conventions systemd-boot expects -- `debos` has no
+particular alignment with systemd beyond being able to debootstrap a
+chroot. `mkosi.postinst` runs `../common/install.sh --root /` inside the
+finished chroot, exactly like `image/pi/`'s custom stage and
+`tools/mac-test-vm` all three do with the same script, with the three
+watchdog binaries placed at `watchdog-bin/` beforehand by
+`.github/workflows/image.yml`'s `build-watchdog-binaries` job (amd64).
+**Not run end to end in this development sandbox** (needs a Linux
+loop-device/systemd-nspawn environment a macOS worktree does not have) --
+validated with `actionlint` (the workflow invoking it) and reviewed
+against mkosi's own documented CLI and script-discovery convention
+instead. `install.sh` itself **was** run for real end to end on this
+machine, inside a Lima VM (`tools/mac-test-vm`) -- see `../README.md`'s
+usage section and this task's final report.

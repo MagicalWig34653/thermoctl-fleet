@@ -1,0 +1,24 @@
+#!/bin/bash -e
+# mkosi finalize/postinst script (section 19.4) -- runs chrooted into the
+# finished amd64 rootfs, so `/` here already is that rootfs. mkosi
+# discovers and runs this script automatically by filename, no entry in
+# mkosi.conf needed.
+#
+# The three watchdog binaries must already exist at
+# image/x86/watchdog-bin/thermoctl-{watchdog,leds,restore-mover}, placed
+# there by .github/workflows/image.yml before `mkosi build` runs (built by
+# that workflow's own build-watchdog-binaries job for linux/amd64) -- this
+# script has no way to reach outside the chroot to fetch or build them
+# itself.
+REPO_ROOT="$SRCDIR/.."
+
+install -d -m 0755 /usr/local/bin
+cp "$SRCDIR/watchdog-bin/thermoctl-watchdog" /usr/local/bin/
+cp "$SRCDIR/watchdog-bin/thermoctl-leds" /usr/local/bin/ 2>/dev/null || true
+cp "$SRCDIR/watchdog-bin/thermoctl-restore-mover" /usr/local/bin/
+chmod 0755 /usr/local/bin/thermoctl-watchdog /usr/local/bin/thermoctl-restore-mover
+
+# --skip-watchdog-build: binaries already placed above. --arch amd64: the
+# status-LED unit is deliberately not installed on this target
+# (image/x86/README.md -- no 40-pin header on a mini PC).
+bash "$REPO_ROOT/image/common/install.sh" --root / --arch amd64 --skip-watchdog-build
