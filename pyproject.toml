@@ -154,6 +154,13 @@ plugins = ["pydantic.mypy"]
 module = ["pyrage", "pyrage.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# `tools/docs_screenshots.py` only: Playwright and Pillow are installed ad
+# hoc to regenerate the website screenshots, not project dependencies --
+# CI and a plain dev install do not have them.
+module = ["playwright", "playwright.*", "PIL", "PIL.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --cov=protocol --cov=fleet --cov=agent --cov=tools --cov-report=term-missing"
