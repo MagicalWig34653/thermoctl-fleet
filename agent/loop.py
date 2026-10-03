@@ -1608,6 +1608,36 @@ def execute_command(
        `agent.commands_channel._classify`, section 18.2 -- it never reaches
        this function as a `Command` at all; see `_handle_rejected_command`.)
 
+    **At-most-once semantics, chosen deliberately (cross-review finding):**
+    `command.id` is recorded into `state.executed_ids` (durably, via
+    `_record_executed`'s own `save_agent_state` write) **before** the
+    handler runs, not after. Section 7 promises "executed at most once",
+    never "executed exactly once" -- the two are not the same guarantee,
+    and only the first is actually achievable without a transaction
+    spanning this process and whatever the handler just did to the system
+    (a Docker pull, an SSH session, a backup). Recording after the effect
+    (the previous shape of this function) left a window in which a crash
+    between the handler returning and the write landing on disk would lose
+    the dedup entry entirely -- a crash-looped agent, or a redelivery after
+    reconnect, could then run the *same* command again, including a second
+    `open_access` SSH session or a second `image_update` pull-and-restart.
+    Recording first closes that window the other way: a crash *during* the
+    handler (including a mid-effect `SystemExit`/`BaseException`, not just
+    an anticipated `Exception`) now means the command is simply never
+    retried on redelivery -- its id is already in `state.executed_ids`, so
+    the duplicate check above rejects it, silently, with no result ever
+    reported. That silence is intentional, not a regression: the cloud's
+    own command expiry (`command.expires_at`) is what notices an
+    unreported command and lets the operator retry with a fresh id if the
+    effect genuinely never completed; this function has no way to tell
+    "crashed before the effect" apart from "crashed after it" without a
+    mechanism the specification does not provide, and guessing wrong in
+    either direction would risk a double effect instead.
+    4. **Result reported, then the outcome logged locally** -- in that
+       order relative to step 3's `_record_executed`, not after it: the id
+       is already durable by the time the handler is even called, so there
+       is nothing left to protect by delaying this.
+
     Every branch above additionally appends to the apartment's **local**
     log (`ctx.local_log_path`, `_append_local_log`) -- section 7: "every
     command and every rejection lands in the apartment's local log, not
@@ -1642,6 +1672,11 @@ def execute_command(
             )
         )
 
+    # **Recorded before the handler runs** (cross-review finding) -- see
+    # this function's own docstring, "At-most-once semantics, chosen
+    # deliberately", for why durability has to come first, not last.
+    _record_executed(state, command.id, state_path)
+
     handler = _HANDLERS[command.command]
     start = time.monotonic()
     try:
@@ -1671,7 +1706,6 @@ def execute_command(
         )
     duration_s = time.monotonic() - start
 
-    _record_executed(state, command.id, state_path)
     outcome_text = (
         f"successful={handler_result.successful}"
         + (f", error={handler_result.error_text}" if handler_result.error_text else "")

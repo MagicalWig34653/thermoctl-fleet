@@ -1,6 +1,87 @@
 # Status
 
-Last updated: 2026-10-02.
+Last updated: 2026-10-03.
+
+## Codex full review findings 1, 6, 7: SSE bookmark ordering, record-before-
+## execute, restore-report retry (2026-10-03)
+
+Three durability findings in the agent, all variations on the same theme
+("don't let a crash between two writes lose or double-execute a command"
+-- section 7, "every command is executed at most once"):
+
+1. **`agent/commands_channel.py` (`_stream_once`): the SSE `Last-Event-ID`
+   bookmark was persisted as soon as an event came off the wire, before it
+   was ever `yield`ed to the caller.** Since `fleet.storage
+   .pending_commands` resumes a reconnect strictly *after* this bookmark
+   (sequence greater than, not greater-or-equal), persisting it early
+   meant a crash between that write and the caller actually finishing with
+   the item was **permanent loss** -- the next reconnect never asked for
+   that command again, and no later poll resurfaced it either. Fixed by
+   moving every `_write_last_event_id` call to the far side of its own
+   `yield` (for both a `Command`/`RejectedCommand` and a `desired_state`
+   `DesiredStateReceived` item) -- the write now only runs once the
+   caller's `for item in receive_commands(...):` body has returned and
+   comes back in for the next item, which is exactly the point at which
+   the previous item is known to be durably handled. The module's own
+   docstring (point 3) and the inline comments at each write site were
+   rewritten to state the new contract, not the old one.
+2. **`agent/loop.py` (`execute_command`): `command.id` used to be recorded
+   into `state.executed_ids` *after* the handler ran, not before.** A
+   crash between the handler's effect and that write would lose the dedup
+   entry, and a redelivered command could then run a second time --
+   exactly what section 7 rules out. Fixed by moving the
+   `_record_executed` call to before the handler is invoked (still after
+   the id-charset and duplicate/expiry checks, which are unaffected). The
+   chosen semantics -- documented directly in `execute_command`'s own
+   docstring now -- is "at most once", not "exactly once": a crash *during*
+   the handler (including a `SystemExit`/other `BaseException`, not only
+   the already-caught `Exception`) means the command is simply never
+   retried on redelivery (its id is already durable, so the duplicate
+   check above rejects the redelivery silently, with no result reported);
+   the cloud's own command expiry is what surfaces an unreported command
+   to the operator, not a second attempt by this agent guessing whether
+   the first one actually finished.
+3. **`agent/restore.py` (`_report_restore_result`): a failed
+   `POST /v1/restore/result` was logged and swallowed, but the one caller
+   that tracks "already reported" (`_check_and_report_mover_status`)
+   wrote its marker unconditionally anyway**, so a result lost to a
+   transient network failure was never retried -- the next poll cycle saw
+   the marker already matching that `backup_id` and skipped reporting
+   forever. Fixed by having `_report_restore_result` return whether the
+   POST actually succeeded (`bool`, was `None`), and writing the marker in
+   `_check_and_report_mover_status` only on `True`. `check_and_apply_pending
+   _restore`'s own call site (no marker involved there) is unaffected.
+
+**Tests** (`tests/test_agent_loop_execution.py`,
+`tests/test_agent_commands_channel.py`, `tests/test_agent_restore.py`):
+crash simulations at each of the three boundaries above --
+`execute_command` with a handler raising `SystemExit` (proving the id is
+durable on disk *before* the handler is even called, and that a
+redelivered id after such a crash does not re-invoke the handler);
+`_stream_once` driven as a bare generator across individual `next()`
+calls (not `list(...)`, which would hide the ordering under test),
+proving the bookmark is absent until the caller comes back for the next
+item, for both a plain `Command` and a `desired_state` event, and that
+`gen.close()` right after receiving an item without a further `next()`
+leaves the bookmark unmoved (simulated crash, no loss) while a completed
+item's bookmark does survive a fresh generator (simulated process
+restart); `_report_restore_result`'s own return value on a `204`, a
+non-2xx response, and a transport error; `_check_and_report_mover_status`
+not writing the marker on a failed POST and successfully retrying (and
+then writing the marker) on the next cycle. Two existing end-to-end tests
+in `tests/test_agent_commands_channel.py` encoded the old (now-incorrect)
+"bookmark advances as soon as an item is received" assumption and were
+rewritten to prove the new contract instead
+(`test_receive_commands_holds_an_sse_connection_and_receives_a_command`,
+renamed `test_receive_commands_last_event_id_resume_skips_only_items_the_
+caller_finished`) -- no other existing test anywhere in the suite assumed
+the old ordering.
+
+`.venv/bin/ruff check .`, `.venv/bin/mypy .`, and the whole suite via
+`.venv/bin/python -m pytest -q --no-cov` (coverage disabled only to get a
+clean pass/fail signal without the report tail) all pass clean; the whole
+suite was run three times with an identical dot count and exit code 0
+each time.
 
 ## P6.2 -- UI login hardening: TOTP encryption at rest + passkeys (WebAuthn)
 
