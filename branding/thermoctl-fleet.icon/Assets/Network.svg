@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Fleet motif: a thin arc of three small houses along the bottom edge,
+       well clear of the main house/thermometer glyph above, never
+       crossing it, even at small sizes. Bottom-most layer. -->
+  <path d="M 340 884 Q 512 824 684 884" fill="none" stroke="#ffffff" stroke-width="12"
+        stroke-linecap="round" opacity="0.55" />
+  <g fill="#ffffff" opacity="0.9">
+    <circle cx="340" cy="884" r="22" />
+    <circle cx="512" cy="852" r="26" />
+    <circle cx="684" cy="884" r="22" />
+  </g>
+</svg>

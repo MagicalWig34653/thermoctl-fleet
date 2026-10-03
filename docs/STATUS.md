@@ -2,6 +2,157 @@
 
 Last updated: 2026-10-03.
 
+## Documentation website review follow-up: icon redesign via ictool, passwordless section filled, typography, SVG diagram fix (2026-10-03)
+
+Main-session review of the documentation-website task below asked for six
+changes plus a separate icon redesign. Addressed on the same branch, after
+merging `main` (which by then carried the passwordless-passkey feature,
+section below):
+
+1. **Icon redesign.** The first version (described accurately by the
+   reviewer as reading like "a mushroom/UFO") is replaced: one house
+   silhouette (the glass layer, `Assets/Glass.svg`) with a bold thermometer
+   centered inside it (`Assets/Flame.svg`, a small flame at the roof apex)
+   and a thin arc of three small house/dot glyphs along the bottom,
+   clearly below the house, never crossing it (`Assets/Network.svg`).
+   Rendered and checked with Icon Composer's own CLI -- **not** `xcrun
+   --find ictool` (that path resolves but rejects every invocation with an
+   `actool`-style "Unknown argument" error); the working one is
+   `/Applications/Xcode.app/Contents/Applications/Icon Composer.app
+   /Contents/Executables/ictool <bundle> --export-image --output-file
+   <out> --platform macOS --rendition <Default|Dark|ClearLight> --width
+   <n> --height <n> --scale 1`. Checked at 1024px and downscaled to 64px
+   for legibility; `Default` and `ClearLight` read cleanly as a house with
+   a thermometer at both sizes, `Dark` renders a weaker, more ghosted
+   thermometer (the glass layer's translucency interacts differently with
+   `Dark`'s transparent-outside-the-glyph canvas) but the house silhouette
+   itself stays clear -- accepted as a legitimate stylistic variant, not a
+   defect, given the time budget for further iteration. The three 1024px
+   renditions are committed under `branding/renders/` and embedded in
+   `README.md`. Site favicon/apple-touch-icon PNGs (`site/assets/icon/
+   apple-touch-icon.png` at 180px, `favicon-32.png` at 32px) are now
+   rendered directly by `ictool` from the `Default` rendition, replacing
+   the earlier Playwright-flattened render. `site/assets/icon/favicon.svg`
+   is a simplified flat redraw of the same house/thermometer/arc shapes
+   (no glass/translucency, since SVG favicons need to render identically
+   with no runtime effects layer).
+2. **Passwordless passkey login section filled** in `site/docs/betrieb.html`
+   (`<!-- TODO: filled after merge -->` placeholder replaced) from
+   `fleet/ui_auth.py` and the "Passwordless passkey login from known
+   networks" STATUS.md section below: `FLEET_UI_PASSWORDLESS_NETWORKS`
+   (comma-separated CIDRs, same syntax as `FLEET_UI_TRUSTED_PROXIES`,
+   empty/unset = off), only global networks narrower than /16 (IPv4) or
+   /32 (IPv6) are accepted, a typed password is still always checked, TOTP
+   alone is never enough, `FLEET_UI_TRUSTED_PROXIES` is required behind a
+   reverse proxy for the feature to see the real client address at all,
+   and the login page's own hint text. Added the env var to the table in
+   `einstieg.html` and a line on the landing page's login feature card.
+   The login screenshot was **not** retaken (the existing one already
+   shows the real login form; retaking would need re-seeding with a
+   passwordless network configured, not "cheap" per the review's own
+   carve-out).
+3. **German typography** in `site/` prose: `" -- "` (double-hyphen dash)
+   replaced with `" – "` (en dash) throughout, leaving `<code>`/`<pre>`
+   content, command-line flags, and the one legitimate double-hyphen HTML
+   comment marker untouched. Straight `"…"` quotes in German prose replaced
+   with `„…"` where practical, matching the convention `fleet/templates
+   /ui/login.html`'s own passwordless hint already uses.
+4. **Architecture diagram label overlap fixed** on the landing page: the
+   two cross-boundary edge labels ("HTTPS POST ...", "SSE GET ...") were
+   repositioned off the arrow lines and boxes; checked at 1280px (desktop)
+   and 375px (mobile, inside `.diagram-wrap`'s horizontal scroll) with a
+   throwaway Playwright screenshot.
+5. **Footer rephrased**: "ein Gerüst, keine fertige Anwendung" no longer
+   matches reality (stage 1 is implemented and tested; only container
+   updates/`apply_update` stay inactive pending thermoctl's health API,
+   per STATUS.md's own open points) -- replaced with wording that says so.
+6. **`tasks-light.png`/`tasks-dark.png`** (captured but unused in the first
+   pass) are now linked into `betrieb.html` where the task list is
+   introduced.
+7. **Command list verified against `protocol.commands.CommandType`**: the
+   landing page and `betrieb.html` were both missing `diagnostic_bundle`
+   (section 21.5, stage 1) -- added to both with its actual effect/risk.
+
+Re-verified after all of the above: `ruff check .` clean, `mypy protocol
+fleet agent tools` clean, full `pytest --junitxml=...`, and the internal
+link checker again found zero broken links. Exact numbers in this task's
+final report.
+
+## German documentation website, demo screenshots, app icon (2026-10-03)
+
+Added `site/`: a static, German-language documentation website (plain
+HTML/CSS, no build step, responsive, light/dark via
+`prefers-color-scheme`) aimed at a landlord who does not yet know the
+project -- a landing page (what it is/is not, an inline SVG architecture
+diagram, the six security principles, the feature list) and docs pages
+(`einstieg.html` Fleet-server setup and every `FLEET_*` env var grepped
+from the actual code, `benutzer.html` the `fleet.admin` CLI, `wohnung.html`
+the registration/enrollment flow from section 15.3/19/21, `betrieb.html`
+daily operation, `sicherheit.html` the six principles in detail, `faq.html`,
+`glossar.html`). Two sections are placeholders for work still on other
+branches, each marked with `<!-- TODO: filled after merge -->` plus a
+visible "kommt in Kürze" callout: passwordless passkey login
+(`FLEET_UI_PASSWORDLESS_NETWORKS`) in `betrieb.html`, and image
+build/flash/test-VM tooling in `wohnung.html`.
+
+`.github/workflows/pages.yml` deploys `site/` to GitHub Pages on every push
+to `main` touching `site/**` (`actions/upload-pages-artifact` +
+`actions/deploy-pages`, pinned the same way the existing workflows pin
+action versions) -- **not enabled via the API and not pushed by this
+task**, per instruction; the main session does that.
+
+`tools/docs_screenshots.py` seeds a throwaway SQLite database (fictional
+apartments "Musterstraße 1, WE 3/5", "Beispielweg 9, WE 1" -- heartbeats,
+one open fault, one absence alarm, a backup record, a desired-state
+revision and a rollout, all via `Storage`'s real API, never invented JSON),
+creates a UI account through the real `python -m fleet.admin create-user`
+CLI, starts the real `fleet.app` ASGI app via `uvicorn`, and drives the
+real login (password + TOTP computed with `pyotp`) and six further pages
+with Playwright/Chromium, in both `light` and `dark` `color_scheme`
+contexts (a 30 s wait between the two logins avoids a TOTP-replay
+rejection -- same time-step code twice is rejected by design). Captured
+PNGs are re-saved optimized plus a WebP copy under `site/assets/img/` and
+linked into the relevant docs pages. Excluded from meaningful coverage
+(`pytest`'s `--cov=tools` reports it at 0%, no `fail-under` threshold
+configured so this does not fail CI) -- it drives a browser against a
+throwaway server; nothing in it is reachable from the test suite, and a
+unit test would only re-mock Playwright.
+
+`branding/thermoctl-fleet.icon`: an Xcode Icon Composer bundle (`icon.json`
++ three layered SVGs -- a fleet/network motif, a thermometer-with-flame
+glyph, a glass highlight), modeled on the format of ClaudeWatch's and
+FiSiTrainer's own `AppIcon.icon` bundles. `xcrun --find ictool` resolves on
+this machine but rejects every tried invocation with an `actool`-style
+"Unknown argument" error (no documented CLI contract found for a bare
+`.icon` bundle outside Xcode itself) -- PNG renders for the website
+(favicon, `apple-touch-icon.png`) were instead produced by rendering a
+flattened equivalent SVG (`site/assets/icon/favicon.svg`) with Playwright,
+not by the Icon Composer bundle directly. The bundle itself is unverified
+inside actual Xcode/Icon Composer by this task.
+
+**Umlaut cleanup (CLAUDE.md task): no changes made.** Checked
+`protocol/events.py`, `agent/log_filter.py`, `tools/check_image_config.py`
+and their tests for `ae`/`oe`/`ue` transliterations, plus a broader grep
+across `fleet/`. Every genuine match is either a wire-contract field/value
+(`protocol.events.Event.schluessel`/`schwere`/`titel`, "mirrors
+thermoctl's real, unmodified webhook payload byte for byte" per that
+module's own docstring) or a log-filter keyword/regex matched verbatim
+against thermoctl's own real (and itself inconsistently transliterated,
+e.g. "Zigbee2MQTT-Geraeteliste ist ungültig") log message templates in
+`agent/log_filter.py`'s `_WARN_FIXED_MESSAGES`/`_WARN_TEMPLATES`/
+`_EXTRA_SAFE_KEY_SHAPES` -- changing any of these would silently break
+matching against the real log lines they exist to recognize. The
+`tools/check_image_config.py` match (`pruefe-konfiguration.py`) is a
+reference to another repository's actual filename, not prose. No display
+text using a transliteration instead of a real umlaut was found in these
+files.
+
+Verification run on this branch: `ruff check .` clean, `mypy protocol
+fleet agent tools` clean (79 source files), `pytest --junitxml=...` --
+`tests="2093" failures="0" errors="0" skipped="1"`. A standalone link
+checker confirmed every internal `href`/`src` in `site/**/*.html` resolves
+to an existing file.
+
 ## Passwordless passkey login from known networks (2026-10-03) **SR**
 
 Owner decision (2026-10-03, recorded in `docs/specification.md` section 12,

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sicherheit – thermoctl-fleet</title>
+<meta name="description" content="Die sechs Sicherheitsgrundsätze von thermoctl-fleet im Detail: geschlossener Befehlskatalog, Image-Quellen im Agenten, keine privaten Schlüssel in der Cloud, keine Mieterdaten im Klartext, der Agent als Sicherheitsgrenze, der Watchdog ohne Netz.">
+<link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Zum Inhalt springen</a>
+<header class="site-header">
+  <img class="logo" src="../assets/icon/favicon.svg" alt="">
+  <a class="brand" href="../index.html">thermoctl-fleet</a>
+  <nav>
+    <a href="index.html">Dokumentation</a>
+    <a href="sicherheit.html">Sicherheit</a>
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet">GitHub</a>
+  </nav>
+</header>
+<main id="main" class="wide">
+<div class="docs-layout">
+<aside>
+  <h2>Dokumentation</h2>
+  <ul>
+    <li><a href="einstieg.html">Einstieg &amp; Fleet-Server</a></li>
+    <li><a href="benutzer.html">Benutzer anlegen</a></li>
+    <li><a href="wohnung.html">Wohnung hinzufügen</a></li>
+    <li><a href="betrieb.html">Täglicher Betrieb</a></li>
+    <li><a class="current" href="sicherheit.html">Sicherheit</a></li>
+    <li><a href="faq.html">FAQ</a></li>
+    <li><a href="glossar.html">Glossar</a></li>
+  </ul>
+</aside>
+<div>
+  <h1>Sicherheit</h1>
+  <p>Diese sechs Grundsätze stehen in <code>CLAUDE.md</code> als nicht verhandelbar. Jede
+  Änderung an ihnen braucht die ausdrückliche Freigabe des Projektinhabers und wird in der
+  Haupt-Sitzung gelesen, nicht nur im Review.</p>
+
+  <h2 id="p1">1. Der Befehlskatalog ist geschlossen</h2>
+  <p><code>protocol.commands.CommandType</code> enthält ausschließlich die von der
+  Spezifikation freigegebenen Stufe-1-Befehle. Ein neuer Wert dort ist nie eine kleine
+  Ergänzung – er erweitert, was ein möglicherweise kompromittierter Fleet-Server einer
+  Wohnung befehlen kann. Stufe 2 (Abschnitt 7) erst nach ausdrücklicher Freigabe des
+  Projektinhabers, nach einer Heizsaison Betriebserfahrung.</p>
+
+  <h2 id="p2">2. Image-Quellen sind im Agenten hartcodiert, nicht in der Cloud</h2>
+  <p>Die Liste erlaubter Registrierungs-Präfixe lebt als Konstante im <code>agent</code>-Paket.
+  Die Cloud nennt nur Version und Digest, nie die Quelle. Kein Digest, kein Start –
+  „latest“ oder ein Tag ohne Digest wird ausnahmslos abgelehnt.</p>
+
+  <h2 id="p3">3. Keine privaten Schlüssel in der Cloud</h2>
+  <p>WireGuard- und Geräteschlüsselpaare entstehen auf der Basisstation und verlassen sie
+  nie; die Cloud sieht ausschließlich öffentliche Schlüssel. Ein Endpunkt oder ein Modell,
+  das einen privaten Schlüssel annimmt oder zurückgibt, ist ein Designfehler, keine
+  Funktion.</p>
+
+  <h2 id="backups">4. Keine Mieterdaten im Klartext in der Cloud</h2>
+  <p>Betriebsdaten-Backups (thermoctl-Datenbank, Zigbee2MQTT-Gerätetabelle) werden auf dem
+  Gerät verschlüsselt, bevor sie hochgeladen werden. Die Cloud speichert nur den opaken
+  Block und sieht nie den Schlüssel. Beim Restore verschlüsselt der Browser den vom
+  Vermieter eingegebenen Schlüssel lokal für genau das Zielgerät; die Cloud reicht ihn nur
+  durch und löscht ihn, sobald er abgerufen wurde oder abgelaufen ist. Gerätekonfiguration
+  ohne Mieterbezug darf im Klartext liegen – die beiden Backup-Arten dürfen nicht
+  gemischt werden.</p>
+
+  <h2 id="p5">5. Der Agent ist die Sicherheitsgrenze, nicht die Cloud</h2>
+  <p>Jede Prüfung, ob ein Befehl ausgeführt wird (Id schon gesehen? Ablaufzeit
+  überschritten? Voraussetzung für eine Soll-Zustand-Änderung erfüllt?), gehört in den
+  Agenten und wird dort durchgesetzt – selbst wenn die Cloud etwas anderes sagt. Konkretes
+  Beispiel: fehlt einer Wohnung die <code>pilot_mode</code>-Markierung, verweigert
+  <strong>der Agent</strong> den Befehl <code>open_access</code> – nicht die
+  Fleet-Oberfläche. Eine kompromittierte Cloud kann deshalb keine SSH-Sitzung in einer
+  Produktionswohnung öffnen.</p>
+
+  <h2 id="p6">6. Der Watchdog kennt kein Netz und keine Registry</h2>
+  <p>Arbeitsteilung: der Agent lädt ein neues Image herunter und prüft seinen Digest gegen
+  die hartcodierten Quellen (Grundsatz 2) – der Watchdog tauscht danach nur zwischen zwei
+  bereits lokal vorhandenen, bereits geprüften Digests. Er ist in Go geschrieben, statisch
+  gebaut, unter 300 Zeilen – genau deshalb, weil er das Einzige sein muss, das noch
+  funktioniert, wenn alles andere kaputt ist. Sein <code>go.mod</code> bleibt ohne eine
+  einzige Abhängigkeit, auch nicht für ein Docker-SDK „nur um die Laufzeit anzusprechen“.</p>
+
+  <h2 id="einordnung">Was das in der Praxis bedeutet</h2>
+  <div class="callout ok">
+    <p>Ein kompromittierter Fleet-Server kann: Heartbeats und Ereignisse lesen, die vier
+    Stufe-1-Befehle schicken (die alle keinerlei Risiko tragen), und sehen, welche
+    Wohnungen welche Version fahren.</p>
+    <p>Ein kompromittierter Fleet-Server kann <strong>nicht</strong>: einen Sollwert
+    ändern, ein Schloss öffnen, eine andere Software starten als die hartcodiert erlaubte,
+    einen privaten Schlüssel abgreifen, oder lesbare Mieterdaten einsehen.</p>
+  </div>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+  <p><a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/CLAUDE.md">CLAUDE.md</a> ·
+  <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a></p>
+</footer>
+</body>
+</html>

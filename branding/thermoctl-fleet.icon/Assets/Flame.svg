@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Bold, simple thermometer with a small flame on top: the "heating
+       overview" motif, centered inside the house glyph above it. Sized to
+       read cleanly at 32px: thick stem, large bulb, no fine detail. -->
+  <g fill="#ffffff">
+    <rect x="462" y="420" width="100" height="260" rx="50" />
+    <circle cx="512" cy="700" r="100" />
+  </g>
+  <path d="M512 330 C470 290 464 250 498 215 C490 252 516 266 516 296
+           C540 272 540 244 522 215 C566 250 566 296 532 330 Z" fill="#ffffff" />
+</svg>

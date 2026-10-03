@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>thermoctl-fleet – Überblick für Vermieter</title>
+<meta name="description" content="thermoctl-fleet ist der Überblick des Vermieters über alle Wohnungen: Heartbeat, Störungsmeldungen, Alarm bei Ausbleiben, ein kurzer geschlossener Befehlskatalog. Keine zweite Steuerung, kein Datensammler.">
+<link rel="icon" href="assets/icon/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/icon/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="assets/icon/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Zum Inhalt springen</a>
+<header class="site-header">
+  <img class="logo" src="assets/icon/favicon.svg" alt="">
+  <a class="brand" href="index.html">thermoctl-fleet</a>
+  <nav>
+    <a href="docs/index.html">Dokumentation</a>
+    <a href="docs/sicherheit.html">Sicherheit</a>
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet">GitHub</a>
+  </nav>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <img class="hero-icon" src="assets/icon/favicon.svg" alt="">
+    <h1>Der Überblick über alle Wohnungen – ohne die zweite Steuerung zu werden</h1>
+    <p class="lead">
+      thermoctl-fleet ist ein kleiner Cloud-Dienst für Vermieter mit mehreren
+      <a href="https://github.com/MagicalWig34653/thermoctl">thermoctl</a>-Installationen:
+      er empfängt von jeder Wohnung einen Herzschlag mit Gesundheitsdaten, sammelt
+      Störungen, schlägt Alarm beim <strong>Ausbleiben</strong> einer Meldung – und kann
+      einer Wohnung einen kurzen, geschlossenen Katalog von Wartungsbefehlen schicken.
+    </p>
+    <div class="cta-row">
+      <a class="btn primary" href="docs/einstieg.html">Dokumentation starten</a>
+      <a class="btn secondary" href="docs/sicherheit.html">Sicherheitsmodell lesen</a>
+    </div>
+  </section>
+
+  <h2 id="ist-nicht">Was das hier nicht ist</h2>
+  <p>
+    Diese drei Sätze stehen nicht nebenbei im Dokument – sie sind in der
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a>
+    (Abschnitte 1 und 6) bewusst und unwiderruflich festgelegt:
+  </p>
+  <div class="callout not">
+    <p><strong>Keine zweite Steuerung.</strong> Sollwerte, Zeitpläne, Frostschutz und
+    Scharfschaltung bleiben in der Wohnung. Die Cloud kann sie nicht ändern – nicht
+    „derzeit nicht geplant“, sondern: den Befehl dafür gibt es schlicht nicht, und er wird
+    nicht ohne ausdrückliche Freigabe des Projektinhabers nachgerüstet.</p>
+    <p><strong>Kein Datensammler.</strong> Raumtemperaturen, Sollwerte, Zeitpläne,
+    Abwesenheitszeiten sowie Mieternamen und Kontaktdaten werden nicht übertragen
+    (Abschnitt 6). Was der Betrieb braucht, sind Gesundheitsdaten – kein Verhaltensprofil.</p>
+    <p><strong>Kein Ersatz für die Wohnungsansicht.</strong> Der Mieter sieht die Cloud nie.
+    Er bedient weiterhin ausschließlich seine eigene thermoctl-Instanz.</p>
+  </div>
+  <p>
+    Die Begründung dahinter: ein kompromittierter Fleet-Server, der nur zusehen kann, ist
+    ein Datenschutzvorfall. Einer, der auch schalten kann, sind zwölf kalte oder
+    überhitzte Wohnungen gleichzeitig. Diese Reihenfolge lässt sich später nicht
+    umkehren, deshalb steht sie von Anfang an fest.
+  </p>
+
+  <h2 id="architektur">Wie die Teile zusammenspielen</h2>
+  <p>
+    Vier Bausteine, jeder mit genau einer Aufgabe. Die Wohnung spricht die Cloud nur über
+    den Agenten an – nie direkt, und nur nach außen (keine Portweiterleitung im
+    Mieter-Router nötig).
+  </p>
+  <div class="diagram-wrap">
+    <svg viewBox="0 0 1150 460" xmlns="http://www.w3.org/2000/svg" role="img"
+         aria-label="Architekturdiagramm: thermoctl und Zigbee2MQTT in der Wohnung sprechen lokal mit dem Agenten; der Agent sendet per HTTPS einen Heartbeat an den Fleet-Dienst in der Cloud und hält eine SSE-Verbindung für Befehle offen; der Watchdog läuft neben dem Agenten auf dem bloßen System und tauscht Container anhand lokal bereits geprüfter Digests.">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+        </marker>
+        <style>
+          .box { fill: var(--bg-elevated, #fff); stroke: var(--border, #ccc); stroke-width: 1.5; rx: 10; }
+          .lbl { font: 600 15px -apple-system, sans-serif; fill: var(--text, #111); }
+          .sub { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); }
+          .edge { stroke: var(--accent-2, #21609b); stroke-width: 2; fill: none; marker-end: url(#arrow); color: var(--accent-2, #21609b); }
+          .edge2 { stroke: var(--accent, #c25a1a); stroke-width: 2; fill: none; marker-end: url(#arrow); color: var(--accent, #c25a1a); }
+          .edgelbl { font: 12px -apple-system, sans-serif; fill: var(--text-muted, #666); text-anchor: middle; }
+          .frame { fill: none; stroke: var(--border, #ccc); stroke-width: 1; stroke-dasharray: 5 4; }
+          .framelbl { font: 700 12px -apple-system, sans-serif; fill: var(--text-muted, #666); letter-spacing: .04em; text-transform: uppercase; }
+        </style>
+      </defs>
+
+      <!-- Apartment frame -->
+      <rect class="frame" x="20" y="20" width="430" height="420" rx="14"/>
+      <text class="framelbl" x="36" y="44">Wohnung / Basisstation</text>
+
+      <rect class="box" x="50" y="70" width="170" height="60" rx="10"/>
+      <text class="lbl" x="60" y="95">thermoctl</text>
+      <text class="sub" x="60" y="114">lokale REST-API, read-only</text>
+
+      <rect class="box" x="250" y="70" width="170" height="60" rx="10"/>
+      <text class="lbl" x="260" y="95">Zigbee2MQTT</text>
+      <text class="sub" x="260" y="114">+ Mosquitto, nur lokal</text>
+
+      <rect class="box" x="150" y="190" width="200" height="70" rx="10"/>
+      <text class="lbl" x="162" y="217">Agent</text>
+      <text class="sub" x="162" y="236">einzige Verbindung nach außen</text>
+      <text class="sub" x="162" y="251">read-only Token in thermoctl</text>
+
+      <rect class="box" x="150" y="320" width="200" height="80" rx="10"/>
+      <text class="lbl" x="162" y="347">Watchdog</text>
+      <text class="sub" x="162" y="366">Go, ohne Abhängigkeiten</text>
+      <text class="sub" x="162" y="381">kennt kein Netz, keine Registry</text>
+      <text class="sub" x="162" y="396">tauscht nur lokal geprüfte Images</text>
+
+      <line class="edge" x1="135" y1="130" x2="200" y2="190"/>
+      <line class="edge" x1="335" y1="130" x2="280" y2="190"/>
+      <line class="edge" x1="250" y1="260" x2="250" y2="320"/>
+      <text class="edgelbl" x="256" y="296" text-anchor="start">geprüfte Digests</text>
+
+      <!-- Cloud frame -->
+      <rect class="frame" x="700" y="20" width="430" height="420" rx="14"/>
+      <text class="framelbl" x="716" y="44">Cloud (Vermieter)</text>
+
+      <rect class="box" x="730" y="90" width="370" height="60" rx="10"/>
+      <text class="lbl" x="742" y="115">Fleet-Dienst</text>
+      <text class="sub" x="742" y="134">Heartbeat- und Ereignisannahme, Befehlsversand, Web-UI</text>
+
+      <rect class="box" x="730" y="190" width="170" height="60" rx="10"/>
+      <text class="lbl" x="742" y="215">Alarme</text>
+      <text class="sub" x="742" y="234">bei Ausbleiben</text>
+
+      <rect class="box" x="930" y="190" width="170" height="60" rx="10"/>
+      <text class="lbl" x="942" y="215">Web-UI</text>
+      <text class="sub" x="942" y="234">TOTP + Passkey</text>
+
+      <rect class="box" x="730" y="290" width="370" height="60" rx="10"/>
+      <text class="lbl" x="742" y="315">Verschlüsselte Backups</text>
+      <text class="sub" x="742" y="334">Cloud sieht nur den opaken Block, nie den Schlüssel</text>
+
+      <line class="edge" x1="915" y1="150" x2="915" y2="190"/>
+      <line class="edge" x1="915" y1="150" x2="1015" y2="190"/>
+      <line class="edge" x1="915" y1="150" x2="915" y2="290"/>
+
+      <!-- Cross-boundary connections, each in its own horizontal lane in
+           the gap between the two frames so the lines never cross each
+           other, and each label sits centered above/below its own lane,
+           clear of both the line and the boxes on either side. -->
+      <path class="edge2" d="M250,190 L250,140 L730,140" />
+      <text class="edgelbl" x="490" y="126">HTTPS POST /v1/heartbeat</text>
+      <text class="edgelbl" x="490" y="157">alle 120 s</text>
+
+      <path class="edge" d="M915,150 L915,210 L350,210" />
+      <text class="edgelbl" x="490" y="196" fill="var(--accent-2,#21609b)">SSE GET /v1/commands</text>
+      <text class="edgelbl" x="490" y="227" fill="var(--accent-2,#21609b)">Befehle</text>
+    </svg>
+  </div>
+  <p>
+    Die Pfeilrichtung ist bewusst asymmetrisch: die Wohnung ruft die Cloud per gewöhnlichem
+    <code>POST</code> (Heartbeat, Ereignisse, Befehlsergebnisse); die Cloud selbst öffnet
+    nie eine Verbindung zur Wohnung. Befehle laufen stattdessen über einen offen gehaltenen
+    <code>GET /v1/commands</code> (Server-Sent Events) – die Wohnung hält die Verbindung,
+    nicht umgekehrt. Kein Port muss im Router des Mieters freigegeben werden.
+  </p>
+
+  <h2 id="sicherheit">Sicherheitsmodell in Kürze</h2>
+  <p>Sechs Grundsätze, die nicht verhandelbar sind (Details: <a href="docs/sicherheit.html">Sicherheit</a>):</p>
+  <div class="grid-cards">
+    <div class="card">
+      <h3>1. Geschlossener Befehlskatalog</h3>
+      <p>Die Cloud kann einer Wohnung nur das schicken, was in einer kurzen, festen Liste
+      steht. Eine Erweiterung ist niemals „nur eine kleine Ergänzung“.</p>
+    </div>
+    <div class="card">
+      <h3>2. Image-Quellen fest im Agenten</h3>
+      <p>Die erlaubten Registrierungen stehen als Konstante im Agenten, nicht in der Cloud.
+      Die Cloud nennt nur Version und Digest – nie die Quelle. Kein Digest, kein Start.</p>
+    </div>
+    <div class="card">
+      <h3>3. Keine privaten Schlüssel in der Cloud</h3>
+      <p>WireGuard- und Geräteschlüsselpaare entstehen auf der Basisstation und verlassen
+      sie nie. Die Cloud sieht ausschließlich öffentliche Schlüssel.</p>
+    </div>
+    <div class="card">
+      <h3>4. Keine Mieterdaten im Klartext</h3>
+      <p>Betriebsdaten-Backups werden auf dem Gerät verschlüsselt, bevor sie hochgeladen
+      werden. Die Cloud speichert nur den opaken Block, nie den Schlüssel.</p>
+    </div>
+    <div class="card">
+      <h3>5. Der Agent ist die Sicherheitsgrenze</h3>
+      <p>Jede Prüfung, ob ein Befehl ausgeführt wird, sitzt im Agenten – selbst wenn die
+      Cloud etwas anderes sagt. Eine kompromittierte Cloud kann keine Sitzung öffnen, die
+      der Agent lokal verweigert.</p>
+    </div>
+    <div class="card">
+      <h3>6. Der Watchdog kennt kein Netz</h3>
+      <p>Er tauscht nur zwischen zwei lokal bereits geprüften Digests – in Go, statisch
+      gebaut, ohne eine einzige Abhängigkeit. Genau deshalb funktioniert er noch, wenn
+      alles andere kaputt ist.</p>
+    </div>
+  </div>
+
+  <h2 id="features">Was der Dienst konkret kann</h2>
+  <div class="grid-cards">
+    <div class="card">
+      <h3>Heartbeat &amp; Alarm bei Ausbleiben</h3>
+      <p>Jede Wohnung meldet sich alle 120 Sekunden. Der eigentliche Wert liegt nicht im
+      Empfang, sondern im Alarm, wenn drei Meldungen hintereinander fehlen.</p>
+    </div>
+    <div class="card">
+      <h3>Störungen mit Quittierung</h3>
+      <p>Die sechs thermoctl-Störungsarten laufen in der Cloud zusammen. Eine Quittierung
+      gilt nur für das aktuelle Auftreten – tritt die Störung erneut auf, erscheint sie
+      wieder.</p>
+    </div>
+    <div class="card">
+      <h3>Batterie &amp; Signal pro Gerät</h3>
+      <p>Geräte-Id, Batteriestand und Signalqualität – ohne Gerätenamen (die Raumnamen
+      enthalten können) und ohne Messwerte.</p>
+    </div>
+    <div class="card">
+      <h3>Geschlossener Befehlskatalog</h3>
+      <p><code>report_now</code>, <code>fetch_logs</code>, <code>backup_now</code>,
+      <code>agent_restart</code>, <code>diagnostic_bundle</code> – mit Id, Ablaufzeit und
+      lokalem Protokoll in der Wohnung selbst.</p>
+    </div>
+    <div class="card">
+      <h3>Verschlüsselte Backups &amp; Restore</h3>
+      <p>Betriebsdaten werden auf dem Gerät verschlüsselt. Der Entschlüsselungsschlüssel
+      wird im Browser lokal verschlüsselt und nie im Klartext an die Cloud übertragen.</p>
+    </div>
+    <div class="card">
+      <h3>Gestaffelte Rollouts</h3>
+      <p>Updates laufen über Soll-Zustand, nie per Fernsteuerung einzelner Befehle –
+      kontrolliert, eine Wohnung nach der anderen, mit Rückfallpfad.</p>
+    </div>
+    <div class="card">
+      <h3>Mieterwechsel</h3>
+      <p>Eine ausdrückliche UI-Aktion mit Pflichtgrund rotiert den Gerätetoken und löscht
+      die Verlaufsdaten der vorherigen Mietzeit – verschlüsselte Backups bleiben, unter
+      eigener Aufbewahrungsfrist.</p>
+    </div>
+    <div class="card">
+      <h3>Anmeldung mit TOTP &amp; Passkey</h3>
+      <p>Zwei-Faktor-Anmeldung der Web-Oberfläche: TOTP-Secrets liegen verschlüsselt mit
+      einem Schlüssel aus der Umgebung, Passkeys (WebAuthn) als zweiter Faktor. Aus
+      eigenen, bekannten Netzen genügt optional ein Passkey allein, ohne Passwort.</p>
+    </div>
+  </div>
+
+  <h2 id="weiter">Weiterlesen</h2>
+  <p>
+    Die vollständige <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a>
+    ist die verbindliche Quelle für Details. Diese Website erklärt sie in Alltagssprache.
+    Am besten geht es mit dem <a href="docs/einstieg.html">Einstieg</a> weiter.
+  </p>
+  <div class="cta-row">
+    <a class="btn primary" href="docs/einstieg.html">Zur Dokumentation</a>
+  </div>
+</main>
+
+<footer class="site-footer">
+  <p>
+    thermoctl-fleet ist freie Software (AGPL-3.0) –
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet">Quellcode auf GitHub</a>.
+    Stufe 1 – Heartbeat, Störungen, Alarme, die Befehle oben, Backups/Restore,
+    Rollouts, Mieterwechsel, Anmeldung – ist implementiert und getestet.
+    Container-Updates über den Soll-Zustand sind fertig, bleiben aber
+    abgeschaltet, bis thermoctl eine eigene Health-API bereitstellt; Details im
+    laufend aktualisierten
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/STATUS.md">STATUS.md</a>.
+  </p>
+</footer>
+</body>
+</html>

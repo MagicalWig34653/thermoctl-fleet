@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossar – thermoctl-fleet</title>
+<meta name="description" content="Begriffe von thermoctl-fleet kurz erklärt: Agent, Watchdog, Heartbeat, Desired State, Rollout und mehr.">
+<link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Zum Inhalt springen</a>
+<header class="site-header">
+  <img class="logo" src="../assets/icon/favicon.svg" alt="">
+  <a class="brand" href="../index.html">thermoctl-fleet</a>
+  <nav>
+    <a href="index.html">Dokumentation</a>
+    <a href="sicherheit.html">Sicherheit</a>
+    <a href="https://github.com/MagicalWig34653/thermoctl-fleet">GitHub</a>
+  </nav>
+</header>
+<main id="main" class="wide">
+<div class="docs-layout">
+<aside>
+  <h2>Dokumentation</h2>
+  <ul>
+    <li><a href="einstieg.html">Einstieg &amp; Fleet-Server</a></li>
+    <li><a href="benutzer.html">Benutzer anlegen</a></li>
+    <li><a href="wohnung.html">Wohnung hinzufügen</a></li>
+    <li><a href="betrieb.html">Täglicher Betrieb</a></li>
+    <li><a href="sicherheit.html">Sicherheit</a></li>
+    <li><a href="faq.html">FAQ</a></li>
+    <li><a class="current" href="glossar.html">Glossar</a></li>
+  </ul>
+</aside>
+<div>
+  <h1>Glossar</h1>
+  <dl class="glossary">
+    <dt>Agent</dt>
+    <dd>Das kleine Programm auf der Basisstation jeder Wohnung. Einzige Verbindung zur
+    Cloud, liest thermoctl nur über dessen lokale, read-only REST-API.</dd>
+
+    <dt>Basisstation</dt>
+    <dd>Der kleine Rechner (Raspberry Pi oder amd64) in der Wohnung, auf dem Agent,
+    thermoctl, Zigbee2MQTT und Mosquitto laufen.</dd>
+
+    <dt>Desired State (Soll-Zustand)</dt>
+    <dd>Die von der Cloud genannte Zielkonfiguration der vier Container einer Wohnung
+    (Version, Digest). Der Agent gleicht lokal ab und setzt sie um – es ist keine
+    Fernsteuerung einzelner Schritte.</dd>
+
+    <dt>Diagnosebündel</dt>
+    <dd>Ein auf Abruf erzeugtes Bündel aus Logs und Systeminformationen für die
+    Fehlersuche – getrennt von <code>fetch_logs</code>, mit eigener, kürzerer
+    Aufbewahrungsfrist.</dd>
+
+    <dt>Fleet-Dienst</dt>
+    <dd>Der Cloud-Teil (<code>fleet/</code>): nimmt Heartbeats und Ereignisse an, schlägt
+    Alarm, verteilt Befehle, stellt die Weboberfläche bereit.</dd>
+
+    <dt>Heartbeat</dt>
+    <dd>Die alle 120 Sekunden gesendete Statusmeldung einer Wohnung: Erreichbarkeit,
+    Modus, offene Störungen, Batterie- und Signalwerte – keine Raumtemperaturen, keine
+    Sollwerte.</dd>
+
+    <dt>Registrierungscode</dt>
+    <dd>Ein einmaliger, zeitlich begrenzter Code, mit dem ein Gerät sich bei der Cloud
+    anmeldet. Läuft nach erster Verwendung oder nach 24 Stunden ab.</dd>
+
+    <dt>Rollout</dt>
+    <dd>Ein gestaffeltes Update über mehrere Wohnungen, eine nach der anderen, mit
+    Rückfallpfad auf die alte Version.</dd>
+
+    <dt>SSE (Server-Sent Events)</dt>
+    <dd>Das Format, über das die Cloud Befehle an eine Wohnung liefert: die Wohnung hält
+    eine Verbindung offen (<code>GET /v1/commands</code>), die Cloud schreibt Ereignisse
+    hinein. Kein eingehender Port in der Wohnung nötig.</dd>
+
+    <dt>TOTP</dt>
+    <dd>Zeitbasiertes Einmalpasswort, zweiter Faktor bei der Anmeldung an der
+    Weboberfläche, verschlüsselt mit <code>FLEET_TOTP_KEY</code> gespeichert.</dd>
+
+    <dt>Verifizierungscode</dt>
+    <dd>Ein kurzer Code, den ein neu registriertes Gerät anzeigt und der in der
+    Fleet-Oberfläche bestätigt werden muss, bevor die Konfiguration freigegeben wird.</dd>
+
+    <dt>Watchdog</dt>
+    <dd>Ein kleines, abhängigkeitsfreies Go-Programm neben dem Agenten auf der
+    Basisstation, das zwischen zwei bereits lokal geprüften Container-Versionen
+    umschalten kann – auch wenn der Rest des Systems kaputt ist.</dd>
+
+    <dt>WebAuthn / Passkey</dt>
+    <dd>Standard für Anmeldung ohne Passwort-Eingabe über ein Gerät oder einen
+    Sicherheitsschlüssel; in thermoctl-fleet als zweiter Faktor neben TOTP.</dd>
+  </dl>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+  <p><a href="https://github.com/MagicalWig34653/thermoctl-fleet/blob/main/docs/specification.md">Spezifikation</a></p>
+</footer>
+</body>
+</html>
