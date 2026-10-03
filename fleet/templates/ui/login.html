@@ -14,9 +14,19 @@
     <label for="username">Benutzername
         <input type="text" id="username" name="username" autocomplete="username" required autofocus>
     </label>
+    {% if passwordless_available %}
+    {# Owner decision 2026-10-03: from a network listed in
+       FLEET_UI_PASSWORDLESS_NETWORKS a passkey alone suffices -- the
+       password field stays for the TOTP path, but is no longer required. #}
+    <p class="hint" id="passwordless-hint">Du bist in einem bekannten Netz: Mit Passkey brauchst du kein Passwort und keinen Bestätigungscode – Benutzername eingeben und „Mit Passkey anmelden“ wählen.</p>
+    <label for="password">Passwort (nur ohne Passkey nötig)
+        <input type="password" id="password" name="password" autocomplete="current-password">
+    </label>
+    {% else %}
     <label for="password">Passwort
         <input type="password" id="password" name="password" autocomplete="current-password" required>
     </label>
+    {% endif %}
     <label for="totp_code">Bestätigungscode (Authenticator-App)
         <input type="text" id="totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code">
     </label>

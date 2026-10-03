@@ -2,6 +2,46 @@
 
 Last updated: 2026-10-03.
 
+## Passwordless passkey login from known networks (2026-10-03) **SR**
+
+Owner decision (2026-10-03, recorded in `docs/specification.md` section 12,
+"Decided afterward"): from the landlord's own external addresses a passkey
+alone suffices -- no password, no TOTP. Implemented in the main session
+(auth logic, CLAUDE.md working method).
+
+- **Configuration:** `FLEET_UI_PASSWORDLESS_NETWORKS` -- comma-separated
+  IPs/CIDRs, same syntax as `FLEET_UI_TRUSTED_PROXIES`; empty (default) =
+  off. Server environment only, deliberately not editable in the UI.
+- **Only global, narrow networks** (`fleet.ui_auth.passwordless_networks`): entries broader than /16 (IPv4) or /32 (IPv6) are refused (`0.0.0.0/0` would otherwise pass `is_global`); an IPv4-mapped IPv6 client (`::ffff:a.b.c.d`) is compared as IPv4. Private,
+  loopback, link-local and malformed entries are dropped with a warning.
+  Behind a reverse proxy *without* `FLEET_UI_TRUSTED_PROXIES` every request
+  appears to come from the proxy's private address -- a private entry would
+  otherwise enable passwordless login for the whole internet. Behind a
+  proxy, `FLEET_UI_TRUSTED_PROXIES` must be set for the feature to match
+  the real client address at all (fails closed otherwise).
+- **Rules** (`fleet.ui_auth.authenticate(passwordless=...)`, set by
+  `fleet/ui_routes.py::login_submit` only for an *empty* password from a
+  known network): the password is waived only together with a passkey
+  assertion (UV required as before); a typed password is always verified;
+  a TOTP code alone is never enough; lockout, per-IP throttle, failure
+  counting and the generic error stay identical. The Argon2 verify still
+  runs against the dummy hash so timing does not change.
+- **UI:** `/ui/login` shows a hint and drops `required` from the password
+  field when the visitor is inside a known network (and WebAuthn is
+  configured); `fleet/static/ui/webauthn.js` already submits via
+  `form.submit()`, so no JS change was needed.
+- **Tests:** `tests/test_ui_webauthn_routes.py` (passkey alone succeeds from
+  a known network; refused from another network; refused when unset; a
+  typed wrong password still refused; TOTP-only without password refused;
+  a failed passwordless assertion counts toward the lockout; hint/required
+  only in a known network) and `tests/test_ui_auth.py` (parser keeps only
+  global networks; the flag never waives the password on the TOTP path).
+  Mutation check: with the flag forced off, the success test fails.
+- **Verification (main session):** `ruff check .` -> All checks passed!;
+  `mypy .` -> Success: no issues found in 161 source files; full pytest via
+  junitxml -> tests="2103" failures="0" errors="0" skipped="1"; TOTAL 8123
+  stmts / 30 missed / 99%, `fleet/ui_auth.py` 100%.
+
 ## Codex full review findings 1, 6, 7: SSE bookmark ordering, record-before-
 ## execute, restore-report retry (2026-10-03)
 
