@@ -165,6 +165,17 @@ _DEFAULT_WEBAUTHN_BEGIN_THROTTLE_THRESHOLD = 30
 
 _TRUSTED_PROXIES_ENV = "FLEET_UI_TRUSTED_PROXIES"
 
+# Owner decision 2026-10-03 (docs/specification.md section 12, "Decided
+# afterward"): from these networks -- the landlord's own *external*
+# addresses, comma-separated IPs/CIDRs -- a passkey alone is enough to log
+# in, without password and without TOTP. Empty (the default) switches the
+# feature off entirely. Only configurable on the server, never in the UI:
+# a stolen session must not be able to whitelist its own network.
+_PASSWORDLESS_NETWORKS_ENV = "FLEET_UI_PASSWORDLESS_NETWORKS"
+# Narrowest sensible bound for "the landlord's own external address(es)":
+# anything broader (up to `0.0.0.0/0`, which `is_global` accepts) is refused.
+_PASSWORDLESS_MIN_PREFIX = {4: 16, 6: 32}
+
 _SESSION_ABSOLUTE_LIFETIME_S_ENV = "FLEET_UI_SESSION_ABSOLUTE_LIFETIME_S"
 _DEFAULT_SESSION_ABSOLUTE_LIFETIME_S = 12 * 60 * 60.0
 
@@ -261,6 +272,64 @@ def _parse_trusted_proxies(
         except ValueError:
             logger.warning("Ignoring malformed entry in %s: %r", _TRUSTED_PROXIES_ENV, candidate)
     return networks
+
+
+def _network_is_global(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    """Seam for tests: the only addresses a repository may use in tests are
+    the RFC 5737/3849 documentation ranges, which `ipaddress` itself counts
+    as non-global."""
+
+    return network.is_global
+
+
+def passwordless_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Parses `FLEET_UI_PASSWORDLESS_NETWORKS` (same syntax as
+    `FLEET_UI_TRUSTED_PROXIES`) and keeps **only globally routable**
+    networks. A private, loopback, link-local or otherwise non-global entry
+    is dropped with a warning: behind a reverse proxy without
+    `FLEET_UI_TRUSTED_PROXIES`, every request appears to come from the
+    proxy's own (typically private) address -- a `10.0.0.0/8` entry here
+    would then turn passwordless login on for the whole internet. The
+    feature is meant for the landlord's external address, so refusing
+    non-global entries costs nothing legitimate and fails closed."""
+
+    accepted: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for network in _parse_trusted_proxies(os.environ.get(_PASSWORDLESS_NETWORKS_ENV, "")):
+        if network.prefixlen < _PASSWORDLESS_MIN_PREFIX[network.version]:
+            logger.warning(
+                "Ignoring overly broad entry in %s: %s -- at most /%d (IPv4) or /%d (IPv6).",
+                _PASSWORDLESS_NETWORKS_ENV,
+                network,
+                _PASSWORDLESS_MIN_PREFIX[4],
+                _PASSWORDLESS_MIN_PREFIX[6],
+            )
+        elif _network_is_global(network):
+            accepted.append(network)
+        else:
+            logger.warning(
+                "Ignoring non-global entry in %s: %s -- only external addresses are allowed.",
+                _PASSWORDLESS_NETWORKS_ENV,
+                network,
+            )
+    return accepted
+
+
+def is_passwordless_network(client_ip: str) -> bool:
+    """`True` iff `client_ip` (already resolved by `resolve_client_ip`) lies
+    in one of `passwordless_networks()`. Empty configuration -> `False`."""
+
+    networks = passwordless_networks()
+    if not networks:
+        return False
+    # A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`;
+    # compare it as the IPv4 address it is, so an IPv4 entry still matches.
+    try:
+        mapped = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    if isinstance(mapped, ipaddress.IPv6Address) and mapped.ipv4_mapped is not None:
+        client_ip = str(mapped.ipv4_mapped)
+    return _ip_in_networks(client_ip, networks)
 
 
 def _ip_in_networks(
@@ -448,6 +517,7 @@ def authenticate(
     webauthn_assertion: str | None = None,
     webauthn_challenge_id: int | None = None,
     webauthn_pre_csrf: str | None = None,
+    passwordless: bool = False,
 ) -> UiUserRecord | None:
     """The single entry point for a login attempt (P3.0, extended by P6.2).
     Returns the authenticated `UiUserRecord` on success, `None` on **any**
@@ -467,6 +537,14 @@ def authenticate(
     failure -- applies identically to both second-factor kinds, per the
     task requirement "throttling/lockout from P3.0 must apply equally to
     passkey attempts."
+
+    **Passwordless, owner decision 2026-10-03:** `passwordless=True`
+    (set by `fleet/ui_routes.py` only for an empty password from a client
+    inside `FLEET_UI_PASSWORDLESS_NETWORKS`) waives the password -- but only
+    together with a passkey assertion, which then is the sole factor (a
+    user-verifying passkey is itself possession plus PIN/biometrics). On the
+    TOTP path the flag is ignored: a TOTP code alone is never enough.
+    Lockout, failure counting and the generic `None` apply unchanged.
 
     **The Argon2 verify always runs, unconditionally, before any decision
     is made** -- including for a locked account (cross-review: an earlier
@@ -525,10 +603,20 @@ def authenticate(
         and _naive_utc_now(now) < user.locked_until
     )
 
-    password_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
-    password_ok = _verify_password(password_hash, password)
-
     using_webauthn = webauthn_assertion is not None
+
+    # Passwordless (owner decision 2026-10-03): only together with a passkey
+    # -- never "TOTP alone" and never "nothing". The caller
+    # (`fleet/ui_routes.py`) only sets this for a client inside
+    # `FLEET_UI_PASSWORDLESS_NETWORKS` that submitted no password. The
+    # Argon2 verify still runs (against the dummy hash) so this path costs
+    # the same wall-clock time as every other one.
+    if passwordless and using_webauthn:
+        _verify_password(_DUMMY_PASSWORD_HASH, password)
+        password_ok = True
+    else:
+        password_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
+        password_ok = _verify_password(password_hash, password)
     second_factor_ok = False
     matched_totp_step: int | None = None
     webauthn_outcome: webauthn_auth.LoginAssertionOutcome | None = None
@@ -733,6 +821,8 @@ def require_ui_user(
 
 
 __all__ = [
+    "is_passwordless_network",
+    "passwordless_networks",
     "AuthenticatedUiSession",
     "MIN_PASSWORD_LENGTH",
     "NewSession",

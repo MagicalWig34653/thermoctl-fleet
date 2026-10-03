@@ -60,6 +60,7 @@ from fleet.ui_auth import (
     ip_throttle_duration_s,
     ip_throttle_threshold,
     ip_throttle_window_s,
+    is_passwordless_network,
     normalize_username,
     require_ui_user,
     resolve_client_ip,
@@ -209,7 +210,13 @@ def login_form(request: Request) -> HTMLResponse:
     response = templates.TemplateResponse(
         request,
         "login.html",
-        {"pre_csrf": pre_csrf, "error": None, "webauthn_enabled": webauthn_auth.is_configured()},
+        {
+            "pre_csrf": pre_csrf,
+            "error": None,
+            "webauthn_enabled": webauthn_auth.is_configured(),
+            "passwordless_available": webauthn_auth.is_configured()
+            and is_passwordless_network(resolve_client_ip(request)),
+        },
     )
     _set_pre_csrf_cookie(response, pre_csrf)
     return response
@@ -230,6 +237,8 @@ def _generic_login_failure_response(request: Request) -> Response:
             "pre_csrf": new_pre_csrf,
             "error": _GENERIC_LOGIN_ERROR,
             "webauthn_enabled": webauthn_auth.is_configured(),
+            "passwordless_available": webauthn_auth.is_configured()
+            and is_passwordless_network(resolve_client_ip(request)),
         },
         status_code=401,
     )
@@ -317,7 +326,7 @@ def login_submit(
     request: Request,
     background_tasks: BackgroundTasks,
     username: str = Form(...),
-    password: str = Form(...),
+    password: str = Form(default=""),
     pre_csrf: str = Form(...),
     totp_code: str = Form(default=""),
     webauthn_assertion: str | None = Form(default=None),
@@ -379,6 +388,10 @@ def login_submit(
             webauthn_assertion=webauthn_assertion,
             webauthn_challenge_id=parsed_challenge_id,
             webauthn_pre_csrf=pre_csrf,
+            # Owner decision 2026-10-03: from a configured external network,
+            # a passkey alone suffices -- but only when no password was
+            # typed at all; a typed password is always verified as usual.
+            passwordless=password == "" and is_passwordless_network(client_ip),
         )
     else:
         user = authenticate(

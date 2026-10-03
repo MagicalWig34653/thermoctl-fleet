@@ -41,6 +41,13 @@ main {
     margin: 0 auto;
 }
 
+.hint {
+    border: 1px solid currentColor;
+    padding: 0.75rem 1rem;
+    border-radius: 0.25rem;
+    opacity: 0.85;
+}
+
 .error {
     border: 1px solid #c00;
     padding: 0.75rem 1rem;

@@ -829,3 +829,165 @@ def test_login_via_passkey_rejects_an_assertion_with_user_not_verified(
     )
     assert response.status_code == 401
     assert client.cookies.get("fleet_ui_session") is None
+
+
+# --- Passwordless passkey login from known networks (owner decision 2026-10-03) ---
+
+KNOWN_EXTERNAL_IP = "203.0.113.7"  # TEST-NET-3, documentation range -- but see below
+OTHER_EXTERNAL_IP = "198.51.100.9"
+
+
+@pytest.fixture
+def known_network_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `ipaddress` treats the RFC 5737 documentation ranges as non-global,
+    # which `passwordless_networks()` deliberately refuses -- so the test
+    # pins `is_global` for exactly these two addresses' networks instead of
+    # using a real provider's range in the repository.
+    monkeypatch.setenv("FLEET_UI_PASSWORDLESS_NETWORKS", f"{KNOWN_EXTERNAL_IP}/32")
+    monkeypatch.setattr(
+        "fleet.ui_auth._network_is_global",
+        lambda network: str(network) in (f"{KNOWN_EXTERNAL_IP}/32", f"{OTHER_EXTERNAL_IP}/32"),
+    )
+
+
+def _client_from(storage: Storage, ip: str) -> TestClient:
+    return TestClient(app, base_url=ORIGIN, client=(ip, 50000))
+
+
+def _passwordless_attempt(
+    client: TestClient, authenticator: SoftAuthenticator, credential_id: bytes, password: str = ""
+) -> int:
+    pre_csrf, _ = _get_login_form(client)
+    options = client.post(
+        "/ui/login/webauthn/begin", data={"username": USERNAME, "pre_csrf": pre_csrf}
+    ).json()
+    assertion_json = authenticator.get_assertion(
+        rp_id(), base64url_to_bytes(options["challenge"]), ORIGIN, credential_id
+    )
+    response = client.post(
+        "/ui/login",
+        data={
+            "username": USERNAME,
+            "password": password,
+            "pre_csrf": pre_csrf,
+            "webauthn_assertion": assertion_json,
+            "webauthn_challenge_id": str(options["fleetChallengeId"]),
+        },
+        follow_redirects=False,
+    )
+    return response.status_code
+
+
+def test_passkey_alone_logs_in_from_a_known_network(
+    client: TestClient, password: str, totp_secret: str, user_id: int, storage: Storage,
+    known_network_env: None,
+) -> None:
+    credential_id, authenticator, _ = _register_passkey_via_http(
+        client, password, totp_secret, storage
+    )
+    known = _client_from(storage, KNOWN_EXTERNAL_IP)
+    assert _passwordless_attempt(known, authenticator, credential_id) == 303
+    assert known.cookies.get("fleet_ui_session") is not None
+
+
+def test_passkey_alone_is_refused_from_an_unknown_network(
+    client: TestClient, password: str, totp_secret: str, user_id: int, storage: Storage,
+    known_network_env: None,
+) -> None:
+    credential_id, authenticator, _ = _register_passkey_via_http(
+        client, password, totp_secret, storage
+    )
+    other = _client_from(storage, OTHER_EXTERNAL_IP)
+    assert _passwordless_attempt(other, authenticator, credential_id) == 401
+    assert other.cookies.get("fleet_ui_session") is None
+
+
+def test_passkey_alone_is_refused_when_the_feature_is_not_configured(
+    client: TestClient, password: str, totp_secret: str, user_id: int, storage: Storage,
+) -> None:
+    credential_id, authenticator, _ = _register_passkey_via_http(
+        client, password, totp_secret, storage
+    )
+    known = _client_from(storage, KNOWN_EXTERNAL_IP)
+    assert _passwordless_attempt(known, authenticator, credential_id) == 401
+
+
+def test_a_typed_wrong_password_is_still_refused_from_a_known_network(
+    client: TestClient, password: str, totp_secret: str, user_id: int, storage: Storage,
+    known_network_env: None,
+) -> None:
+    """A typed password is always verified -- the known network only waives
+    an *empty* password, it never makes a wrong one acceptable."""
+
+    credential_id, authenticator, _ = _register_passkey_via_http(
+        client, password, totp_secret, storage
+    )
+    known = _client_from(storage, KNOWN_EXTERNAL_IP)
+    assert _passwordless_attempt(known, authenticator, credential_id, "wrong-password") == 401
+
+
+def test_no_password_and_no_passkey_is_refused_from_a_known_network(
+    user_id: int, storage: Storage, totp_secret: str, known_network_env: None,
+) -> None:
+    """Passwordless means "passkey instead of password + second factor" --
+    a TOTP code alone (or nothing) is never enough."""
+
+    known = _client_from(storage, KNOWN_EXTERNAL_IP)
+    app.dependency_overrides[get_storage] = lambda: storage
+    try:
+        pre_csrf, _ = _get_login_form(known)
+        response = known.post(
+            "/ui/login",
+            data={
+                "username": USERNAME,
+                "password": "",
+                "pre_csrf": pre_csrf,
+                "totp_code": _totp_now(totp_secret, datetime.now(UTC)),
+            },
+            follow_redirects=False,
+        )
+    finally:
+        app.dependency_overrides.pop(get_storage, None)
+    assert response.status_code == 401
+
+
+def test_a_failed_passwordless_assertion_counts_towards_the_lockout(
+    client: TestClient, password: str, totp_secret: str, user_id: int, storage: Storage,
+    known_network_env: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _register_passkey_via_http(client, password, totp_secret, storage)
+    monkeypatch.setenv("FLEET_UI_LOCKOUT_THRESHOLD", "1")
+    known = _client_from(storage, KNOWN_EXTERNAL_IP)
+    pre_csrf, _ = _get_login_form(known)
+    options = known.post(
+        "/ui/login/webauthn/begin", data={"username": USERNAME, "pre_csrf": pre_csrf}
+    ).json()
+    response = known.post(
+        "/ui/login",
+        data={
+            "username": USERNAME,
+            "pre_csrf": pre_csrf,
+            "webauthn_assertion": json.dumps({"rawId": "bm90LXJlYWw", "response": {}}),
+            "webauthn_challenge_id": str(options["fleetChallengeId"]),
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 401
+    user = storage.get_ui_user_by_username(USERNAME)
+    assert user is not None
+    assert user.locked_until is not None
+
+
+def test_login_form_shows_the_passwordless_hint_only_in_a_known_network(
+    storage: Storage, known_network_env: None,
+) -> None:
+    app.dependency_overrides[get_storage] = lambda: storage
+    try:
+        known_html = _client_from(storage, KNOWN_EXTERNAL_IP).get("/ui/login").text
+        other_html = _client_from(storage, OTHER_EXTERNAL_IP).get("/ui/login").text
+    finally:
+        app.dependency_overrides.pop(get_storage, None)
+    assert 'id="passwordless-hint"' in known_html
+    assert re.search(r'id="password"[^>]*required', known_html) is None
+    assert 'id="passwordless-hint"' not in other_html
+    assert re.search(r'id="password"[^>]*required', other_html) is not None

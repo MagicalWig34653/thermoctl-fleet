@@ -1464,3 +1464,69 @@ def test_authenticate_two_concurrent_webauthn_assertions_allow_exactly_one_succe
     final_credential = storage.get_webauthn_credential(credential_id)
     assert final_credential is not None
     assert final_credential.sign_count == 7
+
+
+# --- FLEET_UI_PASSWORDLESS_NETWORKS (owner decision 2026-10-03) ---
+
+
+def test_passwordless_networks_is_empty_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fleet.ui_auth import is_passwordless_network, passwordless_networks
+
+    monkeypatch.delenv("FLEET_UI_PASSWORDLESS_NETWORKS", raising=False)
+    assert passwordless_networks() == []
+    assert is_passwordless_network("8.8.8.8") is False
+
+
+def test_passwordless_networks_keeps_global_and_drops_private_loopback_and_malformed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fleet.ui_auth import is_passwordless_network, passwordless_networks
+
+    monkeypatch.setenv(
+        "FLEET_UI_PASSWORDLESS_NETWORKS",
+        "8.8.8.0/24, 10.0.0.0/8,127.0.0.1, fe80::/64, not-an-ip, 2001:4860::/32",
+    )
+    assert [str(n) for n in passwordless_networks()] == ["8.8.8.0/24", "2001:4860::/32"]
+    assert is_passwordless_network("8.8.8.42") is True
+    assert is_passwordless_network("2001:4860::1") is True
+    # A private address -- e.g. a reverse proxy's own, when
+    # FLEET_UI_TRUSTED_PROXIES is not configured -- must never match.
+    assert is_passwordless_network("10.1.2.3") is False
+    assert is_passwordless_network("127.0.0.1") is False
+    assert is_passwordless_network("not-an-ip") is False
+    assert "non-global" in caplog.text
+
+
+def test_authenticate_passwordless_flag_never_waives_the_password_for_totp(
+    storage: Storage, user_id: int, totp_secret: str
+) -> None:
+    """`passwordless=True` only ever applies together with a passkey
+    assertion -- on the TOTP path an empty password stays a failure."""
+
+    now = datetime.now(UTC)
+    user = authenticate(
+        storage, USERNAME, "", _totp_now(totp_secret, now), now, passwordless=True
+    )
+    assert user is None
+
+
+def test_passwordless_networks_refuses_overly_broad_entries(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fleet.ui_auth import passwordless_networks
+
+    monkeypatch.setenv(
+        "FLEET_UI_PASSWORDLESS_NETWORKS", "0.0.0.0/0, ::/0, 8.0.0.0/8, 8.8.0.0/16, 2001:4860::/31"
+    )
+    assert [str(n) for n in passwordless_networks()] == ["8.8.0.0/16"]
+    assert "overly broad" in caplog.text
+
+
+def test_is_passwordless_network_matches_an_ipv4_mapped_ipv6_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fleet.ui_auth import is_passwordless_network
+
+    monkeypatch.setenv("FLEET_UI_PASSWORDLESS_NETWORKS", "8.8.8.0/24")
+    assert is_passwordless_network("::ffff:8.8.8.8") is True
+    assert is_passwordless_network("::ffff:9.9.9.9") is False
