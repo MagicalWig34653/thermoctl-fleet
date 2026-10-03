@@ -42,6 +42,7 @@ from agent.commands_channel import (
     CommandStreamAuthError,
     CommandStreamError,
     CommandStreamReauthRequired,
+    DesiredStateReceived,
     RejectedCommand,
     _append_to_outbox,
     _classify,
@@ -240,21 +241,51 @@ def test_receive_commands_holds_an_sse_connection_and_receives_a_command(
             gen = receive_commands(client, last_event_id_path)
             try:
                 item = next(gen)
+                assert item == command
+                # **Cross-review finding 1:** not yet persisted -- the
+                # caller has not finished with `item` yet (has not come
+                # back in for the next one), so a crash right here must
+                # not advance the bookmark past a command nothing has
+                # durably recorded as handled.
+                assert (
+                    not last_event_id_path.exists()
+                    or last_event_id_path.read_text(encoding="utf-8").strip() == ""
+                )
+
+                second = app_storage.create_command(
+                    APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+                    now=datetime.now(UTC),
+                )
+                assert next(gen) == second
             finally:
                 gen.close()
 
-            assert item == command
-            # Persisted after the item was handed over -- P5.1c: `<epoch>.1`,
-            # not a bare sequence.
+            # Persisted once the caller came back in for `second` -- that
+            # is what durably recorded `command`'s own bookmark. P5.1c:
+            # `<epoch>.1`, not a bare sequence.
             assert (
                 last_event_id_path.read_text(encoding="utf-8").strip()
                 == f"{app_storage.get_epoch()}.1"
             )
 
 
-def test_receive_commands_last_event_id_resume_skips_the_already_seen_command(
+def test_receive_commands_last_event_id_resume_skips_only_items_the_caller_finished(
     tmp_path: Path, app_storage: Storage
 ) -> None:
+    """P5.1c, **updated for cross-review finding 1** (2026-10-03): the
+    bookmark used to be persisted as soon as an event was off the wire,
+    before it was even yielded -- so merely *receiving* an item (even one
+    `gen.close()` interrupted immediately after) was already enough to
+    advance it. Now the write sits on the far side of the `yield`, and
+    only runs once the caller comes back in for the *next* item (see
+    `_stream_once`'s own comments) -- so this test's old shape (`next`
+    once, close, assert the bookmark already moved) would no longer prove
+    anything true. Rewritten to show both halves of the actual guarantee:
+    an item the caller **did** finish with (signalled here by asking for
+    the next one before closing) is never redelivered; one it merely
+    received and then crashed/closed on (no further `next()` call) safely
+    *is* redelivered -- exactly the "no loss" trade this fix makes."""
+
     token = _issue_token(app_storage)
     first = app_storage.create_command(
         APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
@@ -269,17 +300,24 @@ def test_receive_commands_last_event_id_resume_skips_the_already_seen_command(
             gen = receive_commands(client, last_event_id_path)
             try:
                 assert next(gen) == first
+                second = app_storage.create_command(
+                    APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
+                    now=datetime.now(UTC),
+                )
+                # Resuming the generator for `second` is exactly what
+                # persists `first`'s own bookmark -- that write sits right
+                # after `first`'s `yield`, never before it.
+                assert next(gen) == second
             finally:
-                gen.close()
+                gen.close()  # simulated crash -- never comes back for more
 
-            second = app_storage.create_command(
-                APARTMENT, CommandType.BACKUP_NOW, lines=None, ui_username="landlord",
-                now=datetime.now(UTC),
-            )
-
-            # A fresh generator (simulating a restarted agent process),
-            # reading the same persisted `last_event_id_path`, must not see
-            # `first` again.
+            # A fresh generator (a restarted agent process), reading the
+            # same persisted `last_event_id_path`, must not see `first`
+            # again -- its bookmark is durable. It *does* still see
+            # `second`, though: nothing ever told this generator the
+            # caller had finished with it (closed before a third `next()`
+            # call), so its own bookmark was never written -- the same
+            # guarantee, the other direction: no premature loss either.
             gen2 = receive_commands(client, last_event_id_path)
             try:
                 item = next(gen2)
@@ -654,6 +692,132 @@ def test_stream_once_skips_an_sse_event_with_no_data_field(tmp_path: Path) -> No
     assert len(items) == 1
     assert isinstance(items[0], Command)
     assert items[0].id == "cmd-1"
+
+
+# --- Bookmark persisted only after the caller is done with the item -------
+# (cross-review finding 1, 2026-10-03): `fleet.storage.pending_commands`
+# resumes a reconnect strictly *after* the persisted `Last-Event-ID`
+# (sequence greater than, not greater-or-equal), so writing that bookmark
+# before the caller has finished with the item it belongs to is permanent
+# loss, not just a harmless re-delivery, if the caller crashes in between.
+# These tests drive `_stream_once` as a bare generator (not via `list(...)`,
+# which would hide exactly the ordering under test) to observe the bookmark
+# file at each point between two `next()` calls -- the same shape
+# `agent.loop.run`'s own `for item in commands:` loop drives it with.
+
+
+def test_stream_once_does_not_persist_the_bookmark_until_the_caller_asks_for_the_next_item(
+    tmp_path: Path,
+) -> None:
+    body = (
+        'event: message\nid: e1\ndata: {"id": "cmd-1", "command": "report_now", '
+        '"expires_at": "2026-01-01T00:00:00Z", "protocol_version": 1}\n\n'
+        'event: message\nid: e2\ndata: {"id": "cmd-2", "command": "report_now", '
+        '"expires_at": "2026-01-01T00:00:00Z", "protocol_version": 1}\n\n'
+    )
+    last_event_id_path = tmp_path / "last-event-id"
+    items = _stream_once(_sse_body_client(body), last_event_id_path)
+
+    first = next(items)
+    assert isinstance(first, Command) and first.id == "cmd-1"
+    # Not yet persisted -- the caller has not finished with `first` yet (it
+    # has not asked for the next item). A crash right here must leave the
+    # bookmark exactly where a reconnect would re-deliver "cmd-1", not
+    # silently skip past it.
+    assert _read_last_event_id(last_event_id_path) is None
+
+    second = next(items)
+    assert isinstance(second, Command) and second.id == "cmd-2"
+    # Now that the caller came back in for the *next* item, the bookmark
+    # for the *previous* one ("e1") is persisted -- the caller is known to
+    # be done with "cmd-1" (whatever it did with it already happened,
+    # synchronously, between the two `next()` calls above).
+    assert _read_last_event_id(last_event_id_path) == "e1"
+    # Still not "e2" -- that one is not yet finished either.
+
+    with pytest.raises(StopIteration):
+        next(items)
+    assert _read_last_event_id(last_event_id_path) == "e2"
+
+
+def test_stream_once_crash_between_items_leaves_the_bookmark_at_the_finished_one(
+    tmp_path: Path,
+) -> None:
+    """A caller that dies right after finishing the first item (e.g. the
+    whole process crashes once `_record_executed` and `report_result` have
+    both already happened for "cmd-1", but before it ever calls `next()`
+    again) never even runs the code that would persist "e1" -- that code
+    is on the far side of the `yield` the *second* `next()` call resumes.
+    Simulated here by simply never making that second call (the generator
+    is garbage-collected / closed instead, standing in for the process
+    exiting) -- this is not a special case the implementation has to
+    detect, it falls out of ordinary generator semantics."""
+
+    body = (
+        'event: message\nid: e1\ndata: {"id": "cmd-1", "command": "report_now", '
+        '"expires_at": "2026-01-01T00:00:00Z", "protocol_version": 1}\n\n'
+        'event: message\nid: e2\ndata: {"id": "cmd-2", "command": "report_now", '
+        '"expires_at": "2026-01-01T00:00:00Z", "protocol_version": 1}\n\n'
+    )
+    last_event_id_path = tmp_path / "last-event-id"
+    items = _stream_once(_sse_body_client(body), last_event_id_path)
+
+    first = next(items)
+    assert isinstance(first, Command) and first.id == "cmd-1"
+    # Simulated crash -- never asks for "cmd-2". `_stream_once` is typed as
+    # the narrower `Iterator` (see `test_stream_once_calls_on_contact_true_
+    # once_connected`'s own comment for why); it is still a real generator
+    # object at runtime, so `.close()` works -- only the static type is too
+    # narrow to know that.
+    items.close()  # type: ignore[attr-defined]
+
+    # No loss, but also no premature advance: the next reconnect still
+    # resumes from "before e1", i.e. re-delivers "cmd-1" -- exactly what a
+    # process that crashed without finishing it needs.
+    assert _read_last_event_id(last_event_id_path) is None
+
+
+def test_stream_once_desired_state_bookmark_also_waits_for_the_next_next_call(
+    tmp_path: Path,
+) -> None:
+    """P5.4b: the same ordering applies to `event: desired_state` items,
+    not only plain `Command`s -- both code paths through `_stream_once`
+    persist the bookmark after their own `yield`, never before it."""
+
+    from protocol.desired_state import (
+        DesiredState,
+        Services,
+        ServiceState,
+        UpdateWindow,
+    )
+
+    digest = "sha256:" + "a" * 64
+    desired_state = DesiredState(
+        revision=1,
+        services=Services(
+            thermoctl=ServiceState(image="x", version="1", digest=digest),
+            zigbee2mqtt=ServiceState(image="x", version="1", digest=digest),
+            mosquitto=ServiceState(image="x", version="1", digest=digest),
+            agent=ServiceState(image="x", version="1", digest=digest),
+        ),
+        window=UpdateWindow(from_="09:00", until="16:00", not_below_outdoor_temp_c=-2.0),
+    )
+    event_json = f'{{"desired_state": {desired_state.model_dump_json()}, "pilot_mode": true}}'
+    body = (
+        f"event: desired_state\nid: e1\ndata: {event_json}\n\n"
+        'event: message\nid: e2\ndata: {"id": "cmd-1", "command": "report_now", '
+        '"expires_at": "2026-01-01T00:00:00Z", "protocol_version": 1}\n\n'
+    )
+    last_event_id_path = tmp_path / "last-event-id"
+    items = _stream_once(_sse_body_client(body), last_event_id_path)
+
+    first = next(items)
+    assert isinstance(first, DesiredStateReceived)
+    assert _read_last_event_id(last_event_id_path) is None
+
+    second = next(items)
+    assert isinstance(second, Command) and second.id == "cmd-1"
+    assert _read_last_event_id(last_event_id_path) == "e1"
 
 
 def test_stream_once_non_200_non_auth_response_raises_command_stream_error(

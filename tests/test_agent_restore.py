@@ -43,6 +43,7 @@ from agent.restore import (
     MOVER_STATUS_REPORTED_MARKER_FILENAME,
     RestoreTargets,
     _check_and_report_mover_status,
+    _report_restore_result,
     _resolve_prospective,
     apply_pending_restore,
     check_and_apply_pending_restore,
@@ -50,7 +51,7 @@ from agent.restore import (
     run_restore_poll_loop,
 )
 from agent.safe_io import UnsafeStateFileError
-from protocol.restore import PendingRestore
+from protocol.restore import PendingRestore, RestoreResult
 
 THERMOCTL_DB_CONTENT = b"a real sqlite file, or close enough for this test"
 Z2M_DATABASE_CONTENT = b"zigbee2mqtt device table"
@@ -946,6 +947,115 @@ def test_check_and_report_mover_status_no_file_is_a_no_op(tmp_path: Path) -> Non
         base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
     )
     _check_and_report_mover_status(client, targets)  # must not raise, nothing posted
+
+
+# --- `_report_restore_result` return value + marker-on-failure ------------
+# (cross-review finding, 2026-10-03): the function used to swallow a
+# failed POST silently and report nothing about it to its caller, which
+# used to let `_check_and_report_mover_status` write the "already
+# reported" marker regardless -- so a result lost to a transient network
+# failure was never retried. `_report_restore_result` now returns whether
+# the POST actually succeeded, and the marker is written only on `True`.
+
+
+def test_report_restore_result_returns_true_on_success(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/restore/result"
+        return httpx.Response(204)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+
+    assert _report_restore_result(client, RestoreResult(success=True, detail="x")) is True
+
+
+def test_report_restore_result_returns_false_on_a_non_2xx_response(tmp_path: Path) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+
+    # Must not raise either -- same "logged and swallowed" contract as
+    # before, just with an honest return value added on top.
+    assert _report_restore_result(client, RestoreResult(success=True, detail="x")) is False
+
+
+def test_report_restore_result_returns_false_on_a_transport_failure(tmp_path: Path) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated network failure")
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+
+    assert _report_restore_result(client, RestoreResult(success=True, detail="x")) is False
+
+
+def test_check_and_report_mover_status_does_not_write_the_marker_on_a_failed_post(
+    tmp_path: Path,
+) -> None:
+    """The POST fails every time -- the marker must never be written, so
+    the (still-unreported) result is retried, not lost, on the next
+    poll cycle."""
+
+    targets = _targets(tmp_path)
+    _write_mover_status(targets, backup_id="backup-9", result="success", detail="applied")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+    _check_and_report_mover_status(client, targets)
+
+    marker_path = targets.data_dir / MOVER_STATUS_REPORTED_MARKER_FILENAME
+    assert not marker_path.exists()
+
+
+def test_check_and_report_mover_status_retries_a_previously_failed_report(
+    tmp_path: Path,
+) -> None:
+    """The first poll cycle's POST fails (no marker written, per the test
+    above); the next cycle's POST succeeds -- it must actually be retried
+    (not permanently skipped), and only *then* does the marker get
+    written."""
+
+    targets = _targets(tmp_path)
+    _write_mover_status(targets, backup_id="backup-9", result="success", detail="applied")
+
+    call_count = 0
+    should_fail = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if should_fail:
+            return httpx.Response(500)
+        assert request.url.path == "/v1/restore/result"
+        return httpx.Response(204)
+
+    client = httpx.Client(
+        base_url="https://fleet.invalid", transport=httpx.MockTransport(handler)
+    )
+
+    _check_and_report_mover_status(client, targets)  # fails, no marker
+    marker_path = targets.data_dir / MOVER_STATUS_REPORTED_MARKER_FILENAME
+    assert not marker_path.exists()
+
+    should_fail = False
+    _check_and_report_mover_status(client, targets)  # retried, succeeds now
+
+    assert call_count == 2
+    assert marker_path.read_text(encoding="utf-8") == "backup-9"
+
+    # And now that the marker is written, a third cycle does not report
+    # the same backup id again.
+    _check_and_report_mover_status(client, targets)
+    assert call_count == 2
 
 
 def test_check_and_report_mover_status_forwards_success(tmp_path: Path) -> None:

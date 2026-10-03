@@ -238,6 +238,120 @@ def test_diagnostic_bundle_reports_honest_failure_when_unconfigured(tmp_path: Pa
     assert command.id in state.executed_ids
 
 
+# --- At-most-once durability (cross-review findings 1/6/7, 2026-10-03) -----
+# The id is now recorded *before* the handler runs, not after -- see
+# `execute_command`'s own docstring, "At-most-once semantics, chosen
+# deliberately". These tests simulate a crash at exactly that boundary:
+# the handler never returns at all (a `BaseException`, not merely an
+# `Exception` -- `execute_command`'s own broad `except Exception` clause
+# must not be what is masking this), and prove two things together: (1)
+# the id was durably persisted to `state_path` before the crash (no loss:
+# a fresh `load_agent_state` of that same path, simulating the next
+# process start, already sees it), and (2) a second `execute_command` call
+# for the identical, redelivered command id -- the next thing that would
+# happen on reconnect -- does not run the handler again (no double
+# execution).
+
+
+def test_execute_command_persists_the_id_before_the_handler_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A handler that raises `SystemExit` (a `BaseException`, deliberately
+    not caught by `execute_command`'s own `except Exception`) simulates the
+    agent process dying mid-handler. The id must already be durable on
+    disk by the time that happens -- recorded before the handler was ever
+    called, not after it would have returned."""
+
+    import agent.loop as loop_module
+
+    def _dies_mid_effect(_command: Command, _ctx: ExecutionContext) -> None:
+        raise SystemExit("simulated crash mid-handler")
+
+    monkeypatch.setitem(loop_module._HANDLERS, CommandType.REPORT_NOW, _dies_mid_effect)
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.REPORT_NOW)
+    state_path = tmp_path / "executed_ids"
+
+    with pytest.raises(SystemExit):
+        execute_command(command, state, ctx, state_path=state_path)
+
+    # Durable, not just in the in-memory `state` object: a fresh load from
+    # disk (what the next process start would see) already has it.
+    reloaded = load_agent_state(state_path)
+    assert command.id in reloaded.executed_ids
+
+
+def test_execute_command_crash_mid_handler_prevents_a_later_double_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the simulated crash above, a redelivery of the identical
+    command id (the SSE bookmark not having advanced past it either, see
+    `tests/test_agent_commands_channel.py`) must not run the handler a
+    second time -- it is already in `executed_ids`, so the duplicate check
+    rejects it before the (still broken, or now fixed) handler is ever
+    reached again. This is the "crash after the effect but before the
+    report" case resolving to *no retry*, not to *retry* -- the chosen
+    at-most-once semantics, not exactly-once."""
+
+    import agent.loop as loop_module
+
+    calls = 0
+
+    def _dies_mid_effect(_command: Command, _ctx: ExecutionContext) -> None:
+        nonlocal calls
+        calls += 1
+        raise SystemExit("simulated crash mid-handler")
+
+    monkeypatch.setitem(loop_module._HANDLERS, CommandType.REPORT_NOW, _dies_mid_effect)
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.REPORT_NOW)
+    state_path = tmp_path / "executed_ids"
+
+    with pytest.raises(SystemExit):
+        execute_command(command, state, ctx, state_path=state_path)
+    assert calls == 1
+
+    # Simulate the next process start: a fresh `AgentState` loaded from the
+    # same durable file, as `agent.loop.run` actually does on startup.
+    restarted_state = load_agent_state(state_path)
+    outcome = execute_command(command, restarted_state, ctx, state_path=state_path)
+
+    assert calls == 1  # handler was not invoked again
+    assert outcome.result is None  # nothing (re-)reported for a duplicate
+
+
+def test_execute_command_normal_completion_still_records_before_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not just the crash path -- even on ordinary completion, the id is
+    already durable on disk *while* the handler is still running (recorded
+    before it was called), not only once the handler returns."""
+
+    import agent.loop as loop_module
+    from agent.loop import _HandlerResult
+
+    seen_during_handler: list[bool] = []
+
+    def _check_already_recorded(command: Command, _ctx: ExecutionContext) -> _HandlerResult:
+        reloaded = load_agent_state(tmp_path / "executed_ids")
+        seen_during_handler.append(command.id in reloaded.executed_ids)
+        return _HandlerResult(successful=True)
+
+    monkeypatch.setitem(loop_module._HANDLERS, CommandType.REPORT_NOW, _check_already_recorded)
+
+    state = AgentState()
+    ctx = _ctx(tmp_path)
+    command = _command(CommandType.REPORT_NOW)
+
+    execute_command(command, state, ctx, state_path=tmp_path / "executed_ids")
+
+    assert seen_during_handler == [True]
+
+
 def test_execute_command_turns_an_unexpected_handler_exception_into_a_failed_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

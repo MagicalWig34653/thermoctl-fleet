@@ -24,18 +24,33 @@ sections 3, 7; P5.4b adds the `desired_state` event, section 13).
    but still rejected the same way (section 18.2: "the agent rejects
    commands of a newer version it does not know ... reports that as a
    result, and keeps running").
-3. **Persists `Last-Event-ID` as soon as an event is off the wire, before
-   yielding it to the caller.** This is a transport-level bookmark --
-   "which events has this SSE stream already delivered" -- not an
-   execution-safety mechanism; section 7's own "the agent remembers the
-   last 200 ids" (P5.2's `AgentState.executed_ids`) is what actually
-   guards against ever *executing* the same command twice. Persisting
-   eagerly means a caller that crashes between receiving an event and
-   finishing whatever it does with it simply re-receives that one event on
-   the next reconnect -- it never silently advances the bookmark past a
-   command nothing ever actually saw. Written atomically (temporary file
-   plus `Path.replace`, the same pattern `agent.heartbeat_sender`'s buffer
-   file and `agent.loop.report_watchdog_state` both already use).
+3. **Persists `Last-Event-ID` only after the caller has finished with the
+   item -- never before.** This is a transport-level bookmark -- "which
+   events has this SSE stream already delivered" -- but `fleet.app
+   .pending_commands` resumes a reconnect strictly *after* this bookmark
+   (sequence greater than, not greater-or-equal), so persisting it early is
+   not merely "a caller re-sees one extra event", it is **permanent loss**
+   of whatever was yielded but not yet durably handled: the next reconnect
+   never asks for it again, and no later poll surfaces it either (a command
+   already past this bookmark is gone from both delivery paths at once,
+   until -- and unless -- it simply expires unreported on the cloud side).
+   An earlier version of this module persisted the bookmark eagerly, right
+   after the event came off the wire and before `yield`, reasoning that
+   section 7's "the agent remembers the last 200 ids"
+   (`agent.loop.AgentState.executed_ids`) was the only guard that actually
+   mattered; cross-review found the gap this leaves: a crash *after* that
+   early write but *before* the caller durably records the id (P5.2's own
+   `_record_executed`, which itself now runs before the handler for the
+   matching reason) loses the command outright, with neither mechanism
+   left to redeliver it. The code after each `yield` below therefore only
+   runs once the `for item in receive_commands(...):` loop in the caller
+   calls back in for the next item -- i.e. once the caller's own body for
+   the previous item has returned -- and this generator relies on exactly
+   that: the bookmark for an item is written in the gap between "caller's
+   body for it finished" and "this generator asks the wire for what comes
+   next", never any earlier. Written atomically (temporary file plus
+   `Path.replace`, the same pattern `agent.heartbeat_sender`'s buffer file
+   and `agent.loop.report_watchdog_state` both already use).
 4. On a dropped or failed stream (a transport error, or a non-200 response
    this module cannot make sense of as SSE), falls back to polling
    `GET /v1/commands?wait=0` once (section 3's own fallback), honouring
@@ -419,20 +434,12 @@ def _stream_once(
         _raise_for_non_200(event_source.response, "GET /v1/commands (SSE)")
         on_contact(True)
         for sse in event_source.iter_sse():
-            # Persisted as soon as the event is off the wire, **before**
-            # yielding it -- `Last-Event-ID` is a transport-level bookmark
-            # ("which events has this stream already delivered"), not an
-            # execution-safety mechanism; section 7's own "the agent
-            # remembers the last 200 ids" (P5.2's `AgentState.executed_ids`)
-            # is what actually protects against ever executing the same
-            # command twice. Persisting here means an agent that crashes
-            # between receiving an event and finishing whatever it does
-            # with it simply re-receives that one event on reconnect --
-            # never silently drops it by advancing the bookmark past a
-            # command it never actually saw processed.
-            if sse.id:
-                _write_last_event_id(last_event_id_path, sse.id)
             if not sse.data:
+                # Nothing was (or could be) yielded for this one -- no item
+                # exists for a crash to lose, so there is nothing gained by
+                # delaying this particular write.
+                if sse.id:
+                    _write_last_event_id(last_event_id_path, sse.id)
                 continue
             # P5.4b: `event: desired_state` carries a `DesiredStateEvent`,
             # never a `Command` -- dispatched by the SSE event name
@@ -442,8 +449,22 @@ def _stream_once(
                 item = _parse_desired_state_event(sse.data)
                 if item is not None:
                     yield item
+                # Reached only once the caller's own handling of `item` has
+                # returned (see the module docstring, point 3) -- `None`
+                # (a malformed event, nothing yielded) falls straight
+                # through from the `if` above with nothing to wait for.
+                if sse.id:
+                    _write_last_event_id(last_event_id_path, sse.id)
                 continue
             yield _parse_event_data(sse.data)
+            # Persisted here, not above the `yield` -- see the module
+            # docstring, point 3: this is the earliest point at which the
+            # caller is known to be done with the item (a `Command` or
+            # `RejectedCommand`) this `sse.id` belongs to, whether that
+            # means it was durably recorded as executed, rejected, or (for
+            # a duplicate) simply re-recognized as already seen.
+            if sse.id:
+                _write_last_event_id(last_event_id_path, sse.id)
 
 
 def _poll_once(

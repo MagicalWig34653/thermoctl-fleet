@@ -671,13 +671,22 @@ def apply_pending_restore(pending: PendingRestore, targets: RestoreTargets) -> R
     return RestoreResult(success=True, detail=DETAIL_STAGED)
 
 
-def _report_restore_result(client: httpx.Client, result: RestoreResult) -> None:
+def _report_restore_result(client: httpx.Client, result: RestoreResult) -> bool:
     """`POST /v1/restore/result` -- "report result to the fleet
     (success/failure, no content)" (owner decision). Errors reporting the
     result are logged and swallowed, same reasoning as
     `ensure_age_recipient_reported`: a failure to *report* must not be
     confused with a failure to *stage*, and the caller has already done
-    everything it can about the restore itself by the time this runs."""
+    everything it can about the restore itself by the time this runs.
+
+    **Returns whether the POST actually succeeded** (cross-review
+    finding): swallowing the error here is right -- a failed report must
+    not crash the restore poll loop or the mover-status check -- but it
+    must not look like success to the caller either. A caller that writes
+    an "already reported" marker on the strength of this call alone (see
+    `_check_and_report_mover_status`) needs to know which happened, or a
+    report lost to a transient network failure is never retried: the
+    marker would already claim it was reported."""
 
     try:
         response = client.post(
@@ -686,6 +695,8 @@ def _report_restore_result(client: httpx.Client, result: RestoreResult) -> None:
         response.raise_for_status()
     except Exception:
         logger.exception("Reporting the restore result to the fleet failed.")
+        return False
+    return True
 
 
 def _check_and_report_mover_status(client: httpx.Client, targets: RestoreTargets) -> None:
@@ -749,8 +760,22 @@ def _check_and_report_mover_status(client: httpx.Client, targets: RestoreTargets
     if read_text_safe(marker_path) == backup_id:
         return
 
-    _report_restore_result(client, RestoreResult(success=result == "success", detail=detail))
-    write_bytes_safe(marker_path, backup_id.encode("utf-8"))
+    reported = _report_restore_result(
+        client, RestoreResult(success=result == "success", detail=detail)
+    )
+    # **Cross-review finding:** the marker used to be written unconditionally
+    # here, even when the POST above failed -- `_report_restore_result`
+    # swallows transport/HTTP errors (so one failed report cannot crash this
+    # periodic check), but that silence used to be indistinguishable from
+    # success to this caller, so a report lost to a transient failure was
+    # never retried: the very next cycle saw the marker already matching
+    # `backup_id` and skipped reporting again, permanently. The marker is
+    # now written only once the POST actually succeeded; on failure this
+    # function returns with no marker written, and the next poll cycle
+    # (`run_restore_poll_loop`) finds the same still-unmarked `backup_id` and
+    # retries the report.
+    if reported:
+        write_bytes_safe(marker_path, backup_id.encode("utf-8"))
 
 
 def check_and_apply_pending_restore(client: httpx.Client, targets: RestoreTargets) -> bool:
