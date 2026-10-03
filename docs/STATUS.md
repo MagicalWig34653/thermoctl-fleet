@@ -37,6 +37,16 @@ Verified again after the fix: `ruff check .` and `mypy .` both exit 0;
 full suite 2143 tests, 0 failures/errors, 1 pre-existing/unrelated skip;
 `tools/docs_screenshots.py` at 100% line coverage.
 
+Website follow-up: `site/docs/wohnung.html` now documents the released
+image artifacts and checksum, the macOS flash CLI and its safety checks,
+plus the Lima enrollment walkthrough and digest-swap limitation. The
+Wi-Fi file is described as written but not yet consumed at boot --
+**open point:** `tools/flash_image.py` writes `wifi.env` to the boot
+partition, but nothing in `image/` reads it yet (needs a first-boot unit
+that hands it to NetworkManager and then deletes it). No FAQ
+entry claimed this tooling was missing, so `site/docs/faq.html` was left
+unchanged.
+
 ## `tools/docs_screenshots.py` test coverage (2026-10-03)
 
 Was 0% covered (144 statements, no test file at all). Added
