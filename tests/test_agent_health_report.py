@@ -105,11 +105,59 @@ def test_maybe_advance_proven_advances_after_the_hour(tmp_path: Path) -> None:
     path.write_text(f"desired={_DIGEST_B}\nproven={_DIGEST_A}\nsince={since}\n", encoding="utf-8")
 
     an_hour_later = datetime.fromtimestamp(since + PROVEN_ADVANCE_AFTER_S, tz=UTC)
-    assert _maybe_advance_proven(path, now=lambda: an_hour_later) is True
+    # Own digest matches `desired` -- the ordinary, successful case: this
+    # process is actually running what it is about to promote.
+    assert (
+        _maybe_advance_proven(
+            path, now=lambda: an_hour_later, own_digest_reader=lambda: _DIGEST_B
+        )
+        is True
+    )
 
     desired, proven, _since = _read_watchdog_state_full(path)  # type: ignore[misc]
     assert desired == _DIGEST_B
     assert proven == _DIGEST_B
+
+
+def test_maybe_advance_proven_false_when_rolled_back_to_proven(tmp_path: Path) -> None:
+    """Main-session read-back fix: `watchdog/watch.go`'s `RollBackToProven`
+    never touches the state file -- it only restarts the container on
+    `proven`'s digest. After a rollback the file is unchanged
+    (`desired=X`, `proven=<old>`, stale `since`), so elapsed time alone
+    would otherwise promote the already-rolled-back `X` an hour later.
+    This process's own running digest is still `proven` (`_DIGEST_A`),
+    not `desired` (`_DIGEST_B`) -- must not promote."""
+
+    path = tmp_path / "state.env"
+    since = 1_000_000
+    path.write_text(f"desired={_DIGEST_B}\nproven={_DIGEST_A}\nsince={since}\n", encoding="utf-8")
+
+    an_hour_later = datetime.fromtimestamp(since + PROVEN_ADVANCE_AFTER_S, tz=UTC)
+    assert (
+        _maybe_advance_proven(
+            path, now=lambda: an_hour_later, own_digest_reader=lambda: _DIGEST_A
+        )
+        is False
+    )
+    # Unchanged.
+    assert _read_watchdog_state_full(path) == (_DIGEST_B, _DIGEST_A, since)
+
+
+def test_maybe_advance_proven_false_when_own_digest_unresolvable(tmp_path: Path) -> None:
+    """`own_digest_reader` returning `None` (Docker unreachable, or no
+    matching `RepoDigests` entry) must never be treated as a match --
+    "cannot tell" is not "yes"."""
+
+    path = tmp_path / "state.env"
+    since = 1_000_000
+    path.write_text(f"desired={_DIGEST_B}\nproven={_DIGEST_A}\nsince={since}\n", encoding="utf-8")
+
+    an_hour_later = datetime.fromtimestamp(since + PROVEN_ADVANCE_AFTER_S, tz=UTC)
+    assert (
+        _maybe_advance_proven(path, now=lambda: an_hour_later, own_digest_reader=lambda: None)
+        is False
+    )
+    assert _read_watchdog_state_full(path) == (_DIGEST_B, _DIGEST_A, since)
 
 
 # --- run_health_report_loop (section 17 step 5) -----------------------------
@@ -246,6 +294,49 @@ def test_run_health_report_loop_advances_proven_after_the_hour(tmp_path: Path) -
     desired, proven, _since = _read_watchdog_state_full(watchdog_path)  # type: ignore[misc]
     assert desired == _DIGEST_B
     assert proven == _DIGEST_B
+
+
+def test_run_health_report_loop_does_not_promote_a_rolled_back_agent(tmp_path: Path) -> None:
+    """End-to-end version of `test_maybe_advance_proven_false_when_rolled_back_to_proven`:
+    the watchdog already rolled this process back to `proven` (it is
+    actually running `_DIGEST_A`, resolved here the same way the health
+    report itself is, via the fake Docker Engine API), while the state
+    file still names `_DIGEST_B` as `desired` from the failed swap. An
+    hour past that swap's `since` must not promote `_DIGEST_B`."""
+
+    health_path = tmp_path / "health.env"
+    watchdog_path = tmp_path / "state.env"
+    since = 1_000_000
+    watchdog_path.write_text(
+        f"desired={_DIGEST_B}\nproven={_DIGEST_A}\nsince={since}\n", encoding="utf-8"
+    )
+    an_hour_later = datetime.fromtimestamp(since + PROVEN_ADVANCE_AFTER_S, tz=UTC)
+
+    with run_fake_docker_api_with_app(
+        inspect=_agent_inspect(_DIGEST_A), images=_agent_images(_DIGEST_A)
+    ) as (socket_path, _app):
+        stop_event = threading.Event()
+
+        def _sleep_and_stop(_seconds: float) -> None:
+            stop_event.set()
+
+        run_health_report_loop(
+            health_path,
+            watchdog_path,
+            "0.4.0",
+            socket_path=socket_path,
+            interval_s=1000.0,
+            now=lambda: an_hour_later,
+            sleep=_sleep_and_stop,
+            stop_event=stop_event,
+        )
+
+    # The health report honestly names what is actually running --
+    # `_DIGEST_A`, not the still-desired `_DIGEST_B`.
+    assert f"digest={_DIGEST_A}" in health_path.read_text(encoding="utf-8")
+    desired, proven, _since = _read_watchdog_state_full(watchdog_path)  # type: ignore[misc]
+    assert desired == _DIGEST_B
+    assert proven == _DIGEST_A
 
 
 def test_run_health_report_loop_survives_a_broken_watchdog_state_file(tmp_path: Path) -> None:

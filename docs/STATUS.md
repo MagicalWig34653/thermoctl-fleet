@@ -2,6 +2,100 @@
 
 Last updated: 2026-10-03.
 
+## Main-session read-back: three further fixes on top of the Codex findings (2026-10-03)
+
+Three issues found in the main-session read-back of the branch that fixed
+the Codex findings directly below. **Desired-state reconciliation remains
+inactive in production**, unchanged -- these are further activation
+correctness fixes, not new activation conditions.
+
+**1. `watchdog/watch.go` `AwaitHealthReport`: the 10-minute deadline had
+become a standing expiry on an already-healthy revision.** The Codex-
+finding fix below restructured the loop to check restarts first and
+require freshness relative to `now()` -- but kept the original `for
+now().Before(deadline)` as the loop's own entry condition. Once `now()`
+reached the deadline, the loop body stopped running at all, and the
+function unconditionally returned "no health report ... within the
+deadline" -- `Reconcile` calls this function fresh on *every* tick for as
+long as `desired != proven` (i.e. for up to the full one-hour mark from
+section 17 step 6, not only the first 10 minutes), so a perfectly
+healthy revision, still reporting fresh with zero restarts, would have
+been rolled back on the very first tick past minute 10. Fixed: the
+10-minute check is now only reached *after* the restart check and the
+freshness check have both come back negative for the current tick, never
+as the loop's own entry condition -- `for { ...; if !now().Before(deadline)
+{ return ... }; sleep }`. New tests: `TestAwaitHealthReportFreshPastDeadlineStaysHealthy`
+(now 30 minutes past Since, report still fresh -> no rollback),
+`TestAwaitHealthReportStalePastDeadlineRollsBack` (now 30 minutes past
+Since, report never refreshed -> rollback), and
+`TestAwaitHealthReportThreeRestartsPastDeadlineRollsBack`. Root package:
+**286 statement lines** (same counting method, `grep -v '^\s*//' <file> |
+grep -v '^\s*$' | wc -l`), up from 284.
+
+**2. `agent.loop._maybe_advance_proven` could promote an already-rolled-back
+digest.** `watchdog/watch.go`'s `RollBackToProven` never rewrites the
+state file -- it only restarts the container on `proven`'s digest. After
+a watchdog rollback the file is therefore left exactly as it was before
+the failed swap (`desired=X`, `proven=<the actually running digest>`,
+unchanged `since`), so elapsed-time-since-`since` alone kept growing as
+if `X` were healthy, and an hour later the previous version of this
+function would have promoted the already-rolled-back `X` to `proven`,
+discarding the one known-good rollback target for a digest that was not
+even running. Fixed: a new required check, `own_digest_reader` (default
+`_default_own_digest_reader`, resolving this process's own running
+digest the identical way `run_health_report_loop` already does for the
+health report -- `current_repo_digest` against the agent's own
+container/source, never a second read of the state file this function is
+about to write, which would be circular) -- promotion now additionally
+requires that digest to equal `desired`. `None` (unresolvable) never
+counts as a match. `run_health_report_loop` passes through the digest it
+already resolved for the health report itself on the same tick, so this
+costs no extra Docker call. New tests:
+`test_maybe_advance_proven_false_when_rolled_back_to_proven`,
+`test_maybe_advance_proven_false_when_own_digest_unresolvable`, and the
+end-to-end `test_run_health_report_loop_does_not_promote_a_rolled_back_agent`.
+
+**3. The agent could re-hand-off the same already-failed digest forever.**
+A freshly restarted agent process (started by the watchdog on `proven`
+after a rollback) has no in-memory record that `desired`'s digest was
+already tried -- if the fleet still names that same digest, the next
+reconcile attempt would pull, verify, hand it off, and self-stop again,
+repeating the full pull/swap/wait/rollback cycle every reconcile
+interval, forever. Detected in `reconcile_desired_state`'s own agent
+branch: if the *current* state file's `desired` already equals the
+digest about to be handed off (nothing changed since the last attempt)
+**and** this process's own currently running digest (resolved the same
+way as fix 2) equals `proven`, not `desired` -- the watchdog already
+rolled this exact digest back. Treated as a failed update: no new
+handoff (no state write, no self-stop), reported as a failure with
+`ReconcileOutcome.rolled_back_unhealthy=True`. This deliberately reuses
+`_DesiredStateReconciler.attempt`'s existing known-bad-digest guard --
+the same `_FailedRollback` mechanism `_await_or_rollback_pending_swap`
+already uses for the other three services -- rather than inventing a
+second one: `RECONCILE_SERVICE_ORDER`/`_load_failed_rollback`'s own
+validation already accepted `service="agent"`, so no change to that
+guard was needed, only feeding it from this new call site. New tests:
+`test_reconcile_agent_service_refuses_to_rehandoff_an_already_rolled_back_digest`,
+`test_reconcile_agent_service_hands_off_normally_when_not_a_repeat` (the
+contrasting, genuinely-first-attempt case), and
+`test_reconciler_attempt_does_not_retry_an_agent_digest_already_rolled_back`
+(the guard blocking a subsequent attempt end to end, at the
+`_DesiredStateReconciler` layer).
+
+**Verification:** `ruff check .` clean; `mypy .` (161 files) and `mypy
+protocol fleet agent tools` (78 files) clean; pytest (`--junitxml`):
+`<testsuite ... errors="0" failures="0" skipped="1" tests="2076" .../>`,
+coverage TOTAL 8084 stmts / 30 missed / 99%; Go: `go vet ./...` clean,
+`go test -count=1 ./...` all four packages ok, `gofmt -l .` empty,
+`watchdog/check_contract.sh` passing.
+
+**Files:** `agent/loop.py` (`reconcile_desired_state`'s agent branch,
+`_default_own_digest_reader`, `_maybe_advance_proven`,
+`run_health_report_loop`), `watchdog/watch.go` (`AwaitHealthReport`),
+`watchdog/watch_test.go`, `tests/test_agent_reconcile.py`,
+`tests/test_agent_health_report.py`,
+`tests/test_agent_desired_state_reconciler.py`.
+
 ## Codex full review findings 2, 5 -- desired-state reconciliation activation blockers (2026-10-03)
 
 Fixes four confirmed findings from an external ("Codex") full review of

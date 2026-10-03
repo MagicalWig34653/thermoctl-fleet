@@ -460,3 +460,69 @@ func TestAwaitHealthReportStaleRelativeToNowTreatedAsMissing(t *testing.T) {
 		t.Fatal("expected a non-empty reason for the stale-relative-to-now report, got healthy")
 	}
 }
+
+// Main-session read-back fix: the 10-minute deadline must not become a
+// standing expiry on a revision that already proved itself and is still
+// reporting fine -- `Reconcile` calls `AwaitHealthReport` fresh on every
+// tick for as long as `desired != proven` (i.e. for up to the full
+// one-hour mark from section 17 step 6, not only for the first 10
+// minutes), so a `for now().Before(deadline)` loop condition used to make
+// every tick past minute 10 return "no health report" unconditionally,
+// rolling back a perfectly healthy revision. These three tests all set
+// `now()` well past `Since+10min` from the very first check.
+
+func TestAwaitHealthReportFreshPastDeadlineStaysHealthy(t *testing.T) {
+	since := testNow.Unix()
+	rt := &fakeRuntime{}
+	// now() is 30 minutes after Since -- 20 minutes past the 10-minute
+	// deadline -- but the report itself is fresh relative to *now*,
+	// having just been (re)written at that same later point in time.
+	clock := &fakeClock{t: testNow.Add(30 * time.Minute)}
+	health := writeHealth(t, "sha256:new", clock.t.Unix())
+
+	reason, err := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
+	if err != nil || reason != "" {
+		t.Fatalf("reason=%q err=%v, expected healthy -- fresh report past the deadline must not roll back", reason, err)
+	}
+	if clock.sleeps != 0 {
+		t.Errorf("slept %d times, expected an immediate healthy result", clock.sleeps)
+	}
+}
+
+func TestAwaitHealthReportStalePastDeadlineRollsBack(t *testing.T) {
+	since := testNow.Unix()
+	// Written at Since, never refreshed -- stale relative to "now", 30
+	// minutes later.
+	health := writeHealth(t, "sha256:new", since)
+	rt := &fakeRuntime{}
+	clock := &fakeClock{t: testNow.Add(30 * time.Minute)}
+
+	reason, err := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reason == "" {
+		t.Fatal("expected a non-empty rollback reason for a stale report past the deadline, got healthy")
+	}
+	if clock.sleeps != 0 {
+		t.Errorf("slept %d times, expected an immediate rollback -- the deadline was already behind us", clock.sleeps)
+	}
+}
+
+func TestAwaitHealthReportThreeRestartsPastDeadlineRollsBack(t *testing.T) {
+	since := testNow.Unix()
+	missing := filepath.Join(t.TempDir(), "never-written.env")
+	rt := &fakeRuntime{restarts: maxRestarts}
+	clock := &fakeClock{t: testNow.Add(30 * time.Minute)}
+
+	reason, err := AwaitHealthReport(rt, missing, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reason == "" {
+		t.Fatal("expected a non-empty rollback reason for three restarts past the deadline, got healthy")
+	}
+	if clock.sleeps != 0 {
+		t.Errorf("slept %d times, expected an immediate rollback", clock.sleeps)
+	}
+}
