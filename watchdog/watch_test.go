@@ -394,7 +394,9 @@ func TestReconcileResumedMidSwapPastDeadlineRollsBack(t *testing.T) {
 
 func TestReconcileResumedMidSwapWithTimeRemainingFindsHealthy(t *testing.T) {
 	since := testNow.Add(-9 * time.Minute).Unix() // 1 minute of the 10 left
-	health := writeHealth(t, "sha256:new", since+30)
+	// Fresh relative to "now" (testNow), not just relative to since --
+	// full-review fix: a report must satisfy both.
+	health := writeHealth(t, "sha256:new", testNow.Unix()-30)
 	rt := &fakeRuntime{running: true, digest: "sha256:new"}
 	s := State{Desired: "sha256:new", Proven: "sha256:old", Since: since}
 	clock := newFakeClock()
@@ -405,5 +407,56 @@ func TestReconcileResumedMidSwapWithTimeRemainingFindsHealthy(t *testing.T) {
 	}
 	if len(rt.startedFor) != 0 {
 		t.Fatalf("started %v, expected no action -- it was already running and proved healthy", rt.startedFor)
+	}
+}
+
+// Full-review fix: the restart count must be checked on every poll, not
+// only before the first health report is ever seen -- a revision that
+// wrote one good report and then started crash-looping must still be
+// rolled back while desired != proven.
+
+func TestAwaitHealthReportCrashLoopAfterOneGoodReportRollsBack(t *testing.T) {
+	since := testNow.Unix()
+	health := writeHealth(t, "sha256:new", since)
+	rt := &fakeRuntime{restarts: 0}
+	clock := newFakeClock()
+
+	// First poll: fresh, matching report, no restarts yet -- healthy.
+	reason, err := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
+	if err != nil || reason != "" {
+		t.Fatalf("reason=%q err=%v, expected healthy on the first check", reason, err)
+	}
+
+	// The same revision now starts crash-looping: the health report on
+	// disk is untouched (the old version under the old logic), but the
+	// restart count has since climbed to the threshold.
+	rt.restarts = maxRestarts
+	reason, err = AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reason == "" {
+		t.Fatal("expected a non-empty rollback reason once restarts hit the threshold, got healthy")
+	}
+}
+
+// Full-review fix: a report that matches digest and Since but has not
+// been refreshed recently (relative to now) must not count as healthy
+// forever -- the writing process may have died without the container
+// itself restarting.
+
+func TestAwaitHealthReportStaleRelativeToNowTreatedAsMissing(t *testing.T) {
+	since := testNow.Add(-5 * time.Minute).Unix() // still well within the 10-minute deadline
+	// Matches digest and is >= Since, but was written long before "now".
+	health := writeHealth(t, "sha256:new", since)
+	rt := &fakeRuntime{}
+	clock := newFakeClock() // now == testNow, i.e. 5 minutes after the report's own timestamp
+
+	reason, err := AwaitHealthReport(rt, health, State{Desired: "sha256:new", Since: since}, clock.now, clock.sleep)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reason == "" {
+		t.Fatal("expected a non-empty reason for the stale-relative-to-now report, got healthy")
 	}
 }

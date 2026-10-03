@@ -28,6 +28,18 @@ const healthDeadline = 10 * time.Minute
 // 5), independent of the deadline above.
 const maxRestarts = 3
 
+// healthStaleAfter: how old a health report may be, relative to *now*, and
+// still count as proof of life (section 22.3: "the watchdog checks its
+// age, older than 120 seconds counts as silent" -- reused here verbatim,
+// not a separately invented bound). Full-review fix: a single health
+// report that once matched s.Desired/s.Since used to satisfy
+// AwaitHealthReport forever, on every later Reconcile tick, even once the
+// revision that wrote it had since crash-looped and gone silent -- this
+// bound is what makes "the report is still fresh" an actual, repeated
+// check against the clock, not a one-time fact recorded at the moment it
+// first appeared.
+const healthStaleAfter = 120 * time.Second
+
 // Runtime is the seam onto the container runtime (section 18.3): addressed
 // only through this interface, never a library -- tests substitute a fake,
 // never Docker.
@@ -48,18 +60,43 @@ type Runtime interface {
 // resuming mid-window (the watchdog itself restarted) waits only the
 // remainder, never a fresh 10 minutes. now/sleep are injected so tests
 // never wait on a real clock -- production passes time.Now/time.Sleep.
+//
+// **Full-review fix, two parts, both needed together:**
+//
+//  1. **The restart count is checked before the health report, not
+//     after.** The previous order returned "healthy" the moment any
+//     single matching report was found, before ever looking at restarts
+//     again -- so a revision that wrote one good report and then started
+//     crash-looping was never rolled back, because the health check kept
+//     winning the race against the restart check on every later call.
+//     Checking restarts first means three restarts roll back immediately,
+//     regardless of what the health file still says.
+//  2. **The report must also be fresh relative to *now*, not only
+//     relative to s.Since** (healthStaleAfter, section 22.3's own 120
+//     seconds). Without this, a report written once, right after the
+//     swap, and never updated again (the writing process died without
+//     restarting the container -- so the restart-count check above never
+//     fires either) would go on satisfying "healthy" forever: this
+//     function is called fresh on every Reconcile tick as long as
+//     s.Desired != s.Proven, and the old check only ever asked "is this
+//     the right digest, from on-or-after the swap" -- never "is this
+//     still happening". A report older than healthStaleAfter is treated
+//     exactly like a missing one.
 func AwaitHealthReport(rt Runtime, healthPath string, s State, now func() time.Time, sleep func(time.Duration)) (reason string, err error) {
 	deadline := time.Unix(s.Since, 0).Add(healthDeadline)
 	for now().Before(deadline) {
-		if h, readErr := ReadHealth(healthPath); readErr == nil && h.Digest == s.Desired && h.Timestamp >= s.Since {
-			return "", nil
-		}
 		_, _, restarts, statusErr := rt.Status()
 		if statusErr != nil {
 			return "", fmt.Errorf("checking restart count: %w", statusErr)
 		}
 		if restarts >= maxRestarts {
 			return "the container restarted three times in a row", nil
+		}
+		if h, readErr := ReadHealth(healthPath); readErr == nil &&
+			h.Digest == s.Desired &&
+			h.Timestamp >= s.Since &&
+			now().Sub(time.Unix(h.Timestamp, 0)) <= healthStaleAfter {
+			return "", nil
 		}
 		sleep(healthPollInterval)
 	}
