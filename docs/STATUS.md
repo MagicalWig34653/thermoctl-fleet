@@ -1216,6 +1216,39 @@ exploitable (closed allowlist, every staged byte is agent-authored and
 hash-checked, `os.Root` refuses escapes), to be added for consistency
 with `openRegularNoFollow`'s discipline.
 
+## Follow-up closed: `StagingRoot` post-open re-check (2026-10-03)
+
+Closes the low-severity follow-up noted directly above. `openEntryNoFollow`
+and `readManifestBytes` (`watchdog/cmd/thermoctl-restore-mover/stagingroot.go`)
+now Fstat the descriptor `root.OpenFile` actually returned -- never
+re-Lstat the name, which would just reopen the identical race one call
+later -- and refuse unless it is still a lone-linked regular file *and*
+`os.SameFile` holds against the original `Lstat`'s `os.FileInfo`. The
+`os.SameFile` check is what actually matters here: an attacker's in-root
+symlink target can itself be a lone-linked regular file, so the
+type/link-count checks alone would not catch a swap-for-a-same-shaped
+decoy -- only comparing device+inode against the pre-open `Lstat` does.
+`requireSingleLink` factors the link-count extraction out so the
+pre-open and post-open checks apply the identical rule.
+`readManifestBytes` picked up the pre-open `Nlink == 1` check it was
+missing too (manifest.json is the same agent-controlled read path,
+closed for consistency, no existing test relied on a hard-linked
+manifest being accepted).
+
+New regression tests (`stagingroot_test.go`) use a test-only hook
+(`testPostLstatHook`, nil in production) to land a symlink-swap or a
+hard-link-swap deterministically in the exact window between the Lstat
+and the Open, for both `openEntryNoFollow` and `readManifestBytes` --
+each refused -- plus one acceptance test per function confirming an
+unswapped file still passes with the hook installed (so the test
+actually exercises the race window instead of vacuously passing).
+`go vet`/`gofmt`/`go test -cover` all clean, coverage for this package
+79.3% -> 80.6%; `watchdog/go.mod` still has zero `require` lines;
+`watchdog/check_contract.sh` passes unchanged.
+
+**Files:** `watchdog/cmd/thermoctl-restore-mover/stagingroot.go`,
+`watchdog/cmd/thermoctl-restore-mover/stagingroot_test.go`.
+
 ## P5.5d -- restore mover open points (resumable finalize, narrower ReadWritePaths=, `_resolve_prospective` fix)
 
 Closes the three open points left after the P5.5c and P5.5b cross-review
