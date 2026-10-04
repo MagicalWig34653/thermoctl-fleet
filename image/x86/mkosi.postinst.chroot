@@ -40,3 +40,71 @@ FSTAB_LINE='PARTLABEL=ESP /boot/firmware vfat defaults 0 2'
 if ! grep -qxF "$FSTAB_LINE" /etc/fstab 2>/dev/null; then
   printf '%s\n' "$FSTAB_LINE" >>/etc/fstab
 fi
+
+# Also bind-mount the SAME partition at /efi (main-session review finding,
+# confirmed against the actual Debian 13 "trixie" systemd 257.13-1~deb13u1
+# source package): `bootctl`/`kernel-install` only ever look for the ESP
+# at /efi, /boot, or /boot/efi (bootctl(1)/kernel-install(8), "--esp-path="
+# and "The $BOOT partition") -- there is no environment variable or config
+# file that redirects *that* lookup, only kernel-install's own separate
+# $BOOT_ROOT (which the /etc/kernel/install.conf.d/ drop-in written below
+# does not even need to set once this bind mount exists). Crucially, Debian's
+# own systemd-boot package ships the hook that runs on every future kernel
+# update (`/etc/kernel/postinst.d/zz-systemd-boot`, package `systemd-boot`,
+# debian/extra/kernel/postinst.d/zz-systemd-boot in that exact source
+# package version) as:
+#
+#   test -x /usr/bin/bootctl || exit 0
+#   bootctl is-installed --quiet || exit 0
+#   kernel-install add "$1" "$2"
+#
+# -- an unconditional, argument-less `bootctl is-installed --quiet` gate
+# with no hook or flag this image could pass it. Without a real ESP at one
+# of bootctl's three fixed paths, that check fails, the hook exits 0
+# silently, and `kernel-install add` is never even attempted: every future
+# kernel update from unattended-upgrades would install a new kernel on
+# disk and never put it on the ESP, with no error anywhere. Rather than
+# overriding every individual tool that touches the ESP (fragile, and this
+# conffile-owned hook is not one this image should patch), this bind mount
+# makes /efi a real, ordinary second mount point of the exact same
+# partition already mounted at /boot/firmware above -- not a symlink
+# (image/README.md's "Boot partition path": a symlink resolves through the
+# FAT partition's own namespace, which a hostile medium controls before
+# first boot; a bind mount is a kernel-level second mount of the same
+# block device, configured here, outside FAT's own namespace entirely).
+# `nofail`: a transient failure to bind-mount must not block boot the way
+# a missing *source* filesystem would.
+# `x-systemd.requires-mounts-for=/boot/firmware`: orders this mount after
+# the real partition mount above (systemd-fstab-generator, fstab(5)).
+#
+# **Not verified against a real boot** (same sandbox limitation as the
+# rest of this file -- no Linux loop-device/systemd-nspawn environment
+# here): verified by reading bootctl(1)/kernel-install(8) and the actual
+# Debian 13 systemd source package, not by booting a built image. Tracked
+# as an open point in image/README.md's "Boot partition path" section
+# until a real amd64 build-and-boot test runs.
+install -d -m 0755 /efi
+FSTAB_BIND_LINE='/boot/firmware /efi none bind,nofail,x-systemd.requires-mounts-for=/boot/firmware 0 0'
+if ! grep -qxF "$FSTAB_BIND_LINE" /etc/fstab 2>/dev/null; then
+  printf '%s\n' "$FSTAB_BIND_LINE" >>/etc/fstab
+fi
+
+# Pins layout=uki for every future kernel-install invocation, inline
+# (not a sibling file staged via image/x86/mkosi.extra -- mkosi-chroot
+# only guarantees $REPO_ROOT above is reachable inside the chroot, not
+# this script's own directory on the host) rather than relying on
+# kernel-install's own "auto" layout detection (kernel-install(8): "auto"
+# picks "uki" only if the *kernel binary itself* is a UKI, which a plain
+# apt-installed linux-image-amd64 kernel is not -- it would otherwise
+# resolve to "bls" or "other" depending on exactly what mkosi's own
+# build-time UKI generation left behind under $BOOT, either way silently
+# stopping every future kernel update from ever producing a new UKI on
+# the ESP, kernel-install's own 90-uki-copy.install plugin only running
+# when the layout actually is "uki", with no error of any kind).
+# BOOT_ROOT= is deliberately not set: kernel-install's own "$BOOT
+# partition" autodetection already finds the real ESP at /efi now that it
+# is bind-mounted above, so there is nothing left to override.
+install -d -m 0755 /etc/kernel/install.conf.d
+cat >/etc/kernel/install.conf.d/thermoctl.conf <<'EOF'
+layout=uki
+EOF

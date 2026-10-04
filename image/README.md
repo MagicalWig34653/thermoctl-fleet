@@ -125,23 +125,101 @@ rather than the alternatives considered:
     so this one line is what overrides the `/efi` default, not merely a
     label.
 
-No other file changed its *behaviour* for this -- `agent/registration.py`,
+This repository's own files -- `agent/registration.py`,
 `agent/encryption.py`, `common/agent-compose.yml`, `common/install.sh`,
-`common/firstboot-wifi.sh` and its unit, and `tools/flash_image.py` already
-assumed one path; the gap was exclusively in what the amd64 image itself
-mounted there. `common/firstboot-wifi.sh` and
-`thermoctl-firstboot-wifi.service` did carry a second, `/efi`-specific
+`common/firstboot-wifi.sh` and its unit, and `tools/flash_image.py` --
+already assumed one path, unchanged by this fix; the gap was exclusively
+in what the amd64 image itself mounted there. `common/firstboot-wifi.sh`
+and `thermoctl-firstboot-wifi.service` did carry a second, `/efi`-specific
 branch before this fix (to tolerate the old amd64 behaviour); that branch
 is now removed rather than left dormant, so a future regression back to
 `/efi` shows up as a missing file (and a failed
 `check_boot_partition_path_consistency`), not as silently-working
 dual-path tolerance.
 
-Still open: an actual end-to-end mkosi build and boot test on a Linux
-runner (this gap was found and closed by reading mkosi's and
-`systemd-gpt-auto-generator`'s own documentation, not by booting a built
-image -- see "State of this scaffold" below for why a real build does not
-run in this sandbox).
+### Stock boot tooling still needs `/efi` -- a second mount, not a reversion
+
+Main-session review of this fix found a real gap in it: `bootctl` and
+`kernel-install` -- not this repository's own code, but the stock Debian
+tools every future kernel update runs through -- have **no** override for
+where they look for the ESP other than three hard-coded paths, `/efi`,
+`/boot`, and `/boot/efi` (`bootctl(1)`/`kernel-install(8)`,
+`--esp-path=`/`--boot-path=`: "If not specified, `/efi/`, `/boot/`, and
+`/boot/efi/` are checked in turn"). Mounting the ESP *only* at
+`/boot/firmware` makes it invisible to that autodetection entirely.
+Confirmed against the actual Debian 13 "trixie" `systemd` source package
+(`257.13-1~deb13u1`): the `systemd-boot` package ships
+`/etc/kernel/postinst.d/zz-systemd-boot`
+(`debian/extra/kernel/postinst.d/zz-systemd-boot`), the hook that runs on
+**every** kernel update, as exactly:
+
+```sh
+test -x /usr/bin/bootctl || exit 0
+bootctl is-installed --quiet || exit 0
+kernel-install add "$1" "$2"
+```
+
+An unconditional, argument-less `bootctl is-installed --quiet` gate, with
+no flag or environment variable to tell it where the ESP actually is.
+Without a real ESP at one of its three fixed paths, that check fails, the
+hook exits `0` silently, and `kernel-install add` is never even attempted
+-- every kernel update from `unattended-upgrades` (enabled by this image,
+`common/unattended-upgrades/`) would install a new kernel on disk and
+never place a UKI for it on the ESP, with **no error anywhere**. The same
+applies to `systemd-boot-update.service` (`ExecStart=bootctl --graceful
+update`, upstream unit, unmodified), which updates the `systemd-boot`
+loader binary itself on every boot.
+
+**Fix: `x86/mkosi.postinst.chroot` also bind-mounts the same partition at
+`/efi`** (`/boot/firmware /efi none bind,nofail,x-systemd.requires-mounts
+-for=/boot/firmware`), rather than overriding every individual tool that
+touches the ESP (`bootctl`'s own `--esp-path=` has no persistent
+config-file form; Debian's hook above has no flag at all). A bind mount,
+not a second mount of the same `PARTLABEL=ESP` by device -- one coherent
+view, two paths. **Still not a symlink**: the same reasoning as above
+applies doubly here, since `bootctl`/`kernel-install` would be exactly the
+tools a hostile FAT partition's own symlink target could redirect. A bind
+mount is a kernel-level second mount point of the same block device,
+configured in `/etc/fstab`, entirely outside FAT's own namespace -- a
+hostile medium cannot redirect it the way it could a symlink resolved
+through the FAT filesystem itself.
+
+This also makes `/efi` a real, valid ESP again from `kernel-install`'s own
+"$BOOT partition" autodetection (same three paths, `/efi` checked first),
+so **no** `BOOT_ROOT=` override is needed in `/etc/kernel/install.conf`.
+What *is* still pinned explicitly, in a new
+`/etc/kernel/install.conf.d/thermoctl.conf` drop-in `mkosi.postinst.chroot`
+writes: `layout=uki`. Left to `kernel-install`'s own `auto` detection,
+layout only resolves to `uki` when the kernel binary itself is a UKI
+(`kernel-install(8)`, `auto`: "If the kernel is a UKI set layout to uki[;]
+if not[,] default to bls if ... or other otherwise") -- a plain
+apt-installed `linux-image-amd64` kernel is not, so `auto` would silently
+land on `bls` or `other` instead, and `kernel-install`'s own
+`90-uki-copy.install` plugin only runs for `uki`. Pinning it explicitly
+makes every future kernel update produce a UKI the same way this image's
+own build already does (`Bootloader=systemd-boot`, `x86/mkosi.conf`),
+instead of silently stopping at some unpredictable future point with no
+error.
+
+`tools/check_image_config.py`'s `check_boot_partition_path_consistency`
+now also asserts both of these are present in `mkosi.postinst.chroot`
+(the `/efi` bind-mount line and `layout=uki`), so a regression dropping
+either fails the same way a regression to the old dual-path version
+already does.
+
+**Verification status, explicitly:** everything in this section is
+derived from reading `bootctl(1)`, `kernel-install(8)`, and the actual
+Debian 13 `systemd` source package's own kernel postinst hook -- **not**
+from an actual amd64 build-and-boot test, let alone a real kernel-update
+cycle against a built image. The sandbox this work was done in has no
+Linux loop-device/systemd-nspawn environment to run a real `mkosi build`,
+nor a real device to boot it on and run `apt upgrade` against a kernel
+package, so neither the bind mount's effect on `bootctl`'s own
+autodetection nor `kernel-install add`'s actual output under `layout=uki`
+has been observed directly. This -- a real `mkosi build`, a real boot,
+and ideally a real simulated kernel update -- stays the open point for
+this whole section, on top of the one already named in "State of this
+scaffold" below.
 
 ## State of this scaffold
 

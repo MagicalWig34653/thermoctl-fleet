@@ -2,6 +2,77 @@
 
 Last updated: 2026-10-04.
 
+## Boot-path fix, follow-up: stock kernel-update tooling also needs `/efi` (2026-10-04)
+
+Main-session review of the amd64 boot-path fix below found a real gap in
+it, not just a style nit: mounting the ESP *only* at `/boot/firmware`
+breaks `bootctl`/`kernel-install` outright, because neither has any
+override for where it looks for the ESP other than three hard-coded
+paths (`/efi`, `/boot`, `/boot/efi` -- `bootctl(1)`/`kernel-install(8)`,
+`--esp-path=`/`--boot-path=`). Confirmed against the actual Debian 13
+"trixie" `systemd` source package (`257.13-1~deb13u1`,
+`debian/extra/kernel/postinst.d/zz-systemd-boot`, the hook `systemd-boot`
+installs to run on **every** kernel update): it is exactly
+`bootctl is-installed --quiet || exit 0` followed by `kernel-install add`
+-- an unconditional, argument-less gate with no flag to tell it where the
+ESP actually is. Without a real ESP at one of those three paths, that
+check fails, the hook exits `0` silently, and every future kernel update
+from `unattended-upgrades` would land a new kernel on disk and never put
+a UKI for it on the ESP, with no error anywhere. `systemd-boot-update
+.service` (the upstream unit that keeps the `systemd-boot` loader binary
+itself current, `ExecStart=bootctl --graceful update`) has the exact same
+problem.
+
+Fix, in `image/x86/mkosi.postinst.chroot` (full reasoning in
+`image/README.md`'s "Boot partition path" section, new "Stock boot
+tooling still needs `/efi`" subsection):
+
+- A second `/etc/fstab` line bind-mounts the same `PARTLABEL=ESP`
+  partition at `/efi` too (`/boot/firmware /efi none bind,nofail,
+  x-systemd.requires-mounts-for=/boot/firmware`) -- a bind mount, not a
+  symlink (same reasoning as the original fix applies doubly here:
+  `bootctl`/`kernel-install` are exactly the tools a hostile FAT
+  partition's own symlink target could redirect; a bind mount is a
+  kernel-level second mount point, outside FAT's own namespace). This
+  alone makes `kernel-install`'s own `$BOOT` autodetection (also `/efi`,
+  `/boot`, `/boot/efi`) find the real ESP again, so no `BOOT_ROOT=`
+  override is needed.
+- A new `/etc/kernel/install.conf.d/thermoctl.conf` drop-in pins
+  `layout=uki` explicitly -- `kernel-install`'s own `auto` layout
+  detection only resolves to `uki` when the kernel *binary itself* is a
+  UKI, which a plain apt-installed `linux-image-amd64` kernel is not, so
+  it would otherwise silently land on `bls` or `other` and never produce
+  a UKI for a later kernel at all.
+
+`tools/check_image_config.py`'s `check_boot_partition_path_consistency`
+now also asserts both of these lines are present in
+`mkosi.postinst.chroot`, so a regression dropping either fails the same
+way the original boot-path regression check already does. Three new
+tests in `tests/test_image_config.py` cover both negative cases plus one
+positive case confirming the shared minimal test fixture itself is valid.
+
+**Verification status, explicitly (the main session asked this be
+stated clearly): everything in this entry is derived from reading
+`bootctl(1)`, `kernel-install(8)`, and the real Debian 13 `systemd`
+source package's own kernel postinst hook -- it has NOT been confirmed
+by an actual amd64 `mkosi build`, an actual boot, or an actual simulated
+kernel update against a built image.** The sandbox this was done in has
+no Linux loop-device/systemd-nspawn environment for a real `mkosi build`,
+nor a device to boot it on and run a kernel upgrade against. Whether the
+bind mount actually satisfies `bootctl is-installed`'s own ESP-detection
+logic in practice, and what `kernel-install add` actually produces under
+`layout=uki` on a real system, remain unconfirmed by an actual run --
+this is the explicit open point for this whole entry, on top of the
+"image/README.md, State of this scaffold" one already named below.
+
+Verified (documentation/static checks only, same bound as above): `ruff
+check .` and `mypy .` both exit 0; `shellcheck
+image/x86/mkosi.postinst.chroot` exits 0; `actionlint` exits 0; `python -m
+tools.check_image_config` exits 0; full suite green --
+`<testsuite errors="0" failures="0" skipped="3" tests="2283" .../>`
+(the three skips are pre-existing and environment-only: no `age` CLI, no
+`PIL` in this `.venv`, both already documented where those tests live).
+
 ## Amd64 boot-path gap closed; `image.yml` gets a manual build-only run (2026-10-04)
 
 Two independent pieces, same branch.

@@ -647,6 +647,20 @@ def check_boot_partition_path_consistency(root: Path = IMAGE_DIR) -> None:
     - `image/common/install.sh`'s own boot-partition template placement
     - `image/x86/mkosi.postinst.chroot`'s static fstab mount target
 
+    Also checks the two related findings from the main-session review of
+    that fix (confirmed against the real Debian 13 "trixie" systemd
+    source package, `debian/extra/kernel/postinst.d/zz-systemd-boot`):
+    mounting the ESP *only* at `/boot/firmware` leaves it invisible to
+    `bootctl`/`kernel-install`'s own hard-coded "/efi, /boot, /boot/efi"
+    autodetection, so neither `systemd-boot-update.service` nor, more
+    importantly, Debian's own kernel postinst hook (which gates
+    `kernel-install add` on an unconditional, argument-less `bootctl
+    is-installed --quiet`) would ever find it -- silently stopping every
+    future kernel update from reaching the ESP. `mkosi.postinst.chroot`
+    now also bind-mounts the same partition at `/efi` (asserted below)
+    and pins `layout=uki` in an `/etc/kernel/install.conf.d/` drop-in
+    (asserted below) instead.
+
     Does not re-check `thermoctl-firstboot-wifi.service`
     (`check_firstboot_wifi_unit` above already does, including the
     "no /efi left over" half of this same check) to avoid checking the
@@ -695,6 +709,27 @@ def check_boot_partition_path_consistency(root: Path = IMAGE_DIR) -> None:
             f"{postinst_path}: does not write a static fstab line mounting the ESP at "
             f"{BOOT_PARTITION_PATH!r} -- without it, systemd-gpt-auto-generator falls "
             f"back to its own default (/efi), reopening the amd64 boot-path gap."
+        )
+    # Main-session review finding: bootctl/kernel-install, and in
+    # particular Debian's own systemd-boot package's
+    # /etc/kernel/postinst.d/zz-systemd-boot hook (which every
+    # unattended-upgrades kernel update runs), only ever look for the ESP
+    # at /efi, /boot, or /boot/efi -- never at BOOT_PARTITION_PATH alone.
+    # Without a second, real mount of the same partition at /efi, that
+    # hook's own unconditional `bootctl is-installed --quiet` gate fails
+    # and it silently never calls `kernel-install add` for a new kernel.
+    if f"{BOOT_PARTITION_PATH} /efi none bind" not in postinst_content:
+        raise ImageError(
+            f"{postinst_path}: does not bind-mount {BOOT_PARTITION_PATH!r} onto /efi -- "
+            f"without it, Debian's own kernel postinst hook "
+            f"(/etc/kernel/postinst.d/zz-systemd-boot) can never find the ESP, and "
+            f"future kernel updates never reach it."
+        )
+    if "layout=uki" not in postinst_content:
+        raise ImageError(
+            f"{postinst_path}: does not pin layout=uki for kernel-install -- without "
+            f"it, kernel-install's own layout autodetection may silently stop producing "
+            f"a UKI for a future kernel update."
         )
 
 

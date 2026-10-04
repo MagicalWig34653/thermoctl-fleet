@@ -800,3 +800,69 @@ def test_boot_partition_path_consistency_rejects_a_postinst_still_mounting_efi(
     )
     with pytest.raises(ImageError, match="mkosi.postinst.chroot"):
         check_boot_partition_path_consistency(root)
+
+
+def _write_valid_boot_partition_fixture(root: Path, postinst_content: str) -> None:
+    common = root / "common"
+    common.mkdir(parents=True)
+    (common / "agent-compose.yml").write_text(
+        f"- {BOOT_PARTITION_PATH}/thermoctl:{BOOT_PARTITION_PATH}/thermoctl:ro\n"
+        f"- {BOOT_PARTITION_PATH}/agent-registration.json:"
+        f"{BOOT_PARTITION_PATH}/agent-registration.json:ro\n",
+        encoding="utf-8",
+    )
+    (common / "install.sh").write_text(f"{BOOT_PARTITION_PATH}/thermoctl\n", encoding="utf-8")
+    x86 = root / "x86"
+    x86.mkdir()
+    (x86 / "mkosi.postinst.chroot").write_text(postinst_content, encoding="utf-8")
+
+
+def test_boot_partition_path_consistency_rejects_a_postinst_missing_the_efi_bind_mount(
+    tmp_path: Path,
+) -> None:
+    # Main-session review finding: bootctl/kernel-install, and in
+    # particular Debian's own kernel postinst hook
+    # (/etc/kernel/postinst.d/zz-systemd-boot), only ever look for the
+    # ESP at /efi, /boot, or /boot/efi -- mounting it only at
+    # BOOT_PARTITION_PATH leaves every future kernel update unable to
+    # find it, silently.
+    root = tmp_path / "image"
+    _write_valid_boot_partition_fixture(
+        root,
+        f"FSTAB_LINE='PARTLABEL=ESP {BOOT_PARTITION_PATH} vfat defaults 0 2'\n"
+        "layout=uki\n",
+    )
+    with pytest.raises(ImageError, match="bind-mount"):
+        check_boot_partition_path_consistency(root)
+
+
+def test_boot_partition_path_consistency_rejects_a_postinst_missing_layout_uki(
+    tmp_path: Path,
+) -> None:
+    # Without layout=uki pinned, kernel-install's own "auto" layout
+    # detection may silently stop producing a UKI for a future kernel.
+    root = tmp_path / "image"
+    _write_valid_boot_partition_fixture(
+        root,
+        f"FSTAB_LINE='PARTLABEL=ESP {BOOT_PARTITION_PATH} vfat defaults 0 2'\n"
+        f"FSTAB_BIND_LINE='{BOOT_PARTITION_PATH} /efi none bind,nofail'\n",
+    )
+    with pytest.raises(ImageError, match="layout=uki"):
+        check_boot_partition_path_consistency(root)
+
+
+def test_boot_partition_path_consistency_passes_a_complete_minimal_fixture(
+    tmp_path: Path,
+) -> None:
+    # Confirms the helper fixture above is actually valid end to end (not
+    # just "raises for the right reason" in the two negative tests), so a
+    # typo in the helper itself can't silently make both negative tests
+    # pass for the wrong reason.
+    root = tmp_path / "image"
+    _write_valid_boot_partition_fixture(
+        root,
+        f"FSTAB_LINE='PARTLABEL=ESP {BOOT_PARTITION_PATH} vfat defaults 0 2'\n"
+        f"FSTAB_BIND_LINE='{BOOT_PARTITION_PATH} /efi none bind,nofail'\n"
+        "layout=uki\n",
+    )
+    check_boot_partition_path_consistency(root)
