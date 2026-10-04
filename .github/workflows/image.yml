@@ -318,7 +318,19 @@ jobs:
           cp -r image/x86/watchdog-bin "$stage/watchdog-bin"
       - name: Build with mkosi
         working-directory: thermoctl-fleet/image/x86
+        # mkosi v21 sandboxes more of its own internal operations (package
+        # manager cache sync, etc.) through bubblewrap's unprivileged
+        # user-namespace path than v20.2 did, even when mkosi itself runs
+        # as root via sudo -- bwrap still calls unshare(CLONE_NEWUSER) and
+        # writes its own uid_map, which Ubuntu's AppArmor stack blocks by
+        # default on the runner image (`kernel.apparmor_restrict_
+        # unprivileged_userns=1`), regardless of the caller's EUID:
+        # "bwrap: setting up uid map: Permission denied". This sysctl only
+        # affects what this CI job's own build tooling is allowed to do on
+        # the runner -- it has no bearing on the shipped image itself
+        # (which never creates a user namespace).
         run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
           sudo mkosi --output-dir ../../mkosi-out build
       - name: Compress and checksum
         working-directory: thermoctl-fleet
