@@ -251,7 +251,27 @@ Mac test VM is [`../tools/mac-test-vm`](../tools/mac-test-vm).
 
 ## Usage
 
-### 1. Build and flash a real device (`tools/flash_image.py`)
+### 1. Image mit der Terminal-Oberfläche schreiben (empfohlen)
+
+Installieren Sie die optionale Oberfläche mit `pip install '.[flash]'` und starten
+Sie im Projektverzeichnis `python -m tools.flash_tui`. Wählen Sie das `.img.xz`
+(Image-Dateien im aktuellen Ordner und in `~/Downloads` erscheinen in der Auswahl),
+den externen Datenträger und die Registrierungsdaten. Liegt `SHA256SUMS` neben
+dem Image, wird die komprimierte Datei vor dem Schreiben geprüft. Tippen Sie die
+angezeigte Datenträgerkennung zur Bestätigung exakt ein. Mit `d` schalten Sie
+den schreibgeschützten Probelauf um; `r` aktualisiert die Datenträgerliste,
+`t` wechselt zwischen heller und dunkler Darstellung.
+Schreiben und Rücklesen zeigen Fortschritt, Geschwindigkeit und Restzeit.
+
+macOS verwendet `diskutil`, Linux `lsblk` und `udisksctl` beziehungsweise
+`umount`. Linux-Schreibzugriffe benötigen Root-Rechte (`sudo`). Windows nutzt
+PowerShell und verlangt ein Terminal mit Administratorrechten; dieser Backend
+ist auf realer Hardware **ungetestet**. Alle Plattformen prüfen externe
+physische ganze Datenträger und schließen System-/Boot-Datenträger aus.
+Datenträger über 256 GB sind in der TUI gesperrt. Registrierungscode und
+WLAN-Passwort werden nicht in den Fortschrittsmeldungen angezeigt.
+
+### 2. CLI als Alternative (`tools/flash_image.py`)
 
 ```
 # List candidate disks (external, physical only -- an internal disk never
@@ -289,7 +309,7 @@ unbooted card or drive under physical control.
 The amd64 mkosi image still needs an end-to-end boot test ("Boot partition
 path" above).
 
-### 2. Build the images in CI (`.github/workflows/image.yml`)
+### 3. Build the images in CI (`.github/workflows/image.yml`)
 
 Push a `v*` tag -- the same tag the watchdog's own binaries are built
 under (`.github/workflows/go.yml`), so the image and the watchdog version
