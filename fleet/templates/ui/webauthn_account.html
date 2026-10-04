@@ -17,7 +17,7 @@
         <form method="post" action="/ui/account/webauthn/delete" class="inline-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="credential_id" value="{{ credential.id.hex() }}">
-            <button type="submit">Entfernen</button>
+            <button type="submit" class="button--danger">Entfernen</button>
         </form>
     </li>
     {% endfor %}

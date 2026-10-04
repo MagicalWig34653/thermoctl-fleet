@@ -408,6 +408,48 @@ def test_get_house_overview_carries_property_and_floor_data(storage: Storage) ->
     assert by_id[APARTMENT_B].floor is None
 
 
+# -- ApartmentTile.short_label (UI-redesign stage 2 polish: compact site
+# map, "Alle Wohnungen") -----------------------------------------------------
+
+
+def test_short_label_uses_the_part_after_the_last_comma_in_a_landlord_label(
+    storage: Storage,
+) -> None:
+    """A landlord's own `label` is typically "<address>, WE <n>" (the demo
+    seed data in `tools/docs_screenshots.py`) -- the compact site-map block
+    prints only the "WE <n>" tail, never the whole address, so several
+    blocks fit side by side on one floor row."""
+
+    prop = storage.create_property(name="Musterstraße 1", address="Musterstraße 1, Musterstadt")
+    storage.create_apartment(
+        APARTMENT_A,
+        property_id=prop.id,
+        label="Musterstraße 1, WE 3",
+        floor="2. OG",
+        orientation="Süd",
+        state="occupied",
+        heating_circuits=4,
+        pilot_mode=False,
+    )
+
+    tiles = build_house_overview(storage, BASE_TIME)
+
+    assert tiles[0].short_label == "WE 3"
+
+
+def test_short_label_falls_back_to_the_apartment_id_without_a_comma(storage: Storage) -> None:
+    """No landlord-authored label at all (bare `set_apartment_token`,
+    `label` defaults to the apartment id itself) -- the short label is the
+    id unchanged, never truncated blindly (two different apartments must
+    never end up displaying identically)."""
+
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
+
+    tiles = build_house_overview(storage, BASE_TIME)
+
+    assert tiles[0].short_label == APARTMENT_A
+
+
 # -- fleet.ui_house.group_tiles_by_property (UI-redesign stage 1) ------------
 
 

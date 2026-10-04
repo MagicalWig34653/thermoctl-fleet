@@ -3,18 +3,18 @@
 {% block title %}{{ apartment_id }} – thermoctl-fleet{% endblock %}
 
 {% block content %}
-{# "Eine Wohnung" (UI-redesign stage 2) -- already German-rendered and
+{# "Eine Wohnung" (UI-redesign stage 2) – already German-rendered and
    already derived by fleet/ui_apartment.py::build_apartment_detail. This
    template only iterates and prints; it makes no ordering, wording, or
    gap/caught-up decisions of its own.
 
-   Three tabs ("Überblick"/"Wartung"/"Technik", brief) -- every *existing*
+   Three tabs ("Überblick"/"Wartung"/"Technik", brief) – every *existing*
    section/form/field/hidden input from before this stage is unchanged,
    only grouped into one of three panels, server-rendered via `?ansicht=`
    (fleet/ui_routes.py::_normalize_apartment_tab) so each tab works
    without JavaScript: a plain link, a full page load, the server decides
    which panel to render. The other two panels' markup is not sent at all
-   for a given request -- not merely hidden by CSS -- keeping the page
+   for a given request – not merely hidden by CSS – keeping the page
    light and keeping "every section still exists, just grouped" true of
    the rendered output too, not only of the template source. #}
 <p><a href="/ui/">&larr; Zurück zur Übersicht</a></p>
@@ -48,6 +48,24 @@
 <section aria-labelledby="history-heading">
     <h2 id="history-heading">Erreichbarkeit ({{ detail.history_days }} Tage)</h2>
     {% if detail.timeline %}
+    {# Compact timeline bar (UI-redesign stage 2 polish) -- the same
+       entries as the list below, as proportionally-sized horizontal
+       segments (fleet/ui_apartment.py::_timeline_width_percents), newest
+       on the left. Decorative only: every entry's full text stays in the
+       list underneath and in this bar's own native tooltip, so a
+       screen reader or a no-CSS client loses nothing by this div's
+       presence. #}
+    <div class="timeline-bar" role="presentation" aria-hidden="true">
+        {% for entry in detail.timeline %}
+        {# No inline `style` -- this application's CSP sends no `style-src
+           'unsafe-inline'` (fleet/ui_routes.py's security-headers
+           middleware), so each segment's width is one of the fixed
+           `.tl-w-*` percent classes (fleet-ui.css, generated 1..100)
+           rather than a computed inline width. #}
+        <span class="timeline-bar__segment tl-w-{{ [entry.width_percent | round | int, 1] | max }} {{ 'timeline-bar__segment--gap' if entry.is_gap else 'timeline-bar__segment--contact' }}"
+              title="{{ entry.label }}, {{ entry.when_text }}{% if entry.duration_text %} ({{ entry.duration_text }}){% endif %}"></span>
+        {% endfor %}
+    </div>
     <ol class="timeline">
         {% for entry in detail.timeline %}
         <li class="timeline__entry {{ 'timeline__entry--gap' if entry.is_gap else 'timeline__entry--contact' }}">
@@ -88,7 +106,7 @@
                 <input type="hidden" name="zone" value="{{ fault.zone }}">
                 <input type="hidden" name="since" value="{{ fault.since.isoformat() }}">
                 <label>
-                    Hinweis (optional)
+                    Hinweis
                     <input type="text" name="note" maxlength="500" value="{{ fault.acknowledged_note or '' }}">
                 </label>
                 <button type="submit">{{ "Erneut quittieren" if fault.acknowledged_by else "Quittieren" }}</button>
@@ -202,7 +220,7 @@
             {% if cmd.error_text %}<p class="command-history__error">{{ cmd.error_text }}</p>{% endif %}
             {% if cmd.log_excerpt %}
             <div class="command-history__log">
-                <p class="command-history__meta">Erfasst {{ cmd.log_excerpt.captured_text }}, Quelle: {{ cmd.log_excerpt.source }} -- {{ cmd.log_excerpt.dropped_lines }} Zeile(n) entfernt</p>
+                <p class="command-history__meta">Erfasst {{ cmd.log_excerpt.captured_text }}, Quelle: {{ cmd.log_excerpt.source }} – {{ cmd.log_excerpt.dropped_lines }} Zeile(n) entfernt</p>
                 {% if cmd.log_excerpt.lines %}
                 <pre class="command-history__log-lines">{{ cmd.log_excerpt.lines | join("\n") }}</pre>
                 {% else %}
@@ -251,19 +269,19 @@
     <h2 id="restore-heading">Wiederherstellen</h2>
     {# P5.5b, section 15.2/15.3's "Decided afterward" paragraph
        (2026-09-28): only offered once a device is assigned *and* has
-       already reported its own age recipient -- there is nothing this
+       already reported its own age recipient – there is nothing this
        form could encrypt to otherwise. #}
     {% if detail.restore_pending %}
     <p>Eine Wiederherstellung wartet bereits auf das Gerät ({{ detail.restore_pending_expires_text }}).</p>
     {% elif not detail.restore_device_recipient %}
-    <p>Kein Gerät mit gemeldetem Schlüssel für diese Wohnung -- keine Wiederherstellung möglich.</p>
+    <p>Kein Gerät mit gemeldetem Schlüssel für diese Wohnung – keine Wiederherstellung möglich.</p>
     {% elif not detail.restore_operational_backups %}
     <p>Keine Betriebsdaten-Sicherung für diese Wohnung vorhanden.</p>
     {% else %}
     <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/restore"
           id="restore-form" data-recipient="{{ detail.restore_device_recipient }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        {# The ciphertext this form actually submits -- written by
+        {# The ciphertext this form actually submits – written by
            fleet/static/ui/restore_form.js just before submit, never by
            the landlord directly. #}
         <input type="hidden" name="key_block_b64" id="restore-key-block" value="">
@@ -282,7 +300,7 @@
     </form>
     {# Owner decision (a), cross-review, 2026-09-28: this protects against
        a leaked database, logs, server backups, or passive reading of the
-       fleet -- it does NOT protect against an actively taken-over fleet
+       fleet – it does NOT protect against an actively taken-over fleet
        server serving a modified script at the next restore (accepted
        deliberately, spec section 15.3's own "limit of the browser-side
        encryption" paragraph). The landlord compares this value against
@@ -295,22 +313,22 @@
 </section>
 
 {# Danger zone (brief: "tenant change in a separated danger zone with
-   confirmation") -- same single link to the existing, unchanged
+   confirmation") – same single link to the existing, unchanged
    confirmation page as before this stage; only its visual grouping (a
    distinct, clearly marked zone, set apart from the routine maintenance
    actions above) is new. #}
 <section class="danger-zone" aria-labelledby="tenant-change-heading">
     <h2 id="tenant-change-heading">Mieterwechsel</h2>
-    <p class="danger-zone__hint">Setzt Zugangsdaten und Verlauf dieser Wohnung zurück -- nicht rückgängig zu machen.</p>
+    <p class="danger-zone__hint">Setzt Zugangsdaten und Verlauf dieser Wohnung zurück – nicht rückgängig zu machen.</p>
     {% if bundle_cleanup_failed %}
     {# Cross-review fix (2026-10-02): the tenant change itself (token
        rotation, history deletion) already succeeded by the time this
-       notice can appear -- it only ever means some diagnostic bundle
+       notice can appear – it only ever means some diagnostic bundle
        blob file could not be removed from disk; see the server log for
        which one. #}
-    <p class="error" role="alert">Mieterwechsel durchgeführt. Mindestens eine Diagnose-Sicherung konnte nicht gelöscht werden -- siehe Server-Log.</p>
+    <p class="error" role="alert">Mieterwechsel durchgeführt. Mindestens eine Diagnose-Sicherung konnte nicht gelöscht werden – siehe Server-Log.</p>
     {% endif %}
-    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">Mieterwechsel durchführen</a></p>
+    <p><a class="command-button button--danger" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">Mieterwechsel durchführen</a></p>
 </section>
 
 </div>
@@ -393,7 +411,7 @@
         Revision {{ detail.desired_state_outcome.revision }}:
         <span class="apartment-tile__tag">{{ "erfolgreich" if detail.desired_state_outcome.successful else "fehlgeschlagen" }}</span>
         {% if detail.desired_state_outcome.service_label %}({{ detail.desired_state_outcome.service_label }}){% endif %}
-        -- {{ detail.desired_state_outcome.reason }} (gemeldet {{ detail.desired_state_outcome.reported_text }})
+        – {{ detail.desired_state_outcome.reason }} (gemeldet {{ detail.desired_state_outcome.reported_text }})
     </p>
     {% endif %}
 

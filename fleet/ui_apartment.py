@@ -95,7 +95,7 @@ history list (`CommandDisplay`, `build_command_history`).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from fleet.alarms import ABSENCE_THRESHOLD, AlarmKind
@@ -110,6 +110,7 @@ from fleet.storage import (
     HeartbeatHistoryEntry,
     Storage,
 )
+from fleet.ui_format import format_local_datetime, format_technical_reason
 from fleet.ui_house import FAULT_KIND_LABELS, NEXT_STEP_TEXT, STATUS_LABELS
 from protocol import FaultKind
 from protocol.backups import BackupKind
@@ -294,7 +295,11 @@ def build_desired_state_outcome_display(
     return DesiredStateOutcomeDisplay(
         revision=record.revision,
         successful=record.successful,
-        reason=record.reason,
+        # Agent-echoed, not landlord-authored (unlike `DesiredStateDisplay
+        # .reason`, the "Grund" a human typed when setting the desired
+        # state, left untouched) -- see
+        # `fleet.ui_format.format_technical_reason`'s own docstring.
+        reason=format_technical_reason(record.reason),
         service_label=(
             DESIRED_STATE_SERVICE_LABELS.get(record.service, record.service)
             if record.service is not None
@@ -302,6 +307,25 @@ def build_desired_state_outcome_display(
         ),
         reported_text=_format_timestamp(record.reported_at),
     )
+
+
+# `DeviceState.zigbee_bridge` is "deliberately free text, no enum"
+# (protocol/heartbeat.py's own comment: the specification names
+# "connected" only as an example, not a closed list) -- the same
+# agent-origin-free-text situation `fleet.ui_format.format_technical_
+# reason` exists for, just a different field. Only the one value the
+# specification's own example names gets a German translation; anything
+# else is shown unmodified rather than guessed at.
+_ZIGBEE_BRIDGE_TRANSLATIONS: dict[str, str] = {
+    "connected": "verbunden",
+}
+
+
+def _format_zigbee_bridge(raw: str) -> str:
+    translated = _ZIGBEE_BRIDGE_TRANSLATIONS.get(raw)
+    if translated is not None:
+        return translated
+    return format_technical_reason(raw)
 
 
 def _truncate_error_text(error_text: str) -> str:
@@ -317,10 +341,10 @@ def _format_duration_seconds(duration_s: float) -> str:
 def _format_timestamp(moment: datetime) -> str:
     """A fixed, unambiguous absolute timestamp (not a relative "vor X" --
     the "Befehle" history is an audit-style list where an exact moment
-    matters more than its age) -- always UTC, since every stored timestamp
-    here is naive UTC (see `fleet/storage.py`'s own module docstring)."""
+    matters more than its age) -- German local date/time
+    (`fleet.ui_format.format_local_datetime`), not a raw UTC string."""
 
-    return moment.strftime("%Y-%m-%d %H:%M UTC")
+    return format_local_datetime(moment)
 
 
 def _command_status_label(record: CommandRecord, now: datetime) -> str:
@@ -639,6 +663,15 @@ class TimelineEntry:
     duration_text: str | None
     heartbeat_count: int | None
     caught_up_count: int | None
+    # UI-redesign stage 2 polish ("Überblick" tab: reachability "as a
+    # proper visual, e.g. a compact timeline bar"). A share of 100 across
+    # every entry in the same `ApartmentDetail.timeline`, proportional to
+    # each entry's real elapsed time (not to its row count) -- computed
+    # once in `_build_timeline`/`_timeline_width_percents` below, from the
+    # same `sent_at` values already read for `when_text`/`duration_text`.
+    # No new data: every input here was already fetched for the text
+    # rendering, this only derives one more number from it.
+    width_percent: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -812,14 +845,19 @@ class ApartmentDetail:
     desired_state_active: bool
 
 
-def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> TimelineEntry:
+def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> tuple[TimelineEntry, float]:
     """Collapses one contiguous run of reachable heartbeats (`run_rows`,
     ascending by `sent_at`, never empty) into a single `TimelineEntry` --
     "erreichbar von ... bis ..., N Herzschläge", plus how many of them were
     delivered late via a catch-up batch (P2.1b). A run of exactly one
     heartbeat renders as a single point in time ("vor X"), not a
     zero-length range, since "von X bis X" would only restate the same
-    moment twice."""
+    moment twice.
+
+    Also returns the run's own span in seconds (`end - start`, 0.0 for a
+    single-heartbeat run) -- the raw input to the timeline bar's
+    `width_percent` (`_timeline_width_percents`), computed from the same
+    `sent_at` values this function already reads for `when_text`."""
 
     start = run_rows[0].sent_at
     end = run_rows[-1].sent_at
@@ -831,7 +869,7 @@ def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> Timeline
         if len(run_rows) == 1
         else f"von {_relative_duration(now, start)} bis {_relative_duration(now, end)}"
     )
-    return TimelineEntry(
+    entry = TimelineEntry(
         is_gap=False,
         label="Erreichbar",
         when_text=when_text,
@@ -839,6 +877,7 @@ def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> Timeline
         heartbeat_count=len(run_rows),
         caught_up_count=caught_up_count,
     )
+    return entry, (end - start).total_seconds()
 
 
 def _build_timeline(rows: list[HeartbeatHistoryEntry], now: datetime) -> list[TimelineEntry]:
@@ -873,11 +912,15 @@ def _build_timeline(rows: list[HeartbeatHistoryEntry], now: datetime) -> list[Ti
     `now` -> no trailing gap entry, exactly one run)."""
 
     entries: list[TimelineEntry] = []
+    spans_s: list[float] = []
     current_run: list[HeartbeatHistoryEntry] = []
     previous_sent_at: datetime | None = None
     for row in rows:
         if previous_sent_at is not None and (row.sent_at - previous_sent_at) > ABSENCE_THRESHOLD:
-            entries.append(_close_run(current_run, now))
+            run_entry, run_span_s = _close_run(current_run, now)
+            entries.append(run_entry)
+            spans_s.append(run_span_s)
+            gap_span_s = (row.sent_at - previous_sent_at).total_seconds()
             entries.append(
                 TimelineEntry(
                     is_gap=True,
@@ -891,13 +934,54 @@ def _build_timeline(rows: list[HeartbeatHistoryEntry], now: datetime) -> list[Ti
                     caught_up_count=None,
                 )
             )
+            spans_s.append(gap_span_s)
             current_run = []
         current_run.append(row)
         previous_sent_at = row.sent_at
     if current_run:
-        entries.append(_close_run(current_run, now))
+        run_entry, run_span_s = _close_run(current_run, now)
+        entries.append(run_entry)
+        spans_s.append(run_span_s)
     entries.reverse()
-    return entries
+    spans_s.reverse()
+    percents = _timeline_width_percents(spans_s)
+    return [
+        replace(entry, width_percent=percent)
+        for entry, percent in zip(entries, percents, strict=True)
+    ]
+
+
+# A visual floor for one segment of the "Erreichbarkeit" timeline bar
+# (UI-redesign stage 2 polish) -- a single-heartbeat run or a very short
+# gap would otherwise round to a sliver too thin to see or tap/hover for
+# its tooltip; every segment stays at least this wide, and every other
+# segment gives up the same share so the row still sums to 100%.
+_TIMELINE_MIN_SEGMENT_PERCENT = 3.0
+
+
+def _timeline_width_percents(spans_s: list[float]) -> list[float]:
+    """One percentage per entry, summing to 100 -- each entry's share of
+    the *total elapsed time these entries actually cover* (not of the
+    `?days=` window, which an entry list rarely fills exactly: the first
+    run can start mid-window, and the interval since the last heartbeat up
+    to `now` is deliberately never a trailing entry at all, see
+    `_build_timeline`'s own docstring). Proportional to real duration, not
+    to row count, so a two-week gap reads as dramatically wider than a
+    five-minute one -- the whole point of a timeline *bar* over the
+    existing text list, which already says as much in words but not in
+    relative size."""
+
+    if not spans_s:
+        return []
+    total = sum(spans_s)
+    if total <= 0:
+        # Every entry has zero measured span (e.g. the one and only row is
+        # a single heartbeat) -- nothing to be proportional *to*, split
+        # the row evenly rather than dividing by zero.
+        return [100.0 / len(spans_s)] * len(spans_s)
+    raw = [max((span / total) * 100.0, _TIMELINE_MIN_SEGMENT_PERCENT) for span in spans_s]
+    scale = 100.0 / sum(raw)
+    return [value * scale for value in raw]
 
 
 def _fault_kind_label(fault_kind: str | None) -> str:
@@ -1156,7 +1240,7 @@ def build_apartment_detail(
         weakest_battery_percent=heartbeat.devices.weakest_battery_percent,
         worst_signal_quality=heartbeat.devices.worst_signal_quality,
         silent_devices=heartbeat.devices.silent_devices,
-        zigbee_bridge=heartbeat.devices.zigbee_bridge,
+        zigbee_bridge=_format_zigbee_bridge(heartbeat.devices.zigbee_bridge),
         per_device=per_device,
         agent_version=heartbeat.agent,
         thermoctl_version=heartbeat.thermoctl.version,

@@ -189,27 +189,191 @@ main {
 }
 
 .error {
-    border: 1px solid #c00;
+    border: 1px solid var(--signal);
     padding: 0.75rem 1rem;
     border-radius: 0.25rem;
+    color: var(--signal);
+}
+
+/* A handful of error placeholders (`#webauthn-error`, `#webauthn-
+ * register-error`) exist in the DOM up front for `webauthn.js` to fill
+ * in client-side and start out empty -- an empty red-bordered box reads
+ * as a layout bug, not "no error", so it is hidden until it actually has
+ * text (forms pass, "inline validation messages ... shown next to the
+ * field": absence of a message means no box at all, not an empty one). */
+.error:empty {
+    display: none;
 }
 
 label {
     display: block;
     margin-top: 0.75rem;
+    font-weight: 500;
 }
 
 input[type=text],
-input[type=password] {
+input[type=password],
+input[type=date],
+select,
+textarea {
+    display: block;
     width: 100%;
-    max-width: 20rem;
-    padding: 0.4rem;
-    margin-top: 0.25rem;
+    max-width: 20rem; /* "medium" default -- see the per-field overrides below */
+    padding: 0.45rem 0.55rem;
+    margin-top: 0.35rem;
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    box-sizing: border-box;
 }
 
-button {
-    padding: 0.4rem 1rem;
+/* Forms pass (UI-redesign stage 2 polish, "die Formulare richtig
+ * formatieren"): consistent widths *per input*, keyed by the field's own
+ * `name` attribute. Field names are fixed (CLAUDE.md: every form's field
+ * names stay byte-identical) so one rule here covers every template that
+ * happens to share a name, with no template edits needed. Three tiers --
+ * short (a code/number/date/short id), medium (the 20rem default above,
+ * for a name/label/single-line text), long (a digest or other content
+ * that benefits from the page's own ~34rem measure, docs/ui-redesign-
+ * plan.md's "Type" section). `input[name^="..."]` matches the per-service
+ * `version_{{ name }}`/`digest_{{ name }}` fields on "Sollzustand
+ * bearbeiten" too, not only the bare `version`/`digest` fields elsewhere. */
+input[name="totp_code"],
+input[name="floor"],
+input[name="orientation"],
+input[name="lines"],
+input[name="stagger_hours"],
+input[name="timeout_hours"],
+input[name="window_from"],
+input[name="window_until"],
+input[name="window_temp"],
+input[name="watchdog_version"],
+input[name="acquisition_date"],
+input[name^="version"] {
+    max-width: 9rem;
+}
+
+input[name="digest"],
+input[name^="digest_"],
+input[name="q"],
+input[name="reason"],
+input[name="note"],
+input[name="notes"],
+input[name="address"],
+input[name="verification_code"] {
+    max-width: 34rem;
+}
+
+/* Helper text under a field (brief: "helper text under fields") -- a
+ * plain, quiet line directly below the input it belongs to. Existing
+ * inline parenthetical hints ("(JJJJ-MM-TT)", "(sha256:...)") stay in the
+ * label text itself where the hint *is* the expected format of the very
+ * next input (so it reads right before typing); `.field-hint` is for the
+ * handful of forms that spell the same thing out as its own line. */
+.field-hint {
+    display: block;
+    margin-top: 0.3rem;
+    font-size: 0.85rem;
+    opacity: 0.75;
+    max-width: 34rem;
+}
+
+/* Required/optional marking (brief: "clear required/optional marking").
+ * HTML's own `required` attribute already drives `:required`/`:optional`
+ * -- styled here instead of adding a parallel "(Pflichtfeld)"/"(optional)"
+ * text to every single label (several already spell "(Pflichtfeld)" out
+ * where the form has exactly one field and the word carries real
+ * meaning, e.g. rollout_confirm.html's "Grund" -- those stay, this is the
+ * general case). */
+/* Scoped to the actual "fields" (text/password/date inputs and selects)
+ * -- a label wrapping a checkbox/radio (the "Wohnungen"-selection rows on
+ * "Neuer Rollout") is a list selection, not a form field with its own
+ * required/optional state, and must not get a "(optional)" marker. */
+label:has(input[type=text]:required)::after,
+label:has(input[type=password]:required)::after,
+label:has(input[type=date]:required)::after,
+label:has(select:required)::after {
+    content: " *";
+    color: var(--signal);
+}
+
+label:has(input[type=text]:optional)::after,
+label:has(input[type=password]:optional)::after,
+label:has(input[type=date]:optional)::after,
+label:has(select:optional)::after {
+    content: " (optional)";
+    font-size: 0.8rem;
+    font-weight: 400;
+    opacity: 0.65;
+}
+
+fieldset {
+    border: 1px solid var(--line);
+    border-radius: 0.4rem;
+    padding: 0.75rem 1rem 1rem;
+    margin: 1.25rem 0 0;
+}
+
+fieldset > fieldset {
     margin-top: 1rem;
+}
+
+legend {
+    font-weight: 600;
+    padding: 0 0.3rem;
+}
+
+/* Button variants (brief: "primary/secondary/danger button styles").
+ * `<button>` (a form's own submit action -- always the one primary thing
+ * a form does) gets a filled flame look by default. `a.command-button`
+ * keeps its existing outlined look unchanged (`ul.command-buttons` holds
+ * several side by side -- filling all of them equally loud would fight
+ * this file's own "quiet is the default, trouble has to compete for
+ * attention" rule, docs/ui-redesign-plan.md's principle 1); `.button--
+ * secondary`/`.button--danger` are modifiers either element can opt into.
+ * `.button--danger` reuses the same `--signal` colour the status system
+ * already uses for "alarm" -- never the only signal, the label itself
+ * already says "...durchführen"/"ausbauen"/"entfernen" (never colour
+ * alone, this file's existing rule). */
+button {
+    display: inline-block;
+    padding: 0.5rem 1.1rem;
+    margin-top: 1rem;
+    border: 1px solid var(--flame);
+    border-radius: 0.35rem;
+    background: var(--flame);
+    color: var(--surface);
+    font: inherit;
+    font-weight: 500;
+    text-align: center;
+    cursor: pointer;
+}
+
+button:hover {
+    filter: brightness(0.92);
+}
+
+.button--secondary,
+button.button--secondary {
+    background: transparent;
+    border-color: var(--line);
+    color: var(--ink);
+}
+
+.button--danger,
+button.button--danger,
+a.command-button.button--danger {
+    background: var(--signal);
+    border-color: var(--signal);
+    color: var(--surface);
+}
+
+a.command-button.button--danger:hover {
+    color: var(--surface);
+    border-color: var(--signal);
+    filter: brightness(0.92);
 }
 
 a.skip-link {
@@ -527,11 +691,13 @@ ul.backup-list li {
     display: inline;
 }
 
-/* "Das Haus" (P3.1, UI-redesign stage 1) -- the house summary line, the
- * per-property building visual, and the one shared apartment-card markup
- * (`.unit`) used both inside the floor-stack grid and inside the plain
- * fallback list. See docs/ui-redesign-plan.md's "Layout concept" for the
- * reasoning (one semantic structure, styled two ways, not two markups).
+/* "Das Haus" (P3.1, UI-redesign stage 1; made compact in stage 2 polish,
+ * see `.unit-block` below) -- the house summary line, the per-property
+ * building visual, and the one shared apartment-block markup
+ * (`.unit-block`) used both inside the floor-stack grid and inside the
+ * plain fallback list. See docs/ui-redesign-plan.md's "Layout concept"
+ * for the original reasoning (one semantic structure, styled two ways,
+ * not two markups) -- still true, only the block's own size changed.
  */
 .house-summary {
     font-size: 1.05rem;
@@ -546,98 +712,107 @@ ul.backup-list li {
     margin: 0 0 0.75rem;
 }
 
+/* "Alle Wohnungen" compact site map (UI-redesign stage 2 polish): a
+ * building drawn as floor rows, several small apartment blocks per floor,
+ * sized so a ~20-apartment house fits on one screen -- see
+ * `_unit_macros.html`'s own comment for why the per-tile detail that used
+ * to live here moved to the action inbox/a tooltip/one click away. */
 .building {
     display: flex;
     flex-direction: column;
-    gap: 0.6rem;
+    gap: 0.4rem;
     border: 1px solid var(--line);
     border-radius: 0.5rem;
-    padding: 0.85rem;
+    padding: 0.6rem 0.75rem;
     background: var(--surface);
 }
 
 .building__floor {
     display: grid;
-    grid-template-columns: 3.5rem 1fr;
-    gap: 0.75rem;
-    align-items: start;
+    grid-template-columns: 3rem 1fr;
+    gap: 0.5rem;
+    align-items: center;
 }
 
 .building__floor-label {
     font-weight: 600;
-    font-size: 0.85rem;
+    font-size: 0.78rem;
     opacity: 0.75;
-    padding-top: 0.6rem;
 }
 
 .building__units {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.6rem;
+    gap: 0.35rem;
 }
 
+/* Fallback for a property with no recorded floor data -- same compact
+ * blocks, wrapped in a row instead of grouped by floor (brief: "still
+ * compact" applies here too, this is not a lesser rendering). */
 ul.unit-list {
     list-style: none;
     margin: 0.5rem 0 0;
     padding: 0;
-    display: grid;
-    gap: 0.6rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
 }
 
-/* One apartment, as a card -- status conveyed by the left accent bar
- * *and* the icon shape in `.unit__status` *and* its German text, never by
- * colour alone (same rule the original P3.1 CSS already stated). */
-.unit {
-    display: flex;
-    flex-direction: column;
+ul.unit-list li {
+    display: contents;
+}
+
+/* One apartment, as a small labelled block -- status conveyed by the
+ * left accent bar *and* the icon shape *and* the native tooltip's German
+ * status word (never colour alone, same rule the original P3.1 CSS
+ * already stated). Deliberately tiny and uniform so many sit side by
+ * side on one floor row; the full status/next-step text that used to be
+ * printed on every block now lives in the `title` attribute (tooltip,
+ * works without CSS/JS) and one click away on the apartment page. */
+.unit-block {
+    display: inline-flex;
+    align-items: center;
     gap: 0.3rem;
-    min-width: 11rem;
-    flex: 1 1 11rem;
+    min-width: 2.75rem;
+    min-height: 1.75rem;
     border: 1px solid var(--line);
-    border-inline-start-width: 0.3rem;
-    border-radius: 0.4rem;
-    padding: 0.6rem 0.8rem;
+    border-inline-start-width: 0.25rem;
+    border-radius: 0.3rem;
+    padding: 0.25rem 0.5rem;
     text-decoration: none;
     color: inherit;
     background: var(--paper);
+    font-size: 0.8rem;
+    line-height: 1.1;
 }
 
-.unit--ok {
+.unit-block--ok {
     border-inline-start-color: var(--teal);
     opacity: 0.85;
 }
 
-.unit--fault { border-inline-start-color: var(--amber); }
-.unit--outdated { border-inline-start-color: var(--amber); }
-.unit--alarm { border-inline-start-color: var(--signal); }
-.unit--never_reported { border-inline-start-color: var(--line); border-style: dashed; }
+.unit-block--fault { border-inline-start-color: var(--amber); }
+.unit-block--outdated { border-inline-start-color: var(--amber); }
+.unit-block--alarm { border-inline-start-color: var(--signal); }
+.unit-block--never_reported { border-inline-start-color: var(--line); border-style: dashed; }
 
-.unit__id {
+.unit-block__label {
     font-weight: 600;
-}
-
-.unit__status {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.9rem;
+    white-space: nowrap;
 }
 
 .unit__status--heading {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
     font-size: 1rem;
     font-weight: 500;
     margin: 0.1rem 0;
 }
 
-.unit__next-step,
 .apartment-heading__next-step {
     font-size: 0.9rem;
     font-weight: 500;
-}
-
-.unit__meta {
-    font-size: 0.85rem;
-    opacity: 0.8;
 }
 
 /* Status icon -- shape + colour together (never colour alone): circle
@@ -690,6 +865,48 @@ ul.unit-list {
     margin-bottom: 0.4rem;
 }
 
+/* Clear cards per section (UI-redesign stage 2 polish, "Überblick": tidy
+ * layout, consistent spacing) -- every top-level `<section>` of the
+ * apartment page's grid (any tab) gets the same quiet card treatment, so
+ * "Erreichbarkeit", "Störungen", "Batterie und Signal", "Alarme", etc.
+ * read as clearly separate, evenly spaced blocks instead of one long
+ * unbroken scroll held apart only by `<h2>` margins. The danger zone
+ * keeps its own distinct `--signal` border (unchanged) rather than this
+ * neutral one. */
+.apartment-grid > section {
+    border: 1px solid var(--line);
+    border-radius: 0.5rem;
+    padding: 1rem 1.1rem;
+    background: var(--surface);
+}
+
+/* Higher specificity than the generic card rule above on purpose -- the
+ * danger zone keeps its own distinct `--signal` border, never the
+ * neutral one every other card gets (CLAUDE.md-adjacent "never colour
+ * alone" rule: the border colour is paired with its own explicit German
+ * warning text, unchanged below). */
+.apartment-grid > section.danger-zone {
+    border-color: var(--signal);
+}
+
+.apartment-grid > section > h2:first-child,
+.apartment-grid > section > h2:first-of-type {
+    margin-top: 0;
+}
+
+.apartment-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+}
+
+/* The generic `main section + section { margin-top: 1.5rem }` rule
+ * (P3.2, above) would otherwise add on top of this grid's own `gap` --
+ * one spacing mechanism per container, not two stacked on each other. */
+main .apartment-grid > section + section {
+    margin-top: 0;
+}
+
 /* The apartment-detail sections' `<dl>` fact lists (Batterie/Signal,
  * Version und System, ...) had no styling of their own before this stage
  * (browser default dt-block/dd-block stacking, each pair several lines
@@ -726,31 +943,9 @@ ul.unit-list {
 
 /* Buttons and text inputs, restyled with the new tokens (shared across
  * every page, not just the two rebuilt this stage -- see this file's own
- * top-of-file note on why that is in scope). */
-button {
-    font-family: inherit;
-    font-size: 0.95rem;
-    font-weight: 500;
-    border: 1px solid var(--line);
-    border-radius: 0.35rem;
-    background: var(--surface);
-    color: var(--ink);
-    cursor: pointer;
-}
-
-button:hover {
-    border-color: var(--flame);
-}
-
-input[type=text],
-input[type=password] {
-    border: 1px solid var(--line);
-    border-radius: 0.35rem;
-    background: var(--surface);
-    color: var(--ink);
-    font-family: inherit;
-}
-
+ * top-of-file note on why that is in scope). The button's own primary/
+ * secondary/danger look is the forms-pass rule near the top of this file
+ * (UI-redesign stage 2 polish, "button { ... }") -- not restated here. */
 a.command-button {
     border-color: var(--line);
     font-weight: 500;
@@ -769,7 +964,7 @@ a.command-button:hover {
     .apartment-grid {
         display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 0 2rem;
+        gap: 1.1rem 2rem;
         align-items: start;
     }
 
@@ -1064,17 +1259,6 @@ a.command-button:hover {
     font-weight: 500;
 }
 
-.apartments-filter select {
-    display: block;
-    margin-top: 0.25rem;
-    padding: 0.4rem;
-    border: 1px solid var(--line);
-    border-radius: 0.35rem;
-    background: var(--surface);
-    color: var(--ink);
-    font-family: inherit;
-}
-
 .apartments-list {
     list-style: none;
     margin: 0;
@@ -1164,6 +1348,144 @@ code.digest {
 .setup-flow__steps li {
     margin-bottom: 0.5rem;
 }
+
+/* Reachability timeline bar (UI-redesign stage 2 polish, apartment.html's
+ * "Überblick" tab) -- one `flex-basis` percent class per integer 1..100,
+ * generated rather than an inline `style="width: ..."` (this application's
+ * CSP sends no `style-src 'unsafe-inline'`, see fleet/ui_routes.py's
+ * security-headers middleware and this file's own header comment on why an
+ * inline style is treated the same as an inline script here: a page CSP
+ * cannot itself bypass). Each segment's own width is computed in Python
+ * (fleet/ui_apartment.py::_timeline_width_percents), rounded to the nearest
+ * whole percent by the template, and matched to one of these classes. */
+.timeline-bar {
+    display: flex;
+    width: 100%;
+    height: 0.9rem;
+    border-radius: 0.25rem;
+    overflow: hidden;
+    margin: 0.35rem 0 0.75rem;
+    border: 1px solid var(--line);
+}
+
+.timeline-bar__segment {
+    flex-shrink: 0;
+    flex-grow: 0;
+    height: 100%;
+}
+
+.timeline-bar__segment--contact {
+    background: var(--teal);
+}
+
+.timeline-bar__segment--gap {
+    background: var(--signal);
+}
+
+.timeline-bar__segment + .timeline-bar__segment {
+    border-inline-start: 1px solid var(--paper);
+}
+
+.tl-w-1 { flex-basis: 1%; }
+.tl-w-2 { flex-basis: 2%; }
+.tl-w-3 { flex-basis: 3%; }
+.tl-w-4 { flex-basis: 4%; }
+.tl-w-5 { flex-basis: 5%; }
+.tl-w-6 { flex-basis: 6%; }
+.tl-w-7 { flex-basis: 7%; }
+.tl-w-8 { flex-basis: 8%; }
+.tl-w-9 { flex-basis: 9%; }
+.tl-w-10 { flex-basis: 10%; }
+.tl-w-11 { flex-basis: 11%; }
+.tl-w-12 { flex-basis: 12%; }
+.tl-w-13 { flex-basis: 13%; }
+.tl-w-14 { flex-basis: 14%; }
+.tl-w-15 { flex-basis: 15%; }
+.tl-w-16 { flex-basis: 16%; }
+.tl-w-17 { flex-basis: 17%; }
+.tl-w-18 { flex-basis: 18%; }
+.tl-w-19 { flex-basis: 19%; }
+.tl-w-20 { flex-basis: 20%; }
+.tl-w-21 { flex-basis: 21%; }
+.tl-w-22 { flex-basis: 22%; }
+.tl-w-23 { flex-basis: 23%; }
+.tl-w-24 { flex-basis: 24%; }
+.tl-w-25 { flex-basis: 25%; }
+.tl-w-26 { flex-basis: 26%; }
+.tl-w-27 { flex-basis: 27%; }
+.tl-w-28 { flex-basis: 28%; }
+.tl-w-29 { flex-basis: 29%; }
+.tl-w-30 { flex-basis: 30%; }
+.tl-w-31 { flex-basis: 31%; }
+.tl-w-32 { flex-basis: 32%; }
+.tl-w-33 { flex-basis: 33%; }
+.tl-w-34 { flex-basis: 34%; }
+.tl-w-35 { flex-basis: 35%; }
+.tl-w-36 { flex-basis: 36%; }
+.tl-w-37 { flex-basis: 37%; }
+.tl-w-38 { flex-basis: 38%; }
+.tl-w-39 { flex-basis: 39%; }
+.tl-w-40 { flex-basis: 40%; }
+.tl-w-41 { flex-basis: 41%; }
+.tl-w-42 { flex-basis: 42%; }
+.tl-w-43 { flex-basis: 43%; }
+.tl-w-44 { flex-basis: 44%; }
+.tl-w-45 { flex-basis: 45%; }
+.tl-w-46 { flex-basis: 46%; }
+.tl-w-47 { flex-basis: 47%; }
+.tl-w-48 { flex-basis: 48%; }
+.tl-w-49 { flex-basis: 49%; }
+.tl-w-50 { flex-basis: 50%; }
+.tl-w-51 { flex-basis: 51%; }
+.tl-w-52 { flex-basis: 52%; }
+.tl-w-53 { flex-basis: 53%; }
+.tl-w-54 { flex-basis: 54%; }
+.tl-w-55 { flex-basis: 55%; }
+.tl-w-56 { flex-basis: 56%; }
+.tl-w-57 { flex-basis: 57%; }
+.tl-w-58 { flex-basis: 58%; }
+.tl-w-59 { flex-basis: 59%; }
+.tl-w-60 { flex-basis: 60%; }
+.tl-w-61 { flex-basis: 61%; }
+.tl-w-62 { flex-basis: 62%; }
+.tl-w-63 { flex-basis: 63%; }
+.tl-w-64 { flex-basis: 64%; }
+.tl-w-65 { flex-basis: 65%; }
+.tl-w-66 { flex-basis: 66%; }
+.tl-w-67 { flex-basis: 67%; }
+.tl-w-68 { flex-basis: 68%; }
+.tl-w-69 { flex-basis: 69%; }
+.tl-w-70 { flex-basis: 70%; }
+.tl-w-71 { flex-basis: 71%; }
+.tl-w-72 { flex-basis: 72%; }
+.tl-w-73 { flex-basis: 73%; }
+.tl-w-74 { flex-basis: 74%; }
+.tl-w-75 { flex-basis: 75%; }
+.tl-w-76 { flex-basis: 76%; }
+.tl-w-77 { flex-basis: 77%; }
+.tl-w-78 { flex-basis: 78%; }
+.tl-w-79 { flex-basis: 79%; }
+.tl-w-80 { flex-basis: 80%; }
+.tl-w-81 { flex-basis: 81%; }
+.tl-w-82 { flex-basis: 82%; }
+.tl-w-83 { flex-basis: 83%; }
+.tl-w-84 { flex-basis: 84%; }
+.tl-w-85 { flex-basis: 85%; }
+.tl-w-86 { flex-basis: 86%; }
+.tl-w-87 { flex-basis: 87%; }
+.tl-w-88 { flex-basis: 88%; }
+.tl-w-89 { flex-basis: 89%; }
+.tl-w-90 { flex-basis: 90%; }
+.tl-w-91 { flex-basis: 91%; }
+.tl-w-92 { flex-basis: 92%; }
+.tl-w-93 { flex-basis: 93%; }
+.tl-w-94 { flex-basis: 94%; }
+.tl-w-95 { flex-basis: 95%; }
+.tl-w-96 { flex-basis: 96%; }
+.tl-w-97 { flex-basis: 97%; }
+.tl-w-98 { flex-basis: 98%; }
+.tl-w-99 { flex-basis: 99%; }
+.tl-w-100 { flex-basis: 100%; }
 
 @media (prefers-reduced-motion: reduce) {
     * {

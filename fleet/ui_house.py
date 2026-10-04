@@ -126,6 +126,11 @@ class ApartmentTile:
     property_id: int | None = None
     property_name: str | None = None
     property_address: str | None = None
+    # UI-redesign stage 2 polish ("Alle Wohnungen" compact site map): a
+    # short label for the small per-apartment block, computed once here
+    # rather than guessed at in the template (CLAUDE.md: derivation logic
+    # belongs in Python). See `_short_label` below for the heuristic.
+    short_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,26 @@ def _relative_duration(now: datetime, moment: datetime) -> str:
     return f"{days} Tag{'en' if days != 1 else ''}"
 
 
+def _short_label(apartment_id: str, label: str | None) -> str:
+    """The short name the compact "Alle Wohnungen" site-map block prints
+    (brief, UI-redesign stage 2 polish: "per apartment a small labelled
+    block ... short name"). A landlord's own `label` is typically the full
+    address plus unit ("Musterstraße 1, WE 3", see the demo seed data in
+    `tools/docs_screenshots.py`) -- too long for a block meant to sit
+    several-per-floor-row. If the label contains a comma, the part after
+    the *last* one is already the landlord's own "WE 3"-style unit name
+    and is used as-is; otherwise the apartment id itself, which is already
+    short by convention (section 20.1: "a permanent id", e.g.
+    `beispielweg9-we1"), is used unchanged -- never truncated blindly,
+    which could make two different apartments display identically."""
+
+    if label and "," in label:
+        tail = label.rsplit(",", 1)[1].strip()
+        if tail:
+            return tail
+    return apartment_id
+
+
 def _fault_display(fault: OpenFault) -> FaultDisplay:
     return FaultDisplay(kind_label=FAULT_KIND_LABELS[fault.kind], zone=fault.zone)
 
@@ -225,6 +250,7 @@ def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
         else None
     )
     status = _CATEGORY_STATUS[_category(overview)]
+    short_label = _short_label(overview.apartment_id, overview.label)
 
     if latest is None:
         return ApartmentTile(
@@ -240,6 +266,7 @@ def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
             property_id=overview.property_id,
             property_name=overview.property_name,
             property_address=overview.property_address,
+            short_label=short_label,
             never_reported=True,
             last_contact_text="noch nie gemeldet",
             mode=None,
@@ -264,6 +291,7 @@ def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
         property_id=overview.property_id,
         property_name=overview.property_name,
         property_address=overview.property_address,
+        short_label=short_label,
         never_reported=False,
         last_contact_text=f"vor {_relative_duration(now, latest.received_at)}",
         mode=heartbeat.thermoctl.mode,

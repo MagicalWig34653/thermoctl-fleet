@@ -28,9 +28,9 @@
 
 <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="reason">Grund (Pflichtfeld)
+    <label for="reason">Grund
         <input type="text" id="reason" name="reason" required>
     </label>
-    <button type="submit">Mieterwechsel bestätigen</button>
+    <button type="submit" class="button--danger">Mieterwechsel bestätigen</button>
 </form>
 {% endblock %}

@@ -29,8 +29,8 @@
     </label>
     <label for="state">Zustand
         <select id="state" name="state" required>
-            {% for state in apartment_states %}
-            <option value="{{ state }}" {% if state == apartment.state %}selected{% endif %}>{{ state }}</option>
+            {% for state, state_label in apartment_states %}
+            <option value="{{ state }}" {% if state == apartment.state %}selected{% endif %}>{{ state_label }}</option>
             {% endfor %}
         </select>
     </label>
@@ -38,7 +38,7 @@
         <input type="checkbox" id="pilot_mode" name="pilot_mode" value="true" {% if apartment.pilot_mode %}checked{% endif %}>
         Pilotbetrieb (schaltet den Agent-Befehl "open_access" frei)
     </label>
-    <label for="reason">Grund (Pflichtfeld)
+    <label for="reason">Grund
         <input type="text" id="reason" name="reason" required>
     </label>
     <button type="submit">Speichern</button>

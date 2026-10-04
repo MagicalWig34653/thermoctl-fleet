@@ -31,9 +31,9 @@
         {% endfor %}
     </ul>
     {% else %}
-    {# "Empty inbox = calm confirmation" (brief) -- no icon, no colour,
+    {# "Empty inbox = calm confirmation" (brief) – no icon, no colour,
        just the plain German sentence the headline above already gave. #}
-    <p class="inbox-empty">Nichts zu tun -- alle {{ overview.apartment_count }} Wohnungen sind in Ordnung.</p>
+    <p class="inbox-empty">Nichts zu tun – alle {{ overview.apartment_count }} Wohnungen sind in Ordnung.</p>
     {% endif %}
 </section>
 
@@ -56,7 +56,7 @@
                 <span class="building__floor-label">{{ floor.floor_label }}</span>
                 <div class="building__units">
                     {% for tile in floor.tiles %}
-                    {{ units.apartment_card(tile) }}
+                    {{ units.apartment_block(tile) }}
                     {% endfor %}
                 </div>
             </div>
@@ -66,7 +66,7 @@
         <ul class="unit-list">
             {% for floor in group.floors %}
             {% for tile in floor.tiles %}
-            <li>{{ units.apartment_card(tile) }}</li>
+            <li>{{ units.apartment_block(tile) }}</li>
             {% endfor %}
             {% endfor %}
         </ul>
