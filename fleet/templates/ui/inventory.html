@@ -4,7 +4,7 @@
 
 {% block content %}
 {# "Einrichtung" (UI-redesign stage 2, information-architecture area 3,
-   replacing "Inventar") -- properties, apartments (each with its current
+   replacing "Inventar") – properties, apartments (each with its current
    device, if any), and devices not in service. Already German-rendered
    and derived by fleet/ui_inventory.py::build_inventory_view; this
    template only iterates and prints. #}
@@ -16,31 +16,31 @@
 
 <section class="setup-flow" aria-labelledby="setup-flow-heading">
     <h2 id="setup-flow-heading">Neue Basisstation vorbereiten</h2>
-    {# A guided step flow -- numbered steps are justified here (brief:
+    {# A guided step flow – numbered steps are justified here (brief:
        "numbered markers ... are a sequence"), unlike anywhere else in
        this application, because preparing a device genuinely *is* one:
        register, prepare a one-time code, hand the station to the
        installer, confirm once it reports back. Every step links straight
        into the existing, unchanged route/form for that step
-       (fleet/ui_routes.py's P4.2/P4.2b/P4.3 routes) -- nothing new is
+       (fleet/ui_routes.py's P4.2/P4.2b/P4.3 routes) – nothing new is
        built here, only the order these forms already have to happen in
        is made explicit. #}
     <ol class="setup-flow__steps">
         <li>
-            <strong>Gerät registrieren</strong> -- Seriennummer, Modell und
+            <strong>Gerät registrieren</strong> – Seriennummer, Modell und
             Versionen eintragen (<a href="#device-register-form">Formular unten</a>).
         </li>
         <li>
-            <strong>Vorbereiten</strong> -- beim registrierten Gerät unter
+            <strong>Vorbereiten</strong> – beim registrierten Gerät unter
             "Geräte nicht im Einsatz" auf "Vorbereiten" klicken; der
             einmalige Registrierungscode wird dort genau einmal angezeigt.
         </li>
         <li>
-            <strong>Ausliefern</strong> -- Basisstation mit diesem Code vor
+            <strong>Ausliefern</strong> – Basisstation mit diesem Code vor
             Ort in Betrieb nehmen; sie meldet sich danach selbst.
         </li>
         <li>
-            <strong>Bestätigen</strong> -- unter
+            <strong>Bestätigen</strong> – unter
             <a href="/ui/inventory/devices/confirm">"Geräteregistrierungen bestätigen"</a>
             den Bestätigungscode prüfen und der Wohnung zuordnen.
         </li>
@@ -60,7 +60,7 @@
             {% for apartment in group.apartments %}
             <li>
                 <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
-                – {{ apartment.state }}
+                – {{ apartment.state_label }}
                 {% if apartment.floor %}, {{ apartment.floor }}{% endif %}
                 {% if apartment.orientation %}, {{ apartment.orientation }}{% endif %}
                 , {{ apartment.heating_circuits }} Heizkreis(e)
@@ -95,7 +95,7 @@
             {% for apartment in view.unassigned_apartments %}
             <li>
                 <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
-                – {{ apartment.state }}
+                – {{ apartment.state_label }}
                 &nbsp;<a href="{{ apartment.edit_href }}">Bearbeiten</a>
                 {% if apartment.replace_device_href %}
                 &nbsp;<a href="{{ apartment.replace_device_href }}">Gerät ausbauen/tauschen</a>
@@ -118,7 +118,7 @@
     {% if view.devices_not_in_service %}
     <ul class="inventory-devices">
         {% for device in view.devices_not_in_service %}
-        <li>{{ device.id }} ({{ device.model }}) – {{ device.state }}, seit {{ device.acquisition_date }},
+        <li>{{ device.id }} ({{ device.model }}) – {{ device.state_label }}, seit {{ device.acquisition_date }},
             Image {{ device.image_version }}, Watchdog {{ device.watchdog_version }}
             {% if device.prepare_href %}
             &nbsp;<a href="{{ device.prepare_href }}">Vorbereiten</a>
@@ -128,8 +128,8 @@
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <label>Neuer Zustand
                     <select name="target_state" required>
-                        {% for target in device.allowed_target_states %}
-                        <option value="{{ target }}">{{ target }}</option>
+                        {% for target, target_label in device.allowed_target_states %}
+                        <option value="{{ target }}">{{ target_label }}</option>
                         {% endfor %}
                     </select>
                 </label>

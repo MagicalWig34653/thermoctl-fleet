@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from fleet.storage import RolloutApartmentRecord, Storage
+from fleet.ui_format import format_local_datetime, format_technical_reason
 
 ROLLOUT_SERVICE_LABELS: dict[str, str] = {
     "thermoctl": "thermoctl",
@@ -40,9 +41,23 @@ _APARTMENT_STATUS_LABELS: dict[str, str] = {
 
 
 def _format_timestamp(moment: datetime | None) -> str | None:
+    """German local date/time (`fleet.ui_format.format_local_datetime`),
+    not a raw UTC string -- see that module's own docstring."""
+
     if moment is None:
         return None
-    return moment.strftime("%Y-%m-%d %H:%M UTC")
+    return format_local_datetime(moment)
+
+
+def _format_agent_reason(raw: str | None) -> str | None:
+    """`stopped_reason`/`last_outcome_reason` are agent-echoed, not
+    landlord-authored (unlike `RolloutDetail.reason`, the "Grund" a human
+    typed on the start/resume/cancel form, left untouched) -- see
+    `fleet.ui_format.format_technical_reason`'s own docstring."""
+
+    if raw is None:
+        return None
+    return format_technical_reason(raw)
 
 
 @dataclass(frozen=True)
@@ -70,7 +85,7 @@ def build_rollout_list(storage: Storage) -> list[RolloutListEntry]:
                 version=rollout.version,
                 state=rollout.state,
                 state_label=_ROLLOUT_STATE_LABELS.get(rollout.state, rollout.state),
-                stopped_reason=rollout.stopped_reason,
+                stopped_reason=_format_agent_reason(rollout.stopped_reason),
                 created_text=_format_timestamp(rollout.created_at) or "",
                 created_by=rollout.created_by,
                 total_apartments=len(apartments),
@@ -103,7 +118,7 @@ def _apartment_display(record: RolloutApartmentRecord) -> RolloutApartmentDispla
         revision=record.revision,
         started_text=_format_timestamp(record.started_at),
         converged_text=_format_timestamp(record.converged_at),
-        last_outcome_reason=record.last_outcome_reason,
+        last_outcome_reason=_format_agent_reason(record.last_outcome_reason),
     )
 
 
@@ -141,7 +156,7 @@ def build_rollout_detail(storage: Storage, rollout_id: str) -> RolloutDetail | N
         digest=rollout.digest,
         state=rollout.state,
         state_label=_ROLLOUT_STATE_LABELS.get(rollout.state, rollout.state),
-        stopped_reason=rollout.stopped_reason,
+        stopped_reason=_format_agent_reason(rollout.stopped_reason),
         stagger_hours=rollout.stagger_hours,
         timeout_hours=rollout.timeout_hours,
         pilot_converged_text=_format_timestamp(rollout.pilot_converged_at),

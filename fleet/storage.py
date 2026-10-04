@@ -5436,7 +5436,7 @@ class Storage:
             if previous_assignment is not None:
                 if not replace_previous:
                     raise ValueError(
-                        f"Wohnung {apartment_id!r} hat bereits ein aktives Gerät -- "
+                        f"Wohnung {apartment_id!r} hat bereits ein aktives Gerät – "
                         "Ersetzen muss ausdrücklich bestätigt werden."
                     )
                 if previous_device_target_state not in ("faulty", "in_storage"):
@@ -6540,7 +6540,7 @@ class Storage:
             )
             if not result.rowcount:
                 raise ValueError(
-                    f"Gerät {device_id!r} wurde inzwischen anderweitig bearbeitet -- "
+                    f"Gerät {device_id!r} wurde inzwischen anderweitig bearbeitet – "
                     "bitte erneut versuchen."
                 )
 
@@ -6644,7 +6644,7 @@ class Storage:
 
         if target_state not in REMOVE_DEVICE_TARGET_STATES:
             raise ValueError(
-                f"Unbekannter Zielzustand {target_state!r} -- nur "
+                f"Unbekannter Zielzustand {target_state!r} – nur "
                 f"{list(REMOVE_DEVICE_TARGET_STATES)} sind erlaubt."
             )
         if not reason.strip():

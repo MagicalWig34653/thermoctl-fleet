@@ -27,11 +27,36 @@ from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from fleet.ui_inventory import (
     APARTMENT_ID_PATTERN,
+    APARTMENT_STATE_LABELS,
+    DEVICE_LIFECYCLE_LABELS,
     build_inventory_view,
 )
+from protocol.inventory import ApartmentState, DeviceLifecycle
 from tests.conftest import store_encrypted_totp_secret
 
 USERNAME = "landlord"
+
+
+# -- Text-hygiene pass (UI-redesign stage 2 polish): APARTMENT_STATE_LABELS/
+# DEVICE_LIFECYCLE_LABELS ---------------------------------------------------
+
+
+def test_apartment_state_labels_cover_every_apartment_state() -> None:
+    """Same "covers every member or this test fails" guarantee
+    `test_fault_kind_labels_cover_every_fault_kind` already gives
+    `fleet.ui_house.FAULT_KIND_LABELS` -- a new `ApartmentState` member
+    added to the protocol without a German label here must fail loudly,
+    not silently fall back to the stored English value."""
+
+    assert set(APARTMENT_STATE_LABELS) == {state.value for state in ApartmentState}
+    for label in APARTMENT_STATE_LABELS.values():
+        assert label
+
+
+def test_device_lifecycle_labels_cover_every_device_lifecycle_state() -> None:
+    assert set(DEVICE_LIFECYCLE_LABELS) == {state.value for state in DeviceLifecycle}
+    for label in DEVICE_LIFECYCLE_LABELS.values():
+        assert label
 
 
 @pytest.fixture
@@ -1127,9 +1152,10 @@ def test_apartment_edit_submit_retire_apartment_does_not_delete_it(
     assert apartment is not None  # still exists -- "not deleted, retired"
     assert apartment.state == "retired"
 
-    # Still listed on the inventory view.
+    # Still listed on the inventory view -- German label (text-hygiene
+    # pass, UI-redesign stage 2 polish), not the stored English value.
     view_response = client.get("/ui/inventory")
-    assert "retired" in view_response.text
+    assert "Außer Betrieb" in view_response.text
     assert "house7-a03" in view_response.text
 
 

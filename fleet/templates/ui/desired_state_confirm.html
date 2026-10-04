@@ -3,7 +3,7 @@
 {% block title %}Sollzustand bestätigen – thermoctl-fleet{% endblock %}
 
 {% block content %}
-{# P5.4b: step two of two -- the actual write (Storage.create_desired_state_revision)
+{# P5.4b: step two of two – the actual write (Storage.create_desired_state_revision)
    only ever happens on the POST this form submits to, never on step one. #}
 <p><a href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">&larr; Zurück zur Bearbeitung</a></p>
 <h1>Sollzustand bestätigen</h1>
@@ -29,7 +29,7 @@
 {% if both_thermoctl_and_zigbee_changed %}
 <p class="error" role="alert">
     Warnung: thermoctl und Zigbee2MQTT ändern sich in dieser Revision beide. Der Agent
-    aktualisiert je Durchlauf nur einen Dienst -- das ist in der Fleet-Oberfläche nicht
+    aktualisiert je Durchlauf nur einen Dienst – das ist in der Fleet-Oberfläche nicht
     erzwungen, wird hier aber angezeigt, weil ein eigenes Zigbee2MQTT-Release
     empfohlen wird.
 </p>
@@ -55,7 +55,7 @@
     <input type="hidden" name="window_from" value="{{ window_from }}">
     <input type="hidden" name="window_until" value="{{ window_until }}">
     <input type="hidden" name="window_temp" value="{{ window_temp }}">
-    <label for="reason">Grund (Pflichtfeld)
+    <label for="reason">Grund
         <input type="text" id="reason" name="reason" required>
     </label>
     <button type="submit">Bestätigen</button>

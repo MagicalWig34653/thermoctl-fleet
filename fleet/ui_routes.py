@@ -71,9 +71,11 @@ from fleet.ui_auth import (
     webauthn_begin_throttle_key,
     webauthn_begin_throttle_threshold,
 )
+from fleet.ui_format import format_local_datetime
 from fleet.ui_house import build_house_overview
 from fleet.ui_inventory import (
     APARTMENT_ID_PATTERN,
+    APARTMENT_STATE_LABELS,
     DEFAULT_APARTMENT_STATE,
     MAX_APARTMENT_ID_LENGTH,
     MAX_DEVICE_ID_LENGTH,
@@ -979,7 +981,9 @@ def apartment_edit_form(
             "ui_session": authenticated,
             "csrf_token": authenticated.session.csrf_token,
             "apartment": record,
-            "apartment_states": [state.value for state in ApartmentState],
+            "apartment_states": [
+                (state.value, APARTMENT_STATE_LABELS[state.value]) for state in ApartmentState
+            ],
             "error": None,
         },
     )
@@ -1027,7 +1031,9 @@ def apartment_edit_submit(
                 "ui_session": authenticated,
                 "csrf_token": authenticated.session.csrf_token,
                 "apartment": record,
-                "apartment_states": [s.value for s in ApartmentState],
+                "apartment_states": [
+                    (s.value, APARTMENT_STATE_LABELS[s.value]) for s in ApartmentState
+                ],
                 "error": message,
             },
             status_code=400,
@@ -1189,7 +1195,9 @@ def device_prepare_submit(
         ).model_dump_json(indent=2)
 
     registration = storage.get_active_registration_for_device(device_id)
-    expires_at = registration.expires_at.isoformat() if registration is not None else ""
+    expires_at = (
+        format_local_datetime(registration.expires_at) if registration is not None else ""
+    )
 
     response = templates.TemplateResponse(
         request,
