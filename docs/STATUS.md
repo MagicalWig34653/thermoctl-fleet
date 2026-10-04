@@ -1,6 +1,80 @@
 # Status
 
-Last updated: 2026-10-03.
+Last updated: 2026-10-04.
+
+## Fleet UI redesign, stage 1: house overview + apartment detail (2026-10-04)
+
+The owner found the fleet web UI ("ziemlich unschön") hard to scan for
+"which apartment needs me right now". Stage 1 of a full redesign (plan in
+`docs/ui-redesign-plan.md`) rebuilds two screens for real -- `fleet/
+templates/ui/index.html` ("Das Haus") and `fleet/templates/ui/apartment
+.html` -- plus the shared `base.html` nav and `fleet/static/ui/fleet-ui
+.css`; every other template is untouched and keeps today's look for now.
+
+- **Palette/type**: six named colour tokens per theme derived from the app
+  icon (`branding/thermoctl-fleet.icon`), light and dark via `@media
+  (prefers-color-scheme: dark)`. Type is **Archivo** (SIL OFL 1.1),
+  self-hosted as static TTF under `fleet/static/ui/fonts/` (`OFL.txt`
+  alongside) -- no CDN, no external request, compatible with the existing
+  `script-src 'self'`/`default-src 'self'` CSP.
+- **The building visual** ("Das Haus"'s memorable element): apartments now
+  group by property and, where every apartment in a property has a
+  recorded floor, draw as a top-down floor stack (`fleet/ui_house.py
+  ::group_tiles_by_property`, new `PropertyGroup`/`FloorGroup`). One
+  missing floor in a property falls the whole property back to a plain
+  list; apartments with no property land in their own trailing,
+  ungrouped section. One semantic list (property → floor → apartment) is
+  styled as the floor stack via CSS grid -- there is no separate
+  "accessible" markup, the same structure *is* the screen-reader fallback.
+- **Five-category status replaces the old binary quiet/trouble split**:
+  `alarm`/`fault`/`outdated`/`never_reported`/`ok`, each with a German
+  label and (where there is something to do) a plain-language next step
+  (`fleet/ui_house.py::STATUS_LABELS`/`NEXT_STEP_TEXT`). The apartment
+  detail page shows the same status via a new `ApartmentDetail.status`/
+  `status_label`/`next_step_text` (`fleet/ui_apartment.py::_detail_status`,
+  reusing the house view's own labels so the two pages never disagree).
+  Status is still never colour alone -- icon shape (circle/square/
+  triangle/diamond/dashed ring) plus text, same rule the original P3.0 CSS
+  already stated.
+- **Apartment detail** gets a two-column reading grid above 960px (history/
+  faults/battery-signal/version/alarms on the left, tenant-change/commands/
+  desired-state/backups/restore on the right) via CSS `grid-column`
+  assignment on the existing `<section>` elements by their own
+  `aria-labelledby` -- no section renamed, reordered in the DOM, or given a
+  different field/form/hidden-input; collapses to today's single column
+  below that width.
+- **Storage/view-model change**: `Storage.get_house_overview` now also
+  reads `floor`/`orientation`/`property_id`/`property_name`/
+  `property_address` via an outer join to `properties` (new fields on
+  `ApartmentOverview`, all optional/defaulted, so every existing caller/
+  test keeps working). `ApartmentTile` gained matching optional fields
+  plus `status`/`status_label`/`next_step_text`; `quiet` is unchanged.
+
+**Self-review bug caught in round 1 of screenshot critique**: the dark
+theme's `--ink` (text colour) and `--paper` (page background) tokens both
+resolved to the same navy, rendering every redesigned page unreadable in
+dark mode. Fixed by giving `--ink` its own light off-white value in the
+dark block. **Round 2**: the apartment page's right column towered over
+the left one (plain, unstyled `<dl>` fact lists, one line per field) --
+added a compact label/value grid for `<dl>`/`<table>` inside `.apartment-
+grid` and moved "Batterie und Signal"/"Version und System"/"Alarme" to the
+left column (content-weight balance, not just meaning) to close the gap;
+also gave `button`/`input[type=text|password]`/`a.command-button` their
+first real styling (token-based border/colour), previously plain browser
+defaults everywhere.
+
+Verified: `ruff check fleet/` and `mypy fleet/` both exit 0; full suite
+2288 tests, 0 failures/errors, 3 pre-existing/unrelated skips (plus 12 new
+tests for `fleet.ui_house.group_tiles_by_property`/the storage join, all
+passing, `fleet/ui_house.py` at 100% line coverage). Screenshots (seeded
+via `tools/docs_screenshots.py`'s own `seed()`/`create_ui_user()`/
+`start_server()`, Playwright/Chromium in a scratch venv) at 1440px/390px,
+light/dark, under `docs/ui-redesign/`.
+
+**Open for stage 2** (not started): `tasks.html`, `inventory.html`, the
+various confirm/form pages, and login/account all still use the pre-
+redesign look -- they inherit the new base tokens/type/button styling
+(shared CSS, not duplicated) but none of their own layouts changed.
 
 ## CI fix: flash-tool tests no longer need macOS (2026-10-03)
 

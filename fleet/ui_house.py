@@ -69,6 +69,32 @@ class FaultDisplay:
     zone: str
 
 
+# UI-redesign stage 1 (see docs/ui-redesign-plan.md): one plain-language
+# status per tile, replacing the old binary `quiet`/`trouble` split with
+# the five categories `_category` already computes below -- `quiet`
+# itself stays on `ApartmentTile` unchanged (existing callers/tests read
+# it), `status` is additive. Every status also carries its own German
+# label and, where there is something to do, a plain-language next step
+# (brief: "anything needing action must stand out with a plain-language
+# next step") -- never colour alone, per this package's existing
+# accessibility rule.
+STATUS_LABELS: dict[str, str] = {
+    "alarm": "Meldet sich nicht",
+    "fault": "Störung",
+    "outdated": "Veraltete Version",
+    "never_reported": "Noch nie gemeldet",
+    "ok": "In Ordnung",
+}
+
+NEXT_STEP_TEXT: dict[str, str | None] = {
+    "alarm": "Vor Ort prüfen: Strom und Netzwerk der Basisstation.",
+    "fault": "Störung ansehen und, falls erledigt, quittieren.",
+    "outdated": "Update der Protokollversion einplanen.",
+    "never_reported": "Einrichtung der Basisstation prüfen.",
+    "ok": None,
+}
+
+
 @dataclass(frozen=True)
 class ApartmentTile:
     """One tile's worth of already German-rendered, already-derived display
@@ -88,6 +114,49 @@ class ApartmentTile:
     open_faults: list[FaultDisplay]
     alarm_since_text: str | None
     quiet: bool
+    # UI-redesign stage 1 additions -- see the module comment above and
+    # docs/ui-redesign-plan.md. All optional/defaulted so every existing
+    # direct construction of `ApartmentTile` (none left in this codebase,
+    # but kept defensive) and every existing test keeps working unchanged.
+    status: str = "ok"
+    status_label: str = "In Ordnung"
+    next_step_text: str | None = None
+    floor: str | None = None
+    orientation: str | None = None
+    property_id: int | None = None
+    property_name: str | None = None
+    property_address: str | None = None
+
+
+@dataclass(frozen=True)
+class FloorGroup:
+    """One floor's worth of tiles within a `PropertyGroup`, ordered the
+    same way the apartments were already sorted "by trouble" (see this
+    module's docstring) -- the floor-stack visual is this list rendered as
+    a CSS grid row, nothing more; the semantic order (and therefore the
+    screen-reader order) and the visual order are the same list."""
+
+    floor_label: str
+    tiles: list[ApartmentTile]
+
+
+@dataclass(frozen=True)
+class PropertyGroup:
+    """One property's worth of tiles, grouped by floor for the building
+    visual (the brief's "memorable element") -- or left as a single,
+    ungrouped floor when any apartment in this property has no recorded
+    floor (`has_floor_data=False`), per the brief's own fallback rule
+    ("a plain list fallback for properties without floor data"). Floors
+    are ordered top-down as German floor labels sort reasonably
+    (`EG`, `1. OG`, `2. OG`, ... -- see `_floor_sort_key` below); any
+    apartment with a floor value this scheme cannot place sorts last
+    rather than being dropped."""
+
+    property_id: int | None
+    property_name: str | None
+    property_address: str | None
+    has_floor_data: bool
+    floors: list[FloorGroup]
 
 
 def _naive_utc(value: datetime) -> datetime:
@@ -142,6 +211,12 @@ def _category(overview: ApartmentOverview) -> int:
     return 4
 
 
+# `_category`'s integer sort key, named for use in `ApartmentTile.status`
+# and the two lookup dicts above -- one name per category, kept in the
+# same 0=worst..4=fine order.
+_CATEGORY_STATUS = {0: "alarm", 1: "fault", 2: "outdated", 3: "never_reported", 4: "ok"}
+
+
 def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
     latest = overview.latest
     alarm_since_text = (
@@ -149,11 +224,22 @@ def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
         if overview.open_alarm is not None
         else None
     )
+    status = _CATEGORY_STATUS[_category(overview)]
 
     if latest is None:
         return ApartmentTile(
             apartment_id=overview.apartment_id,
             label=overview.label,
+            alarm_since_text=alarm_since_text,
+            quiet=status == "ok",
+            status=status,
+            status_label=STATUS_LABELS[status],
+            next_step_text=NEXT_STEP_TEXT[status],
+            floor=overview.floor,
+            orientation=overview.orientation,
+            property_id=overview.property_id,
+            property_name=overview.property_name,
+            property_address=overview.property_address,
             never_reported=True,
             last_contact_text="noch nie gemeldet",
             mode=None,
@@ -162,14 +248,22 @@ def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
             thermoctl_version=None,
             outdated=False,
             open_faults=[],
-            alarm_since_text=alarm_since_text,
-            quiet=_category(overview) == 4,
         )
 
     heartbeat = latest.heartbeat
     return ApartmentTile(
         apartment_id=overview.apartment_id,
         label=overview.label,
+        alarm_since_text=alarm_since_text,
+        quiet=status == "ok",
+        status=status,
+        status_label=STATUS_LABELS[status],
+        next_step_text=NEXT_STEP_TEXT[status],
+        floor=overview.floor,
+        orientation=overview.orientation,
+        property_id=overview.property_id,
+        property_name=overview.property_name,
+        property_address=overview.property_address,
         never_reported=False,
         last_contact_text=f"vor {_relative_duration(now, latest.received_at)}",
         mode=heartbeat.thermoctl.mode,
@@ -178,8 +272,6 @@ def _build_tile(overview: ApartmentOverview, now: datetime) -> ApartmentTile:
         thermoctl_version=heartbeat.thermoctl.version,
         outdated=latest.outdated,
         open_faults=[_fault_display(fault) for fault in heartbeat.open_faults],
-        alarm_since_text=alarm_since_text,
-        quiet=_category(overview) == 4,
     )
 
 
@@ -203,9 +295,105 @@ def build_house_overview(storage: Storage, now: datetime) -> list[ApartmentTile]
     return [_build_tile(overview, now) for overview in overviews_sorted]
 
 
+# German floor labels this scheme can place, top to bottom -- "DG" (Dachgeschoss)
+# above the top numbered floor, "EG" at street level, basement levels below.
+# Anything not in this list (a typo, a free-text floor name) sorts after every
+# recognized floor, by its own text, rather than being dropped from the
+# building visual -- the brief's fallback is for *missing* floor data, not for
+# an unrecognized one, so this is purely a "doesn't block the page" guard.
+_KNOWN_FLOOR_ORDER = (
+    ["DG"] + [f"{n}. OG" for n in range(20, 0, -1)] + ["EG"] + [f"{n}. UG" for n in range(1, 6)]
+)
+
+
+def _floor_sort_key(floor_label: str) -> tuple[int, str]:
+    """Top-down sort key for one floor's label within a property -- a
+    recognized label (`"EG"`, `"2. OG"`, `"1. UG"`, `"DG"`) sorts by its
+    position in `_KNOWN_FLOOR_ORDER`; anything else sorts after every
+    recognized floor, alphabetically among itself, per this function's own
+    "doesn't block the page" comment above."""
+
+    try:
+        return (_KNOWN_FLOOR_ORDER.index(floor_label), "")
+    except ValueError:
+        return (len(_KNOWN_FLOOR_ORDER), floor_label)
+
+
+def group_tiles_by_property(tiles: list[ApartmentTile]) -> list[PropertyGroup]:
+    """Groups already-built tiles into one `PropertyGroup` per property for
+    "Das Haus"'s building visual (the brief's "memorable element"), plus one
+    trailing group (`property_id=None`) for apartments with no property
+    assigned at all.
+
+    A property's apartments are drawn as a stack of floors only when *every*
+    one of them has a recorded floor (`has_floor_data=True`); the moment one
+    apartment in a property is missing its floor, the whole property falls
+    back to a single ungrouped list -- a floor stack with one silent gap in
+    it would misrepresent the building, per the brief's own fallback rule.
+    Apartment order within a floor, and property order, both come entirely
+    from the input list's own order (already sorted "by trouble" by
+    `build_house_overview`) -- this function only groups, it establishes no
+    ordering of its own among apartments.
+    """
+
+    order: list[tuple[int | None, str | None, str | None]] = []
+    seen: set[tuple[int | None, str | None, str | None]] = set()
+    members: dict[tuple[int | None, str | None, str | None], list[ApartmentTile]] = {}
+    for tile in tiles:
+        key = (tile.property_id, tile.property_name, tile.property_address)
+        if key not in seen:
+            seen.add(key)
+            order.append(key)
+            members[key] = []
+        members[key].append(tile)
+
+    groups: list[PropertyGroup] = []
+    no_property: PropertyGroup | None = None
+    for property_id, property_name, property_address in order:
+        group_tiles = members[(property_id, property_name, property_address)]
+        has_floor_data = property_id is not None and all(
+            tile.floor is not None for tile in group_tiles
+        )
+        if has_floor_data:
+            by_floor: dict[str, list[ApartmentTile]] = {}
+            for tile in group_tiles:
+                assert tile.floor is not None  # guaranteed by has_floor_data above
+                by_floor.setdefault(tile.floor, []).append(tile)
+            floors = [
+                FloorGroup(floor_label=label, tiles=by_floor[label])
+                for label in sorted(by_floor, key=_floor_sort_key)
+            ]
+        else:
+            floors = [FloorGroup(floor_label="", tiles=group_tiles)]
+        group = PropertyGroup(
+            property_id=property_id,
+            property_name=property_name,
+            property_address=property_address,
+            has_floor_data=has_floor_data,
+            floors=floors,
+        )
+        if property_id is None:
+            no_property = group
+        else:
+            groups.append(group)
+
+    # Apartments with no property at all are shown last, grouped together
+    # under their own quiet fallback section -- never mixed into a real
+    # property's building visual (there is nothing to draw: no property
+    # means no address, no floor plan to speak of).
+    if no_property is not None:
+        groups.append(no_property)
+    return groups
+
+
 __all__ = [
     "FAULT_KIND_LABELS",
+    "NEXT_STEP_TEXT",
+    "STATUS_LABELS",
     "ApartmentTile",
     "FaultDisplay",
+    "FloorGroup",
+    "PropertyGroup",
     "build_house_overview",
+    "group_tiles_by_property",
 ]

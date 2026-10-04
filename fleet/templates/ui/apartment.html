@@ -8,11 +8,19 @@
    This template only iterates and prints; it makes no ordering, wording, or
    gap/caught-up decisions of its own. #}
 <p><a href="/ui/">&larr; Zurück zum Haus</a></p>
-<h1>{{ apartment_id }}{% if detail and detail.label and detail.label != apartment_id %} ({{ detail.label }}){% endif %}</h1>
 
 {% if detail is none %}
+<h1>{{ apartment_id }}</h1>
 <p>Diese Wohnung ist nicht bekannt.</p>
 {% else %}
+
+<div class="apartment-heading">
+    <h1>{{ apartment_id }}{% if detail.label and detail.label != apartment_id %} ({{ detail.label }}){% endif %}</h1>
+    <p class="unit__status unit__status--heading"><span class="status-icon status-icon--{{ detail.status }}" aria-hidden="true"></span>{{ detail.status_label }}</p>
+    {% if detail.next_step_text %}<p class="apartment-heading__next-step">{{ detail.next_step_text }}</p>{% endif %}
+</div>
+
+<div class="apartment-grid">
 
 <nav aria-label="Zeitraum der Erreichbarkeitshistorie">
     <a href="?days=3">3 Tage</a>
@@ -360,6 +368,7 @@
     {% endif %}
 </section>
 
+</div>
 {% endif %}
 {% endblock %}
 

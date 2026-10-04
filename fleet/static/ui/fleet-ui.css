@@ -10,35 +10,175 @@
  * without any policy relaxation.
  */
 
-:root { color-scheme: light dark; }
+/* UI-redesign stage 1 (docs/ui-redesign-plan.md) -- self-hosted type,
+ * colour tokens, the shared header/nav, the "Das Haus" building visual,
+ * and the apartment-detail two-column grid. Everything above this block
+ * (the original P3.0-P6.2 rules) is left in place for the templates this
+ * stage does not touch yet (tasks.html, inventory.html, the various
+ * confirm/form pages) -- see that plan's own "what this stage covers"
+ * note. Component classes shared with those untouched templates
+ * (`.apartment-tile__tag`, `button`, `input[type=...]`, `.hint`/`.error`)
+ * are restyled in place via the new tokens below rather than duplicated,
+ * so the whole application reads as one system even though only two
+ * pages were rebuilt.
+ */
+
+@font-face {
+    font-family: "Archivo";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("/ui/static/fonts/Archivo-Regular.ttf") format("truetype");
+}
+
+@font-face {
+    font-family: "Archivo";
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url("/ui/static/fonts/Archivo-Medium.ttf") format("truetype");
+}
+
+@font-face {
+    font-family: "Archivo";
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url("/ui/static/fonts/Archivo-SemiBold.ttf") format("truetype");
+}
+
+@font-face {
+    font-family: "Archivo";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("/ui/static/fonts/Archivo-Bold.ttf") format("truetype");
+}
+
+:root {
+    color-scheme: light dark;
+
+    /* Named tokens -- see docs/ui-redesign-plan.md's "Colour" section for
+     * the WCAG/"never colour alone" reasoning behind each one. Light
+     * values here, dark values in the `prefers-color-scheme: dark` block
+     * below -- no manual theme toggle exists in this application, so the
+     * OS preference (already declared via `color-scheme` above) is the
+     * only switch. */
+    --ink: #1b2430;
+    --paper: #f7f5f1;
+    --surface: #ffffff;
+    --line: #8a8f98;
+    --flame: #e85a1a;
+    --amber: #9a5c08;
+    --teal: #237567;
+    --signal: #c62e1f;
+    --focus-ring: #1b2430;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        /* `--ink` is the dark theme's *text* colour (a warm off-white, not
+         * pure white -- less glare against the graphite-navy `--paper`
+         * background); the two must never collide, see the P3.0 bug this
+         * comment replaced (dark-theme text and background both resolved
+         * to the same navy, rendering every page unreadable). */
+        --ink: #e8eaf0;
+        --paper: #0f1626;
+        --surface: #182134;
+        --line: #5b6578;
+        --flame: #ff8a3d;
+        --amber: #ffb347;
+        --teal: #6fd6c8;
+        --signal: #ff8577;
+        --focus-ring: #ffd36e;
+    }
+}
 
 body {
-    font-family: system-ui, sans-serif;
+    font-family: "Archivo", system-ui, sans-serif;
     margin: 0;
     padding: 0;
     line-height: 1.5;
+    background: var(--paper);
+    color: var(--ink);
 }
 
-header nav {
+h1, h2, h3 {
+    font-weight: 600;
+    line-height: 1.25;
+}
+
+h1 { font-size: 1.8rem; }
+h2 { font-size: 1.2rem; }
+h3 { font-size: 1.05rem; }
+
+a {
+    color: var(--flame);
+}
+
+:focus-visible {
+    outline: 3px solid var(--focus-ring);
+    outline-offset: 2px;
+}
+
+header nav,
+.app-nav {
     display: flex;
-    gap: 1rem;
+    gap: 1.25rem;
     align-items: center;
     padding: 0.75rem 1rem;
-    border-bottom: 1px solid #8888;
+    border-bottom: 1px solid var(--line);
+    flex-wrap: wrap;
 }
 
-header nav a {
+header nav a,
+.app-nav a {
     text-decoration: none;
+    font-weight: 500;
 }
 
-header nav form {
+header nav form,
+.app-nav__logout {
     margin-inline-start: auto;
 }
 
+.app-header__bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    background: var(--surface);
+}
+
+.app-header__brand {
+    font-weight: 700;
+    padding: 0.75rem 1rem 0.75rem 1.25rem;
+    white-space: nowrap;
+}
+
+.app-nav {
+    flex: 1;
+    border-bottom: none;
+}
+
 main {
-    padding: 1rem;
-    max-width: 60rem;
+    padding: 1rem 1.25rem 3rem;
+    max-width: 72rem;
     margin: 0 auto;
+}
+
+@media (max-width: 42rem) {
+    .app-header__bar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    .app-header__brand {
+        padding: 0.75rem 1rem 0.25rem;
+    }
+    .app-nav {
+        padding: 0.25rem 0.5rem 0.75rem;
+        gap: 0.75rem;
+        row-gap: 0.4rem;
+    }
 }
 
 .hint {
@@ -385,4 +525,273 @@ ul.backup-list li {
    either, see this file's own header comment). */
 .inline-form {
     display: inline;
+}
+
+/* "Das Haus" (P3.1, UI-redesign stage 1) -- the house summary line, the
+ * per-property building visual, and the one shared apartment-card markup
+ * (`.unit`) used both inside the floor-stack grid and inside the plain
+ * fallback list. See docs/ui-redesign-plan.md's "Layout concept" for the
+ * reasoning (one semantic structure, styled two ways, not two markups).
+ */
+.house-summary {
+    font-size: 1.05rem;
+    margin: 0.25rem 0 1.5rem;
+}
+
+.property-group {
+    margin-top: 2rem;
+}
+
+.property-group h2 {
+    margin: 0 0 0.75rem;
+}
+
+.building {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    border: 1px solid var(--line);
+    border-radius: 0.5rem;
+    padding: 0.85rem;
+    background: var(--surface);
+}
+
+.building__floor {
+    display: grid;
+    grid-template-columns: 3.5rem 1fr;
+    gap: 0.75rem;
+    align-items: start;
+}
+
+.building__floor-label {
+    font-weight: 600;
+    font-size: 0.85rem;
+    opacity: 0.75;
+    padding-top: 0.6rem;
+}
+
+.building__units {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+}
+
+ul.unit-list {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.6rem;
+}
+
+/* One apartment, as a card -- status conveyed by the left accent bar
+ * *and* the icon shape in `.unit__status` *and* its German text, never by
+ * colour alone (same rule the original P3.1 CSS already stated). */
+.unit {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    min-width: 11rem;
+    flex: 1 1 11rem;
+    border: 1px solid var(--line);
+    border-inline-start-width: 0.3rem;
+    border-radius: 0.4rem;
+    padding: 0.6rem 0.8rem;
+    text-decoration: none;
+    color: inherit;
+    background: var(--paper);
+}
+
+.unit--ok {
+    border-inline-start-color: var(--teal);
+    opacity: 0.85;
+}
+
+.unit--fault { border-inline-start-color: var(--amber); }
+.unit--outdated { border-inline-start-color: var(--amber); }
+.unit--alarm { border-inline-start-color: var(--signal); }
+.unit--never_reported { border-inline-start-color: var(--line); border-style: dashed; }
+
+.unit__id {
+    font-weight: 600;
+}
+
+.unit__status {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.9rem;
+}
+
+.unit__status--heading {
+    font-size: 1rem;
+    font-weight: 500;
+    margin: 0.1rem 0;
+}
+
+.unit__next-step,
+.apartment-heading__next-step {
+    font-size: 0.9rem;
+    font-weight: 500;
+}
+
+.unit__meta {
+    font-size: 0.85rem;
+    opacity: 0.8;
+}
+
+/* Status icon -- shape + colour together (never colour alone): circle
+ * (ok), square (outdated), triangle (fault), diamond (alarm), a dashed
+ * ring (never reported, matching the dashed card border above). */
+.status-icon {
+    display: inline-block;
+    width: 0.65rem;
+    height: 0.65rem;
+    flex: none;
+}
+
+.status-icon--ok {
+    border-radius: 50%;
+    background: var(--teal);
+}
+
+.status-icon--outdated {
+    border-radius: 0.1rem;
+    background: var(--amber);
+}
+
+.status-icon--fault {
+    background: var(--amber);
+    clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
+}
+
+.status-icon--alarm {
+    background: var(--signal);
+    transform: rotate(45deg);
+}
+
+.status-icon--never_reported {
+    border-radius: 50%;
+    border: 0.12rem dashed var(--line);
+    background: transparent;
+}
+
+/* Apartment detail heading + two-column grid (UI-redesign stage 1). The
+ * grid assigns each *existing* <section> to a column by its own
+ * `aria-labelledby` (DOM order and every id/name/hidden field inside each
+ * section stay exactly as before -- only the visual column changes);
+ * below the breakpoint every section returns to today's single column,
+ * in today's order. */
+.apartment-heading {
+    margin-bottom: 1rem;
+}
+
+.apartment-heading h1 {
+    margin-bottom: 0.4rem;
+}
+
+/* The apartment-detail sections' `<dl>` fact lists (Batterie/Signal,
+ * Version und System, ...) had no styling of their own before this stage
+ * (browser default dt-block/dd-block stacking, each pair several lines
+ * tall) -- a compact label/value grid keeps the already-dense right
+ * column from towering over the left one, without changing a single field
+ * or value the template prints. */
+.apartment-grid dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: 1rem;
+    row-gap: 0.3rem;
+    margin: 0.6rem 0 0;
+}
+
+.apartment-grid dl dt {
+    font-weight: 500;
+    opacity: 0.75;
+}
+
+.apartment-grid dl dd {
+    margin: 0;
+}
+
+.apartment-grid table {
+    border-collapse: collapse;
+    margin-top: 0.5rem;
+}
+
+.apartment-grid th,
+.apartment-grid td {
+    text-align: left;
+    padding: 0.3rem 0.75rem 0.3rem 0;
+}
+
+/* Buttons and text inputs, restyled with the new tokens (shared across
+ * every page, not just the two rebuilt this stage -- see this file's own
+ * top-of-file note on why that is in scope). */
+button {
+    font-family: inherit;
+    font-size: 0.95rem;
+    font-weight: 500;
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    background: var(--surface);
+    color: var(--ink);
+    cursor: pointer;
+}
+
+button:hover {
+    border-color: var(--flame);
+}
+
+input[type=text],
+input[type=password] {
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    background: var(--surface);
+    color: var(--ink);
+    font-family: inherit;
+}
+
+a.command-button {
+    border-color: var(--line);
+    font-weight: 500;
+}
+
+a.command-button:hover {
+    border-color: var(--flame);
+    color: var(--flame);
+}
+
+@media (min-width: 60rem) {
+    .apartment-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0 2rem;
+        align-items: start;
+    }
+
+    .apartment-grid > section {
+        min-width: 0;
+    }
+
+    /* Left: what happened and what the system currently reads -- history,
+     * faults, battery/signal, version/system, alarms. Right: what you can
+     * do about it -- tenant change, commands, desired state, backups,
+     * restore. Split by content weight as much as by meaning (see
+     * docs/ui-redesign-plan.md) -- "Sollzustand" alone, with its service
+     * list, roughly matches the whole left column's height. */
+    .apartment-grid > section[aria-labelledby="history-heading"],
+    .apartment-grid > section[aria-labelledby="faults-heading"],
+    .apartment-grid > section[aria-labelledby="devices-heading"],
+    .apartment-grid > section[aria-labelledby="version-heading"],
+    .apartment-grid > section[aria-labelledby="alarms-heading"] {
+        grid-column: 1;
+    }
+
+    .apartment-grid > section[aria-labelledby="tenant-change-heading"],
+    .apartment-grid > section[aria-labelledby="commands-heading"],
+    .apartment-grid > section[aria-labelledby="desired-state-heading"],
+    .apartment-grid > section[aria-labelledby="backups-heading"],
+    .apartment-grid > section[aria-labelledby="restore-heading"] {
+        grid-column: 2;
+    }
 }

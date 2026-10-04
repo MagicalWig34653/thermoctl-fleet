@@ -70,7 +70,7 @@ from fleet.ui_auth import (
     webauthn_begin_throttle_key,
     webauthn_begin_throttle_threshold,
 )
-from fleet.ui_house import build_house_overview
+from fleet.ui_house import build_house_overview, group_tiles_by_property
 from fleet.ui_inventory import (
     APARTMENT_ID_PATTERN,
     DEFAULT_APARTMENT_STATE,
@@ -593,6 +593,7 @@ def index(
     the authenticated request to it and renders the template."""
 
     tiles = build_house_overview(storage, datetime.now(UTC))
+    property_groups = group_tiles_by_property(tiles)
     response = templates.TemplateResponse(
         request,
         "index.html",
@@ -600,6 +601,7 @@ def index(
             "ui_session": authenticated,
             "csrf_token": authenticated.session.csrf_token,
             "tiles": tiles,
+            "property_groups": property_groups,
         },
     )
     response.headers["Cache-Control"] = "no-store"

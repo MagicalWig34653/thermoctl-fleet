@@ -110,7 +110,7 @@ from fleet.storage import (
     HeartbeatHistoryEntry,
     Storage,
 )
-from fleet.ui_house import FAULT_KIND_LABELS
+from fleet.ui_house import FAULT_KIND_LABELS, NEXT_STEP_TEXT, STATUS_LABELS
 from protocol import FaultKind
 from protocol.backups import BackupKind
 from protocol.commands import CommandType
@@ -715,6 +715,15 @@ class ApartmentDetail:
     history_days: int
     timeline: list[TimelineEntry]
     never_reported: bool
+    # UI-redesign stage 1 (docs/ui-redesign-plan.md): the same five-category
+    # status this page's own `fleet/ui_house.py::ApartmentTile` already
+    # carries for "Das Haus" -- same labels/next-step text (imported, not
+    # duplicated), computed from fields this dataclass already has, so the
+    # status chip at the top of the page always agrees with the tile that
+    # linked here.
+    status: str
+    status_label: str
+    next_step_text: str | None
     open_faults: list[OpenFaultDisplay]
     past_faults: list[PastFaultDisplay]
     # Battery/signal (section 9) -- the fleet-wide aggregates the heartbeat
@@ -914,6 +923,32 @@ def _build_alarm_display(alarm: AlarmRecord, now: datetime) -> AlarmDisplay:
     )
 
 
+def _detail_status(
+    never_reported: bool,
+    has_open_alarm: bool,
+    open_fault_count: int,
+    outdated: bool,
+) -> tuple[str, str, str | None]:
+    """Mirrors `fleet.ui_house._category`'s own ordering exactly (alarm >
+    fault > outdated > never-reported > ok) so the status chip here never
+    disagrees with the tile that linked to this page -- returns the status
+    key plus its already-rendered label/next-step text (both from
+    `fleet.ui_house`'s own dicts, the single source of truth for this
+    wording)."""
+
+    if has_open_alarm:
+        status = "alarm"
+    elif open_fault_count:
+        status = "fault"
+    elif outdated:
+        status = "outdated"
+    elif never_reported:
+        status = "never_reported"
+    else:
+        status = "ok"
+    return status, STATUS_LABELS[status], NEXT_STEP_TEXT[status]
+
+
 def build_apartment_detail(
     storage: Storage, apartment_id: str, now: datetime, days: int | str | None
 ) -> ApartmentDetail | None:
@@ -1045,14 +1080,24 @@ def build_apartment_detail(
         _build_alarm_display(alarm, now)
         for alarm in storage.list_alarms_for_apartment(apartment_id)
     ]
+    has_open_alarm = any(alarm.open for alarm in alarms)
 
     if latest is None:
+        status, status_label, next_step_text = _detail_status(
+            never_reported=True,
+            has_open_alarm=has_open_alarm,
+            open_fault_count=len(open_faults),
+            outdated=False,
+        )
         return ApartmentDetail(
             apartment_id=apartment_id,
             label=label,
             history_days=history_days,
             timeline=timeline,
             never_reported=True,
+            status=status,
+            status_label=status_label,
+            next_step_text=next_step_text,
             open_faults=open_faults,
             past_faults=past_faults,
             weakest_battery_percent=None,
@@ -1091,12 +1136,21 @@ def build_apartment_detail(
         )
 
     heartbeat = latest.heartbeat
+    status, status_label, next_step_text = _detail_status(
+        never_reported=False,
+        has_open_alarm=has_open_alarm,
+        open_fault_count=len(open_faults),
+        outdated=latest.outdated,
+    )
     return ApartmentDetail(
         apartment_id=apartment_id,
         label=label,
         history_days=history_days,
         timeline=timeline,
         never_reported=False,
+        status=status,
+        status_label=status_label,
+        next_step_text=next_step_text,
         open_faults=open_faults,
         past_faults=past_faults,
         weakest_battery_percent=heartbeat.devices.weakest_battery_percent,

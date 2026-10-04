@@ -22,22 +22,25 @@
 <body>
 <a class="skip-link" href="#main">Zum Inhalt springen</a>
 {% if ui_session %}
-<header>
-    <nav aria-label="Hauptnavigation">
-        <a href="/ui/">Das Haus</a>
-        {# "Aufgaben" is section 9's third view, built in P3.4. #}
-        <a href="/ui/tasks">Aufgaben</a>
-        {# "Inventar" is section 9's fourth, quiet view, built in P4.1. #}
-        <a href="/ui/inventory">Inventar</a>
-        {# P5.4c: the rollout queue list/detail view. #}
-        <a href="/ui/rollouts">Rollouts</a>
-        {# P6.2: passkey (WebAuthn) management for the logged-in account. #}
-        <a href="/ui/account/webauthn">Konto</a>
-        <form method="post" action="/ui/logout">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button type="submit">Abmelden</button>
-        </form>
-    </nav>
+<header class="app-header">
+    <div class="app-header__bar">
+        <span class="app-header__brand">thermoctl-fleet</span>
+        <nav class="app-nav" aria-label="Hauptnavigation">
+            <a href="/ui/">Das Haus</a>
+            {# "Aufgaben" is section 9's third view, built in P3.4. #}
+            <a href="/ui/tasks">Aufgaben</a>
+            {# "Inventar" is section 9's fourth, quiet view, built in P4.1. #}
+            <a href="/ui/inventory">Inventar</a>
+            {# P5.4c: the rollout queue list/detail view. #}
+            <a href="/ui/rollouts">Rollouts</a>
+            {# P6.2: passkey (WebAuthn) management for the logged-in account. #}
+            <a href="/ui/account/webauthn">Konto</a>
+            <form method="post" action="/ui/logout" class="app-nav__logout">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit">Abmelden</button>
+            </form>
+        </nav>
+    </div>
 </header>
 {% endif %}
 <main id="main">
