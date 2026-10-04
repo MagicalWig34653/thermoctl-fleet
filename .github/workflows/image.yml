@@ -277,7 +277,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             debootstrap systemd-container qemu-utils dosfstools \
-            systemd-ukify bubblewrap
+            systemd-ukify bubblewrap systemd-boot
           sudo pip install --break-system-packages \
             "mkosi[bootable] @ git+https://github.com/systemd/mkosi@v20.2"
           mkosi --version
