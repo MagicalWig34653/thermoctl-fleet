@@ -886,7 +886,7 @@ def test_successful_login_sets_a_correctly_flagged_session_cookie(
     # And the session actually works for the protected page.
     protected = client.get("/ui/")
     assert protected.status_code == 200
-    assert "Das Haus" in protected.text
+    assert "Übersicht" in protected.text
 
 
 def test_login_with_wrong_password_wrong_totp_and_unknown_user_give_the_same_response(
@@ -975,7 +975,7 @@ def test_protected_page_without_a_session_redirects_to_login(client: TestClient)
 
     assert response.status_code == 303
     assert response.headers["location"] == "/ui/login"
-    assert "Das Haus" not in response.text
+    assert "Übersicht" not in response.text
 
 
 def _login(client: TestClient, password: str, totp_secret: str) -> None:

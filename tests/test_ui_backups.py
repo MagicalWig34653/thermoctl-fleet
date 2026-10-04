@@ -143,7 +143,7 @@ def test_backups_are_listed_on_the_apartment_page(
     )
 
     _login(client, password, totp_secret)
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
     assert "Sicherungen" in response.text
@@ -163,7 +163,7 @@ def test_operational_data_backup_shows_the_age_decrypt_command(
     )
 
     _login(client, password, totp_secret)
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
     assert "age -d -i" in response.text
@@ -183,7 +183,7 @@ def test_no_backups_shows_the_empty_state_message(
     _create_apartment(storage)
     _login(client, password, totp_secret)
 
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert "Keine Sicherungen für diese Wohnung." in response.text
 

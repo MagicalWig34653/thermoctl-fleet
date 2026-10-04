@@ -1,82 +1,80 @@
 {% extends "base.html" %}
+{% import "_unit_macros.html" as units %}
 
-{% block title %}Das Haus – thermoctl-fleet{% endblock %}
+{% block title %}Übersicht – thermoctl-fleet{% endblock %}
 
 {% block content %}
-{# "Das Haus" (P3.1, section 9's first view; UI-redesign stage 1) -- one
-   card per apartment, already sorted by trouble and already rendered into
-   German text by fleet/ui_house.py::build_house_overview, grouped into
-   properties/floors by fleet/ui_house.py::group_tiles_by_property. This
-   template only iterates and prints; it makes no ordering, wording, or
-   grouping decisions of its own (see docs/ui-redesign-plan.md for the
-   reasoning behind the floor-stack "building" visual and its fallback).
+{# "Übersicht" (UI-redesign stage 2, information-architecture area 1) --
+   already German-rendered and derived by
+   fleet/ui_overview.py::build_overview. This template only iterates and
+   prints; it makes no triage, ordering, or wording decisions of its own.
+   One sentence, then the action inbox, then the unchanged building/
+   site-map visual (healthy apartments appear only there, per the brief).
+#}
+<h1>Übersicht</h1>
+<p class="overview-headline">{{ overview.headline }}</p>
 
-   One macro renders a single apartment, reused identically whether it
-   ends up inside the floor-stack grid or inside a plain fallback list --
-   there is exactly one markup shape for "one apartment", styled
-   differently by its container, not two parallel descriptions of the
-   same data (brief: "a plain list fallback ... for screen readers"). #}
-{% macro apartment_card(tile) %}
-<a class="unit unit--{{ tile.status }}" href="/ui/apartments/{{ tile.apartment_id | urlpath }}">
-    <span class="unit__id">{{ tile.apartment_id }}{% if tile.label and tile.label != tile.apartment_id %} ({{ tile.label }}){% endif %}</span>
-    <span class="unit__status"><span class="status-icon status-icon--{{ tile.status }}" aria-hidden="true"></span>{{ tile.status_label }}{% if tile.alarm_since_text %}, {{ tile.alarm_since_text }}{% endif %}</span>
-    {% if tile.next_step_text %}<span class="unit__next-step">{{ tile.next_step_text }}</span>{% endif %}
-    {% if not tile.never_reported %}
-    <span class="unit__meta">Letzter Kontakt {{ tile.last_contact_text }}</span>
-    {% if tile.open_faults %}
-    <span class="unit__meta">{{ tile.open_faults | length }} offene Störung{{ "en" if tile.open_faults | length != 1 else "" }}: {{ tile.open_faults | map(attribute="kind_label") | join(", ") }}</span>
-    {% endif %}
-    {% else %}
-    <span class="unit__meta">{{ tile.last_contact_text }}</span>
-    {% endif %}
-</a>
-{% endmacro %}
-
-<h1>Das Haus</h1>
-{% if tiles %}
-{% set trouble_count = tiles | selectattr("quiet", "equalto", false) | list | length %}
-<p class="house-summary">
-    {% if trouble_count > 0 %}
-    {{ trouble_count }} Wohnung{{ "en" if trouble_count != 1 else "" }} brauch{{ "en" if trouble_count != 1 else "t" }} Sie jetzt, {{ tiles | length - trouble_count }} {{ "ist" if tiles | length - trouble_count == 1 else "sind" }} in Ordnung.
-    {% else %}
-    Alle {{ tiles | length }} Wohnungen sind in Ordnung.
-    {% endif %}
-</p>
-
-{% for group in property_groups %}
-<section class="property-group" aria-labelledby="property-heading-{{ loop.index }}">
-    <h2 id="property-heading-{{ loop.index }}">
-        {% if group.property_name %}
-        {{ group.property_name }}{% if group.property_address %} ({{ group.property_address }}){% endif %}
-        {% else %}
-        Ohne Gebäudezuordnung
-        {% endif %}
-    </h2>
-    {% if group.has_floor_data %}
-    <div class="building" role="list" aria-label="Stockwerke">
-        {% for floor in group.floors %}
-        <div class="building__floor" role="listitem">
-            <span class="building__floor-label">{{ floor.floor_label }}</span>
-            <div class="building__units">
-                {% for tile in floor.tiles %}
-                {{ apartment_card(tile) }}
-                {% endfor %}
+<section class="inbox" aria-labelledby="inbox-heading">
+    <h2 id="inbox-heading">Was zu tun ist</h2>
+    {% if overview.inbox %}
+    <ul class="inbox-list">
+        {% for item in overview.inbox %}
+        <li class="inbox-item inbox-item--{{ item.kind }}">
+            <div class="inbox-item__body">
+                <span class="inbox-item__title">{{ item.title }}</span>
+                <span class="inbox-item__subtitle">{{ item.subtitle }}</span>
+                {% if item.since_text %}<span class="inbox-item__meta">{{ item.since_text }}</span>{% endif %}
+                {% if item.stale_hint %}<span class="inbox-item__meta">{{ item.stale_hint }}</span>{% endif %}
             </div>
-        </div>
-        {% endfor %}
-    </div>
-    {% else %}
-    <ul class="unit-list">
-        {% for floor in group.floors %}
-        {% for tile in floor.tiles %}
-        <li>{{ apartment_card(tile) }}</li>
-        {% endfor %}
+            <a class="command-button inbox-item__action" href="{{ item.action_href }}">{{ item.action_label }}</a>
+        </li>
         {% endfor %}
     </ul>
+    {% else %}
+    {# "Empty inbox = calm confirmation" (brief) -- no icon, no colour,
+       just the plain German sentence the headline above already gave. #}
+    <p class="inbox-empty">Nichts zu tun -- alle {{ overview.apartment_count }} Wohnungen sind in Ordnung.</p>
     {% endif %}
 </section>
-{% endfor %}
-{% else %}
-<p>Keine Wohnungen registriert.</p>
-{% endif %}
+
+<section class="site-map" aria-labelledby="site-map-heading">
+    <h2 id="site-map-heading">Alle Wohnungen</h2>
+    {% if overview.property_groups %}
+    {% for group in overview.property_groups %}
+    <section class="property-group" aria-labelledby="property-heading-{{ loop.index }}">
+        <h3 id="property-heading-{{ loop.index }}">
+            {% if group.property_name %}
+            {{ group.property_name }}{% if group.property_address %} ({{ group.property_address }}){% endif %}
+            {% else %}
+            Ohne Gebäudezuordnung
+            {% endif %}
+        </h3>
+        {% if group.has_floor_data %}
+        <div class="building" role="list" aria-label="Stockwerke">
+            {% for floor in group.floors %}
+            <div class="building__floor" role="listitem">
+                <span class="building__floor-label">{{ floor.floor_label }}</span>
+                <div class="building__units">
+                    {% for tile in floor.tiles %}
+                    {{ units.apartment_card(tile) }}
+                    {% endfor %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <ul class="unit-list">
+            {% for floor in group.floors %}
+            {% for tile in floor.tiles %}
+            <li>{{ units.apartment_card(tile) }}</li>
+            {% endfor %}
+            {% endfor %}
+        </ul>
+        {% endif %}
+    </section>
+    {% endfor %}
+    {% else %}
+    <p>Keine Wohnungen registriert.</p>
+    {% endif %}
+</section>
 {% endblock %}

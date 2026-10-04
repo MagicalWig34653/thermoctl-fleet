@@ -9,43 +9,107 @@
     (cross-review round 2: `default-src 'self'` without `'unsafe-inline'`
     blocks inline CSS too, not only inline scripts -- see
     fleet/static/ui/fleet-ui.css's own header comment). No page loads a
-    script unless it explicitly opts in via {% block scripts %} below
-    (P5.5b's restore form is the first, and so far only, page that does --
-    see fleet/templates/ui/apartment.html); every other page stays exactly
-    as script-free as P3.0's original "no JS needed" requirement, and the
-    CSP sent by fleet/ui_routes.py's security-headers middleware
-    (`script-src 'self'`, same-origin only, no CDN at runtime -- P5.5b)
-    would refuse anything not served from /ui/static regardless.
+    script unless it explicitly opts in via {% block scripts %} below;
+    every other page stays exactly as script-free as P3.0's original
+    "no JS needed" requirement, and the CSP sent by fleet/ui_routes.py's
+    security-headers middleware (`script-src 'self'`, same-origin only, no
+    CDN at runtime) would refuse anything not served from /ui/static
+    regardless.
     #}
     <link rel="stylesheet" href="/ui/static/fleet-ui.css">
 </head>
 <body>
 <a class="skip-link" href="#main">Zum Inhalt springen</a>
+{#
+UI-redesign stage 2 (docs/ui-redesign-ia.md): four areas, one navigation
+structure, rendered twice -- `.app-sidenav` (a left sidebar, >= 760px) and
+`.app-bottom-nav` (a bottom tab bar, < 760px) -- a CSS-only breakpoint
+switch (`display: none` on whichever is not active for the current
+viewport), not two different link sets: both lists point at the exact
+same four hrefs in the exact same order, so there is exactly one piece of
+navigation information, shown in the layout that fits the viewport. Both
+are real `<nav>` elements with real links -- works without JavaScript, and
+a `display: none` element is correctly removed from the accessibility
+tree, so a screen-reader user is never offered the same four links twice.
+`{% block content %}` is written exactly once below (Jinja forbids the
+same block name twice in one template) -- the `ui_session` check instead
+wraps the *surrounding* chrome (sidebar/topbar/bottom nav), so the login
+page (no session yet) renders the identical `<main id="main">` with none
+of that chrome around it.
+#}
+{#
+`active_area` is derived here from the request path itself, not passed in
+by every single route's own context -- with ~30 routes under `/ui`
+(forms, confirms, downloads, ...) requiring each one to remember to set
+the same value would be exactly the kind of easy-to-forget duplication
+this file's own "one navigation structure" note above argues against.
+`/ui/apartments/...` (the apartment-detail page) is deliberately grouped
+under "Wohnungen" too, not left unhighlighted -- it is that area's own
+detail view, the same way a file's detail page stays under its folder's
+nav entry in any list/detail UI.
+
+Computed only when `ui_session` is set (the only case any of this is
+actually rendered) -- `request.url` requires a `path` key in the ASGI
+scope, which every real request always has, but a handful of this
+package's own unit tests call a route function directly against a bare,
+hand-built scope that deliberately omits it (e.g.
+`tests/test_ui_throttle.py`'s `_make_request`, used only to exercise
+`resolve_client_ip`). Those tests only ever reach the *unauthenticated*
+login-failure template, so guarding this behind `ui_session` keeps them
+working without this file ever needing to know they exist.
+#}
 {% if ui_session %}
-<header class="app-header">
-    <div class="app-header__bar">
-        <span class="app-header__brand">thermoctl-fleet</span>
-        <nav class="app-nav" aria-label="Hauptnavigation">
-            <a href="/ui/">Das Haus</a>
-            {# "Aufgaben" is section 9's third view, built in P3.4. #}
-            <a href="/ui/tasks">Aufgaben</a>
-            {# "Inventar" is section 9's fourth, quiet view, built in P4.1. #}
-            <a href="/ui/inventory">Inventar</a>
-            {# P5.4c: the rollout queue list/detail view. #}
-            <a href="/ui/rollouts">Rollouts</a>
-            {# P6.2: passkey (WebAuthn) management for the logged-in account. #}
+{% set _path = request.url.path %}
+{% set active_area =
+    "uebersicht" if _path == "/ui/" else
+    "wohnungen" if _path.startswith("/ui/apartments") else
+    "einrichtung" if _path.startswith("/ui/inventory") else
+    "updates" if _path.startswith("/ui/rollouts") else
+    none %}
+{% endif %}
+<div class="app-shell">
+    {% if ui_session %}
+    <nav class="app-sidenav" aria-label="Hauptnavigation">
+        <span class="app-sidenav__brand">thermoctl-fleet</span>
+        <a href="/ui/" {% if active_area == "uebersicht" %}aria-current="page"{% endif %}>Übersicht</a>
+        <a href="/ui/apartments" {% if active_area == "wohnungen" %}aria-current="page"{% endif %}>Wohnungen</a>
+        <a href="/ui/inventory" {% if active_area == "einrichtung" %}aria-current="page"{% endif %}>Einrichtung</a>
+        <a href="/ui/rollouts" {% if active_area == "updates" %}aria-current="page"{% endif %}>Updates</a>
+        <div class="app-sidenav__user">
             <a href="/ui/account/webauthn">Konto</a>
-            <form method="post" action="/ui/logout" class="app-nav__logout">
+            <form method="post" action="/ui/logout">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <button type="submit">Abmelden</button>
             </form>
-        </nav>
+        </div>
+    </nav>
+    {% endif %}
+    <div class="app-column">
+        {% if ui_session %}
+        <header class="app-topbar">
+            <span class="app-topbar__brand">thermoctl-fleet</span>
+            <div class="app-topbar__user">
+                <a href="/ui/account/webauthn">Konto</a>
+                <form method="post" action="/ui/logout">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button type="submit">Abmelden</button>
+                </form>
+            </div>
+        </header>
+        {% endif %}
+        <main id="main" class="app-main">
+        {% block content %}{% endblock %}
+        </main>
     </div>
-</header>
+</div>
+{% if ui_session %}
+<nav class="app-bottom-nav" aria-label="Hauptnavigation (mobil)">
+    <a href="/ui/" {% if active_area == "uebersicht" %}aria-current="page"{% endif %}>Übersicht</a>
+    <a href="/ui/apartments" {% if active_area == "wohnungen" %}aria-current="page"{% endif %}>Wohnungen</a>
+    <a href="/ui/inventory" {% if active_area == "einrichtung" %}aria-current="page"{% endif %}>Einrichtung</a>
+    <a href="/ui/rollouts" {% if active_area == "updates" %}aria-current="page"{% endif %}>Updates</a>
+</nav>
 {% endif %}
-<main id="main">
-{% block content %}{% endblock %}
-</main>
 {% block scripts %}{% endblock %}
 </body>
 </html>

@@ -42,6 +42,10 @@ import tools.docs_screenshots as docs_screenshots
 from fleet.storage import Storage, create_storage, upgrade
 from protocol.heartbeat import FaultKind
 from tools.docs_screenshots import (
+    _BW1,
+    _BW2,
+    _WE5,
+    _WE6,
     APARTMENTS,
     _free_port,
     _parse_totp_secret,
@@ -97,12 +101,26 @@ def test_seed_apartment_1_has_a_healthy_heartbeat_with_no_open_faults(tmp_path: 
     assert latest.heartbeat.devices.weakest_battery_percent == 78
 
 
-def test_seed_apartment_2_has_one_open_sensor_fault(tmp_path: Path) -> None:
+def test_seed_we6_has_a_weak_battery_and_no_open_faults(tmp_path: Path) -> None:
+    """WE6 (shares "2. OG" with WE3) is this demo fleet's one "Batterie
+    schwach" case -- under `fleet.ui_tasks.BATTERY_LOW_PERCENT` (20)."""
+
     url = f"sqlite:///{tmp_path}/seed-test.db"
     seed(url)
     storage = create_storage(url)
 
-    latest = storage.get_latest_heartbeat(APARTMENTS[1].id)
+    latest = storage.get_latest_heartbeat(APARTMENTS[_WE6].id)
+    assert latest is not None
+    assert latest.heartbeat.open_faults == []
+    assert latest.heartbeat.devices.weakest_battery_percent == 15
+
+
+def test_seed_we5_has_one_open_sensor_fault(tmp_path: Path) -> None:
+    url = f"sqlite:///{tmp_path}/seed-test.db"
+    seed(url)
+    storage = create_storage(url)
+
+    latest = storage.get_latest_heartbeat(APARTMENTS[_WE5].id)
     assert latest is not None
     assert len(latest.heartbeat.open_faults) == 1
     fault = latest.heartbeat.open_faults[0]
@@ -110,21 +128,37 @@ def test_seed_apartment_2_has_one_open_sensor_fault(tmp_path: Path) -> None:
     assert fault.zone == "Bad"
 
 
-def test_seed_apartment_3_has_an_open_not_reporting_alarm(tmp_path: Path) -> None:
+def test_seed_bw1_has_an_open_not_reporting_alarm_and_is_outdated(tmp_path: Path) -> None:
     url = f"sqlite:///{tmp_path}/seed-test.db"
     seed(url)
     storage = create_storage(url)
 
-    alarms = storage.list_alarms_for_apartment(APARTMENTS[2].id)
+    alarms = storage.list_alarms_for_apartment(APARTMENTS[_BW1].id)
     assert len(alarms) == 1
     assert alarms[0].kind == "not_reporting"
     assert alarms[0].urgency == "high"
     assert alarms[0].cleared_at is None
 
-    # The house overview categorizes apartment 3 as "in trouble" (an open
-    # alarm) -- the one behaviour the demo data exists to show off.
+    # The house overview categorizes BW1 as "in trouble" (an open alarm)
+    # -- the one behaviour the demo data exists to show off. It is also
+    # one version behind (`outdated=True`), so the "Übersicht" action
+    # inbox shows both an alarm row and an "Updates" row for it.
     overview_by_id = {o.apartment_id: o for o in storage.get_house_overview()}
-    assert overview_by_id[APARTMENTS[2].id].open_alarm is not None
+    overview = overview_by_id[APARTMENTS[_BW1].id]
+    assert overview.open_alarm is not None
+    assert overview.latest is not None
+    assert overview.latest.outdated is True
+
+
+def test_seed_bw2_never_reported(tmp_path: Path) -> None:
+    """Beispielweg 9, WE2 (shares "EG" with WE1) is this demo fleet's
+    "noch nie gemeldet" case -- no heartbeat saved for it at all."""
+
+    url = f"sqlite:///{tmp_path}/seed-test.db"
+    seed(url)
+    storage = create_storage(url)
+
+    assert storage.get_latest_heartbeat(APARTMENTS[_BW2].id) is None
 
 
 def test_seed_apartment_1_has_an_operational_data_backup(tmp_path: Path) -> None:
@@ -187,8 +221,9 @@ def test_seed_is_readable_through_the_house_overview_ui_builder(tmp_path: Path) 
     tiles_by_id = {tile.apartment_id: tile for tile in tiles}
     assert set(tiles_by_id) == {entry.id for entry in APARTMENTS}
 
-    assert tiles_by_id[APARTMENTS[1].id].open_faults != []
-    assert tiles_by_id[APARTMENTS[2].id].alarm_since_text is not None
+    assert tiles_by_id[APARTMENTS[_WE5].id].open_faults != []
+    assert tiles_by_id[APARTMENTS[_BW1].id].alarm_since_text is not None
+    assert tiles_by_id[APARTMENTS[_BW2].id].never_reported is True
 
 
 def test_seed_is_readable_through_the_apartment_detail_ui_builder(tmp_path: Path) -> None:
@@ -199,12 +234,16 @@ def test_seed_is_readable_through_the_apartment_detail_ui_builder(tmp_path: Path
     storage = create_storage(url)
 
     now = datetime.now(UTC) + timedelta(minutes=1)
-    detail = build_apartment_detail(storage, APARTMENTS[1].id, now, days=None)
-    assert detail is not None
-    assert detail.label == APARTMENTS[1].label
-    assert len(detail.open_faults) == 1
-    assert detail.desired_state is not None
-    assert detail.desired_state.revision == 1
+
+    fault_detail = build_apartment_detail(storage, APARTMENTS[_WE5].id, now, days=None)
+    assert fault_detail is not None
+    assert fault_detail.label == APARTMENTS[_WE5].label
+    assert len(fault_detail.open_faults) == 1
+
+    we6_detail = build_apartment_detail(storage, APARTMENTS[_WE6].id, now, days=None)
+    assert we6_detail is not None
+    assert we6_detail.desired_state is not None
+    assert we6_detail.desired_state.revision == 1
 
     # Unknown apartment id -> None (same contract `fleet/ui_routes.py`
     # relies on to turn this into a 404).

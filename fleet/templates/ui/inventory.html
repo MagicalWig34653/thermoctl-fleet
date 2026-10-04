@@ -1,18 +1,51 @@
 {% extends "base.html" %}
 
-{% block title %}Inventar – thermoctl-fleet{% endblock %}
+{% block title %}Einrichtung – thermoctl-fleet{% endblock %}
 
 {% block content %}
-{# "Inventar" (P4.1, section 9's fourth, quiet view) -- properties,
-   apartments (each with its current device, if any), and devices not in
-   service. Already German-rendered and derived by
-   fleet/ui_inventory.py::build_inventory_view; this template only
-   iterates and prints. #}
-<h1>Inventar</h1>
+{# "Einrichtung" (UI-redesign stage 2, information-architecture area 3,
+   replacing "Inventar") -- properties, apartments (each with its current
+   device, if any), and devices not in service. Already German-rendered
+   and derived by fleet/ui_inventory.py::build_inventory_view; this
+   template only iterates and prints. #}
+<h1>Einrichtung</h1>
 
 {% if error %}
 <p class="error" role="alert">{{ error }}</p>
 {% endif %}
+
+<section class="setup-flow" aria-labelledby="setup-flow-heading">
+    <h2 id="setup-flow-heading">Neue Basisstation vorbereiten</h2>
+    {# A guided step flow -- numbered steps are justified here (brief:
+       "numbered markers ... are a sequence"), unlike anywhere else in
+       this application, because preparing a device genuinely *is* one:
+       register, prepare a one-time code, hand the station to the
+       installer, confirm once it reports back. Every step links straight
+       into the existing, unchanged route/form for that step
+       (fleet/ui_routes.py's P4.2/P4.2b/P4.3 routes) -- nothing new is
+       built here, only the order these forms already have to happen in
+       is made explicit. #}
+    <ol class="setup-flow__steps">
+        <li>
+            <strong>Gerät registrieren</strong> -- Seriennummer, Modell und
+            Versionen eintragen (<a href="#device-register-form">Formular unten</a>).
+        </li>
+        <li>
+            <strong>Vorbereiten</strong> -- beim registrierten Gerät unter
+            "Geräte nicht im Einsatz" auf "Vorbereiten" klicken; der
+            einmalige Registrierungscode wird dort genau einmal angezeigt.
+        </li>
+        <li>
+            <strong>Ausliefern</strong> -- Basisstation mit diesem Code vor
+            Ort in Betrieb nehmen; sie meldet sich danach selbst.
+        </li>
+        <li>
+            <strong>Bestätigen</strong> -- unter
+            <a href="/ui/inventory/devices/confirm">"Geräteregistrierungen bestätigen"</a>
+            den Bestätigungscode prüfen und der Wohnung zuordnen.
+        </li>
+    </ol>
+</section>
 
 <section>
     <h2>Liegenschaften und Wohnungen</h2>
@@ -161,7 +194,7 @@
     </form>
 </section>
 
-<section>
+<section id="device-register-form">
     <h2>Gerät registrieren</h2>
     <form method="post" action="/ui/inventory/devices">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

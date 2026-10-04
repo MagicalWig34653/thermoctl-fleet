@@ -144,7 +144,7 @@ def test_bundle_is_shown_next_to_its_command_on_the_apartment_page(
     _store_bundle(storage, bundle_storage, APARTMENT, b"age-encryption.org/v1...")
 
     _login(client, password, totp_secret)
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
     assert "Diagnosepaket erstellt" in response.text

@@ -2,6 +2,93 @@
 
 Last updated: 2026-10-04.
 
+## Fleet UI redesign, stage 2: information architecture rebuild (2026-10-04)
+
+The owner rejected stage 1 (below) as only a reskin: "Es soll komplett
+neu gemacht werden. Nicht nur die Farben, sondern die Struktur komplett
+neu bauen." Stage 2 rebuilds the IA itself -- full concept and page
+inventory in **`docs/ui-redesign-ia.md`**, which is now the authoritative
+document for the fleet UI's structure (stage 1's plan document stays only
+for the colour/type reasoning it owns, superseded everywhere else).
+
+- **Four areas replace five flat pages**: Übersicht ("Das Haus" + the old
+  "Aufgaben" merged), Wohnungen (new), Einrichtung (was "Inventar", same
+  URL), Updates (was "Rollouts", same URL). Desktop: left sidebar.
+  Mobile (< 760px): fixed bottom tab bar, same four links. Active area
+  computed once in `base.html` from `request.url.path`, not per-route.
+- **Übersicht** (`fleet/ui_overview.py`, new module) -- one-sentence
+  headline, then an "action inbox" (`InboxItem`: what, which apartment,
+  since when, one link to the exact place the real action lives), then
+  the unchanged `fleet.ui_house` building/site-map visual. `/ui/tasks`
+  303-redirects here (still behind `require_ui_user`). Inbox sourcing
+  (alarm/never-reported from `ApartmentTile.status`, fault/battery/update
+  from `fleet.ui_tasks.build_task_overview`, rollout-stopped from
+  `fleet.ui_rollout.build_rollout_list`) and the deliberate omission of a
+  "failed command" row (no fleet-wide query exists yet -- see "Open
+  points" below) are reasoned through in that module's own docstring.
+- **Wohnungen** (`fleet/ui_apartments_list.py`, new module, `GET
+  /ui/apartments`) -- a flat, searchable (`?q=`)/filterable
+  (`?property=`, `?state=`) list over the same tiles `build_house_overview`
+  already produces. Plain `GET` query parameters -- works without JS.
+- **Apartment page, three tabs** (`?ansicht=ueberblick|wartung|technik`,
+  `fleet/ui_routes.py::_normalize_apartment_tab`, default/fallback
+  `ueberblick`) -- every existing section/form/field/hidden input/CSRF
+  token is unchanged, only grouped: Überblick (history, faults, battery/
+  signal, alarms), Wartung (commands, backups, restore, then tenant
+  change as a separated, red-bordered danger zone), Technik (version/
+  system, desired state, each service's digest shortened via a new
+  `shortdigest` Jinja filter with a "Kopieren" button -- `fleet/static/ui
+  /copy.js`, same-origin, progressive enhancement only, full digest
+  always present via `title="..."`). Server-rendered per tab (only the
+  active tab's markup is sent), not CSS-hidden -- works without JS.
+- **Einrichtung** gets one new section, a numbered "Neue Basisstation
+  vorbereiten" step list reusing the existing register/prepare/confirm
+  routes/forms unchanged -- no new route. Numbered markers used nowhere
+  else in the application (self-review in `docs/ui-redesign-ia.md`).
+- **Wording**: every remaining visible "section 13"/English leftover
+  removed (`desired_state_confirm.html`, `rollout_new.html`); "derzeit
+  inaktiv" -> "derzeit abgeschaltet" everywhere, consistently.
+- **Tests**: two new test modules (`tests/test_ui_overview.py`,
+  `tests/test_ui_apartments_list.py`, unit + HTTP, including data-
+  minimisation/CSRF/security-header coverage matching the existing
+  pattern), new apartment-tab tests in `tests/test_ui_apartment.py`.
+  Every existing test that asserted on now-moved content (commands/
+  backups/restore/tenant-change/desired-state on the apartment page,
+  "Aufgaben"'s three HTTP tests, two heading-text assertions) was updated
+  to navigate to its new tab/page -- no security/CSRF/authorization/
+  data-minimisation assertion was weakened; `tests/test_ui_throttle.py`'s
+  `_make_request` (a bare ASGI scope with no `path` key, used to unit-test
+  `login_submit` directly) surfaced a real bug in `base.html`'s new
+  `request.url.path` read, fixed by guarding that whole computation behind
+  `ui_session` (the only case it is ever used).
+- **Screenshots**: `tools/docs_screenshots.py` extended -- `APARTMENTS`
+  grew from 3 to 5 (two now share "2. OG", two share "EG", for the site
+  map's "several units per floor" requirement; one battery-low, one
+  outdated+alarm, one never-reported, for inbox diversity), a stopped
+  rollout added to the seed, and a new `capture_ui_redesign_ia()`
+  function captures every page/tab at 1440px/390px, light/dark, into
+  `docs/ui-redesign/` (replacing the stage-1 images there). `capture()`
+  itself (feeds `site/`'s screenshots) updated for the new routes; its
+  own filenames (`dashboard-*`, `tasks-*`, ...) kept stable so `site/`'s
+  existing references keep working, even though "Aufgaben" no longer has
+  a distinct page (both filenames now capture the same Übersicht).
+  **Four screenshot critique rounds** against the real rendered pages are
+  recorded in `docs/ui-redesign-ia.md`'s own self-review section (a
+  sidebar active-state contrast fix, an Überblick-tab grid fix, and two
+  rounds fixing a Playwright full-page-screenshot artifact with the new
+  fixed mobile bottom nav).
+- **Open points, not guessed at**:
+  - "Failed command" has no row in the Übersicht inbox yet -- would need
+    a new fleet-wide "most recent failed command per apartment" storage
+    query (`fleet/storage.py` only offers `list_commands_for_apartment`,
+    one apartment at a time); left out of this change rather than adding
+    an unreviewed query alongside the IA rebuild.
+  - `site/`'s own marketing copy (page text describing "Das Haus"/
+    "Aufgaben"/"Inventar"/"Rollouts" by name) was not rewritten -- only
+    its screenshots regenerate correctly against the new UI. Updating the
+    site's prose to match the new area names is a separate, smaller
+    follow-up.
+
 ## Fleet UI redesign, stage 1: house overview + apartment detail (2026-10-04)
 
 The owner found the fleet web UI ("ziemlich unschön") hard to scan for

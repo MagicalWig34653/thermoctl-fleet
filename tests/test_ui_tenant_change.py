@@ -367,7 +367,10 @@ def test_successful_submit_continues_after_one_blob_delete_fails_and_shows_a_not
         failing_storage_path in record.message for record in caplog.records
     )
 
-    notice_page = client.get(response.headers["location"])
+    # The notice lives in the danger-zone section of the "Wartung" tab
+    # (UI-redesign stage 2) -- the redirect's own query parameter
+    # (`bundle_cleanup_failed=1`) is unaffected by which tab renders it.
+    notice_page = client.get(response.headers["location"] + "&ansicht=wartung")
     assert "konnte nicht gelöscht werden" in notice_page.text
 
 

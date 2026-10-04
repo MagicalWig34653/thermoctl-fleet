@@ -736,7 +736,7 @@ def test_unknown_apartment_is_404_with_the_same_layout(
 
     assert response.status_code == 404
     assert "nicht bekannt" in response.text
-    assert "Das Haus" in response.text  # base.html's own nav entry
+    assert "Übersicht" in response.text  # base.html's own nav entry
 
 
 def test_apartment_created_via_inventory_without_a_token_is_200_not_404(
@@ -803,36 +803,54 @@ def test_every_section_renders_from_real_stored_data(
     )
 
     _login(client, password, totp_secret)
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    # UI-redesign stage 2: "Eine Wohnung" is now three tabs
+    # (`?ansicht=ueberblick`/`wartung`/`technik`) -- every section this
+    # test used to find on one page is still there, just split across the
+    # tab its own content now belongs to (see fleet/ui_routes.py's
+    # `APARTMENT_TABS` and apartment.html's own docstring).
+    ueberblick = client.get(f"/ui/apartments/{APARTMENT}?ansicht=ueberblick")
+    wartung = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
+    technik = client.get(f"/ui/apartments/{APARTMENT}?ansicht=technik")
 
-    assert response.status_code == 200
-    body = response.text
+    assert ueberblick.status_code == 200
+    assert wartung.status_code == 200
+    assert technik.status_code == 200
+    overview_body = ueberblick.text
+    maintenance_body = wartung.text
+    technical_body = technik.text
+
     # heartbeat history
-    assert "Erreichbarkeit" in body
-    assert "Erreichbar" in body
+    assert "Erreichbarkeit" in overview_body
+    assert "Erreichbar" in overview_body
     # open faults
-    assert "Fensteralarm" in body
-    assert "kueche" in body
+    assert "Fensteralarm" in overview_body
+    assert "kueche" in overview_body
     # past faults (from the events table) -- never titel/text
-    assert "Fensteralarm" in body  # derived kind from the "fenster:" prefix
-    assert "fenster:bad" in body
-    assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in body
-    assert "MARKER_TEXT_SHOULD_NOT_APPEAR" not in body
+    assert "Fensteralarm" in overview_body  # derived kind from the "fenster:" prefix
+    assert "fenster:bad" in overview_body
+    assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in overview_body
+    assert "MARKER_TEXT_SHOULD_NOT_APPEAR" not in overview_body
     # battery/signal
-    assert "Schwächste Batterie" in body
-    assert "62" in body
-    # version
-    assert "0.1.0" in body
-    assert "0.9.5" in body
+    assert "Schwächste Batterie" in overview_body
+    assert "62" in overview_body
     # alarms
-    assert "Meldet sich nicht" in body
-    # commands (P5.1b): one button per CommandType value, no in-page form
-    # (buttons are GET links to the confirmation page) except the base
-    # layout's own logout form.
-    assert "Sofort melden" in body
-    assert "command-button" in body
-    assert "Keine Befehle für diese Wohnung." in body
-    assert "<form" not in body or "csrf_token" in body  # only the logout form, if any
+    assert "Meldet sich nicht" in overview_body
+    # these three tabs never leak the raw event titel/text either
+    assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in maintenance_body
+    assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in technical_body
+
+    # version (Technik tab)
+    assert "0.1.0" in technical_body
+    assert "0.9.5" in technical_body
+
+    # commands (P5.1b, Wartung tab): one button per CommandType value, no
+    # in-page form (buttons are GET links to the confirmation page) except
+    # the base layout's own logout form and the fault-acknowledge form
+    # (Überblick tab only).
+    assert "Sofort melden" in maintenance_body
+    assert "command-button" in maintenance_body
+    assert "Keine Befehle für diese Wohnung." in maintenance_body
+    assert "<form" not in maintenance_body or "csrf_token" in maintenance_body
 
 
 def test_events_never_show_titel_or_text_even_with_no_prefix_match(
@@ -1091,3 +1109,77 @@ def test_build_desired_state_outcome_display_known_service_maps_to_its_label() -
     display = build_desired_state_outcome_display(record)
 
     assert display.service_label == "Zigbee2MQTT"
+
+
+# -- UI-redesign stage 2: apartment tabs ("?ansicht=") -------------------------
+
+
+def test_default_tab_is_ueberblick(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}")
+
+    assert response.status_code == 200
+    assert 'href="?ansicht=ueberblick" aria-current="page"' in response.text
+    assert "history-heading" in response.text
+    assert "commands-heading" not in response.text
+    assert "version-heading" not in response.text
+
+
+def test_wartung_tab_shows_commands_and_hides_overview_sections(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
+
+    assert response.status_code == 200
+    assert 'href="?ansicht=wartung" aria-current="page"' in response.text
+    assert "commands-heading" in response.text
+    assert "tenant-change-heading" in response.text
+    assert "history-heading" not in response.text
+    assert "version-heading" not in response.text
+
+
+def test_technik_tab_shows_version_and_hides_commands(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=technik")
+
+    assert response.status_code == 200
+    assert 'href="?ansicht=technik" aria-current="page"' in response.text
+    assert "version-heading" in response.text
+    assert "desired-state-heading" in response.text
+    assert "commands-heading" not in response.text
+    assert "history-heading" not in response.text
+
+
+def test_unknown_ansicht_value_falls_back_to_ueberblick(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=does-not-exist")
+
+    assert response.status_code == 200
+    assert 'href="?ansicht=ueberblick" aria-current="page"' in response.text
+
+
+def test_danger_zone_is_a_distinct_section_within_wartung(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
+
+    assert response.status_code == 200
+    assert 'class="danger-zone"' in response.text

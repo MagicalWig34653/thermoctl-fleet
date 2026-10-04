@@ -164,7 +164,7 @@ def test_restore_form_offered_with_recipient_and_operational_backup(
     _create_operational_backup(storage, blob_storage, now)
     _login(client, password, totp_secret)
 
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
     assert response.status_code == 200
     assert 'id="restore-form"' in response.text
     # The key input field must have NO `name` attribute anywhere in the
@@ -195,7 +195,7 @@ def test_restore_form_shows_the_vendored_js_sha256(
     _create_operational_backup(storage, blob_storage, now)
     _login(client, password, totp_secret)
 
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
     assert AGE_VENDOR_JS_SHA256 in response.text
 
 

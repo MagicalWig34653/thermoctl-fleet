@@ -3,11 +3,21 @@
 {% block title %}{{ apartment_id }} – thermoctl-fleet{% endblock %}
 
 {% block content %}
-{# "Eine Wohnung" (P3.2, section 9's second view) -- already German-rendered
-   and already derived by fleet/ui_apartment.py::build_apartment_detail.
-   This template only iterates and prints; it makes no ordering, wording, or
-   gap/caught-up decisions of its own. #}
-<p><a href="/ui/">&larr; Zurück zum Haus</a></p>
+{# "Eine Wohnung" (UI-redesign stage 2) -- already German-rendered and
+   already derived by fleet/ui_apartment.py::build_apartment_detail. This
+   template only iterates and prints; it makes no ordering, wording, or
+   gap/caught-up decisions of its own.
+
+   Three tabs ("Überblick"/"Wartung"/"Technik", brief) -- every *existing*
+   section/form/field/hidden input from before this stage is unchanged,
+   only grouped into one of three panels, server-rendered via `?ansicht=`
+   (fleet/ui_routes.py::_normalize_apartment_tab) so each tab works
+   without JavaScript: a plain link, a full page load, the server decides
+   which panel to render. The other two panels' markup is not sent at all
+   for a given request -- not merely hidden by CSS -- keeping the page
+   light and keeping "every section still exists, just grouped" true of
+   the rendered output too, not only of the template source. #}
+<p><a href="/ui/">&larr; Zurück zur Übersicht</a></p>
 
 {% if detail is none %}
 <h1>{{ apartment_id }}</h1>
@@ -20,12 +30,19 @@
     {% if detail.next_step_text %}<p class="apartment-heading__next-step">{{ detail.next_step_text }}</p>{% endif %}
 </div>
 
+<nav class="apartment-tabs" aria-label="Wohnungsansicht">
+    <a href="?ansicht=ueberblick" {% if active_tab == "ueberblick" %}aria-current="page"{% endif %}>Überblick</a>
+    <a href="?ansicht=wartung" {% if active_tab == "wartung" %}aria-current="page"{% endif %}>Wartung</a>
+    <a href="?ansicht=technik" {% if active_tab == "technik" %}aria-current="page"{% endif %}>Technik</a>
+</nav>
+
+{% if active_tab == "ueberblick" %}
 <div class="apartment-grid">
 
 <nav aria-label="Zeitraum der Erreichbarkeitshistorie">
-    <a href="?days=3">3 Tage</a>
-    <a href="?days=7">7 Tage</a>
-    <a href="?days=14">14 Tage</a>
+    <a href="?ansicht=ueberblick&amp;days=3">3 Tage</a>
+    <a href="?ansicht=ueberblick&amp;days=7">7 Tage</a>
+    <a href="?ansicht=ueberblick&amp;days=14">14 Tage</a>
 </nav>
 
 <section aria-labelledby="history-heading">
@@ -135,47 +152,6 @@
     {% endif %}
 </section>
 
-<section aria-labelledby="version-heading">
-    <h2 id="version-heading">Version und System</h2>
-    {% if detail.never_reported %}
-    <p>Noch keine Daten.</p>
-    {% else %}
-    <dl>
-        <dt>Agent</dt>
-        <dd>{{ detail.agent_version }}</dd>
-        <dt>thermoctl</dt>
-        <dd>{{ detail.thermoctl_version }}</dd>
-        <dt>Protokollversion</dt>
-        <dd>
-            {{ detail.protocol_version }}
-            {%- if detail.outdated %}
-            <span class="apartment-tile__tag">veraltete Protokollversion</span>
-            {%- endif %}
-        </dd>
-        <dt>Modus</dt>
-        <dd>{{ detail.mode }}</dd>
-        <dt>thermoctl erreichbar</dt>
-        <dd>{{ "Ja" if detail.thermoctl_reachable else "Nein" }}</dd>
-        <dt>Laufzeit</dt>
-        <dd>{{ detail.uptime_text }}</dd>
-        <dt>Freier Speicher</dt>
-        <dd>{{ detail.memory_free_percent }} %</dd>
-        <dt>Freier Plattenplatz</dt>
-        <dd>{{ detail.disk_free_percent }} %</dd>
-        <dt>Uhrabweichung</dt>
-        <dd>{{ detail.clock_drift_s }} s</dd>
-        <dt>Letzte Regelentscheidung</dt>
-        <dd>{{ detail.last_decision_text }}</dd>
-        <dt>Zonen</dt>
-        <dd>{{ detail.zones }}</dd>
-        <dt>Zonen ohne Messwert</dt>
-        <dd>{{ detail.zones_without_reading }}</dd>
-        <dt>Zonen mit Wärmebedarf</dt>
-        <dd>{{ detail.zones_with_heat_demand }}</dd>
-    </dl>
-    {% endif %}
-</section>
-
 <section aria-labelledby="alarms-heading">
     <h2 id="alarms-heading">Alarme</h2>
     {% if detail.alarms %}
@@ -196,18 +172,11 @@
     {% endif %}
 </section>
 
-<section aria-labelledby="tenant-change-heading">
-    <h2 id="tenant-change-heading">Mieterwechsel</h2>
-    {% if bundle_cleanup_failed %}
-    {# Cross-review fix (2026-10-02): the tenant change itself (token
-       rotation, history deletion) already succeeded by the time this
-       notice can appear -- it only ever means some diagnostic bundle
-       blob file could not be removed from disk; see the server log for
-       which one. #}
-    <p class="error" role="alert">Mieterwechsel durchgeführt. Mindestens eine Diagnose-Sicherung konnte nicht gelöscht werden -- siehe Server-Log.</p>
-    {% endif %}
-    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">Mieterwechsel durchführen</a></p>
-</section>
+</div>
+{% endif %}
+
+{% if active_tab == "wartung" %}
+<div class="apartment-grid">
 
 <section aria-labelledby="commands-heading">
     <h2 id="commands-heading">Befehle</h2>
@@ -254,49 +223,6 @@
     </ul>
     {% else %}
     <p>Keine Befehle für diese Wohnung.</p>
-    {% endif %}
-</section>
-
-<section aria-labelledby="desired-state-heading">
-    <h2 id="desired-state-heading">Sollzustand (Container-Updates)</h2>
-    <p class="error" role="alert">
-        Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten,
-        Pilotbetrieb erforderlich, section 13).
-    </p>
-    {% if not detail.retired %}
-    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">Sollzustand bearbeiten</a></p>
-    {% endif %}
-
-    {% if detail.desired_state %}
-    <p>Aktuelle Revision: {{ detail.desired_state.revision }}, gesetzt von {{ detail.desired_state.created_by }} am {{ detail.desired_state.created_text }}</p>
-    <p>Grund: {{ detail.desired_state.reason }}</p>
-    <ul>
-        {% for service in detail.desired_state.services %}
-        <li><strong>{{ service.label }}</strong>: {{ service.version }} ({{ service.digest }})</li>
-        {% endfor %}
-    </ul>
-    <p>Fenster: {{ detail.desired_state.window_from }}–{{ detail.desired_state.window_until }} Uhr, nicht unter {{ detail.desired_state.window_not_below_outdoor_temp_c }} °C</p>
-    {% else %}
-    <p>Kein Sollzustand gesetzt.</p>
-    {% endif %}
-
-    {% if detail.desired_state_outcome %}
-    <h3>Letztes gemeldetes Ergebnis</h3>
-    <p>
-        Revision {{ detail.desired_state_outcome.revision }}:
-        <span class="apartment-tile__tag">{{ "erfolgreich" if detail.desired_state_outcome.successful else "fehlgeschlagen" }}</span>
-        {% if detail.desired_state_outcome.service_label %}({{ detail.desired_state_outcome.service_label }}){% endif %}
-        -- {{ detail.desired_state_outcome.reason }} (gemeldet {{ detail.desired_state_outcome.reported_text }})
-    </p>
-    {% endif %}
-
-    {% if detail.desired_state_history %}
-    <h3>Verlauf</h3>
-    <ul>
-        {% for revision in detail.desired_state_history %}
-        <li>Revision {{ revision.revision }} von {{ revision.created_by }} am {{ revision.created_text }}: {{ revision.reason }}</li>
-        {% endfor %}
-    </ul>
     {% endif %}
 </section>
 
@@ -368,13 +294,131 @@
     {% endif %}
 </section>
 
+{# Danger zone (brief: "tenant change in a separated danger zone with
+   confirmation") -- same single link to the existing, unchanged
+   confirmation page as before this stage; only its visual grouping (a
+   distinct, clearly marked zone, set apart from the routine maintenance
+   actions above) is new. #}
+<section class="danger-zone" aria-labelledby="tenant-change-heading">
+    <h2 id="tenant-change-heading">Mieterwechsel</h2>
+    <p class="danger-zone__hint">Setzt Zugangsdaten und Verlauf dieser Wohnung zurück -- nicht rückgängig zu machen.</p>
+    {% if bundle_cleanup_failed %}
+    {# Cross-review fix (2026-10-02): the tenant change itself (token
+       rotation, history deletion) already succeeded by the time this
+       notice can appear -- it only ever means some diagnostic bundle
+       blob file could not be removed from disk; see the server log for
+       which one. #}
+    <p class="error" role="alert">Mieterwechsel durchgeführt. Mindestens eine Diagnose-Sicherung konnte nicht gelöscht werden -- siehe Server-Log.</p>
+    {% endif %}
+    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">Mieterwechsel durchführen</a></p>
+</section>
+
 </div>
+{% endif %}
+
+{% if active_tab == "technik" %}
+<div class="apartment-grid">
+
+<section aria-labelledby="version-heading">
+    <h2 id="version-heading">Version und System</h2>
+    {% if detail.never_reported %}
+    <p>Noch keine Daten.</p>
+    {% else %}
+    <dl>
+        <dt>Agent</dt>
+        <dd>{{ detail.agent_version }}</dd>
+        <dt>thermoctl</dt>
+        <dd>{{ detail.thermoctl_version }}</dd>
+        <dt>Protokollversion</dt>
+        <dd>
+            {{ detail.protocol_version }}
+            {%- if detail.outdated %}
+            <span class="apartment-tile__tag">veraltete Protokollversion</span>
+            {%- endif %}
+        </dd>
+        <dt>Modus</dt>
+        <dd>{{ detail.mode }}</dd>
+        <dt>thermoctl erreichbar</dt>
+        <dd>{{ "Ja" if detail.thermoctl_reachable else "Nein" }}</dd>
+        <dt>Laufzeit</dt>
+        <dd>{{ detail.uptime_text }}</dd>
+        <dt>Freier Speicher</dt>
+        <dd>{{ detail.memory_free_percent }} %</dd>
+        <dt>Freier Plattenplatz</dt>
+        <dd>{{ detail.disk_free_percent }} %</dd>
+        <dt>Uhrabweichung</dt>
+        <dd>{{ detail.clock_drift_s }} s</dd>
+        <dt>Letzte Regelentscheidung</dt>
+        <dd>{{ detail.last_decision_text }}</dd>
+        <dt>Zonen</dt>
+        <dd>{{ detail.zones }}</dd>
+        <dt>Zonen ohne Messwert</dt>
+        <dd>{{ detail.zones_without_reading }}</dd>
+        <dt>Zonen mit Wärmebedarf</dt>
+        <dd>{{ detail.zones_with_heat_demand }}</dd>
+    </dl>
+    {% endif %}
+</section>
+
+<section aria-labelledby="desired-state-heading">
+    <h2 id="desired-state-heading">Sollzustand (Container-Updates)</h2>
+    <p class="error" role="alert">
+        Update-Ausführung ist derzeit abgeschaltet (fail-closed Vorprüfung des Agenten,
+        Pilotbetrieb erforderlich).
+    </p>
+    {% if not detail.retired %}
+    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">Sollzustand bearbeiten</a></p>
+    {% endif %}
+
+    {% if detail.desired_state %}
+    <p>Aktuelle Revision: {{ detail.desired_state.revision }}, gesetzt von {{ detail.desired_state.created_by }} am {{ detail.desired_state.created_text }}</p>
+    <p>Grund: {{ detail.desired_state.reason }}</p>
+    <ul>
+        {% for service in detail.desired_state.services %}
+        <li>
+            <strong>{{ service.label }}</strong>: {{ service.version }}
+            (<code class="digest" title="{{ service.digest }}">{{ service.digest | shortdigest }}</code>
+            <button type="button" class="copy-button" data-copy="{{ service.digest }}" aria-label="Digest von {{ service.label }} kopieren">Kopieren</button>)
+        </li>
+        {% endfor %}
+    </ul>
+    <p>Fenster: {{ detail.desired_state.window_from }}–{{ detail.desired_state.window_until }} Uhr, nicht unter {{ detail.desired_state.window_not_below_outdoor_temp_c }} °C</p>
+    {% else %}
+    <p>Kein Sollzustand gesetzt.</p>
+    {% endif %}
+
+    {% if detail.desired_state_outcome %}
+    <h3>Letztes gemeldetes Ergebnis</h3>
+    <p>
+        Revision {{ detail.desired_state_outcome.revision }}:
+        <span class="apartment-tile__tag">{{ "erfolgreich" if detail.desired_state_outcome.successful else "fehlgeschlagen" }}</span>
+        {% if detail.desired_state_outcome.service_label %}({{ detail.desired_state_outcome.service_label }}){% endif %}
+        -- {{ detail.desired_state_outcome.reason }} (gemeldet {{ detail.desired_state_outcome.reported_text }})
+    </p>
+    {% endif %}
+
+    {% if detail.desired_state_history %}
+    <h3>Verlauf</h3>
+    <ul>
+        {% for revision in detail.desired_state_history %}
+        <li>Revision {{ revision.revision }} von {{ revision.created_by }} am {{ revision.created_text }}: {{ revision.reason }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+</section>
+
+</div>
+{% endif %}
+
 {% endif %}
 {% endblock %}
 
 {% block scripts %}
-{% if detail and detail.restore_device_recipient and detail.restore_operational_backups and not detail.restore_pending %}
+{% if detail and active_tab == "wartung" and detail.restore_device_recipient and detail.restore_operational_backups and not detail.restore_pending %}
 <script src="/ui/static/vendor/age-encryption.vendor.js"></script>
 <script src="/ui/static/restore_form.js"></script>
+{% endif %}
+{% if detail and active_tab == "technik" and detail.desired_state %}
+<script src="/ui/static/copy.js"></script>
 {% endif %}
 {% endblock %}

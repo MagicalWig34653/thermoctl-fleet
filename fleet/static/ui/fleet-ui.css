@@ -762,6 +762,10 @@ a.command-button:hover {
 }
 
 @media (min-width: 60rem) {
+    /* UI-redesign stage 2: each *tab* now holds only its own sections (see
+     * apartment.html's own docstring) -- the two-column split is therefore
+     * per tab, not a single fixed left/right split across every section
+     * on the page the way stage 1 had it. */
     .apartment-grid {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -773,25 +777,397 @@ a.command-button:hover {
         min-width: 0;
     }
 
-    /* Left: what happened and what the system currently reads -- history,
-     * faults, battery/signal, version/system, alarms. Right: what you can
-     * do about it -- tenant change, commands, desired state, backups,
-     * restore. Split by content weight as much as by meaning (see
-     * docs/ui-redesign-plan.md) -- "Sollzustand" alone, with its service
-     * list, roughly matches the whole left column's height. */
+    /* "Überblick": the time-range nav spans both columns above them;
+     * history+faults left, battery/signal+alarms right (round-1 screenshot
+     * critique -- an *unstyled* two-column grid left this to accidental
+     * auto-placement, which happened to read fine but was not a decision;
+     * it is one now). */
+    .apartment-grid > nav {
+        grid-column: 1 / -1;
+    }
+
     .apartment-grid > section[aria-labelledby="history-heading"],
-    .apartment-grid > section[aria-labelledby="faults-heading"],
-    .apartment-grid > section[aria-labelledby="devices-heading"],
-    .apartment-grid > section[aria-labelledby="version-heading"],
-    .apartment-grid > section[aria-labelledby="alarms-heading"] {
+    .apartment-grid > section[aria-labelledby="faults-heading"] {
         grid-column: 1;
     }
 
-    .apartment-grid > section[aria-labelledby="tenant-change-heading"],
-    .apartment-grid > section[aria-labelledby="commands-heading"],
-    .apartment-grid > section[aria-labelledby="desired-state-heading"],
+    .apartment-grid > section[aria-labelledby="devices-heading"],
+    .apartment-grid > section[aria-labelledby="alarms-heading"] {
+        grid-column: 2;
+    }
+
+    /* "Wartung": commands/history on the left, backups+restore on the
+     * right; the danger zone spans both columns at the bottom, set apart
+     * from the routine maintenance actions above it. */
+    .apartment-grid > section[aria-labelledby="commands-heading"] {
+        grid-column: 1;
+        grid-row: 1;
+    }
+
     .apartment-grid > section[aria-labelledby="backups-heading"],
     .apartment-grid > section[aria-labelledby="restore-heading"] {
         grid-column: 2;
+    }
+
+    .apartment-grid > section.danger-zone {
+        grid-column: 1 / -1;
+    }
+
+    /* "Technik": versions/system values on the left, desired state on the
+     * right -- "Sollzustand" alone, with its service list, roughly matches
+     * the left column's own height. */
+    .apartment-grid > section[aria-labelledby="version-heading"] {
+        grid-column: 1;
+    }
+
+    .apartment-grid > section[aria-labelledby="desired-state-heading"] {
+        grid-column: 2;
+    }
+}
+
+/* ==========================================================================
+ * UI-redesign stage 2 (docs/ui-redesign-ia.md): navigation shell (sidebar
+ * desktop / bottom tab bar mobile), the Übersicht action inbox, the
+ * Wohnungen filter list, apartment tabs, the Wartung danger zone, and the
+ * Technik digest/copy affordance -- plan/wireframes in that document.
+ * The >= 760px breakpoint below is the brief's own ("desktop = ... sidebar
+ * ...; mobile (< 760 px) = bottom tab bar").
+ * ========================================================================== */
+
+.app-shell {
+    display: flex;
+    min-height: 100vh;
+}
+
+.app-sidenav {
+    display: none;
+}
+
+.app-column {
+    flex: 1;
+    min-width: 0;
+}
+
+.app-topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1.25rem;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+}
+
+.app-topbar__brand {
+    font-weight: 700;
+}
+
+.app-topbar__user,
+.app-sidenav__user {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.app-topbar__user form,
+.app-sidenav__user form {
+    margin: 0;
+}
+
+.app-topbar__user button,
+.app-sidenav__user button {
+    margin-top: 0;
+}
+
+.app-main {
+    padding: 1rem 1.25rem 5.5rem;
+    max-width: 72rem;
+}
+
+.app-bottom-nav {
+    position: fixed;
+    inset-inline: 0;
+    bottom: 0;
+    display: flex;
+    justify-content: space-between;
+    background: var(--surface);
+    border-top: 1px solid var(--line);
+    padding: 0.4rem 0.5rem env(safe-area-inset-bottom, 0.4rem);
+    z-index: 10;
+}
+
+.app-bottom-nav a {
+    flex: 1;
+    text-align: center;
+    text-decoration: none;
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.5rem 0.25rem;
+    min-height: 2.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0.35rem;
+}
+
+.app-bottom-nav a[aria-current="page"] {
+    background: var(--paper);
+    color: var(--flame);
+}
+
+@media (min-width: 47.5rem) {
+    /* 760px -- the brief's own breakpoint. */
+    .app-shell {
+        max-width: 84rem;
+        margin: 0 auto;
+    }
+
+    .app-sidenav {
+        display: flex;
+        flex-direction: column;
+        gap: 0.9rem;
+        width: 14rem;
+        flex: none;
+        padding: 1.25rem 1rem;
+        border-inline-end: 1px solid var(--line);
+        background: var(--surface);
+    }
+
+    .app-sidenav__brand {
+        font-weight: 700;
+        margin-bottom: 0.5rem;
+    }
+
+    .app-sidenav a {
+        text-decoration: none;
+        font-weight: 500;
+        padding: 0.4rem 0.5rem 0.4rem 0.65rem;
+        border-radius: 0.35rem;
+        border-inline-start: 0.2rem solid transparent;
+    }
+
+    /* Round-1 screenshot critique (docs/ui-redesign-ia.md): a background
+     * of `--paper` on `--surface` alone was too close in value to read as
+     * "active" at a glance -- the same left-accent-bar device the status
+     * system already uses (`.unit`, `.inbox-item`) makes it unambiguous,
+     * not a second, competing way of marking "selected". */
+    .app-sidenav a[aria-current="page"] {
+        background: var(--paper);
+        color: var(--flame);
+        border-inline-start-color: var(--flame);
+    }
+
+    .app-sidenav__user {
+        margin-top: auto;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid var(--line);
+    }
+
+    .app-topbar {
+        display: none;
+    }
+
+    .app-bottom-nav {
+        display: none;
+    }
+
+    .app-main {
+        padding-bottom: 3rem;
+    }
+}
+
+/* "Übersicht" -- the one-sentence headline, then the action inbox. */
+.overview-headline {
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin: 0.25rem 0 1.5rem;
+}
+
+.inbox {
+    margin-bottom: 2rem;
+}
+
+.inbox-list {
+    list-style: none;
+    margin: 0.75rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.6rem;
+}
+
+.inbox-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+    border: 1px solid var(--line);
+    border-inline-start-width: 0.3rem;
+    border-radius: 0.4rem;
+    padding: 0.7rem 0.9rem;
+    background: var(--surface);
+}
+
+.inbox-item--alarm { border-inline-start-color: var(--signal); }
+.inbox-item--fault,
+.inbox-item--update,
+.inbox-item--battery { border-inline-start-color: var(--amber); }
+.inbox-item--never_reported { border-inline-start-color: var(--line); border-style: dashed; }
+.inbox-item--rollout { border-inline-start-color: var(--flame); }
+
+.inbox-item__body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+}
+
+.inbox-item__title {
+    font-weight: 600;
+}
+
+.inbox-item__subtitle {
+    font-size: 0.95rem;
+}
+
+.inbox-item__meta {
+    font-size: 0.85rem;
+    opacity: 0.8;
+}
+
+.inbox-item__action {
+    flex: none;
+    white-space: nowrap;
+}
+
+.inbox-empty {
+    margin-top: 0.75rem;
+}
+
+.site-map .property-group:first-of-type {
+    margin-top: 0.5rem;
+}
+
+/* "Wohnungen" -- the filter form (plain GET) and the flat result list. */
+.apartments-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    align-items: end;
+    margin-bottom: 1.25rem;
+}
+
+.apartments-filter label {
+    margin-top: 0;
+    font-size: 0.9rem;
+    font-weight: 500;
+}
+
+.apartments-filter select {
+    display: block;
+    margin-top: 0.25rem;
+    padding: 0.4rem;
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    background: var(--surface);
+    color: var(--ink);
+    font-family: inherit;
+}
+
+.apartments-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+}
+
+.apartments-list__link {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    text-decoration: none;
+    color: inherit;
+    border: 1px solid var(--line);
+    border-radius: 0.4rem;
+    padding: 0.6rem 0.9rem;
+    background: var(--surface);
+}
+
+.apartments-list__id {
+    font-weight: 600;
+}
+
+.apartments-list__meta {
+    font-size: 0.85rem;
+    opacity: 0.8;
+}
+
+/* Apartment tabs ("Überblick"/"Wartung"/"Technik") -- server-rendered via
+ * `?ansicht=`, aria-current marks the active one (works without JS). */
+.apartment-tabs {
+    display: flex;
+    gap: 0.5rem;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 1.25rem;
+}
+
+.apartment-tabs a {
+    text-decoration: none;
+    font-weight: 500;
+    padding: 0.5rem 0.9rem;
+    border-bottom: 2px solid transparent;
+}
+
+.apartment-tabs a[aria-current="page"] {
+    color: var(--flame);
+    border-bottom-color: var(--flame);
+}
+
+/* "Wartung" danger zone -- tenant change, set apart with its own accent
+ * and an explicit, plain-language warning (never colour alone). */
+.danger-zone {
+    border: 1px solid var(--signal);
+    border-radius: 0.4rem;
+    padding: 0.9rem 1rem;
+    margin-top: 1rem;
+}
+
+.danger-zone__hint {
+    font-size: 0.9rem;
+    opacity: 0.85;
+}
+
+/* "Technik" digest + copy affordance. */
+code.digest {
+    font-size: 0.85rem;
+}
+
+.copy-button {
+    font-size: 0.8rem;
+    padding: 0.15rem 0.5rem;
+    margin-top: 0;
+}
+
+/* "Einrichtung" guided step flow -- the one place numbered steps are
+ * used (see inventory.html's own comment on why that is justified here). */
+.setup-flow {
+    margin-bottom: 2rem;
+}
+
+.setup-flow__steps {
+    padding-inline-start: 1.4rem;
+}
+
+.setup-flow__steps li {
+    margin-bottom: 0.5rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    * {
+        transition: none !important;
+        animation: none !important;
     }
 }

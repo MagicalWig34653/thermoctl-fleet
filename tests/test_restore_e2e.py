@@ -209,7 +209,8 @@ def test_restore_end_to_end_over_the_real_fleet_app(
             )
             assert login_response.status_code == 303
 
-            apartment_page = ui_client.get(f"/ui/apartments/{APARTMENT}")
+            # UI-redesign stage 2: the restore form lives on the "Wartung" tab.
+            apartment_page = ui_client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
             assert "restore-form" in apartment_page.text
             # Owner decision (a), cross-review: the page shows the vendored
             # script's own sha256, so the landlord can compare it against

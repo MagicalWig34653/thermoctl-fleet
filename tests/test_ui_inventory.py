@@ -295,7 +295,7 @@ def test_unauthenticated_inventory_view_redirects_to_login(client: TestClient) -
 
     assert response.status_code == 303
     assert response.headers["location"] == "/ui/login"
-    assert "Inventar" not in response.text
+    assert "Einrichtung" not in response.text
 
 
 @pytest.mark.parametrize(
@@ -353,7 +353,7 @@ def test_inventory_view_renders_after_login(
     response = client.get("/ui/inventory")
 
     assert response.status_code == 200
-    assert "Inventar" in response.text
+    assert "Einrichtung" in response.text
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Content-Security-Policy"] == "default-src 'self'; script-src 'self'"
     assert response.headers["X-Frame-Options"] == "DENY"

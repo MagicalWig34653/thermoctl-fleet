@@ -1,0 +1,21 @@
+{#
+Shared between "Übersicht" (index.html) and "Wohnungen" (apartments_list.html)
+-- the one markup shape for "one apartment, drawn as a unit" (see
+docs/ui-redesign-plan.md's original reasoning, carried into UI-redesign
+stage 2 unchanged: one semantic structure, not two parallel descriptions
+of the same tile). #}
+{% macro apartment_card(tile) %}
+<a class="unit unit--{{ tile.status }}" href="/ui/apartments/{{ tile.apartment_id | urlpath }}">
+    <span class="unit__id">{{ tile.apartment_id }}{% if tile.label and tile.label != tile.apartment_id %} ({{ tile.label }}){% endif %}</span>
+    <span class="unit__status"><span class="status-icon status-icon--{{ tile.status }}" aria-hidden="true"></span>{{ tile.status_label }}{% if tile.alarm_since_text %}, {{ tile.alarm_since_text }}{% endif %}</span>
+    {% if tile.next_step_text %}<span class="unit__next-step">{{ tile.next_step_text }}</span>{% endif %}
+    {% if not tile.never_reported %}
+    <span class="unit__meta">Letzter Kontakt {{ tile.last_contact_text }}</span>
+    {% if tile.open_faults %}
+    <span class="unit__meta">{{ tile.open_faults | length }} offene Störung{{ "en" if tile.open_faults | length != 1 else "" }}: {{ tile.open_faults | map(attribute="kind_label") | join(", ") }}</span>
+    {% endif %}
+    {% else %}
+    <span class="unit__meta">{{ tile.last_contact_text }}</span>
+    {% endif %}
+</a>
+{% endmacro %}
