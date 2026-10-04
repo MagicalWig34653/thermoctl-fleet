@@ -22,6 +22,7 @@ htmlcov/
 
 # Werkzeuge
 .idea/
+.dev/
 .vscode/
 .DS_Store
 .mcp.json

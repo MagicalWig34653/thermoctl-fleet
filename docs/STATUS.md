@@ -2,6 +2,17 @@
 
 Last updated: 2026-10-04.
 
+## Shared PyCharm run configurations and local demo fleet (2026-10-04)
+
+Added grouped `.run/` configurations for the demo fleet, tests, Python and
+Go checks, flash and website tools, and the existing Mac test VM commands.
+`python -m tools.dev_fleet` keeps its generated key, migrated SQLite database,
+fictional seed data, and admin-created demo login under gitignored `.dev/`.
+The key and login file are created mode 0600; reset requires confirmation
+unless `--yes` is passed. Local WebAuthn origin and blob-storage directories
+are configured for the HTTP development server. Target, XML, state reuse,
+reset, and file permissions have dedicated tests.
+
 ## Real `image.yml` builds now actually run and succeed (2026-10-04)
 
 The first real `workflow_dispatch` run of `.github/workflows/image.yml`
