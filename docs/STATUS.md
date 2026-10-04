@@ -2,6 +2,120 @@
 
 Last updated: 2026-10-04.
 
+## Real `image.yml` builds now actually run and succeed (2026-10-04)
+
+The first real `workflow_dispatch` run of `.github/workflows/image.yml`
+(`check-configuration`, both `build-watchdog-binaries`, `build-pi-image`,
+`build-x86-image`) failed in three jobs. Fixing all three, iterating on a
+`ci-image-build` branch against the real GitHub-hosted runners, took nine
+more commits past the first -- the two real builds (`pi-gen`, `mkosi`) hit
+several more real-environment bugs each, beyond what the first failure's
+own error message showed. One fully green `workflow_dispatch` run exists
+now, with all four artifacts present: `watchdog-binaries-{arm64,amd64}`,
+`thermoctl-base-station-pi` (585,474,067 bytes, pi-gen/arm64),
+`thermoctl-base-station-x86` (385,540,000 bytes, mkosi/amd64).
+
+**`check-configuration`:** `tools/check_image_config.py` imports
+`agent.encryption`/`agent.registration` (for `DEFAULT_RECIPIENTS_FILE`/
+`DEFAULT_REGISTRATION_FILE`), which a bare `pip install -e .` does not
+provide (only the base `pydantic` dependency) -- install the `agent`
+extra instead, not `fleet` (kept minimal, per the job's own comment).
+
+**`build-pi-image` (pi-gen, arm64), three real bugs, all in how this
+repository's own custom stage was wired, not in pi-gen itself:**
+
+1. `build-docker.sh` (unlike `build.sh`) never reads `IMG_NAME=`/
+   `RELEASE=`/etc. as process environment variables -- it only `source`s
+   a `config` file (`${DIR}/config` or `-c PATH`). Without one:
+   `realpath: '': No such file or directory`, before even reaching the
+   actual build. Fixed by writing a real `pi-gen/config` file from a new
+   workflow step instead of passing an `env:` block to the build step.
+2. Every pi-gen stage directory needs its own `prerun.sh` calling
+   `copy_previous()` (confirmed against pi-gen's own `stage0`/`stage1`/
+   `stage2`) -- without one, `stage-thermoctl`'s own `${ROOTFS_DIR}` is
+   never populated from the previous stage, which pi-gen's own later
+   `du`/image-sizing step tripped over after a full ~54-minute build:
+   `du: cannot access '.../stage-thermoctl/rootfs': No such file or
+   directory`. Added `image/pi/pi-gen-stage/prerun.sh` (new).
+3. `01-thermoctl` has to stay a **sub-stage** directory nested one level
+   under the stage dir (pi-gen's `run_stage()` only descends into
+   `STAGE_DIR`'s immediate subdirectories looking for numbered scripts) --
+   the workflow's own copy step used to flatten `01-thermoctl`'s contents
+   directly into `stage-thermoctl/`, so `00-run.sh` was silently never
+   executed at all. Fixed in the workflow's "Wire the thermoctl custom
+   stage into pi-gen" step.
+
+   Also pinned the `pi-gen` clone to a specific commit on its own `arm64`
+   branch (`4d8ee447`) instead of a floating branch tip.
+
+**`build-x86-image` (mkosi, amd64), six real bugs, all environment/tool-
+version issues on top of a real `mkosi build`, none in `image/common/
+install.sh` itself:**
+
+1. `image/x86/mkosi.conf` had both `Format=disk` and `OutputFormat=disk`
+   under `[Output]` -- `OutputFormat=` does not exist in mkosi 20.x/21.
+2. `apt-get install mkosi` floats with the runner image (20.2-1 on the
+   current `ubuntu-latest`/noble image) and mkosi is not on PyPI; pinned
+   to an exact upstream git tag via pip instead (`v20.2`, later `v21`,
+   see below).
+3. `Bootable=yes` belongs under `[Content]`, not `[Output]` (mkosi warns
+   and ignores it under `[Output]`).
+4. mkosi's own Debian bootstrap only extracts packages matching
+   `?essential` before running `mkosi.postinst.chroot` -- `apt` itself is
+   priority "important", not "essential", so `apt-get: command not found`
+   inside `image/common/install.sh`'s own Docker-apt-repository step.
+   Added `apt` and `ca-certificates` to `Packages=`.
+5. mkosi disables networking for postinst/finalize scripts by default
+   (`WithNetwork=no`) -- `install.sh`'s Docker-key fetch and `apt-get
+   update` both need it. Set `WithNetwork=yes`; also added `curl` and
+   `gnupg` to `Packages=` (`fetch-docker-key.sh` hard-requires both).
+6. `ukify`, `bubblewrap`, and `systemd-boot` (for the host's own
+   `bootctl`) all have to be installed on the **runner**, not just inside
+   the target rootfs -- mkosi shells out to all three itself.
+7. mkosi v20.2's own bundled `mkosi-initrd` resource config still lists
+   `libtss2-mu0`, a package name trixie's current archive no longer has
+   a candidate for (renamed `libtss2-mu-4.0.1-0t64` upstream in Debian;
+   fixed in mkosi commit `7637bcaf`, first released in **v21** -- re-
+   pinned the git tag from v20.2 to v21).
+8. mkosi v21 routes more of its own internal tooling through
+   bubblewrap's unprivileged-userns sandbox than v20.2 did -- `bwrap:
+   setting up uid map: Permission denied`, even with `sudo mkosi` (root).
+   The GitHub-hosted runner's Ubuntu AppArmor stack blocks
+   `unshare(CLONE_NEWUSER)` by default regardless of EUID
+   (`kernel.apparmor_restrict_unprivileged_userns=1`); relaxed that
+   sysctl for this one job step (CI build tooling only, not the shipped
+   image, which never creates a user namespace).
+9. `systemd-boot` alone pulls in Debian's pre-signed
+   `systemd-boot-efi-amd64-signed` as its EFI counterpart, not the plain
+   `systemd-boot-efi` package that actually ships the raw EFI stub
+   (`/usr/lib/systemd/boot/efi/linuxx64.efi.stub`) mkosi's own `ukify`
+   invocation needs to build a fresh UKI for this image's kernel --
+   confirmed by extracting the real `.deb`. Added `systemd-boot-efi`
+   explicitly to `Packages=`.
+10. `systemd-repart` shells out to `mtools`' `mcopy` to populate the ESP
+    (vfat) partition -- `Could not find mcopy binary.` otherwise. Added
+    `mtools` to the runner's own package set.
+
+Also hardened `check-configuration`/`build-x86-image` against a real but
+unrelated supply-chain gap found along the way: the Ubuntu runner's own
+`debian-archive-keyring` package (2023.4ubuntu1, a Debian-12-era snapshot)
+predates trixie's release/security signing keys, so mkosi's own Debian
+bootstrap rejected every one of trixie's repos with `NO_PUBKEY` for
+several key ids. Fixed by fetching Debian's own current
+`debian-archive-keyring_2025.1_all.deb` directly from `deb.debian.org`,
+pinned to that exact version and verified against both its own published
+SHA256 **and** the SHA256 trixie's own signed `Packages` index lists for
+that exact file, then `dpkg -i`-ing only the verified file -- no
+`[trusted=yes]`, no disabled signature check anywhere in the chain.
+
+**Not changed:** `agent/sources.py`, the watchdog (build flags only),
+`publish-release`'s tag-only gate, any action pin (all stayed pinned by
+the same full SHAs).
+
+Branch `ci-image-build` (10 commits past `main`) stays pushed to origin
+for the review this work still needs; the green run is
+<https://github.com/MagicalWig34653/thermoctl-fleet/actions/runs/37202798022>.
+
 ## Boot-path fix, follow-up: stock kernel-update tooling also needs `/efi` (2026-10-04)
 
 Main-session review of the amd64 boot-path fix below found a real gap in
