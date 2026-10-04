@@ -2,6 +2,33 @@
 
 Last updated: 2026-10-04.
 
+## Flash tool: main-session read-back of the cross-platform refactor + TUI (2026-10-05) **SR**
+
+Read back the Linux and Windows disk-eligibility rules (only external/
+removable/USB whole disks; root/boot traced through LVM/LUKS to the
+physical disk and excluded, unclear topology aborts; Windows USB/SD/MMC
+only, any boot/system flag refuses) and confirmed the 256 GB limit, the
+`--yes` guard and Wi-Fi validation survive on every path. Findings fixed in
+the main session:
+
+- `validate_settings` only checked "not empty" via `protocol/`; a mistyped
+  certificate fingerprint or a non-https fleet address would only have
+  failed on the device after flashing. It now enforces the agent's own
+  fingerprint format (`sha256:` + 64 lowercase hex) and an `https://`
+  address before any disk is touched; a parametrised test asserts the
+  flash rule accepts exactly what `agent.transport.parse_certificate_
+  fingerprint` accepts.
+- Restored 100% coverage of the CLI wrapper (platform selection incl.
+  unsupported platform, explicit partition suffix, empty-field and
+  invalid-fingerprint refusals before any disk call, `verify` refusing a
+  missing or > 256 GB disk).
+- CI now installs the `flash` extra so the Textual pilot tests actually run
+  instead of being skipped.
+
+Verification: ruff clean; mypy clean (178 files); full pytest via junitxml
+tests="2368" failures="0" errors="0" skipped="3"; `tools/flash/*`,
+`tools/flash_image.py`, `tools/flash_tui.py` all 100%.
+
 ## Real `image.yml` builds now actually run and succeed (2026-10-04)
 
 The first real `workflow_dispatch` run of `.github/workflows/image.yml`
@@ -11744,3 +11771,19 @@ Two independent tracks, as required by section 18.3:
   for `linux/amd64` and `linux/arm64` to ghcr.io on `v*` tags, and on every
   pull request as a build check without publishing. `watchdog/` goes into
   **neither** of the two images (no Docker image, see above).
+
+## 2026-10-04: Plattformübergreifendes Flash-Werkzeug und Terminal-Oberfläche
+
+Das Flash-Werkzeug hat einen gemeinsamen Streaming-/Validierungskern und Backends
+für macOS (`diskutil`), Linux (`lsblk`, `udisksctl`/`umount`, Raw-Write mit
+`O_SYNC`) und Windows (PowerShell/PhysicalDrive; auf realer Hardware
+**ungetestet**). Die CLI bleibt als Alternative erhalten; die neue deutsche
+Textual-Oberfläche führt durch Image, Datenträger, Einstellungen, Bestätigung,
+Schreiben, Rücklesen und Boot-Dateien. Ein Probelauf öffnet kein Zielgerät.
+System-/Boot-Datenträger und geänderte Geräteidentitäten werden zurückgewiesen.
+Die Windows- und Linux-Pfade brauchen noch einen Hardwaretest mit dafür
+vorgesehenen entbehrlichen Medien.
+Die Kern- und Backend-Module erreichen mit gemockten Geräten 100 % Zeilenabdeckung.
+Die Textual-Pilot-Tests sind vorhanden, konnten in dieser Sandbox aber nicht
+laufen: der Paketindex war für `pip install 'textual>=8.2.8,<9'` per DNS nicht
+erreichbar. Die TUI-Abdeckung ist deshalb hier noch nicht belegt.

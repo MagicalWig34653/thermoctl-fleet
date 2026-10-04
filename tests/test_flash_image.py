@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import tools.flash_image as _cli_module  # noqa: E402
 from tools.flash_image import (
     WIFI_CONFIG_RELATIVE_PATH,
     FlashError,
@@ -39,6 +40,8 @@ from tools.flash_image import (
     write_wifi_config,
 )
 
+_ORIGINAL_BACKEND = _cli_module._backend
+
 
 @pytest.fixture(autouse=True)
 def _diskutil_on_path(request: pytest.FixtureRequest) -> Iterator[None]:
@@ -50,7 +53,13 @@ def _diskutil_on_path(request: pytest.FixtureRequest) -> Iterator[None]:
     if request.node.name == "test_diskutil_missing_fails_with_clear_error":
         yield
         return
-    with patch("tools.flash_image.shutil.which", return_value="/usr/sbin/diskutil"):
+    with (
+        patch("tools.flash_image.shutil.which", return_value="/usr/sbin/diskutil"),
+        patch(
+            "tools.flash_image._backend",
+            return_value=__import__("tools.flash.macos", fromlist=["macos"]),
+        ),
+    ):
         yield
 
 
@@ -1053,3 +1062,143 @@ def test_main_flash_dry_run_without_wifi_never_writes(tmp_path: Path) -> None:
     run.assert_not_called()
     popen.assert_not_called()
     unmount.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# CLI wrapper branches (main-session additions after the backend refactor)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("platform", "module"),
+    [
+        ("darwin", "tools.flash.macos"),
+        ("linux", "tools.flash.linux"),
+        ("win32", "tools.flash.windows"),
+    ],
+)
+def test_backend_picks_the_module_for_each_supported_platform(platform: str, module: str) -> None:
+    with patch("tools.flash_image.sys.platform", platform):
+        assert _ORIGINAL_BACKEND().__name__ == module
+
+
+def test_backend_refuses_an_unsupported_platform() -> None:
+    with patch("tools.flash_image.sys.platform", "plan9"), pytest.raises(
+        FlashError, match="unsupported platform"
+    ):
+        _ORIGINAL_BACKEND()
+
+
+def test_mount_boot_partition_passes_an_explicit_partition_suffix() -> None:
+    from tools.flash_image import mount_boot_partition as wrapper_mount
+
+    backend = MagicMock()
+    backend.mount_boot_partition.return_value = Path("/Volumes/bootfs")
+    with patch("tools.flash_image._backend", return_value=backend):
+        assert wrapper_mount("/dev/disk4", partition_suffix="s2") == Path("/Volumes/bootfs")
+    backend.mount_boot_partition.assert_called_once_with("/dev/disk4", partition_suffix="s2")
+
+
+def test_main_flash_rejects_invalid_settings_before_touching_any_disk(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    image = tmp_path / "base.img.xz"
+    image.write_bytes(lzma.compress(b"image"))
+    with patch("tools.flash_image.subprocess.run") as run, patch(
+        "tools.flash_image.subprocess.Popen"
+    ) as popen:
+        code = main(
+            [
+                "flash", "--image", str(image), "--disk", "/dev/disk9",
+                "--fleet-address", "https://fleet.example.invalid",
+                "--certificate-fingerprint", "kein-fingerabdruck",
+                "--registration-code", "PLATZHALTER",
+            ]
+        )
+    assert code == 1
+    run.assert_not_called()
+    popen.assert_not_called()
+    assert "Fingerabdruck" in capsys.readouterr().err
+
+
+def test_main_flash_reports_an_empty_required_field_before_touching_any_disk(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    image = tmp_path / "base.img.xz"
+    image.write_bytes(lzma.compress(b"image"))
+    with patch("tools.flash_image.subprocess.run") as run:
+        code = main(
+            [
+                "flash", "--image", str(image), "--disk", "/dev/disk9",
+                "--fleet-address", "https://fleet.example.invalid",
+                "--certificate-fingerprint", "sha256:" + "0" * 64,
+                "--registration-code", "",
+            ]
+        )
+    assert code == 1
+    run.assert_not_called()
+    assert "invalid registration_code" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("size", [None, 300_000_000_000])
+def test_main_verify_refuses_a_missing_or_oversized_disk(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], size: int | None
+) -> None:
+    image = tmp_path / "base.img.xz"
+    image.write_bytes(lzma.compress(b"image"))
+    disks = (
+        []
+        if size is None
+        else [RemovableDisk("/dev/disk9", "/dev/rdisk9", "Big Disk", size, "uuid-9", ())]
+    )
+    backend = MagicMock()
+    with patch("tools.flash_image.list_removable_disks", return_value=disks), patch(
+        "tools.flash_image._backend", return_value=backend
+    ):
+        code = main(["verify", "--disk", "/dev/disk9", "--image", str(image)])
+    assert code == 1
+    backend.verify_disk.assert_not_called()
+    assert "eligible external disk up to 256 GB" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    [
+        "sha256:" + "0" * 64,
+        "sha256:" + "a" * 64,
+        "sha256:" + "A" * 64,
+        "sha256:" + "0" * 63,
+        "sha1:" + "0" * 64,
+        "0" * 64,
+        "sha256:" + "g" * 64,
+        "kein-fingerabdruck",
+    ],
+)
+def test_flash_fingerprint_rule_matches_the_agents_own_parser(fingerprint: str) -> None:
+    """The flash tool must accept exactly what the agent will later pin --
+    otherwise a card that passes here fails at the apartment."""
+
+    from agent.transport import InvalidCertificateFingerprint, parse_certificate_fingerprint
+    from tools.flash.core import validate_settings
+
+    try:
+        parse_certificate_fingerprint(fingerprint)
+        agent_accepts = True
+    except InvalidCertificateFingerprint:
+        agent_accepts = False
+    try:
+        validate_settings("https://fleet.example.invalid", fingerprint, "PLATZHALTER", [], "", "")
+        flash_accepts = True
+    except ValueError:
+        flash_accepts = False
+    assert flash_accepts == agent_accepts
+
+
+@pytest.mark.parametrize(
+    "address", ["http://fleet.example.invalid", "fleet.example.invalid", "https://", "ftp://x"]
+)
+def test_flash_refuses_a_non_https_fleet_address(address: str) -> None:
+    from tools.flash.core import validate_settings
+
+    with pytest.raises(ValueError, match="https"):
+        validate_settings(address, "sha256:" + "0" * 64, "PLATZHALTER", [], "", "")

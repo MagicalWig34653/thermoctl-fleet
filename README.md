@@ -79,7 +79,7 @@ points are in [`docs/STATUS.md`](docs/STATUS.md).
 ## Running locally
 
 ```bash
-python3.13 -m venv .venv && .venv/bin/pip install -e ".[dev,fleet,agent]"
+python3.13 -m venv .venv && .venv/bin/pip install -e ".[dev,fleet,agent,flash]"
 .venv/bin/python -m pytest
 ```
 

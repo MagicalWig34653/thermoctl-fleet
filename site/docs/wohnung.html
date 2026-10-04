@@ -131,11 +131,29 @@
   <pre><code>shasum -a 256 thermoctl-base-station.img.xz
 cat SHA256SUMS</code></pre>
   <p>Der Name oben steht beispielhaft für das Pi-Image; beim amd64-Image nehmen Sie
-  dessen Dateinamen aus dem Release. Für das Flashen auf macOS ist kein weiteres
-  Flash-Programm nötig: <code>tools/flash_image.py</code> nutzt <code>diskutil</code>
-  und Python. Führen Sie die Befehle im ausgecheckten Projekt mit dessen Python-Umgebung aus.</p>
+  dessen Dateinamen aus dem Release. Führen Sie die Befehle im ausgecheckten Projekt
+  mit dessen Python-Umgebung aus.</p>
 
-  <h3>2. Datenträger auswählen und schreiben</h3>
+  <h3>2. Terminal-Oberfläche starten (empfohlen)</h3>
+  <p>Im Projektverzeichnis installieren Sie die optionale Oberfläche und starten
+  den geführten Ablauf:</p>
+  <pre><code>pip install '.[flash]'
+python -m tools.flash_tui</code></pre>
+  <p>Die Oberfläche führt durch „Image wählen“, „Speicherkarte wählen“,
+  „Einstellungen“, „Zusammenfassung + Bestätigung“, „Schreiben“, „Prüfen“ und
+  „Fertig“. Sie zeigt die Größe des Images und prüft eine danebenliegende
+  <code>SHA256SUMS</code>-Datei. Der Registrierungscode und das WLAN-Passwort
+  bleiben in den Meldungen verborgen. Mit <kbd>d</kbd> aktivieren Sie den
+  Probelauf ohne Schreibzugriff, mit <kbd>r</kbd> aktualisieren Sie die
+  Datenträgerliste, mit <kbd>t</kbd> wechseln Sie zwischen heller und dunkler
+  Darstellung. Die Zielkennung müssen Sie exakt eintippen.</p>
+  <p>macOS verwendet <code>diskutil</code>, Linux <code>lsblk</code> sowie
+  <code>udisksctl</code> oder <code>umount</code>. Linux braucht für den
+  Schreibzugriff Root-Rechte. Windows nutzt PowerShell und benötigt ein
+  Terminal mit Administratorrechten; dieser Pfad ist auf realer Hardware
+  <strong>ungetestet</strong>.</p>
+
+  <h3>CLI als Alternative: Datenträger auswählen und schreiben</h3>
   <p>Stecken Sie die SD-Karte oder das externe Laufwerk ein. Lassen Sie sich die zulässigen
   Datenträger anzeigen und übernehmen Sie den Pfad des <strong>richtigen</strong> Geräts.
   Der folgende Ablauf zeigt erst einen Probelauf und dann den Schreibvorgang. Ersetzen
@@ -178,8 +196,8 @@ python -m tools.flash_image flash \
     Das Werkzeug prüft die Datenträgeridentität erneut, hängt ihn aus, prüft noch
     einmal und schreibt erst dann. Anschließend liest es die geschriebenen Bytes
     zurück und vergleicht ihre Prüfsumme; auch vor dem Lesen wird die Identität
-    erneut geprüft. Ein eigener CLI-Unterbefehl <code>verify</code> existiert derzeit
-    nicht – die Prüfung gehört zu <code>flash</code>.</p>
+    erneut geprüft. Der CLI-Unterbefehl <code>verify</code> liest das Image bei Bedarf
+    erneut zurück und vergleicht seine Prüfsumme.</p>
   </div>
   <p>Nach erfolgreicher Prüfung schreibt das Werkzeug in die Boot-Partition
   <code>agent-registration.json</code> mit Fleet-Adresse, Zertifikats-Fingerabdruck und

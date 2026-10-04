@@ -81,6 +81,7 @@ agent = [
     # applies doubly hard to cryptography). See `agent/encryption.py`.
     "pyrage>=1.4",
 ]
+flash = ["textual>=8.2.8,<9"]
 dev = [
     "pytest>=8.3",
     "pytest-cov>=5.0",
