@@ -1,6 +1,87 @@
 # Status
 
-Last updated: 2026-10-03.
+Last updated: 2026-10-04.
+
+## Amd64 boot-path gap closed; `image.yml` gets a manual build-only run (2026-10-04)
+
+Two independent pieces, same branch.
+
+**1. The amd64 boot-path gap (image/README.md's own open point) is
+closed.** The Pi image's boot partition is `/boot/firmware`; mkosi's own
+default for the amd64 image mounts its ESP at `/efi` instead (Debian's
+kernel package leaves files under `/boot`, which is why
+`systemd-gpt-auto-generator`'s own fallback picks `/efi` rather than
+`/boot` there -- see that generator's own manual page). Every actual
+consumer of the boot partition (`agent/registration.py
+::DEFAULT_REGISTRATION_FILE`, `agent/encryption.py
+::DEFAULT_RECIPIENTS_FILE`, `image/common/agent-compose.yml`'s two
+read-only bind mounts, `image/common/install.sh`'s own template
+placement) already hard-coded `/boot/firmware` unconditionally -- the gap
+was exclusively in what the amd64 image itself mounted there.
+
+Chosen fix (full reasoning and the two rejected alternatives --
+a configurable path, and a symlink -- in `image/README.md`'s new "Boot
+partition path" section): **make the amd64 image mount its ESP at
+`/boot/firmware` too**, via two new/changed files, both amd64-only:
+
+- `image/x86/mkosi.repart/00-esp.conf` (new) overrides mkosi's own
+  built-in ESP partition definition -- `Label=ESP` (a fixed GPT partition
+  label to mount by) and `CopyFiles=/boot/firmware:/` instead of mkosi's
+  own default `CopyFiles=/boot:/` (which would have nested this
+  repository's own boot-partition files one level too deep once mounted
+  back at `/boot/firmware`). `image/x86/mkosi.repart/10-root.conf` (new)
+  carries mkosi's own default root-partition definition forward
+  unchanged -- providing any file under `mkosi.repart/` disables all of
+  mkosi's defaults, not just the one being overridden.
+- `image/x86/mkosi.postinst.chroot` now writes a static `/etc/fstab` line
+  (`PARTLABEL=ESP /boot/firmware vfat defaults 0 2`) into the finished
+  image -- a static fstab entry for a partition is what actually
+  suppresses `systemd-gpt-auto-generator`'s own `/efi` unit for it
+  (`systemd-gpt-auto-generator(8)`: no unit is generated for the ESP once
+  an fstab entry for it exists under the `/boot/` hierarchy), not merely
+  the new label.
+
+`image/common/firstboot-wifi.sh` and `thermoctl-firstboot-wifi.service`
+carried a second, `/efi`-specific branch before this fix (to tolerate the
+old amd64 behaviour); both are simplified back to the single real path
+now that there is only one. `tools/check_image_config.py` gets a new
+`check_boot_partition_path_consistency`, called from `check_all`, that
+cross-checks every one of the files above (plus the two agent defaults)
+against a single `BOOT_PARTITION_PATH` constant -- a future regression
+reintroducing a per-target `/efi` path now fails this check, not just a
+real build. `check_firstboot_wifi_unit` also now explicitly rejects a
+reintroduced `/efi` `ConditionPathExists=`/`RequiresMountsFor=` line,
+not just "the single-path required lines are present" (which a
+regressed dual-path version would also satisfy).
+
+**Not run end to end** (found and closed by reading mkosi's and
+`systemd-gpt-auto-generator`'s own documentation, not by booting a built
+image -- an actual mkosi build and boot test on a Linux runner is still
+the open point `image/README.md` already names for this target).
+
+**2. `.github/workflows/image.yml` gets a manual, build-only
+`workflow_dispatch` run.** The workflow already declared
+`workflow_dispatch` at the top level, but every build job
+(`build-watchdog-binaries`, `build-pi-image`, `build-x86-image`) was
+individually gated on `startsWith(github.ref, 'refs/tags/v')`, so a
+manual run only ever exercised `check-configuration` -- never an actual
+build. Each of the three build jobs' `if:` now reads
+`startsWith(github.ref, 'refs/tags/v') || github.event_name ==
+'workflow_dispatch'`, so a manual run on any commit (e.g. confirming a
+merge to main actually builds) now runs the real Pi/amd64/watchdog
+builds too and uploads the `.img.xz` + `SHA256SUMS` as plain workflow
+artifacts. `publish-release` is deliberately **not** extended the same
+way -- its `if:` stays `startsWith(github.ref, 'refs/tags/v')` alone, so
+a manual run never attaches anything to a GitHub release; only a `v*` tag
+push does that. `actionlint` passes on the changed workflow.
+
+Verified: `ruff check .` and `mypy .` both exit 0; `shellcheck` on every
+changed shell script (`image/common/firstboot-wifi.sh`,
+`image/x86/mkosi.postinst.chroot`) exits 0; `actionlint` on
+`.github/workflows/image.yml` exits 0; `python -m tools
+.check_image_config` exits 0; full suite 2076 tests, 0 failures/errors, 1
+pre-existing/unrelated skip. `watchdog/` was not touched by this task, so
+`go vet`/`go test` were not re-run.
 
 ## CI fix: flash-tool tests no longer need macOS (2026-10-03)
 

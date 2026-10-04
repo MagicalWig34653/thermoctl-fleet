@@ -304,13 +304,14 @@ install -d -m 0755 "$(root_path /etc/thermoctl-agent)"
 install -m 0644 "$COMMON_DIR/agent-compose.yml" \
   "$(root_path /etc/thermoctl-agent)/compose.yml"
 
-# The boot partition template -- real path differs between pi/ (FAT32 under
-# /boot/firmware) and x86/ (EFI); both already use /boot/firmware as this
-# repository's own convention (image/common/README.md, backup-recipients
-# section), so this script follows the same path on both targets. The
-# preparation tool (tools/flash_image.py, section 19.5) overwrites this file
-# with real values when an image is actually flashed -- this is only the
-# empty placeholder shipped in the image itself.
+# The boot partition template -- both pi/ (FAT32 under /boot/firmware) and
+# x86/ (the EFI system partition, mounted at /boot/firmware too -- see
+# image/README.md's "Boot partition path" and image/x86/mkosi.repart/
+# 00-esp.conf) use the exact same path, so this script follows the same
+# path on both targets unconditionally. The preparation tool
+# (tools/flash_image.py, section 19.5) overwrites this file with real
+# values when an image is actually flashed -- this is only the empty
+# placeholder shipped in the image itself.
 install -d -m 0755 "$(root_path /boot/firmware/thermoctl)"
 if [ ! -f "$(root_path /boot/firmware/agent-registration.json)" ]; then
   install -m 0644 "$COMMON_DIR/agent-registration.empty.json" \

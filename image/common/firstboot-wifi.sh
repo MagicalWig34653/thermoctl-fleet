@@ -1,23 +1,16 @@
 #!/usr/bin/env bash
 # Import the boot-partition Wi-Fi credentials once, before network-online.
-# WIFI_FILE and WIFI_BOOT_ROOT are for isolated tests; the unit sets neither.
+# Both images mount their boot partition at the same path (section 19,
+# image/README.md's "Boot partition path": the amd64 ESP is mounted at
+# /boot/firmware too, via image/x86/mkosi.repart/00-esp.conf + the static
+# fstab line in image/x86/mkosi.postinst.chroot -- no amd64-specific path
+# is needed here any more). WIFI_FILE and WIFI_BOOT_ROOT are for isolated
+# tests; the unit sets neither.
 set -euo pipefail
 export LC_ALL=C
 umask 077
 
-pi_file="${WIFI_BOOT_ROOT:-}/boot/firmware/thermoctl/wifi.env"
-efi_file="${WIFI_BOOT_ROOT:-}/efi/thermoctl/wifi.env"
-if [ -n "${WIFI_FILE:-}" ]; then
-  wifi_file=$WIFI_FILE
-elif { [ -e "$pi_file" ] || [ -L "$pi_file" ]; } \
-  && { [ -e "$efi_file" ] || [ -L "$efi_file" ]; }; then
-  echo 'firstboot-wifi: credentials exist at both boot paths' >&2
-  exit 1
-elif [ -e "$pi_file" ] || [ -L "$pi_file" ]; then
-  wifi_file=$pi_file
-else
-  wifi_file=$efi_file
-fi
+wifi_file="${WIFI_FILE:-${WIFI_BOOT_ROOT:-}/boot/firmware/thermoctl/wifi.env}"
 profile=thermoctl-firstboot-wifi
 
 erase_file() {

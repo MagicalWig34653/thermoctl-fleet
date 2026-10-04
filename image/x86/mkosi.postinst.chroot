@@ -18,3 +18,25 @@ chmod 0755 /usr/local/bin/thermoctl-watchdog /usr/local/bin/thermoctl-restore-mo
 # (image/x86/README.md -- no 40-pin header on a mini PC).
 bash "$REPO_ROOT/image/common/install.sh" --root / --arch amd64 --skip-watchdog-build
 rm -rf "$REPO_ROOT"
+
+# Mount the ESP at /boot/firmware, not systemd-gpt-auto-generator's own
+# default of /efi (section 19, "the amd64 boot-path gap" --
+# image/README.md's "Boot partition path" section has the full reasoning;
+# image/x86/mkosi.repart/00-esp.conf, next to this file, is the other half
+# -- it labels that same partition `ESP` and copies this repository's own
+# boot-partition files into its root instead of mkosi's own default). A
+# static /etc/fstab line for a partition suppresses gpt-auto-generator's
+# unit for it entirely (systemd-gpt-auto-generator(8): "no unit will be
+# created for the ESP ... if mount entries are found in the /boot/ or
+# /efi/ hierarchies in fstab"), so this is the one change that actually
+# moves the runtime mount, not just a label. `install.sh` already created
+# /boot/firmware (and /boot/firmware/thermoctl inside it) above; `install
+# -d` here is only a defensive no-op if that ever changes.
+#
+# Idempotent (grep before append): mkosi.postinst.chroot can run more than
+# once against the same mkosi cache/incremental build.
+install -d -m 0755 /boot/firmware
+FSTAB_LINE='PARTLABEL=ESP /boot/firmware vfat defaults 0 2'
+if ! grep -qxF "$FSTAB_LINE" /etc/fstab 2>/dev/null; then
+  printf '%s\n' "$FSTAB_LINE" >>/etc/fstab
+fi

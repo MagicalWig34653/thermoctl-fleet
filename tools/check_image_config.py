@@ -23,9 +23,23 @@ import re
 import sys
 from pathlib import Path
 
+from agent.encryption import DEFAULT_RECIPIENTS_FILE
+from agent.registration import DEFAULT_REGISTRATION_FILE
 from protocol.registration import AgentRegistrationFile
 
 IMAGE_DIR = Path(__file__).resolve().parent.parent / "image"
+
+# The one boot-partition path every consumer must agree on (section 19,
+# image/README.md's "Boot partition path"). Both images mount their boot
+# partition here: Raspberry Pi OS's own FAT32 partition for `image/pi/`,
+# and the amd64 ESP for `image/x86/` via `mkosi.repart/00-esp.conf` +
+# the static fstab line in `mkosi.postinst.chroot` (not mkosi's own
+# `/efi` default). `check_boot_partition_path_consistency` below is the
+# one place that cross-checks every file that hard-codes this path
+# against this single constant, so a future edit that drifts one of them
+# (reintroducing a per-target `/efi` path, for example) fails loudly here
+# instead of only showing up on a real device.
+BOOT_PARTITION_PATH = "/boot/firmware"
 
 # Debian package names: lowercase letters, digits, +, -, . -- see Debian Policy
 # §5.6.7. No spaces, no version spec (see packages.txt).
@@ -611,6 +625,79 @@ def check_restore_staging_tmpfiles_entry(path: Path) -> None:
         )
 
 
+def check_boot_partition_path_consistency(root: Path = IMAGE_DIR) -> None:
+    """Checks that every consumer of the boot partition agrees on the same
+    literal path (`BOOT_PARTITION_PATH`, `/boot/firmware`) -- the actual
+    closure check for the amd64 boot-path gap (section 19, image/README.md's
+    "Boot partition path"): the Pi image's boot partition and the amd64
+    mkosi image's ESP used to be mounted at two different paths
+    (`/boot/firmware` vs. `/efi`) while every consumer -- the agent's own
+    defaults, `image/common/agent-compose.yml`'s bind mounts, the Wi-Fi
+    importer's unit -- assumed the Pi's path unconditionally. The fix made
+    the amd64 image mount its ESP at `/boot/firmware` too (`image/x86/mkosi
+    .repart/00-esp.conf` relabels and re-targets the partition's
+    `CopyFiles=`; `image/x86/mkosi.postinst.chroot` writes the matching
+    static `/etc/fstab` line) instead of teaching every consumer a second,
+    target-specific path -- so this check asserts there is, in fact, only
+    ever one path to agree on, across every file that names it:
+
+    - `agent/registration.py::DEFAULT_REGISTRATION_FILE`
+    - `agent/encryption.py::DEFAULT_RECIPIENTS_FILE`
+    - `image/common/agent-compose.yml`'s two boot-partition bind mounts
+    - `image/common/install.sh`'s own boot-partition template placement
+    - `image/x86/mkosi.postinst.chroot`'s static fstab mount target
+
+    Does not re-check `thermoctl-firstboot-wifi.service`
+    (`check_firstboot_wifi_unit` above already does, including the
+    "no /efi left over" half of this same check) to avoid checking the
+    same file's content twice for the same thing.
+    """
+
+    if str(DEFAULT_REGISTRATION_FILE) != f"{BOOT_PARTITION_PATH}/agent-registration.json":
+        raise ImageError(
+            f"agent/registration.py: DEFAULT_REGISTRATION_FILE is "
+            f"{DEFAULT_REGISTRATION_FILE!s}, expected it under {BOOT_PARTITION_PATH!r} "
+            f"(tools/check_image_config.py's own BOOT_PARTITION_PATH)."
+        )
+    if str(DEFAULT_RECIPIENTS_FILE) != f"{BOOT_PARTITION_PATH}/thermoctl/backup-recipients.txt":
+        raise ImageError(
+            f"agent/encryption.py: DEFAULT_RECIPIENTS_FILE is {DEFAULT_RECIPIENTS_FILE!s}, "
+            f"expected it under {BOOT_PARTITION_PATH!r} (tools/check_image_config.py's own "
+            f"BOOT_PARTITION_PATH)."
+        )
+
+    compose_path = root / "common" / "agent-compose.yml"
+    compose_content = compose_path.read_text(encoding="utf-8")
+    required_compose_lines = [
+        f"- {BOOT_PARTITION_PATH}/thermoctl:{BOOT_PARTITION_PATH}/thermoctl:ro",
+        f"- {BOOT_PARTITION_PATH}/agent-registration.json:"
+        f"{BOOT_PARTITION_PATH}/agent-registration.json:ro",
+    ]
+    missing_compose = [line for line in required_compose_lines if line not in compose_content]
+    if missing_compose:
+        raise ImageError(
+            f"{compose_path}: missing boot-partition mount(s) at {BOOT_PARTITION_PATH!r}: "
+            f"{missing_compose!r}."
+        )
+
+    install_sh_path = root / "common" / "install.sh"
+    install_sh_content = install_sh_path.read_text(encoding="utf-8")
+    if f"{BOOT_PARTITION_PATH}/thermoctl" not in install_sh_content:
+        raise ImageError(
+            f"{install_sh_path}: does not place the boot-partition template under "
+            f"{BOOT_PARTITION_PATH!r}."
+        )
+
+    postinst_path = root / "x86" / "mkosi.postinst.chroot"
+    postinst_content = postinst_path.read_text(encoding="utf-8")
+    if f" {BOOT_PARTITION_PATH} vfat" not in postinst_content:
+        raise ImageError(
+            f"{postinst_path}: does not write a static fstab line mounting the ESP at "
+            f"{BOOT_PARTITION_PATH!r} -- without it, systemd-gpt-auto-generator falls "
+            f"back to its own default (/efi), reopening the amd64 boot-path gap."
+        )
+
+
 def check_all(root: Path = IMAGE_DIR) -> None:
     """Runs all checks; raises on the first failure."""
 
@@ -625,6 +712,7 @@ def check_all(root: Path = IMAGE_DIR) -> None:
     check_udev_rule(common / "udev" / "99-zigbee-stick.rules")
     check_agent_registration_template(common / "agent-registration.empty.json")
     check_firstboot_wifi_unit(common / "thermoctl-firstboot-wifi.service")
+    check_boot_partition_path_consistency(root)
     check_watchdog_unit(root.parent / "watchdog" / "thermoctl-watchdog.service")
     check_leds_unit(root.parent / "watchdog" / "cmd" / "thermoctl-leds" / "thermoctl-leds.service")
     check_restore_mover_units(
@@ -652,9 +740,8 @@ def check_firstboot_wifi_unit(path: Path) -> None:
         raise ImageError(f"{path}: Wi-Fi import unit is missing.")
     lines = {line.strip() for line in path.read_text(encoding="utf-8").splitlines()}
     required = {
-        "ConditionPathExists=|/boot/firmware/thermoctl/wifi.env",
-        "ConditionPathExists=|/efi/thermoctl/wifi.env",
-        "RequiresMountsFor=/boot/firmware /efi",
+        f"ConditionPathExists=|{BOOT_PARTITION_PATH}/thermoctl/wifi.env",
+        f"RequiresMountsFor={BOOT_PARTITION_PATH}",
         "Wants=NetworkManager.service",
         "After=NetworkManager.service",
         "Before=NetworkManager-wait-online.service network-online.target",
@@ -665,6 +752,22 @@ def check_firstboot_wifi_unit(path: Path) -> None:
     missing = required - lines
     if missing:
         raise ImageError(f"{path}: missing Wi-Fi import setting(s): {sorted(missing)!r}.")
+    # The amd64 boot-path gap (image/README.md, "Boot partition path") was
+    # closed by making both images mount their boot partition at the same
+    # path -- a reintroduced per-target `/efi` condition or a widened
+    # `RequiresMountsFor=` would silently reopen it, so both are checked
+    # for and rejected explicitly, not just "the required lines are
+    # present" above (which a dual-path version would also satisfy).
+    forbidden_substrings = ["/efi"]
+    content = path.read_text(encoding="utf-8")
+    present = [s for s in forbidden_substrings if s in content]
+    if present:
+        raise ImageError(
+            f"{path}: still references {present!r} -- the amd64 image now mounts its "
+            f"ESP at {BOOT_PARTITION_PATH} too (image/x86/mkosi.repart/00-esp.conf, "
+            f"image/x86/mkosi.postinst.chroot), so this unit must name exactly one "
+            f"boot path, not a per-target pair."
+        )
 
 
 def main() -> int:

@@ -132,28 +132,18 @@ def test_missing_file_is_noop(tmp_path: Path) -> None:
     assert args == []
 
 
-@pytest.mark.parametrize("mount", ["boot/firmware/thermoctl", "efi/thermoctl"])
-def test_discovers_both_real_boot_mount_conventions(tmp_path: Path, mount: str) -> None:
+def test_discovers_the_real_boot_mount_convention(tmp_path: Path) -> None:
+    # Both images mount their boot partition at /boot/firmware now (the
+    # amd64 ESP too, via image/x86/mkosi.repart/00-esp.conf +
+    # mkosi.postinst.chroot's static fstab line) -- there is only ever one
+    # path to auto-discover.
     contents = f"SSID=TestNet\nPASSWORD={TEST_PASSWORD}\n".encode()
-    result, path, args = _run(tmp_path, contents, mount=mount, auto_path=True)
+    result, path, args = _run(
+        tmp_path, contents, mount="boot/firmware/thermoctl", auto_path=True
+    )
     assert result.returncode == 0, result.stderr
     assert not path.exists()
     assert TEST_PASSWORD.encode() in args
-
-
-def test_two_boot_files_are_ambiguous_and_not_imported(tmp_path: Path) -> None:
-    contents = f"SSID=TestNet\nPASSWORD={TEST_PASSWORD}\n".encode()
-    other = tmp_path / "boot/firmware/thermoctl/wifi.env"
-    other.parent.mkdir(parents=True)
-    other.write_bytes(contents)
-    result, path, args = _run(
-        tmp_path, contents, mount="efi/thermoctl", auto_path=True
-    )
-    assert result.returncode != 0
-    assert path.read_bytes() == contents
-    assert other.read_bytes() == contents
-    assert args == []
-    assert TEST_PASSWORD not in result.stdout + result.stderr
 
 
 def test_symlink_is_rejected_without_touching_target(tmp_path: Path) -> None:
