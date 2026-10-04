@@ -1,6 +1,123 @@
 # Status
 
-Last updated: 2026-10-04.
+Last updated: 2026-10-05.
+
+## Fleet UI redesign, stage 2 polish pass (2026-10-05)
+
+The owner approved stage 2's structure (below) and asked for a polish
+pass, then to see it again: a compact site map, text hygiene across every
+template/view-builder, a tidier apartment "Überblick" tab, and "die
+Formulare richtig formatieren" across every form in the application.
+
+- **"Alle Wohnungen" site map is now compact.** The old per-apartment
+  card (next-step text, last-contact line, open-fault list -- the same
+  detail already duplicated in the inbox above) is replaced by a small
+  labelled block: short name + status icon + colour, several per floor
+  row, a whole ~20-apartment house fitting on one screen
+  (`fleet/templates/ui/_unit_macros.html::apartment_block`, new `.unit-
+  block` CSS). The short name (`fleet.ui_house.ApartmentTile.short_label`,
+  `_short_label`) is the part after the last comma of a landlord's own
+  "<address>, WE n" label, falling back to the apartment id -- never
+  truncated blindly. Full detail (status, next step, since-when) stays in
+  the block's native `title` tooltip and one click away; nothing is lost,
+  only moved. Mobile: blocks wrap via `flex-wrap`, still compact.
+- **Text hygiene across every fleet UI template and view builder**:
+  - A single shared helper, `fleet/ui_format.py::format_local_datetime`/
+    `format_local_date`, replaces three different ad hoc renderings
+    (`"%Y-%m-%d %H:%M UTC"` in `ui_apartment.py`/`ui_rollout.py`, raw
+    `.isoformat()` in `ui_routes.py`/`ui_inventory.py`) with one German
+    local-time format (`"04.10.2026, 19:46 Uhr"`, Europe/Berlin,
+    DST-aware via `zoneinfo`). Existing relative "vor 5 Min." text is
+    unchanged.
+  - `fleet.ui_format.format_technical_reason` maps the small set of fixed
+    literal strings the agent is known to echo back (`ReconcileOutcome
+    .reason`/`DesiredStateOutcome.reason`/`Rollout.stopped_reason`/
+    `RolloutApartmentRecord.last_outcome_reason`) to German, and marks
+    anything else as "Technischer Hinweis (Agent): ..." rather than
+    silently printing raw, often-English agent/log text as if it were
+    polished UI copy (the rollout inbox's "agent rejected" example from
+    the work order). A landlord-authored "Grund" (desired-state edit,
+    rollout start/resume/cancel) is never touched -- only the agent-
+    echoed fields are. `fleet.ui_apartment._format_zigbee_bridge` applies
+    the same pattern to `DeviceState.zigbee_bridge` ("deliberately free
+    text, no enum" per its own protocol comment) -- "connected" ->
+    "verbunden".
+  - `ApartmentState`/`DeviceLifecycle` are, by their own docstrings,
+    "Values in English (section 20.1/22.4)" for the *stored* value -- the
+    inventory pages used to print that stored value directly
+    (`apartment.state`, `device.state`, and the state-change `<select>`'s
+    own `<option>` text). `fleet.ui_inventory.APARTMENT_STATE_LABELS`/
+    `DEVICE_LIFECYCLE_LABELS` (closed, "covers every member or the test
+    fails" -- same convention as `fleet.ui_house.FAULT_KIND_LABELS`) now
+    supply a German label everywhere a state is *displayed*; every
+    `<option value="...">` keeps the unchanged English value, only its
+    visible text changed.
+  - Every remaining `" -- "` in user-facing text (templates and Python
+    f-strings alike, Jinja/docstring comments left alone) -> `" – "`;
+    bare `"-"` placeholder cells -> `"–"`; the three ad hoc
+    `"(Pflichtfeld)"` labels removed in favour of the new, consistent
+    required-marker (see below).
+- **Apartment "Überblick" tab**: every top-level section is now a
+  bordered card with consistent spacing (`.apartment-grid > section`,
+  one `gap` mechanism, not card padding stacked on top of the old
+  `main section + section` margin); the danger zone keeps its own
+  `--signal` border via a more specific override. "Erreichbarkeit" gets
+  a compact, proportional timeline bar above the existing text list
+  (`fleet/ui_apartment.py::TimelineEntry.width_percent`/
+  `_timeline_width_percents`, derived from the same `sent_at` values
+  already read for the text, not new data) -- gap/contact segments sized
+  by real elapsed time, not by row count, with a visual 3% floor so no
+  segment disappears. No inline `style` (this app's CSP sends no
+  `style-src 'unsafe-inline'`): width is one of 100 generated `.tl-w-N`
+  percent classes.
+- **Forms, "richtig formatiert" across the whole application**: labels
+  stayed block-level/above their input (already the base pattern, kept);
+  per-field width tiers (short/medium/long) keyed by the input's own
+  fixed `name` attribute via CSS attribute selectors -- no template
+  diffs needed, every form sharing a field name (e.g. `digest`/
+  `digest_{{ service }}`) is covered by one rule; a CSS-driven required/
+  optional marker (`label:has(input:required)::after` -> " *",
+  `:optional` -> " (optional)") replaces the old, inconsistent inline
+  "(Pflichtfeld)" text; `<fieldset>`/`<legend>` (already used on two
+  forms) now get a visible border; button variants -- default `<button>`
+  filled/primary, `.button--secondary`, `.button--danger` (applied to
+  every destructive action: Mieterwechsel, Gerät ausbauen, Rollout
+  abbrechen, Passkey entfernen) -- `a.command-button` keeps its existing
+  outlined look (filling every item of a multi-button row equally loud
+  would fight this file's own "quiet is the default" rule); an empty
+  `.error` placeholder (`#webauthn-error` et al., filled by JS only on
+  an actual error) no longer renders as an empty red box
+  (`.error:empty { display: none }`). `version`/`digest`/`service` on
+  "Neuer Rollout" gained HTML `required`/`pattern` matching what the
+  route already enforces server-side (no backend change). Every form's
+  `action`/`method`/field `name`s/CSRF token/hidden inputs are
+  byte-identical to before this pass.
+- **Screenshots**: `tools/docs_screenshots.py`'s `capture_ui_redesign_ia`
+  extended with three more pages the owner explicitly asked to see --
+  "Konto" (`/ui/account/webauthn`, passkey registration form), "Neuer
+  Rollout" (`/ui/rollouts/new`), and the stopped demo rollout's own
+  detail page (reached by following the "Updates" list's own link, not
+  a hard-coded id) for its Fortsetzen/Abbrechen forms. All 44
+  `docs/ui-redesign/*.png` (1440 + 390, light + dark) regenerated.
+  **Three critique rounds** against the real rendered pages: (1) an
+  empty `#webauthn-register-error` placeholder rendered as a visible
+  red-bordered empty box on "Konto" -> `.error:empty` fix above; (2)
+  `Zigbee-Bridge: connected` and, on "Einrichtung", raw `occupied`/`ok`
+  apartment states (the latter a demo-seed typo not matching
+  `ApartmentState` at all) -> the German-label fixes above, plus
+  correcting the seed fixture's stray `state="ok"` to the real
+  `DEFAULT_APARTMENT_STATE` value; (3) a dark-mode pass confirmed both
+  fixes render correctly and found no further issues.
+- **Tests**: new `tests/test_ui_format.py` (every helper); new
+  `ApartmentTile.short_label`/timeline-bar/`_format_zigbee_bridge`/
+  `APARTMENT_STATE_LABELS`/`DEVICE_LIFECYCLE_LABELS` coverage added to
+  the existing `test_ui_house.py`/`test_ui_apartment.py`/
+  `test_ui_inventory.py` modules (no new test modules needed -- every
+  change extends an existing view builder). Three wording assertions
+  updated because they pinned exactly the presentation this pass changed
+  on purpose (`detail.zigbee_bridge == "connected"` ->  `"verbunden"`,
+  `"retired" in ...` -> `"Außer Betrieb" in ...`); no security/CSRF/
+  authorization/data-minimisation assertion touched.
 
 ## Fleet UI redesign, stage 2: information architecture rebuild (2026-10-04)
 

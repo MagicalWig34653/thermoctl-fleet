@@ -76,7 +76,7 @@ APARTMENTS = [
         floor="2. OG",
         orientation="Süd",
         heating_circuits=4,
-        state="ok",
+        state="occupied",
     ),
     DemoApartment(
         id="musterstr1-we6",
@@ -84,7 +84,7 @@ APARTMENTS = [
         floor="2. OG",
         orientation="Nord",
         heating_circuits=2,
-        state="ok",
+        state="occupied",
     ),
     DemoApartment(
         id="musterstr1-we5",
@@ -92,7 +92,7 @@ APARTMENTS = [
         floor="3. OG",
         orientation="West",
         heating_circuits=3,
-        state="ok",
+        state="occupied",
     ),
     DemoApartment(
         id="beispielweg9-we1",
@@ -100,7 +100,7 @@ APARTMENTS = [
         floor="EG",
         orientation="Ost",
         heating_circuits=5,
-        state="ok",
+        state="occupied",
     ),
     DemoApartment(
         id="beispielweg9-we2",
@@ -497,6 +497,14 @@ _IA_PAGES: tuple[tuple[str, str], ...] = (
     ("/ui/apartments", "wohnungen"),
     ("/ui/inventory", "einrichtung"),
     ("/ui/rollouts", "updates"),
+    # Forms pass (UI-redesign stage 2 polish, "die Formulare richtig
+    # formatieren"): the owner explicitly asked for at least one
+    # screenshot of each major form -- "Konto" (passkey management) and
+    # "Neuer Rollout" each live on their own page, unlike the acknowledge-
+    # fault/restore/commands forms, which are already inline on a page
+    # captured above (wohnung-ueberblick/-wartung).
+    ("/ui/account/webauthn", "konto"),
+    ("/ui/rollouts/new", "rollout-neu"),
 )
 
 _IA_VIEWPORTS: tuple[tuple[int, str], ...] = ((1440, "1440"), (390, "390"))
@@ -591,6 +599,20 @@ def capture_ui_redesign_ia(  # pragma: no cover
                     _shoot_full_page(
                         page, out_dir / f"{stem}-{width_label}-{scheme}.png", width
                     )
+
+                # One more major form: the stopped demo rollout's own
+                # detail page (seed()'s thermoctl rollout across WE3/WE6,
+                # stopped after WE3 fails) carries the "Fortsetzen"/
+                # "Abbrechen" forms -- reached by following the "Updates"
+                # list's own link rather than hard-coding the rollout id
+                # (it is a generated uuid, not something this script
+                # controls).
+                page.goto(f"{base_url}/ui/rollouts", wait_until="networkidle")
+                page.click("table a[href^='/ui/rollouts/']")
+                page.wait_for_load_state("networkidle")
+                _shoot_full_page(
+                    page, out_dir / f"rollout-entscheiden-{width_label}-{scheme}.png", width
+                )
 
                 context.close()
 
