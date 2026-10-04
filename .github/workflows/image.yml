@@ -40,7 +40,12 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - run: pip install -e .
+      # tools/check_image_config.py imports agent.encryption/agent.registration
+      # (DEFAULT_RECIPIENTS_FILE / DEFAULT_REGISTRATION_FILE) -- a plain
+      # `pip install -e .` only pulls the base `pydantic` dependency, so the
+      # `agent` extra (pyrage, cryptography, httpx, ...) has to come along;
+      # `fleet` is not needed here, keeping the job minimal.
+      - run: pip install -e ".[agent]"
       - run: python -m tools.check_image_config
       - name: shellcheck image/common/install.sh
         run: |
@@ -120,7 +125,14 @@ jobs:
           name: watchdog-binaries-arm64
           path: thermoctl-fleet/image/pi/pi-gen-stage/01-thermoctl/files/usr-local-bin
       - name: Clone pi-gen
-        run: git clone --depth 1 --branch arm64 https://github.com/RPi-Distro/pi-gen.git pi-gen
+        # Pinned commit on pi-gen's own `arm64` branch (the branch that
+        # defaults RELEASE to trixie and supports building arm64 images --
+        # the `master` branch targets armhf) instead of a floating branch
+        # tip, so a future upstream pi-gen change cannot silently break
+        # this job.
+        run: |
+          git clone https://github.com/RPi-Distro/pi-gen.git pi-gen
+          git -C pi-gen checkout 4d8ee447dd3d37e8b0ef8752e460d9082d9d435d
       - name: Install pi-gen's own build dependencies (loop device tooling, qemu-user-static)
         run: |
           sudo apt-get update
@@ -131,31 +143,56 @@ jobs:
       - name: Wire the thermoctl custom stage into pi-gen
         run: |
           set -eu
-          STAGE_SRC="thermoctl-fleet/image/pi/pi-gen-stage/01-thermoctl"
+          STAGE_SRC="thermoctl-fleet/image/pi/pi-gen-stage"
           STAGE_DST="pi-gen/stage-thermoctl"
           mkdir -p "$STAGE_DST"
-          cp -r "$STAGE_SRC"/* "$STAGE_DST"/
+          # prerun.sh lives at the STAGE level (pi-gen's own convention,
+          # confirmed against stage0/stage1/stage2/prerun.sh upstream) --
+          # without it, pi-gen never copies the previous stage's rootfs
+          # into this stage's own work dir, and both 01-thermoctl/00-run.sh
+          # and pi-gen's own later export-image/du sizing step fail
+          # against a rootfs directory that was never created
+          # ("du: cannot access '.../stage-thermoctl/rootfs'").
+          cp "$STAGE_SRC/prerun.sh" "$STAGE_DST/prerun.sh"
+          chmod +x "$STAGE_DST/prerun.sh"
+          # 01-thermoctl itself has to stay a SUB-stage directory nested
+          # one level under the stage dir, not flattened into it --
+          # pi-gen's run_stage only descends into STAGE_DIR's immediate
+          # subdirectories to find numbered scripts; a 00-run.sh placed
+          # directly at the stage level is silently never executed.
+          mkdir -p "$STAGE_DST/01-thermoctl"
+          cp -r "$STAGE_SRC/01-thermoctl"/* "$STAGE_DST/01-thermoctl/"
           # install.sh itself + image/common/ -- the custom stage's own
           # 00-run.sh chroots in and runs it directly from this copy, so
           # pi-gen's offline chroot does not need network access to this
           # repository at all.
-          mkdir -p "$STAGE_DST/files/thermoctl-fleet"
-          cp -r thermoctl-fleet/image "$STAGE_DST/files/thermoctl-fleet/image"
-          cp -r thermoctl-fleet/watchdog "$STAGE_DST/files/thermoctl-fleet/watchdog"
+          mkdir -p "$STAGE_DST/01-thermoctl/files/thermoctl-fleet"
+          cp -r thermoctl-fleet/image "$STAGE_DST/01-thermoctl/files/thermoctl-fleet/image"
+          cp -r thermoctl-fleet/watchdog "$STAGE_DST/01-thermoctl/files/thermoctl-fleet/watchdog"
           # EXPORT_IMAGE marks a stage as the one whose rootfs pi-gen turns
           # into a finished .img at the end of the run (pi-gen's own
-          # convention -- an empty marker file is enough).
+          # convention -- an empty marker file is enough). This one stays
+          # at the STAGE level, not inside 01-thermoctl/.
           touch "$STAGE_DST/EXPORT_IMAGE"
-      - name: Build with pi-gen (build-docker.sh)
-        env:
-          IMG_NAME: thermoctl-base-station
-          RELEASE: trixie
-          PI_GEN_RELEASE: false
-          DEPLOY_COMPRESSION: none
+      - name: Write pi-gen config
+        # build-docker.sh (unlike build.sh) does not read these as process
+        # environment variables -- it only `source`s a `config` file, either
+        # ${DIR}/config or one passed via `-c`. Without that file it fails
+        # with `realpath: '': No such file or directory` before ever
+        # reaching IMG_NAME/RELEASE/STAGE_LIST, which is exactly what the
+        # first real run hit.
+        run: |
+          cat > pi-gen/config <<'EOF'
+          IMG_NAME=thermoctl-base-station
+          RELEASE=trixie
+          PI_GEN_RELEASE=false
+          DEPLOY_COMPRESSION=none
           # Only through our own stage and the two base stages it depends
           # on -- pi-gen's own stage2 is "Raspberry Pi OS Lite", everything
           # from stage3 on (desktop, docs, ...) is explicitly skipped.
-          STAGE_LIST: "stage0 stage1 stage2 stage-thermoctl"
+          STAGE_LIST="stage0 stage1 stage2 stage-thermoctl"
+          EOF
+      - name: Build with pi-gen (build-docker.sh)
         run: |
           cd pi-gen
           ./build-docker.sh
@@ -207,11 +244,71 @@ jobs:
         with:
           name: watchdog-binaries-amd64
           path: thermoctl-fleet/image/x86/watchdog-bin
+      - name: Install Debian's current archive keyring
+        # mkosi's debootstrap-equivalent (Debian distribution) runs
+        # `apt-get update` against deb.debian.org/security.debian.org for
+        # `Release=trixie` using the HOST's `/usr/share/keyrings/
+        # debian-archive-keyring.gpg` to verify each repo's `InRelease`.
+        # The Ubuntu-runner apt mirror's own `debian-archive-keyring`
+        # package (2023.4ubuntu1, a Debian 12-era snapshot) predates
+        # trixie's release/security signing keys, so the build failed with
+        # `NO_PUBKEY ...` for every one of trixie's repos. Fetching Ubuntu's
+        # package wouldn't help (same staleness); instead fetch Debian's
+        # own current keyring package directly -- pinned to an exact
+        # version and verified against both its own published SHA256 and
+        # the SHA256 trixie's own (GPG-signed) `Packages` index lists for
+        # that exact file, then `dpkg -i` the verified file only (never
+        # `apt-get install` from an untrusted-at-this-point source, and
+        # never `[trusted=yes]`/a disabled signature check).
+        run: |
+          set -eu
+          keyring_version=2025.1
+          keyring_sha256=9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac
+          keyring_file="debian-archive-keyring_${keyring_version}_all.deb"
+          curl -fsSL -o "/tmp/${keyring_file}" \
+            "https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/${keyring_file}"
+          echo "${keyring_sha256}  /tmp/${keyring_file}" | sha256sum -c -
+          # Cross-check: the same SHA256 as trixie's own signed Packages
+          # index lists for this exact version, independent confirmation
+          # that the file fetched over plain HTTPS matches what the
+          # GPG-signed archive metadata itself declares.
+          curl -fsSL "https://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.gz" \
+            | gunzip -c \
+            | awk -v want="${keyring_sha256}" '
+                /^Package: debian-archive-keyring$/ { f=1 }
+                f && /^SHA256: / { if ($2 != want) { print "SHA256 mismatch with trixie Packages index"; exit 1 } else { print "cross-check OK"; exit 0 } }
+              '
+          sudo dpkg -i "/tmp/${keyring_file}"
       - name: Install mkosi
+        # Pinned to v21 instead of `apt-get install mkosi` -- the
+        # Ubuntu-runner apt mirror's mkosi package version floats with the
+        # runner image (20.2-1 on the noble image this job currently runs
+        # on), and mkosi's own config syntax has changed between major
+        # versions (e.g. the `OutputFormat=` setting image/x86/mkosi.conf
+        # used to carry does not exist in 20.x). mkosi is not published on
+        # PyPI, so pip installs straight from the upstream tag; `[bootable]`
+        # pulls in `pefile`, needed for the systemd-boot/UKI path this
+        # image's `Bootloader=systemd-boot` setting uses.
+        #
+        # v20.2 itself hit a real build failure: mkosi's own bundled
+        # mkosi-initrd resource config (used internally whenever
+        # Bootable=yes builds an initrd) lists a stale package name,
+        # `libtss2-mu0`, which trixie's current archive no longer has a
+        # candidate for (superseded by `libtss2-mu-4.0.1-0t64`) --
+        # `E: Package 'libtss2-mu0' has no installation candidate`. Fixed
+        # upstream by commit 7637bcaf ("Update libtss2-mu to use apt
+        # search pattern"), first released in v21.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            mkosi debootstrap systemd-container qemu-utils dosfstools
+            debootstrap systemd-container qemu-utils dosfstools \
+            systemd-ukify bubblewrap systemd-boot mtools
+          # mtools' mcopy populates the ESP (vfat) partition when
+          # systemd-repart builds the disk image -- "Could not find mcopy
+          # binary." otherwise.
+          sudo pip install --break-system-packages \
+            "mkosi[bootable] @ git+https://github.com/systemd/mkosi@v21"
+          mkosi --version
       - name: Stage repository inputs inside the image
         working-directory: thermoctl-fleet
         run: |
@@ -224,7 +321,19 @@ jobs:
           cp -r image/x86/watchdog-bin "$stage/watchdog-bin"
       - name: Build with mkosi
         working-directory: thermoctl-fleet/image/x86
+        # mkosi v21 sandboxes more of its own internal operations (package
+        # manager cache sync, etc.) through bubblewrap's unprivileged
+        # user-namespace path than v20.2 did, even when mkosi itself runs
+        # as root via sudo -- bwrap still calls unshare(CLONE_NEWUSER) and
+        # writes its own uid_map, which Ubuntu's AppArmor stack blocks by
+        # default on the runner image (`kernel.apparmor_restrict_
+        # unprivileged_userns=1`), regardless of the caller's EUID:
+        # "bwrap: setting up uid map: Permission denied". This sysctl only
+        # affects what this CI job's own build tooling is allowed to do on
+        # the runner -- it has no bearing on the shipped image itself
+        # (which never creates a user namespace).
         run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
           sudo mkosi --output-dir ../../mkosi-out build
       - name: Compress and checksum
         working-directory: thermoctl-fleet
