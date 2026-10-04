@@ -143,20 +143,36 @@ jobs:
       - name: Wire the thermoctl custom stage into pi-gen
         run: |
           set -eu
-          STAGE_SRC="thermoctl-fleet/image/pi/pi-gen-stage/01-thermoctl"
+          STAGE_SRC="thermoctl-fleet/image/pi/pi-gen-stage"
           STAGE_DST="pi-gen/stage-thermoctl"
           mkdir -p "$STAGE_DST"
-          cp -r "$STAGE_SRC"/* "$STAGE_DST"/
+          # prerun.sh lives at the STAGE level (pi-gen's own convention,
+          # confirmed against stage0/stage1/stage2/prerun.sh upstream) --
+          # without it, pi-gen never copies the previous stage's rootfs
+          # into this stage's own work dir, and both 01-thermoctl/00-run.sh
+          # and pi-gen's own later export-image/du sizing step fail
+          # against a rootfs directory that was never created
+          # ("du: cannot access '.../stage-thermoctl/rootfs'").
+          cp "$STAGE_SRC/prerun.sh" "$STAGE_DST/prerun.sh"
+          chmod +x "$STAGE_DST/prerun.sh"
+          # 01-thermoctl itself has to stay a SUB-stage directory nested
+          # one level under the stage dir, not flattened into it --
+          # pi-gen's run_stage only descends into STAGE_DIR's immediate
+          # subdirectories to find numbered scripts; a 00-run.sh placed
+          # directly at the stage level is silently never executed.
+          mkdir -p "$STAGE_DST/01-thermoctl"
+          cp -r "$STAGE_SRC/01-thermoctl"/* "$STAGE_DST/01-thermoctl/"
           # install.sh itself + image/common/ -- the custom stage's own
           # 00-run.sh chroots in and runs it directly from this copy, so
           # pi-gen's offline chroot does not need network access to this
           # repository at all.
-          mkdir -p "$STAGE_DST/files/thermoctl-fleet"
-          cp -r thermoctl-fleet/image "$STAGE_DST/files/thermoctl-fleet/image"
-          cp -r thermoctl-fleet/watchdog "$STAGE_DST/files/thermoctl-fleet/watchdog"
+          mkdir -p "$STAGE_DST/01-thermoctl/files/thermoctl-fleet"
+          cp -r thermoctl-fleet/image "$STAGE_DST/01-thermoctl/files/thermoctl-fleet/image"
+          cp -r thermoctl-fleet/watchdog "$STAGE_DST/01-thermoctl/files/thermoctl-fleet/watchdog"
           # EXPORT_IMAGE marks a stage as the one whose rootfs pi-gen turns
           # into a finished .img at the end of the run (pi-gen's own
-          # convention -- an empty marker file is enough).
+          # convention -- an empty marker file is enough). This one stays
+          # at the STAGE level, not inside 01-thermoctl/.
           touch "$STAGE_DST/EXPORT_IMAGE"
       - name: Write pi-gen config
         # build-docker.sh (unlike build.sh) does not read these as process
@@ -264,7 +280,7 @@ jobs:
               '
           sudo dpkg -i "/tmp/${keyring_file}"
       - name: Install mkosi
-        # Pinned to v20.2 instead of `apt-get install mkosi` -- the
+        # Pinned to v21 instead of `apt-get install mkosi` -- the
         # Ubuntu-runner apt mirror's mkosi package version floats with the
         # runner image (20.2-1 on the noble image this job currently runs
         # on), and mkosi's own config syntax has changed between major
@@ -273,13 +289,22 @@ jobs:
         # PyPI, so pip installs straight from the upstream tag; `[bootable]`
         # pulls in `pefile`, needed for the systemd-boot/UKI path this
         # image's `Bootloader=systemd-boot` setting uses.
+        #
+        # v20.2 itself hit a real build failure: mkosi's own bundled
+        # mkosi-initrd resource config (used internally whenever
+        # Bootable=yes builds an initrd) lists a stale package name,
+        # `libtss2-mu0`, which trixie's current archive no longer has a
+        # candidate for (superseded by `libtss2-mu-4.0.1-0t64`) --
+        # `E: Package 'libtss2-mu0' has no installation candidate`. Fixed
+        # upstream by commit 7637bcaf ("Update libtss2-mu to use apt
+        # search pattern"), first released in v21.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             debootstrap systemd-container qemu-utils dosfstools \
             systemd-ukify bubblewrap systemd-boot
           sudo pip install --break-system-packages \
-            "mkosi[bootable] @ git+https://github.com/systemd/mkosi@v20.2"
+            "mkosi[bootable] @ git+https://github.com/systemd/mkosi@v21"
           mkosi --version
       - name: Stage repository inputs inside the image
         working-directory: thermoctl-fleet
