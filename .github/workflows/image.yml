@@ -228,6 +228,41 @@ jobs:
         with:
           name: watchdog-binaries-amd64
           path: thermoctl-fleet/image/x86/watchdog-bin
+      - name: Install Debian's current archive keyring
+        # mkosi's debootstrap-equivalent (Debian distribution) runs
+        # `apt-get update` against deb.debian.org/security.debian.org for
+        # `Release=trixie` using the HOST's `/usr/share/keyrings/
+        # debian-archive-keyring.gpg` to verify each repo's `InRelease`.
+        # The Ubuntu-runner apt mirror's own `debian-archive-keyring`
+        # package (2023.4ubuntu1, a Debian 12-era snapshot) predates
+        # trixie's release/security signing keys, so the build failed with
+        # `NO_PUBKEY ...` for every one of trixie's repos. Fetching Ubuntu's
+        # package wouldn't help (same staleness); instead fetch Debian's
+        # own current keyring package directly -- pinned to an exact
+        # version and verified against both its own published SHA256 and
+        # the SHA256 trixie's own (GPG-signed) `Packages` index lists for
+        # that exact file, then `dpkg -i` the verified file only (never
+        # `apt-get install` from an untrusted-at-this-point source, and
+        # never `[trusted=yes]`/a disabled signature check).
+        run: |
+          set -eu
+          keyring_version=2025.1
+          keyring_sha256=9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac
+          keyring_file="debian-archive-keyring_${keyring_version}_all.deb"
+          curl -fsSL -o "/tmp/${keyring_file}" \
+            "https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/${keyring_file}"
+          echo "${keyring_sha256}  /tmp/${keyring_file}" | sha256sum -c -
+          # Cross-check: the same SHA256 as trixie's own signed Packages
+          # index lists for this exact version, independent confirmation
+          # that the file fetched over plain HTTPS matches what the
+          # GPG-signed archive metadata itself declares.
+          curl -fsSL "https://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.gz" \
+            | gunzip -c \
+            | awk -v want="${keyring_sha256}" '
+                /^Package: debian-archive-keyring$/ { f=1 }
+                f && /^SHA256: / { if ($2 != want) { print "SHA256 mismatch with trixie Packages index"; exit 1 } else { print "cross-check OK"; exit 0 } }
+              '
+          sudo dpkg -i "/tmp/${keyring_file}"
       - name: Install mkosi
         # Pinned to v20.2 instead of `apt-get install mkosi` -- the
         # Ubuntu-runner apt mirror's mkosi package version floats with the
