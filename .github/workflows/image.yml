@@ -255,9 +255,10 @@ jobs:
         # `NO_PUBKEY ...` for every one of trixie's repos. Fetching Ubuntu's
         # package wouldn't help (same staleness); instead fetch Debian's
         # own current keyring package directly -- pinned to an exact
-        # version and verified against both its own published SHA256 and
-        # the SHA256 trixie's own (GPG-signed) `Packages` index lists for
-        # that exact file, then `dpkg -i` the verified file only (never
+        # version and verified against the SHA256 pinned here in the repo
+        # (the actual trust anchor) plus, as a plausibility cross-check, the
+        # SHA256 trixie's `Packages` index lists for that exact file, then
+        # `dpkg -i` the verified file only (never
         # `apt-get install` from an untrusted-at-this-point source, and
         # never `[trusted=yes]`/a disabled signature check).
         run: |
@@ -268,10 +269,10 @@ jobs:
           curl -fsSL -o "/tmp/${keyring_file}" \
             "https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/${keyring_file}"
           echo "${keyring_sha256}  /tmp/${keyring_file}" | sha256sum -c -
-          # Cross-check: the same SHA256 as trixie's own signed Packages
-          # index lists for this exact version, independent confirmation
-          # that the file fetched over plain HTTPS matches what the
-          # GPG-signed archive metadata itself declares.
+          # Plausibility cross-check against trixie's Packages index. Note:
+          # Packages.gz is fetched over HTTPS but NOT GPG-verified here (only
+          # InRelease is signed) -- the repo-pinned SHA256 above is what the
+          # trust actually rests on; a mismatch here still aborts the build.
           curl -fsSL "https://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.gz" \
             | gunzip -c \
             | awk -v want="${keyring_sha256}" '
