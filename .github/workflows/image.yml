@@ -16,7 +16,13 @@ on:
       - "protocol/registration.py"
       - "tools/check_image_config.py"
       - ".github/workflows/image.yml"
-  # Manual run for a specific commit, e.g. to confirm a merge commit on main.
+  # Manual run for a specific commit, e.g. to confirm a merge commit on
+  # main actually builds. Each build job below is individually gated with
+  # `if: startsWith(github.ref, 'refs/tags/v') || github.event_name ==
+  # 'workflow_dispatch'`, so a manual run also exercises
+  # build-watchdog-binaries/build-pi-image/build-x86-image (uploading the
+  # .img.xz + SHA256SUMS as plain workflow artifacts) -- but never
+  # publish-release, which stays gated on the tag alone, below.
   workflow_dispatch:
 
 permissions:
@@ -40,15 +46,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends shellcheck
-          shellcheck image/common/install.sh image/common/firstboot-wifi.sh image/common/apt/fetch-docker-key.sh
+          shellcheck image/common/install.sh image/common/firstboot-wifi.sh \
+            image/common/apt/fetch-docker-key.sh image/x86/mkosi.postinst.chroot
 
   # Builds the three watchdog binaries once, for both architectures, and
   # hands them to the two real image-build jobs below as artifacts -- the
   # same binaries go.yml's own "build" job produces, just also available to
-  # this workflow without a cross-workflow artifact download. Runs only on a
-  # `v*` tag: section 19.4's own "does not belong in every commit".
+  # this workflow without a cross-workflow artifact download. Runs on a
+  # `v*` tag (section 19.4's own "does not belong in every commit") or a
+  # manual `workflow_dispatch` run -- the latter for confirming a real
+  # build on a specific commit (e.g. a merge to main) without cutting a
+  # release: `publish-release` below stays gated on the tag alone, so a
+  # manual run only ever uploads workflow artifacts, never a GitHub
+  # release asset.
   build-watchdog-binaries:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -92,9 +104,11 @@ jobs:
   # here, see this task's own report) -- syntax-checked with actionlint and
   # reviewed against pi-gen's own documented `build-docker.sh` usage
   # instead. A real run takes 30-60 minutes, which is why it is gated on a
-  # `v*` tag rather than every push.
+  # `v*` tag or a manual `workflow_dispatch` run rather than every push --
+  # see build-watchdog-binaries above for why workflow_dispatch is
+  # included here too (uploads a workflow artifact only, never a release).
   build-pi-image:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: build-watchdog-binaries
     runs-on: ubuntu-latest
     steps:
@@ -180,8 +194,9 @@ jobs:
   # **Not run in this sandbox** (needs a Linux loop-device/systemd-nspawn
   # environment this macOS worktree does not have) -- syntax-checked with
   # actionlint and reviewed against mkosi's own documented CLI instead.
+  # Same `workflow_dispatch` addition as build-pi-image above, same reason.
   build-x86-image:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: build-watchdog-binaries
     runs-on: ubuntu-latest
     steps:
@@ -234,6 +249,12 @@ jobs:
   # version number to keep in sync any more -- the tag itself is that
   # number, for the watchdog binaries inside the image and for the image
   # file name alike.
+  #
+  # Deliberately NOT extended with `|| github.event_name ==
+  # 'workflow_dispatch'` the way the three build jobs above were: a manual
+  # run exists to confirm a real build works, never to publish a GitHub
+  # release asset without a tag. `needs: [build-pi-image, build-x86-image]`
+  # alone would not stop that -- this job's own `if:` has to.
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-pi-image, build-x86-image]

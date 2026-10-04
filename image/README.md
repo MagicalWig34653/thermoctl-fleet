@@ -13,7 +13,7 @@ prepared image, they belong to Debian.
 |---|---|---|
 | Base | Raspberry Pi OS Lite **64-bit** (Debian 13 "Trixie", kernel 6.12 LTS) | Debian 13 "Trixie" **amd64**, minimal |
 | For | Raspberry Pi 4 and 5 | Mini PC with N100, thin client, everything else |
-| Differences | Raspberry Pi kernel/firmware, FAT32 boot partition under `/boot/firmware` | Debian kernel, EFI boot |
+| Differences | Raspberry Pi kernel/firmware, FAT32 boot partition under `/boot/firmware` | Debian kernel, EFI boot, ESP mounted at `/boot/firmware` too (see "Boot partition path" below) |
 
 [`common/`](common/) contains everything else: the package list, the udev
 rule for the Zigbee stick, the `unattended-upgrades` configuration, the
@@ -62,6 +62,164 @@ therefore theoretically an on-site visit. Against that: security updates in
 Debian are narrowly scoped and rarely break, the application has its own
 A/B safeguard via the digests (section 17), and for the rest a prepared
 replacement device sits on the shelf.
+
+## Boot partition path
+
+Both images mount their boot partition at the **same path, `/boot/firmware`**
+-- not just "by convention", enforced: `tools/check_image_config.py`'s
+`check_boot_partition_path_consistency` fails the build if any consumer
+disagrees. This closes a gap found during cross-review: the Pi image's boot
+partition is `/boot/firmware` (Raspberry Pi OS's own layout), but mkosi's
+own default for a bootable disk image mounts the amd64 ESP at `/efi`
+instead (Debian's kernel package leaves files under `/boot`, which is why
+`systemd-gpt-auto-generator`'s own fallback picks `/efi` rather than
+`/boot` here -- see that generator's own manual page, "mounted to `/boot/`
+if that directory is not used ..., and otherwise to `/efi/`"). Meanwhile
+every consumer of the boot partition -- `agent/registration.py
+::DEFAULT_REGISTRATION_FILE`, `agent/encryption.py
+::DEFAULT_RECIPIENTS_FILE`, `common/agent-compose.yml`'s two read-only
+bind mounts, `common/install.sh`'s own template placement -- already
+hard-codes `/boot/firmware` unconditionally, because that is this
+repository's own convention (see each file's own comment), not something
+that was ever meant to differ per target.
+
+**Chosen fix: make the amd64 image mount its ESP at `/boot/firmware` too**,
+rather than the alternatives considered:
+
+- *A single configurable path, threaded through every consumer* -- rejected.
+  It would turn one fixed, hard-coded security-relevant path (CLAUDE.md:
+  "nothing hard-coded except the security principles", and section 19.5's
+  "almost nothing" on the boot partition) into a parameter nothing except
+  the image build itself should ever need to vary, for no benefit: both
+  targets are meant to behave identically from the agent's point of view.
+  It would also widen the surface `check_boot_partition_path_consistency`
+  has to check (a config value instead of a single constant) for zero
+  gain.
+- *A symlink from `/efi` (or vice versa) to `/boot/firmware`* -- rejected
+  per this task's own instruction and for a concrete reason beyond that:
+  the boot partition is FAT, writable by firmware/bootloader and, on a
+  real device, by whoever can swap the storage medium before first boot;
+  a symlink one of these paths resolves through is exactly the kind of
+  thing `image/common/firstboot-wifi.sh`'s own symlink-rejection logic
+  (`test_symlink_is_rejected_without_touching_target`) exists to not have
+  to trust.
+- **Make amd64 mount its ESP at `/boot/firmware` (chosen).** Two pieces,
+  both amd64-only -- the Pi side is already correct and untouched:
+  - [`x86/mkosi.repart/00-esp.conf`](x86/mkosi.repart/00-esp.conf) overrides
+    mkosi's own built-in ESP partition definition: `Label=ESP` (a known,
+    fixed GPT partition label to mount by) and `CopyFiles=/boot/firmware:/`
+    instead of mkosi's own default `CopyFiles=/boot:/` (which would nest
+    this repository's own boot-partition files one level too deep once
+    the same partition is mounted back at `/boot/firmware`, see that
+    file's own comment for the exact mechanism).
+    [`x86/mkosi.repart/10-root.conf`](x86/mkosi.repart/10-root.conf) carries
+    forward mkosi's own default root-partition definition unchanged --
+    providing any file under `mkosi.repart/` disables **all** of mkosi's
+    own defaults, not just the one being overridden.
+  - [`x86/mkosi.postinst.chroot`](x86/mkosi.postinst.chroot) writes a
+    static `/etc/fstab` line (`PARTLABEL=ESP /boot/firmware vfat defaults
+    0 2`) into the finished image. A static fstab entry for a partition
+    is what actually moves the mount: `systemd-gpt-auto-generator(8)`
+    skips generating its own unit for the ESP once an fstab entry for it
+    exists under the `/boot/` hierarchy (`/boot/firmware` qualifies),
+    so this one line is what overrides the `/efi` default, not merely a
+    label.
+
+This repository's own files -- `agent/registration.py`,
+`agent/encryption.py`, `common/agent-compose.yml`, `common/install.sh`,
+`common/firstboot-wifi.sh` and its unit, and `tools/flash_image.py` --
+already assumed one path, unchanged by this fix; the gap was exclusively
+in what the amd64 image itself mounted there. `common/firstboot-wifi.sh`
+and `thermoctl-firstboot-wifi.service` did carry a second, `/efi`-specific
+branch before this fix (to tolerate the old amd64 behaviour); that branch
+is now removed rather than left dormant, so a future regression back to
+`/efi` shows up as a missing file (and a failed
+`check_boot_partition_path_consistency`), not as silently-working
+dual-path tolerance.
+
+### Stock boot tooling still needs `/efi` -- a second mount, not a reversion
+
+Main-session review of this fix found a real gap in it: `bootctl` and
+`kernel-install` -- not this repository's own code, but the stock Debian
+tools every future kernel update runs through -- have **no** override for
+where they look for the ESP other than three hard-coded paths, `/efi`,
+`/boot`, and `/boot/efi` (`bootctl(1)`/`kernel-install(8)`,
+`--esp-path=`/`--boot-path=`: "If not specified, `/efi/`, `/boot/`, and
+`/boot/efi/` are checked in turn"). Mounting the ESP *only* at
+`/boot/firmware` makes it invisible to that autodetection entirely.
+Confirmed against the actual Debian 13 "trixie" `systemd` source package
+(`257.13-1~deb13u1`): the `systemd-boot` package ships
+`/etc/kernel/postinst.d/zz-systemd-boot`
+(`debian/extra/kernel/postinst.d/zz-systemd-boot`), the hook that runs on
+**every** kernel update, as exactly:
+
+```sh
+test -x /usr/bin/bootctl || exit 0
+bootctl is-installed --quiet || exit 0
+kernel-install add "$1" "$2"
+```
+
+An unconditional, argument-less `bootctl is-installed --quiet` gate, with
+no flag or environment variable to tell it where the ESP actually is.
+Without a real ESP at one of its three fixed paths, that check fails, the
+hook exits `0` silently, and `kernel-install add` is never even attempted
+-- every kernel update from `unattended-upgrades` (enabled by this image,
+`common/unattended-upgrades/`) would install a new kernel on disk and
+never place a UKI for it on the ESP, with **no error anywhere**. The same
+applies to `systemd-boot-update.service` (`ExecStart=bootctl --graceful
+update`, upstream unit, unmodified), which updates the `systemd-boot`
+loader binary itself on every boot.
+
+**Fix: `x86/mkosi.postinst.chroot` also bind-mounts the same partition at
+`/efi`** (`/boot/firmware /efi none bind,nofail,x-systemd.requires-mounts
+-for=/boot/firmware`), rather than overriding every individual tool that
+touches the ESP (`bootctl`'s own `--esp-path=` has no persistent
+config-file form; Debian's hook above has no flag at all). A bind mount,
+not a second mount of the same `PARTLABEL=ESP` by device -- one coherent
+view, two paths. **Still not a symlink**: the same reasoning as above
+applies doubly here, since `bootctl`/`kernel-install` would be exactly the
+tools a hostile FAT partition's own symlink target could redirect. A bind
+mount is a kernel-level second mount point of the same block device,
+configured in `/etc/fstab`, entirely outside FAT's own namespace -- a
+hostile medium cannot redirect it the way it could a symlink resolved
+through the FAT filesystem itself.
+
+This also makes `/efi` a real, valid ESP again from `kernel-install`'s own
+"$BOOT partition" autodetection (same three paths, `/efi` checked first),
+so **no** `BOOT_ROOT=` override is needed in `/etc/kernel/install.conf`.
+What *is* still pinned explicitly, in a new
+`/etc/kernel/install.conf.d/thermoctl.conf` drop-in `mkosi.postinst.chroot`
+writes: `layout=uki`. Left to `kernel-install`'s own `auto` detection,
+layout only resolves to `uki` when the kernel binary itself is a UKI
+(`kernel-install(8)`, `auto`: "If the kernel is a UKI set layout to uki[;]
+if not[,] default to bls if ... or other otherwise") -- a plain
+apt-installed `linux-image-amd64` kernel is not, so `auto` would silently
+land on `bls` or `other` instead, and `kernel-install`'s own
+`90-uki-copy.install` plugin only runs for `uki`. Pinning it explicitly
+makes every future kernel update produce a UKI the same way this image's
+own build already does (`Bootloader=systemd-boot`, `x86/mkosi.conf`),
+instead of silently stopping at some unpredictable future point with no
+error.
+
+`tools/check_image_config.py`'s `check_boot_partition_path_consistency`
+now also asserts both of these are present in `mkosi.postinst.chroot`
+(the `/efi` bind-mount line and `layout=uki`), so a regression dropping
+either fails the same way a regression to the old dual-path version
+already does.
+
+**Verification status, explicitly:** everything in this section is
+derived from reading `bootctl(1)`, `kernel-install(8)`, and the actual
+Debian 13 `systemd` source package's own kernel postinst hook -- **not**
+from an actual amd64 build-and-boot test, let alone a real kernel-update
+cycle against a built image. The sandbox this work was done in has no
+Linux loop-device/systemd-nspawn environment to run a real `mkosi build`,
+nor a real device to boot it on and run `apt upgrade` against a kernel
+package, so neither the bind mount's effect on `bootctl`'s own
+autodetection nor `kernel-install add`'s actual output under `layout=uki`
+has been observed directly. This -- a real `mkosi build`, a real boot,
+and ideally a real simulated kernel update -- stays the open point for
+this whole section, on top of the one already named in "State of this
+scaffold" below.
 
 ## State of this scaffold
 
@@ -117,8 +275,8 @@ image without ever touching a disk, for a quick sanity check or in a test.
 
 If Wi-Fi credentials are supplied, `flash_image.py` writes
 `thermoctl/wifi.env` on the boot partition. The Wi-Fi importer checks
-`/boot/firmware` on Pi and `/efi` on the amd64 mkosi image. The shared recipe
-installs NetworkManager and enables
+`/boot/firmware` on both targets now ("Boot partition path" above). The
+shared recipe installs NetworkManager and enables
 `thermoctl-firstboot-wifi.service`, which runs before the NetworkManager
 online wait. Its script accepts exactly `SSID=<1..32 bytes>` and
 `PASSWORD=<8..63 printable ASCII bytes or 64 hex digits>`, creates or updates
@@ -128,10 +286,8 @@ and removed with an error; if NetworkManager cannot save the profile, the
 file remains for a retry on the next boot. FAT and flash wear leveling mean
 overwriting is not a forensic erase of earlier physical copies, so keep the
 unbooted card or drive under physical control.
-The amd64 mkosi image still needs an end-to-end boot test. Other boot files
-used by the agent (`agent-registration.json` and backup recipients) still
-assume `/boot/firmware` on amd64; this Wi-Fi importer does not resolve that
-separate mount-path gap.
+The amd64 mkosi image still needs an end-to-end boot test ("Boot partition
+path" above).
 
 ### 2. Build the images in CI (`.github/workflows/image.yml`)
 

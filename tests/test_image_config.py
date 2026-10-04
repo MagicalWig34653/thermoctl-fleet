@@ -13,11 +13,13 @@ from pathlib import Path
 import pytest
 
 from tools.check_image_config import (
+    BOOT_PARTITION_PATH,
     IMAGE_DIR,
     ImageError,
     check_agent_compose_file,
     check_agent_registration_template,
     check_all,
+    check_boot_partition_path_consistency,
     check_docker_apt_preferences,
     check_docker_apt_source,
     check_docker_key_fetch,
@@ -43,13 +45,31 @@ def test_firstboot_wifi_unit_requires_boot_path_and_ordering(tmp_path: Path) -> 
     content = original.read_text(encoding="utf-8")
     for required in (
         "ConditionPathExists=|/boot/firmware/thermoctl/wifi.env",
-        "ConditionPathExists=|/efi/thermoctl/wifi.env",
         "Before=NetworkManager-wait-online.service network-online.target",
         "ExecStart=/usr/local/bin/thermoctl-firstboot-wifi",
     ):
         path.write_text(content.replace(required, ""), encoding="utf-8")
         with pytest.raises(ImageError):
             check_firstboot_wifi_unit(path)
+
+
+def test_firstboot_wifi_unit_rejects_reintroduced_efi_path(tmp_path: Path) -> None:
+    # The amd64 boot-path gap (image/README.md, "Boot partition path") was
+    # closed by making the amd64 image mount its ESP at /boot/firmware
+    # too, not by teaching this unit a second, per-target path -- a
+    # regression back to a dual-path version (which would otherwise still
+    # contain every line `check_firstboot_wifi_unit`'s own `required` set
+    # checks for) must still fail.
+    original = IMAGE_DIR / "common/thermoctl-firstboot-wifi.service"
+    path = tmp_path / "thermoctl-firstboot-wifi.service"
+    content = original.read_text(encoding="utf-8").replace(
+        "ConditionPathExists=|/boot/firmware/thermoctl/wifi.env\n",
+        "ConditionPathExists=|/boot/firmware/thermoctl/wifi.env\n"
+        "ConditionPathExists=|/efi/thermoctl/wifi.env\n",
+    )
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ImageError, match="/efi"):
+        check_firstboot_wifi_unit(path)
 
 
 def test_package_list_rejects_empty_file(tmp_path: Path) -> None:
@@ -687,3 +707,162 @@ def test_x86_mkosi_hook_is_chrooted_and_sources_are_staged() -> None:
     assert "mkosi.extra/opt/thermoctl-build" in workflow
     assert "cp -r image/common" in workflow
     assert "cp -r image/x86/watchdog-bin" in workflow
+
+
+def test_boot_partition_path_consistency_passes_for_the_real_configuration() -> None:
+    check_boot_partition_path_consistency(IMAGE_DIR)
+
+
+def test_boot_partition_path_consistency_rejects_a_drifted_agent_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.check_image_config as check_image_config
+
+    monkeypatch.setattr(
+        check_image_config, "DEFAULT_REGISTRATION_FILE", Path("/efi/agent-registration.json")
+    )
+    with pytest.raises(ImageError, match="DEFAULT_REGISTRATION_FILE"):
+        check_boot_partition_path_consistency(IMAGE_DIR)
+
+
+def test_boot_partition_path_consistency_rejects_a_drifted_recipients_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.check_image_config as check_image_config
+
+    monkeypatch.setattr(
+        check_image_config,
+        "DEFAULT_RECIPIENTS_FILE",
+        Path("/efi/thermoctl/backup-recipients.txt"),
+    )
+    with pytest.raises(ImageError, match="DEFAULT_RECIPIENTS_FILE"):
+        check_boot_partition_path_consistency(IMAGE_DIR)
+
+
+def test_boot_partition_path_consistency_rejects_a_compose_file_missing_the_mount(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "image"
+    common = root / "common"
+    common.mkdir(parents=True)
+    for name in ("agent-compose.yml", "install.sh"):
+        (common / name).write_text("", encoding="utf-8")
+    x86 = root / "x86"
+    x86.mkdir()
+    (x86 / "mkosi.postinst.chroot").write_text(
+        f"FSTAB_LINE='PARTLABEL=ESP {BOOT_PARTITION_PATH} vfat defaults 0 2'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError, match="boot-partition mount"):
+        check_boot_partition_path_consistency(root)
+
+
+def test_boot_partition_path_consistency_rejects_install_sh_missing_the_template(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "image"
+    common = root / "common"
+    common.mkdir(parents=True)
+    (common / "agent-compose.yml").write_text(
+        f"- {BOOT_PARTITION_PATH}/thermoctl:{BOOT_PARTITION_PATH}/thermoctl:ro\n"
+        f"- {BOOT_PARTITION_PATH}/agent-registration.json:"
+        f"{BOOT_PARTITION_PATH}/agent-registration.json:ro\n",
+        encoding="utf-8",
+    )
+    (common / "install.sh").write_text("", encoding="utf-8")
+    x86 = root / "x86"
+    x86.mkdir()
+    (x86 / "mkosi.postinst.chroot").write_text(
+        f"FSTAB_LINE='PARTLABEL=ESP {BOOT_PARTITION_PATH} vfat defaults 0 2'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ImageError, match="install.sh"):
+        check_boot_partition_path_consistency(root)
+
+
+def test_boot_partition_path_consistency_rejects_a_postinst_still_mounting_efi(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "image"
+    common = root / "common"
+    common.mkdir(parents=True)
+    (common / "agent-compose.yml").write_text(
+        f"- {BOOT_PARTITION_PATH}/thermoctl:{BOOT_PARTITION_PATH}/thermoctl:ro\n"
+        f"- {BOOT_PARTITION_PATH}/agent-registration.json:"
+        f"{BOOT_PARTITION_PATH}/agent-registration.json:ro\n",
+        encoding="utf-8",
+    )
+    (common / "install.sh").write_text(f"{BOOT_PARTITION_PATH}/thermoctl\n", encoding="utf-8")
+    x86 = root / "x86"
+    x86.mkdir()
+    (x86 / "mkosi.postinst.chroot").write_text(
+        "FSTAB_LINE='PARTLABEL=ESP /efi vfat defaults 0 2'\n", encoding="utf-8"
+    )
+    with pytest.raises(ImageError, match="mkosi.postinst.chroot"):
+        check_boot_partition_path_consistency(root)
+
+
+def _write_valid_boot_partition_fixture(root: Path, postinst_content: str) -> None:
+    common = root / "common"
+    common.mkdir(parents=True)
+    (common / "agent-compose.yml").write_text(
+        f"- {BOOT_PARTITION_PATH}/thermoctl:{BOOT_PARTITION_PATH}/thermoctl:ro\n"
+        f"- {BOOT_PARTITION_PATH}/agent-registration.json:"
+        f"{BOOT_PARTITION_PATH}/agent-registration.json:ro\n",
+        encoding="utf-8",
+    )
+    (common / "install.sh").write_text(f"{BOOT_PARTITION_PATH}/thermoctl\n", encoding="utf-8")
+    x86 = root / "x86"
+    x86.mkdir()
+    (x86 / "mkosi.postinst.chroot").write_text(postinst_content, encoding="utf-8")
+
+
+def test_boot_partition_path_consistency_rejects_a_postinst_missing_the_efi_bind_mount(
+    tmp_path: Path,
+) -> None:
+    # Main-session review finding: bootctl/kernel-install, and in
+    # particular Debian's own kernel postinst hook
+    # (/etc/kernel/postinst.d/zz-systemd-boot), only ever look for the
+    # ESP at /efi, /boot, or /boot/efi -- mounting it only at
+    # BOOT_PARTITION_PATH leaves every future kernel update unable to
+    # find it, silently.
+    root = tmp_path / "image"
+    _write_valid_boot_partition_fixture(
+        root,
+        f"FSTAB_LINE='PARTLABEL=ESP {BOOT_PARTITION_PATH} vfat defaults 0 2'\n"
+        "layout=uki\n",
+    )
+    with pytest.raises(ImageError, match="bind-mount"):
+        check_boot_partition_path_consistency(root)
+
+
+def test_boot_partition_path_consistency_rejects_a_postinst_missing_layout_uki(
+    tmp_path: Path,
+) -> None:
+    # Without layout=uki pinned, kernel-install's own "auto" layout
+    # detection may silently stop producing a UKI for a future kernel.
+    root = tmp_path / "image"
+    _write_valid_boot_partition_fixture(
+        root,
+        f"FSTAB_LINE='PARTLABEL=ESP {BOOT_PARTITION_PATH} vfat defaults 0 2'\n"
+        f"FSTAB_BIND_LINE='{BOOT_PARTITION_PATH} /efi none bind,nofail'\n",
+    )
+    with pytest.raises(ImageError, match="layout=uki"):
+        check_boot_partition_path_consistency(root)
+
+
+def test_boot_partition_path_consistency_passes_a_complete_minimal_fixture(
+    tmp_path: Path,
+) -> None:
+    # Confirms the helper fixture above is actually valid end to end (not
+    # just "raises for the right reason" in the two negative tests), so a
+    # typo in the helper itself can't silently make both negative tests
+    # pass for the wrong reason.
+    root = tmp_path / "image"
+    _write_valid_boot_partition_fixture(
+        root,
+        f"FSTAB_LINE='PARTLABEL=ESP {BOOT_PARTITION_PATH} vfat defaults 0 2'\n"
+        f"FSTAB_BIND_LINE='{BOOT_PARTITION_PATH} /efi none bind,nofail'\n"
+        "layout=uki\n",
+    )
+    check_boot_partition_path_consistency(root)
