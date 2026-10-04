@@ -40,7 +40,12 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - run: pip install -e .
+      # tools/check_image_config.py imports agent.encryption/agent.registration
+      # (DEFAULT_RECIPIENTS_FILE / DEFAULT_REGISTRATION_FILE) -- a plain
+      # `pip install -e .` only pulls the base `pydantic` dependency, so the
+      # `agent` extra (pyrage, cryptography, httpx, ...) has to come along;
+      # `fleet` is not needed here, keeping the job minimal.
+      - run: pip install -e ".[agent]"
       - run: python -m tools.check_image_config
       - name: shellcheck image/common/install.sh
         run: |
@@ -120,7 +125,14 @@ jobs:
           name: watchdog-binaries-arm64
           path: thermoctl-fleet/image/pi/pi-gen-stage/01-thermoctl/files/usr-local-bin
       - name: Clone pi-gen
-        run: git clone --depth 1 --branch arm64 https://github.com/RPi-Distro/pi-gen.git pi-gen
+        # Pinned commit on pi-gen's own `arm64` branch (the branch that
+        # defaults RELEASE to trixie and supports building arm64 images --
+        # the `master` branch targets armhf) instead of a floating branch
+        # tip, so a future upstream pi-gen change cannot silently break
+        # this job.
+        run: |
+          git clone https://github.com/RPi-Distro/pi-gen.git pi-gen
+          git -C pi-gen checkout 4d8ee447dd3d37e8b0ef8752e460d9082d9d435d
       - name: Install pi-gen's own build dependencies (loop device tooling, qemu-user-static)
         run: |
           sudo apt-get update
@@ -146,16 +158,25 @@ jobs:
           # into a finished .img at the end of the run (pi-gen's own
           # convention -- an empty marker file is enough).
           touch "$STAGE_DST/EXPORT_IMAGE"
-      - name: Build with pi-gen (build-docker.sh)
-        env:
-          IMG_NAME: thermoctl-base-station
-          RELEASE: trixie
-          PI_GEN_RELEASE: false
-          DEPLOY_COMPRESSION: none
+      - name: Write pi-gen config
+        # build-docker.sh (unlike build.sh) does not read these as process
+        # environment variables -- it only `source`s a `config` file, either
+        # ${DIR}/config or one passed via `-c`. Without that file it fails
+        # with `realpath: '': No such file or directory` before ever
+        # reaching IMG_NAME/RELEASE/STAGE_LIST, which is exactly what the
+        # first real run hit.
+        run: |
+          cat > pi-gen/config <<'EOF'
+          IMG_NAME=thermoctl-base-station
+          RELEASE=trixie
+          PI_GEN_RELEASE=false
+          DEPLOY_COMPRESSION=none
           # Only through our own stage and the two base stages it depends
           # on -- pi-gen's own stage2 is "Raspberry Pi OS Lite", everything
           # from stage3 on (desktop, docs, ...) is explicitly skipped.
-          STAGE_LIST: "stage0 stage1 stage2 stage-thermoctl"
+          STAGE_LIST="stage0 stage1 stage2 stage-thermoctl"
+          EOF
+      - name: Build with pi-gen (build-docker.sh)
         run: |
           cd pi-gen
           ./build-docker.sh
@@ -208,10 +229,22 @@ jobs:
           name: watchdog-binaries-amd64
           path: thermoctl-fleet/image/x86/watchdog-bin
       - name: Install mkosi
+        # Pinned to v20.2 instead of `apt-get install mkosi` -- the
+        # Ubuntu-runner apt mirror's mkosi package version floats with the
+        # runner image (20.2-1 on the noble image this job currently runs
+        # on), and mkosi's own config syntax has changed between major
+        # versions (e.g. the `OutputFormat=` setting image/x86/mkosi.conf
+        # used to carry does not exist in 20.x). mkosi is not published on
+        # PyPI, so pip installs straight from the upstream tag; `[bootable]`
+        # pulls in `pefile`, needed for the systemd-boot/UKI path this
+        # image's `Bootloader=systemd-boot` setting uses.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            mkosi debootstrap systemd-container qemu-utils dosfstools
+            debootstrap systemd-container qemu-utils dosfstools
+          sudo pip install --break-system-packages \
+            "mkosi[bootable] @ git+https://github.com/systemd/mkosi@v20.2"
+          mkosi --version
       - name: Stage repository inputs inside the image
         working-directory: thermoctl-fleet
         run: |
