@@ -1,48 +1,50 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
-{% block title %}Passkeys – thermoctl-fleet{% endblock %}
+{% block title %}Konto – thermoctl-fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Konto{% endblock %}
 
 {% block content %}
-<h1>Passkeys</h1>
-{% if not webauthn_enabled %}
-<p>Passkeys sind auf diesem Server nicht konfiguriert.</p>
-{% else %}
-
-<h2>Vorhandene Passkeys</h2>
-{% if credentials %}
-<ul>
+<div class="page-heading"><div><div class="eyebrow">Einstellungen</div><h1>Ihr Konto.</h1><p class="subtitle">Anmeldung und Zugriff auf Ihre Fleet-Verwaltung.</p></div></div>
+<section class="panel account-card" aria-labelledby="account-heading">
+    <h2 id="account-heading">{{ ui_session.user.username if ui_session else 'Hausverwaltung' }}</h2>
+    <div class="list-row"><span>Rolle</span><span class="badge">Administrator</span></div>
+    <div class="list-row"><span>Passkeys<small>Mit einem Sicherheitsschlüssel oder Ihrem Gerät anmelden.</small></span><span class="badge {{ 'gray' if not webauthn_enabled else '' }}">{{ 'Verfügbar' if webauthn_enabled else 'Nicht konfiguriert' }}</span></div>
+    <div class="list-row"><span>Zwei-Faktor-Anmeldung<small>Authenticator-App eingerichtet</small></span><span class="badge">Aktiv</span></div>
+</section>
+{% if webauthn_enabled %}
+<section class="panel account-card account-passkeys" aria-labelledby="passkeys-heading">
+    <div class="section-head"><h2 id="passkeys-heading">Vorhandene Passkeys</h2><span class="badge gray">{{ credentials | length }}</span></div>
+    {% if credentials %}
     {% for credential in credentials %}
-    <li>
-        {{ credential.label }}
-        <form method="post" action="/ui/account/webauthn/delete" class="inline-form">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="credential_id" value="{{ credential.id.hex() }}">
-            <button type="submit" class="button--danger">Entfernen</button>
-        </form>
-    </li>
+    <div class="list-row"><span>{{ icons.icon("key") }} {{ credential.label }}</span><form method="post" action="/ui/account/webauthn/delete" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="credential_id" value="{{ credential.id.hex() }}">
+        <button type="submit" class="button button--danger">Entfernen</button>
+    </form></div>
     {% endfor %}
-</ul>
-{% else %}
-<p>Noch kein Passkey registriert.</p>
-{% endif %}
-
-<h2>Neuen Passkey registrieren</h2>
-<p id="webauthn-register-error" class="error" role="alert"></p>
-<form id="webauthn-register-reauth-form">
-    <label for="reauth_totp_code"><span class="field-label-text">Aktueller Bestätigungscode (zur Bestätigung)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-        <input type="text" id="reauth_totp_code" inputmode="numeric" autocomplete="one-time-code" required>
-    </label>
-    <label for="passkey_label"><span class="field-label-text">Bezeichnung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-        <input type="text" id="passkey_label" value="Passkey" required>
-    </label>
-    <input type="hidden" id="csrf_token" value="{{ csrf_token }}">
-    <button type="submit">Passkey registrieren</button>
-</form>
-{% endif %}
+    {% else %}<p class="subtitle">Noch kein Passkey registriert.</p>{% endif %}
+</section>
+<section class="panel account-card account-passkeys" aria-labelledby="register-heading">
+    <h2 id="register-heading">Passkey hinzufügen</h2>
+    <p class="subtitle">Bestätigen Sie die Registrierung mit dem aktuellen Code Ihrer Authenticator-App.</p>
+    <p id="webauthn-register-error" class="error" role="alert"></p>
+    <form id="webauthn-register-reauth-form" class="ui-form">
+        <label for="reauth_totp_code"><span class="field-label-text">Aktueller Bestätigungscode (zur Bestätigung)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+            <input type="text" id="reauth_totp_code" inputmode="numeric" autocomplete="one-time-code" required>
+        </label>
+        <label for="passkey_label"><span class="field-label-text">Bezeichnung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+            <input type="text" id="passkey_label" value="Passkey" required>
+        </label>
+        <input type="hidden" id="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="button primary">Passkey registrieren</button>
+    </form>
+</section>
+{% else %}<p class="privacy">{{ icons.icon("shield") }} Passkeys sind auf diesem Server nicht konfiguriert.</p>{% endif %}
+<p class="privacy">{{ icons.icon("shield") }} Fleet empfängt Zustandsdaten. Temperaturen, Zeitpläne und Mieterdaten bleiben in der Wohnung.</p>
 {% endblock %}
 
 {% block scripts %}
-{% if webauthn_enabled %}
-<script src="/ui/static/webauthn.js"></script>
-{% endif %}
+{% if webauthn_enabled %}<script src="/ui/static/webauthn.js"></script>{% endif %}
 {% endblock %}

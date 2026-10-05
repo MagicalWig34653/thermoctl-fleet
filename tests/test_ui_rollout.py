@@ -594,6 +594,10 @@ def test_detail_view_shows_apartments(
     response = client.get(f"/ui/rollouts/{rollout.id}")
     assert response.status_code == 200
     assert PILOT_APARTMENT in response.text
+    assert '<progress class="update-progress" value="0" max="1">' in response.text
+    assert 'id="rollout-confirm-dialog"' in response.text
+    assert 'data-rollout-confirm="Abbrechen"' in response.text
+    assert 'src="/ui/static/rollout-confirm.js"' in response.text
 
 
 def test_resume_requires_reason_and_cancel_writes_audit(

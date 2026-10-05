@@ -1,10 +1,15 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
 {% block title %}Rollout bestätigen – thermoctl-fleet{% endblock %}
 
+{% block main_class %}{% endblock %}
+{% block crumb %}Updates{% endblock %}
+
 {% block content %}
+<div class="page-heading"><div><div class="eyebrow">Software</div><h1>Rollout prüfen.</h1><p class="subtitle">Auswahl und Zielstand vor dem Start bestätigen.</p></div></div>
 <p><a href="/ui/rollouts/new">&larr; Zurück zur Bearbeitung</a></p>
-<h1>Rollout bestätigen</h1>
+<h2 class="subpage-title">Rollout bestätigen</h2>
 
 <p class="error" role="alert">
     Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten, Pilotbetrieb
@@ -15,7 +20,7 @@
 <p><strong>{{ service_label }}</strong> &rarr; Version {{ version }}, Digest {{ digest }}</p>
 <p>Wartezeit nach Pilot: {{ stagger_hours }} h. Zeitüberschreitung je Wohnung: {{ timeout_hours }} h.</p>
 
-<ol>
+<ol class="rollout-confirm-list">
     {% for apartment_id in ordered_apartment_ids %}
     <li>{{ apartment_id }}{% if apartment_id == test_apartment_id %} (Testwohnung){% endif %}</li>
     {% endfor %}
@@ -25,7 +30,7 @@
 <p class="error" role="alert">{{ error }}</p>
 {% endif %}
 
-<form method="post" action="/ui/rollouts/confirm">
+<form class="ui-form panel" method="post" action="/ui/rollouts/confirm">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="service" value="{{ service }}">
     <input type="hidden" name="version" value="{{ version }}">
@@ -39,6 +44,6 @@
     <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="reason" name="reason" required>
     </label>
-    <button type="submit">Rollout starten</button>
+    <button class="button primary" type="submit">Rollout starten</button>
 </form>
 {% endblock %}

@@ -1,19 +1,24 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
 {% block title %}Wohnung bearbeiten – thermoctl-fleet{% endblock %}
 
+{% block main_class %}{% endblock %}
+{% block crumb %}Einrichtung{% endblock %}
+
 {% block content %}
+<div class="page-heading"><div><div class="eyebrow">Verwaltung</div><h1>Wohnung bearbeiten</h1><p class="subtitle">Wohnung und Zuordnung pflegen.</p></div></div>
 {# "Inventar" (P4.1) -- edit an existing apartment's label, floor,
    orientation, heating circuits, state, and pilot_mode. The permanent id
    itself is never editable -- there is no field for it on this form. #}
-<p><a href="/ui/inventory">&larr; Zurück zum Inventar</a></p>
-<h1>Wohnung {{ apartment.id }} bearbeiten</h1>
+<p class="back"><a class="text-button" href="/ui/inventory">&larr; Zurück zum Inventar</a></p>
+<h2 class="subpage-title">Wohnung {{ apartment.id }} bearbeiten</h2>
 
 {% if error %}
 <p class="error" role="alert">{{ error }}</p>
 {% endif %}
 
-<form method="post" action="/ui/inventory/apartments/{{ apartment.id }}/edit">
+<form class="ui-form panel" method="post" action="/ui/inventory/apartments/{{ apartment.id }}/edit">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="label"><span class="field-label-text">Bezeichnung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="label" name="label" value="{{ apartment.label }}" required>
@@ -41,6 +46,6 @@
     <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="reason" name="reason" required>
     </label>
-    <button type="submit">Speichern</button>
+    <button class="button primary" type="submit">Speichern</button>
 </form>
 {% endblock %}

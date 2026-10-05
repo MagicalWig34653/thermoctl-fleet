@@ -422,7 +422,7 @@ def test_inventory_sections_and_apartment_line_render_without_script(
     assert 'action="/ui/inventory/properties"' not in devices.text
 
     steps = client.get("/ui/inventory?bereich=vorbereiten")
-    assert "Neue Basisstation vorbereiten" in steps.text
+    assert "Schritt für Schritt zur neuen Basisstation" in steps.text
     assert "?bereich=basisstationen#device-register-form" in steps.text
     assert 'action="/ui/inventory/devices"' not in steps.text
 

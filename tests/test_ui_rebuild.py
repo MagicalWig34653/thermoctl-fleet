@@ -304,7 +304,11 @@ def test_mobile_menu_works_as_a_plain_link_without_javascript(
 
 
 @pytest.mark.parametrize(
-    "path", ["/ui/", "/ui/apartments", "/ui/tasks", "/ui/inventory", "/ui/rollouts"]
+    "path",
+    [
+        "/ui/", "/ui/apartments", "/ui/tasks", "/ui/inventory",
+        "/ui/rollouts", "/ui/rollouts/new", "/ui/account/webauthn",
+    ],
 )
 def test_pages_satisfy_the_csp_no_inline_style_script_or_handler(
     client: TestClient, password: str, totp_secret: str, user_id: int, path: str
@@ -321,11 +325,14 @@ def test_pages_satisfy_the_csp_no_inline_style_script_or_handler(
         assert forbidden not in html
 
 
-def test_pages_that_are_not_rebuilt_yet_keep_the_legacy_wrapper(
-    client: TestClient, password: str, totp_secret: str, user_id: int
+@pytest.mark.parametrize(
+    "path", ["/ui/inventory", "/ui/rollouts", "/ui/rollouts/new", "/ui/account/webauthn"]
+)
+def test_rebuilt_pages_drop_the_legacy_wrapper(
+    client: TestClient, password: str, totp_secret: str, user_id: int, path: str
 ) -> None:
-    html = _login_and_get(client, password, totp_secret, "/ui/inventory")
-    assert '<main id="main" class="main legacy">' in html
+    html = _login_and_get(client, password, totp_secret, path)
+    assert '<main id="main" class="main">' in html
     assert "/ui/static/legacy.css" in html
 
     rebuilt = client.get("/ui/").text  # same session: a TOTP code may not be replayed
@@ -338,6 +345,7 @@ def test_static_assets_of_the_rebuild_are_served_same_origin(client: TestClient)
         ("legacy.css", "text/css"),
         ("auth.css", "text/css"),
         ("shell.js", "javascript"),
+        ("rollout-confirm.js", "javascript"),
         ("auth.js", "javascript"),
         ("favicon.svg", "image/svg+xml"),
     ):

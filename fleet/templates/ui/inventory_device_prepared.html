@@ -1,25 +1,30 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
 {% block title %}Gerät vorbereitet – thermoctl-fleet{% endblock %}
 
+{% block main_class %}{% endblock %}
+{% block crumb %}Einrichtung{% endblock %}
+
 {% block content %}
+<div class="page-heading"><div><div class="eyebrow">Neue Installation</div><h1>Basisstation vorbereitet.</h1><p class="subtitle">Registrierungscode sicher auf das Gerät übertragen.</p></div></div>
 {# Result page for "Vorbereiten" (P4.2, section 20.2 step 2, 15.3 step 1)
    – shows the one-time registration code exactly once (never logged,
    never stored in plain text – only its hash, see
    fleet/storage.py::Storage.prepare_device). #}
-<h1>Gerät {{ device_id }} vorbereitet</h1>
+<h2 class="subpage-title">Gerät {{ device_id }} vorbereitet</h2>
 
 <p>
     Dieser Registrierungscode wird nur jetzt angezeigt und nirgends im
     Klartext gespeichert. Auf die Boot-Partition des Geräts schreiben
     (<code>agent-registration.json</code>) oder sicher notieren.
 </p>
-<pre>{{ registration_code }}</pre>
+<pre class="inventory-code">{{ registration_code }}</pre>
 <p>Gültig bis: {{ expires_at }} (24 Stunden ab jetzt, oder bis zur ersten Verwendung).</p>
 
 <h2>Inhalt für agent-registration.json</h2>
 {% if registration_file_json %}
-<pre>{{ registration_file_json }}</pre>
+<pre class="inventory-code">{{ registration_file_json }}</pre>
 {% else %}
 <p class="error" role="alert">
     FLEET_PUBLIC_URL und/oder FLEET_CERT_FINGERPRINT sind nicht gesetzt – der
@@ -30,5 +35,5 @@
 </p>
 {% endif %}
 
-<p><a href="/ui/inventory">Zurück zum Inventar</a></p>
+<p class="back"><a class="text-button" href="/ui/inventory">Zurück zum Inventar</a></p>
 {% endblock %}

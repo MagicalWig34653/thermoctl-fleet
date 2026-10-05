@@ -1,10 +1,15 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
 {% block title %}Neuer Rollout – thermoctl-fleet{% endblock %}
 
+{% block main_class %}{% endblock %}
+{% block crumb %}Updates{% endblock %}
+
 {% block content %}
-<p><a href="/ui/rollouts">&larr; Zurück zur Übersicht</a></p>
-<h1>Neuer Rollout</h1>
+<div class="page-heading"><div><div class="eyebrow">Software</div><h1>Neuer Rollout.</h1><p class="subtitle">Software kontrolliert und schrittweise verteilen.</p></div></div>
+<p class="back"><a class="text-button" href="/ui/rollouts">&larr; Zurück zur Übersicht</a></p>
+<h2 class="subpage-title">Neuer Rollout</h2>
 
 <p>
     Ein Rollout aktualisiert genau <strong>einen</strong> Dienst (thermoctl <em>oder</em>
@@ -23,7 +28,7 @@
 <p class="error" role="alert">{{ error }}</p>
 {% endif %}
 
-<form method="post" action="/ui/rollouts/new">
+<form class="ui-form panel" method="post" action="/ui/rollouts/new">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
     <label for="service"><span class="field-label-text">Dienst<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
@@ -50,7 +55,7 @@
         <input type="text" id="timeout_hours" name="timeout_hours" value="{{ timeout_hours }}">
     </label>
 
-    <fieldset>
+    <fieldset class="rollout-selection">
         <legend>
             Wohnungen (Häkchen: in den Rollout aufnehmen; Punkt: als Testwohnung markieren --
             ohne Markierung ist die erste ausgewählte Wohnung dieser Liste die Testwohnung)
@@ -68,6 +73,6 @@
         {% endfor %}
     </fieldset>
 
-    <button type="submit">Weiter</button>
+    <button class="button primary" type="submit">Weiter</button>
 </form>
 {% endblock %}
