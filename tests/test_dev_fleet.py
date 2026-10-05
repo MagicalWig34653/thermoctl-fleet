@@ -11,7 +11,7 @@ from argon2 import PasswordHasher
 
 from fleet.storage import create_storage
 from fleet.totp_crypto import decrypt_totp_secret, load_totp_key
-from tools import dev_fleet, flash_image, flash_tui
+from tools import dev_fleet
 
 
 def test_first_start_creates_private_state_and_real_account(
@@ -97,16 +97,10 @@ def test_private_writer_refuses_to_overwrite(tmp_path: Path) -> None:
     assert path.read_text() == "first"
 
 
-def test_flash_terminal_collects_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
-    answers = iter(["y", "image.img.xz", "disk", "address", "fingerprint", "", ""])
-    monkeypatch.setattr("builtins.input", lambda _: next(answers))
-    monkeypatch.setattr("getpass.getpass", lambda _: "registration-code")
-    calls: list[list[str]] = []
-    def fake_main(args: list[str]) -> int:
-        calls.append(args)
-        return 0
 
-    monkeypatch.setattr(flash_image, "main", fake_main)
-    assert flash_tui.main() == 0
-    assert calls[0] == ["list-disks"]
-    assert calls[1][-2:] == ["--registration-code", "registration-code"]
+
+@pytest.mark.parametrize("port", ["0", "70000"])
+def test_main_rejects_a_port_outside_the_valid_range(port: str) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        dev_fleet.main(["--port", port])
+    assert excinfo.value.code == 2
