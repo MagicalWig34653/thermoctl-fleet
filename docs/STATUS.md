@@ -2,6 +2,20 @@
 
 Last updated: 2026-10-05.
 
+## Fix 2: PyCharm run-configuration editor showed a blank pane (2026-10-05)
+
+Owner: configs still did not run and most opened as an empty white editor
+(only Mypy worked). PyCharm's own log (`~/Library/Logs/JetBrains/
+PyCharm2026.2/idea.log`) showed the cause: `NullPointerException:
+getInterpreterOptions(...) must not be null` in
+`AbstractPythonConfigurationFragmentedEditor` -- the generated files lacked
+`INTERPRETER_OPTIONS` (fixed in the first pass but PyCharm still held the
+broken in-memory objects). All 18 files are now rewritten in exactly the
+layout PyCharm 2026.2 serialises itself (no XML declaration, `default=
+"false"`, `ENV_FILES`, `INTERPRETER_OPTIONS`, shell `INDEPENDENT_
+INTERPRETER_PATH` + empty `<envs />`), and the test asserts the required
+fields. PyCharm must be restarted once to drop the cached broken objects.
+
 ## Fix: PyCharm run configurations did not start (2026-10-05)
 
 Owner report: "Die Pycharm run configs laufen irgendwie nicht". Root
