@@ -34,6 +34,10 @@ def test_shared_run_configurations_have_valid_local_targets() -> None:
             module_element = config.find("module")
             assert module_element is not None
             assert module_element.get("name") == "thermoctl-fleet"
+            # PyCharm 2026.2's editor throws "getInterpreterOptions(...) must not
+            # be null" and shows a blank settings pane when these are missing.
+            assert "INTERPRETER_OPTIONS" in options
+            assert "ENV_FILES" in options
             assert options["ADD_CONTENT_ROOTS"] == "true"
             assert options["ADD_SOURCE_ROOTS"] == "true"
         if config.get("type") == "PythonConfigurationType":
