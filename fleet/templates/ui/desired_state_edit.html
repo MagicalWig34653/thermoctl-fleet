@@ -1,84 +1,100 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% import "_confirm.html" as confirm %}
 
-{% block title %}Sollzustand bearbeiten – thermoctl-fleet{% endblock %}
+{% block title %}Sollzustand bearbeiten – thermoctl fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Wohnungen <span class="crumb-sep">/</span> Sollzustand bearbeiten{% endblock %}
 
 {% block content %}
 {# P5.4b, section 13: version + digest per service, and the update window,
-   for exactly one apartment -- "the fleet service knows no 'for all'".
-   The image field per service is always the fixed, fleet-side display
-   constant (fleet.desired_state_sources.DISPLAY_SOURCES), never something
-   this form lets the landlord type: the agent ignores anything but an
-   exact match with its own hard-coded source list anyway (CLAUDE.md
-   security principle 2). This is step one of two -- it only validates and
-   hands off to the confirmation page below, it never writes a revision
-   itself. #}
-<p><a href="/ui/apartments/{{ apartment_id | urlpath }}">&larr; Zurück zur Wohnung</a></p>
-<h1>Sollzustand bearbeiten</h1>
+   for exactly one apartment -- "the fleet service knows no 'for all'". The
+   image field per service is always the fixed, fleet-side display constant
+   (fleet.desired_state_sources.DISPLAY_SOURCES), never something this form
+   lets the landlord type: the agent ignores anything but an exact match with
+   its own hard-coded source list anyway (CLAUDE.md security principle 2).
+   This is step one of two -- it only validates and hands off to the
+   confirmation page, it never writes a revision itself. #}
+<a class="text-button back" href="/ui/apartments/{{ apartment_id | urlpath }}?ansicht=technik">{{ icons.icon("back") }}Zurück zur Wohnung</a>
 
-<p>
-    Wohnung <strong>{{ apartment_id }}</strong>{% if apartment_label and apartment_label != apartment_id %} ({{ apartment_label }}){% endif %}
-</p>
+<div class="confirm-card wide">
+    <div class="eyebrow">Software</div>
+    <h1>Sollzustand bearbeiten</h1>
+    <p class="subtitle">Wohnung {{ confirm.apartment_ref(apartment_id, apartment_label) }}</p>
 
-<p class="error" role="alert">
-    Update-Ausführung ist derzeit inaktiv: Der Agent lehnt jede Aktualisierung ab,
-    solange thermoctl-Status/Außentemperatur nicht lesbar sind (fail-closed) oder
-    "Pilotbetrieb" für diese Wohnung nicht gesetzt ist. Das Setzen eines Sollzustands
-    hier löst also aktuell keine Aktualisierung am Gerät aus.
-</p>
+    <div class="notice warn">
+        {{ icons.icon("alert") }}
+        <div>
+            <b>Update-Ausführung ist derzeit inaktiv</b>
+            <p>Der Agent lehnt jede Aktualisierung ab, solange thermoctl-Status/Außentemperatur nicht lesbar sind
+            (fail-closed) oder "Pilotbetrieb" für diese Wohnung nicht gesetzt ist. Das Setzen eines Sollzustands
+            hier löst also aktuell keine Aktualisierung am Gerät aus.</p>
+        </div>
+    </div>
 
-{% if active_rollout_id %}
-{# P5.4c cross-review: a manual edit here while this apartment is still
-   queued/in_progress in a running rollout changes its current revision
-   out from under that rollout -- `fleet.rollout.advance_rollout`'s own
-   "revision drift" guard then stops it on its next tick. This is only
-   the advance warning, the enforcement lives in that guard. #}
-<p class="error" role="alert">
-    Diese Wohnung ist Teil des laufenden Rollouts
-    <a href="/ui/rollouts/{{ active_rollout_id | urlpath }}">{{ active_rollout_id }}</a>.
-    Eine manuelle Änderung hier stoppt diesen Rollout beim nächsten Durchlauf
-    des Rollout-Workers (die Revision passt dann nicht mehr zu dem, was der
-    Rollout erwartet).
-</p>
-{% endif %}
+    {% if active_rollout_id %}
+    {# P5.4c cross-review: a manual edit here while this apartment is still
+       queued/in_progress in a running rollout changes its current revision
+       out from under that rollout -- `fleet.rollout.advance_rollout`'s own
+       "revision drift" guard then stops it on its next tick. This is only
+       the advance warning, the enforcement lives in that guard. #}
+    <div class="notice warn" role="alert">
+        {{ icons.icon("alert") }}
+        <div>
+            <b>Laufender Rollout</b>
+            <p>Diese Wohnung ist Teil des laufenden Rollouts
+            <a class="inline-link" href="/ui/rollouts/{{ active_rollout_id | urlpath }}">{{ active_rollout_id }}</a>.
+            Eine manuelle Änderung hier stoppt diesen Rollout beim nächsten Durchlauf
+            des Rollout-Workers (die Revision passt dann nicht mehr zu dem, was der
+            Rollout erwartet).</p>
+        </div>
+    </div>
+    {% endif %}
 
-{% if retired %}
-<p class="error" role="alert">Diese Wohnung ist außer Betrieb, ein Sollzustand kann nicht gesetzt werden.</p>
-{% else %}
+    {% if retired %}
+    <div class="notice error" role="alert">{{ icons.icon("alert") }}<div><b>Diese Wohnung ist außer Betrieb, ein Sollzustand kann nicht gesetzt werden.</b></div></div>
+    {% else %}
 
-{% if error %}
-<p class="error" role="alert">{{ error }}</p>
-{% endif %}
+    {% if error %}
+    <div class="notice error" role="alert">{{ icons.icon("alert") }}<div><b>{{ error }}</b></div></div>
+    {% endif %}
 
-<form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
-    {% for service in services %}
-    <fieldset>
-        <legend>{{ service.label }}</legend>
-        <p>Quelle (Information, nicht änderbar): <code>{{ service.image }}</code></p>
-        <label for="version_{{ service.name }}"><span class="field-label-text">Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-            <input type="text" id="version_{{ service.name }}" name="version_{{ service.name }}" value="{{ service.version }}" maxlength="{{ max_version_length }}" required>
-        </label>
-        <label for="digest_{{ service.name }}"><span class="field-label-text">Digest (sha256:…)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-            <input type="text" id="digest_{{ service.name }}" name="digest_{{ service.name }}" value="{{ service.digest }}" pattern="sha256:[0-9a-f]{64}" required>
-        </label>
-    </fieldset>
-    {% endfor %}
+        {% for service in services %}
+        <fieldset class="confirm-group">
+            <legend>{{ service.label }}</legend>
+            <p class="tiny muted">Quelle (Information, nicht änderbar): <code class="id-text">{{ service.image }}</code></p>
+            <label class="fld" for="version_{{ service.name }}"><span class="field-label-text">Version{{ confirm.required() }}</span>
+                <input class="fld-control" type="text" id="version_{{ service.name }}" name="version_{{ service.name }}" value="{{ service.version }}" maxlength="{{ max_version_length }}" required>
+            </label>
+            <label class="fld" for="digest_{{ service.name }}"><span class="field-label-text">Digest (sha256:…){{ confirm.required() }}</span>
+                <input class="fld-control mono" type="text" id="digest_{{ service.name }}" name="digest_{{ service.name }}" value="{{ service.digest }}" pattern="sha256:[0-9a-f]{64}" required>
+            </label>
+        </fieldset>
+        {% endfor %}
 
-    <fieldset>
-        <legend>Aktualisierungsfenster</legend>
-        <label for="window_from"><span class="field-label-text">Von (HH:MM)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-            <input type="text" id="window_from" name="window_from" value="{{ window_from }}" pattern="[0-2][0-9]:[0-5][0-9]" required>
-        </label>
-        <label for="window_until"><span class="field-label-text">Bis (HH:MM)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-            <input type="text" id="window_until" name="window_until" value="{{ window_until }}" pattern="[0-2][0-9]:[0-5][0-9]" required>
-        </label>
-        <label for="window_temp"><span class="field-label-text">Nicht unter Außentemperatur (°C)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-            <input type="text" id="window_temp" name="window_temp" value="{{ window_temp }}" inputmode="decimal" required>
-        </label>
-    </fieldset>
+        <fieldset class="confirm-group">
+            <legend>Aktualisierungsfenster</legend>
+            <div class="fld-grid">
+                <label class="fld" for="window_from"><span class="field-label-text">Von (HH:MM){{ confirm.required() }}</span>
+                    <input class="fld-control" type="text" id="window_from" name="window_from" value="{{ window_from }}" pattern="[0-2][0-9]:[0-5][0-9]" required>
+                </label>
+                <label class="fld" for="window_until"><span class="field-label-text">Bis (HH:MM){{ confirm.required() }}</span>
+                    <input class="fld-control" type="text" id="window_until" name="window_until" value="{{ window_until }}" pattern="[0-2][0-9]:[0-5][0-9]" required>
+                </label>
+            </div>
+            <label class="fld" for="window_temp"><span class="field-label-text">Nicht unter Außentemperatur (°C){{ confirm.required() }}</span>
+                <input class="fld-control" type="text" id="window_temp" name="window_temp" value="{{ window_temp }}" inputmode="decimal" required>
+            </label>
+        </fieldset>
 
-    <button type="submit">Weiter</button>
-</form>
-{% endif %}
+        <div class="dialog-actions">
+            <a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}?ansicht=technik">Abbrechen</a>
+            <button class="button primary" type="submit">Weiter{{ icons.icon("arrow") }}</button>
+        </div>
+    </form>
+    {% endif %}
+</div>
 {% endblock %}

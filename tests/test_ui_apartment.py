@@ -933,7 +933,7 @@ def test_every_section_renders_from_real_stored_data(
     # the base layout's own logout form and the fault-acknowledge form
     # (Überblick tab only).
     assert "Sofort melden" in maintenance_body
-    assert "command-button" in maintenance_body
+    assert f"/ui/apartments/{APARTMENT}/commands/report_now/confirm" in maintenance_body
     assert "Keine Befehle für diese Wohnung." in maintenance_body
     assert "<form" not in maintenance_body or "csrf_token" in maintenance_body
 
@@ -981,11 +981,12 @@ def test_days_query_parameter_is_capped(
 
     too_large = client.get(f"/ui/apartments/{APARTMENT}?days=9999")
     assert too_large.status_code == 200
-    assert f"({MAX_HISTORY_DAYS} Tage)" in too_large.text
+    assert f'class="active" aria-current="true">{MAX_HISTORY_DAYS} Tage</a>' in too_large.text
 
     default_case = client.get(f"/ui/apartments/{APARTMENT}?days=0")
     assert default_case.status_code == 200
-    assert f"({DEFAULT_HISTORY_DAYS} Tage)" in default_case.text
+    active_days = f'class="active" aria-current="true">{DEFAULT_HISTORY_DAYS} Tage</a>'
+    assert active_days in default_case.text
 
 
 def test_days_query_parameter_non_numeric_is_not_a_422(
@@ -1004,7 +1005,7 @@ def test_days_query_parameter_non_numeric_is_not_a_422(
     response = client.get(f"/ui/apartments/{APARTMENT}?days=abc")
 
     assert response.status_code == 200
-    assert f"({DEFAULT_HISTORY_DAYS} Tage)" in response.text
+    assert f'class="active" aria-current="true">{DEFAULT_HISTORY_DAYS} Tage</a>' in response.text
 
 
 def test_days_query_parameter_a_float_string_is_not_a_422(
@@ -1016,7 +1017,7 @@ def test_days_query_parameter_a_float_string_is_not_a_422(
     response = client.get(f"/ui/apartments/{APARTMENT}?days=3.5")
 
     assert response.status_code == 200
-    assert f"({DEFAULT_HISTORY_DAYS} Tage)" in response.text
+    assert f'class="active" aria-current="true">{DEFAULT_HISTORY_DAYS} Tage</a>' in response.text
 
 
 def test_days_query_parameter_scientific_notation_is_not_a_422(
@@ -1028,7 +1029,7 @@ def test_days_query_parameter_scientific_notation_is_not_a_422(
     response = client.get(f"/ui/apartments/{APARTMENT}?days=1e400")
 
     assert response.status_code == 200
-    assert f"({DEFAULT_HISTORY_DAYS} Tage)" in response.text
+    assert f'class="active" aria-current="true">{DEFAULT_HISTORY_DAYS} Tage</a>' in response.text
 
 
 def test_xss_escaping_of_id_zone_mode_and_key(
@@ -1208,7 +1209,7 @@ def test_default_tab_is_ueberblick(
     response = client.get(f"/ui/apartments/{APARTMENT}")
 
     assert response.status_code == 200
-    assert 'href="?ansicht=ueberblick" aria-current="page"' in response.text
+    assert 'href="?ansicht=ueberblick" class="active" aria-current="page"' in response.text
     assert "history-heading" in response.text
     assert "commands-heading" not in response.text
     assert "version-heading" not in response.text
@@ -1223,7 +1224,7 @@ def test_wartung_tab_shows_commands_and_hides_overview_sections(
     response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
-    assert 'href="?ansicht=wartung" aria-current="page"' in response.text
+    assert 'href="?ansicht=wartung" class="active" aria-current="page"' in response.text
     assert "commands-heading" in response.text
     assert "tenant-change-heading" in response.text
     assert "history-heading" not in response.text
@@ -1239,7 +1240,7 @@ def test_technik_tab_shows_version_and_hides_commands(
     response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=technik")
 
     assert response.status_code == 200
-    assert 'href="?ansicht=technik" aria-current="page"' in response.text
+    assert 'href="?ansicht=technik" class="active" aria-current="page"' in response.text
     assert "version-heading" in response.text
     assert "desired-state-heading" in response.text
     assert "commands-heading" not in response.text
@@ -1255,10 +1256,10 @@ def test_unknown_ansicht_value_falls_back_to_ueberblick(
     response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=does-not-exist")
 
     assert response.status_code == 200
-    assert 'href="?ansicht=ueberblick" aria-current="page"' in response.text
+    assert 'href="?ansicht=ueberblick" class="active" aria-current="page"' in response.text
 
 
-def test_danger_zone_is_a_distinct_section_within_wartung(
+def test_tenant_change_is_a_marked_destructive_link_to_its_confirmation_page(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:
     storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
@@ -1267,4 +1268,12 @@ def test_danger_zone_is_a_distinct_section_within_wartung(
     response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
-    assert 'class="danger-zone"' in response.text
+    assert 'id="tenant-change-heading">Wohnung übergeben</h2>' in response.text
+    # Destructive styling, and only ever a link to the confirmation page --
+    # never a form that would act on one click.
+    assert (
+        f'<a class="button danger" href="/ui/apartments/{APARTMENT}/tenant-change/confirm">'
+        in response.text
+    )
+    section = response.text[response.text.index('id="tenant-change-heading"') :]
+    assert "<form" not in section.split("</section>")[0]

@@ -555,6 +555,92 @@ def test_tasks_page_without_tasks_is_calm(
     assert "nichts offen" in html
 
 
+# -- apartment detail + confirmation pages (phase 2a) ------------------------------------
+
+
+def test_place_text_prefers_property_and_label_then_label_then_id() -> None:
+    from fleet.ui_house import place_text
+
+    assert place_text("Lindenstraße 12", "Wohnung 03", "lin-w03") == "Lindenstraße 12 · Wohnung 03"
+    assert place_text(None, "Wohnung 03", "lin-w03") == "Wohnung 03"
+    assert place_text("Lindenstraße 12", None, "lin-w03") == "lin-w03"
+    assert place_text(None, None, "lin-w03") == "lin-w03"
+
+
+def test_apartment_page_is_rebuilt_with_a_human_heading_and_the_id_as_secondary_text(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _seed_property(storage, APARTMENT_A, APARTMENT_B)
+
+    html = _login_and_get(client, password, totp_secret, f"/ui/apartments/{APARTMENT_B}")
+
+    assert '<main id="main" class="main">' in html  # no legacy wrapper any more
+    assert "<h1>Lindenstraße 12 · Wohnung 2</h1>" in html
+    assert f'<code class="id-text">{APARTMENT_B}</code>' in html
+    assert '<div class="eyebrow">1. OG</div>' in html
+    assert 'aria-label="Wohnungsbereiche"' in html
+    for tab in ("ueberblick", "wartung", "technik"):
+        assert f'href="?ansicht={tab}"' in html
+
+
+def test_unknown_apartment_page_is_a_404_with_the_rebuilt_shell(
+    client: TestClient, password: str, totp_secret: str, user_id: int
+) -> None:
+    _login_and_get(client, password, totp_secret, "/ui/")
+    response = client.get("/ui/apartments/gibt-es-nicht")
+
+    assert response.status_code == 404
+    assert "Diese Wohnung ist nicht bekannt." in response.text
+    assert "Alle Wohnungen" in response.text
+
+
+@pytest.mark.parametrize("tab", ["ueberblick", "wartung", "technik"])
+def test_apartment_tabs_satisfy_the_csp_and_keep_every_form_action(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int, tab: str
+) -> None:
+    _seed_property(storage, APARTMENT_A)
+    path = f"/ui/apartments/{APARTMENT_A}?ansicht={tab}"
+    html = _login_and_get(client, password, totp_secret, path)
+
+    assert " style=" not in html
+    assert "<style" not in html
+    assert not re.search(r"\son[a-z]+=", html)
+    for script in re.findall(r"<script\b[^>]*>", html):
+        assert "src=" in script
+    for forbidden in ("INTERAKTIVER ENTWURF", "Demodaten", "Demo-"):
+        assert forbidden not in html
+    # Every command stays a plain link to its confirmation page.
+    if tab == "wartung":
+        commands = ("report_now", "fetch_logs", "backup_now", "agent_restart", "diagnostic_bundle")
+        for command in commands:
+            assert f'href="/ui/apartments/{APARTMENT_A}/commands/{command}/confirm"' in html
+        assert 'href="/ui/apartments/' + APARTMENT_A + '/tenant-change/confirm"' in html
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "/commands/report_now/confirm",
+        "/commands/fetch_logs/confirm",
+        "/tenant-change/confirm",
+        "/desired-state/edit",
+    ],
+)
+def test_confirmation_pages_are_rebuilt_cards_with_csrf_and_a_cancel_link(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int, suffix: str
+) -> None:
+    _seed_property(storage, APARTMENT_A)
+    html = _login_and_get(client, password, totp_secret, f"/ui/apartments/{APARTMENT_A}{suffix}")
+
+    assert '<main id="main" class="main">' in html
+    assert 'class="confirm-card' in html
+    assert re.search(r'<form method="post" action="/ui/apartments/[^"]+"', html)
+    assert 'name="csrf_token"' in html
+    assert ">Abbrechen</a>" in html
+    assert " style=" not in html
+    assert not re.search(r"\son[a-z]+=", html)
+
+
 # -- login + 2FA as one form ------------------------------------------------------------
 
 

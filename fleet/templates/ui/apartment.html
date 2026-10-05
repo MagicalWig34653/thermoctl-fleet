@@ -1,191 +1,183 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
-{% block title %}{{ apartment_id }} – thermoctl-fleet{% endblock %}
+{% block title %}{{ place or apartment_id }} – thermoctl fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Wohnungen <span class="crumb-sep">/</span> {{ place or apartment_id }}{% endblock %}
 
 {% block content %}
-{# "Eine Wohnung" (UI-redesign stage 2) – already German-rendered and
-   already derived by fleet/ui_apartment.py::build_apartment_detail. This
-   template only iterates and prints; it makes no ordering, wording, or
-   gap/caught-up decisions of its own.
+{# "Eine Wohnung" -- the draft's detail view (tabs Überblick / Wartung /
+   Technik). Already German-rendered and derived by
+   fleet/ui_apartment.py::build_apartment_detail; this template only iterates
+   and prints, it makes no ordering, wording, or gap/caught-up decisions of
+   its own.
 
-   Three tabs ("Überblick"/"Wartung"/"Technik", brief) – every *existing*
-   section/form/field/hidden input from before this stage is unchanged,
-   only grouped into one of three panels, server-rendered via `?ansicht=`
-   (fleet/ui_routes.py::_normalize_apartment_tab) so each tab works
-   without JavaScript: a plain link, a full page load, the server decides
-   which panel to render. The other two panels' markup is not sent at all
-   for a given request – not merely hidden by CSS – keeping the page
-   light and keeping "every section still exists, just grouped" true of
-   the rendered output too, not only of the template source. #}
-<p><a href="/ui/">&larr; Zurück zur Übersicht</a></p>
+   The tabs are server-rendered via `?ansicht=` (fleet/ui_routes.py::
+   _normalize_apartment_tab) so each one works without JavaScript: a plain
+   link, a full page load. The markup of the two inactive tabs is not sent at
+   all -- not merely hidden by CSS.
+
+   Every command keeps its confirmation page: the buttons here are plain
+   links to it, nothing on this page creates a command by itself. Whether an
+   apartment may execute something (pilot_mode, open_access, desired-state
+   preconditions) is decided by the agent, never here -- the page only
+   states it. #}
+<a class="text-button back" href="/ui/apartments">{{ icons.icon("back") }}Alle Wohnungen</a>
 
 {% if detail is none %}
-<h1>{{ apartment_id }}</h1>
-<p>Diese Wohnung ist nicht bekannt.</p>
+<div class="detail-top">
+    <div>
+        <div class="eyebrow">Wohnung</div>
+        <h1>{{ apartment_id }}</h1>
+        <p class="subtitle">Diese Wohnung ist nicht bekannt.</p>
+    </div>
+</div>
 {% else %}
 
-<div class="apartment-heading">
-    <h1>{{ apartment_id }}{% if detail.label and detail.label != apartment_id %} ({{ detail.label }}){% endif %}</h1>
-    <p class="unit__status unit__status--heading"><span class="status-icon status-icon--{{ detail.status }}" aria-hidden="true"></span>{{ detail.status_label }}</p>
-    {% if detail.next_step_text %}<p class="apartment-heading__next-step">{{ detail.next_step_text }}</p>{% endif %}
+<div class="detail-top">
+    <div>
+        <div class="eyebrow">{{ floor or "Wohnung" }}</div>
+        <h1>{{ place }}</h1>
+        <p class="subtitle">Kennung <code class="id-text">{{ apartment_id }}</code></p>
+    </div>
+    <span class="badge{% if tone %} {{ tone }}{% endif %}">{{ "!" if tone == "error" else "◔" if tone == "warn" else "✓" }} {{ detail.status_label }}</span>
 </div>
 
-<nav class="apartment-tabs" aria-label="Wohnungsansicht">
-    <a href="?ansicht=ueberblick" {% if active_tab == "ueberblick" %}aria-current="page"{% endif %}>Überblick</a>
-    <a href="?ansicht=wartung" {% if active_tab == "wartung" %}aria-current="page"{% endif %}>Wartung</a>
-    <a href="?ansicht=technik" {% if active_tab == "technik" %}aria-current="page"{% endif %}>Technik</a>
+<nav class="tabs" aria-label="Wohnungsbereiche">
+    <a href="?ansicht=ueberblick" {% if active_tab == "ueberblick" %}class="active" aria-current="page"{% endif %}>Überblick</a>
+    <a href="?ansicht=wartung" {% if active_tab == "wartung" %}class="active" aria-current="page"{% endif %}>Wartung</a>
+    <a href="?ansicht=technik" {% if active_tab == "technik" %}class="active" aria-current="page"{% endif %}>Technik</a>
 </nav>
 
 {% if active_tab == "ueberblick" %}
-<div class="apartment-grid">
+{% if detail.status != "ok" and detail.next_step_text %}
+<div class="notice{% if tone == 'error' %} error{% endif %}">
+    {{ icons.icon("alert") }}
+    <div>
+        <b>{{ detail.status_label }}</b>
+        <p>{{ detail.next_step_text }}</p>
+    </div>
+</div>
+{% endif %}
 
-<nav aria-label="Zeitraum der Erreichbarkeitshistorie">
-    <a href="?ansicht=ueberblick&amp;days=3">3 Tage</a>
-    <a href="?ansicht=ueberblick&amp;days=7">7 Tage</a>
-    <a href="?ansicht=ueberblick&amp;days=14">14 Tage</a>
-</nav>
+<div class="split">
 
-<section aria-labelledby="history-heading">
-    <h2 id="history-heading">Erreichbarkeit ({{ detail.history_days }} Tage)</h2>
+<section class="panel" aria-labelledby="history-heading">
+    <div class="section-head">
+        <h2 id="history-heading">Erreichbarkeit</h2>
+        <nav class="range-links" aria-label="Zeitraum der Erreichbarkeitshistorie">
+            {% for days in (3, 7, 14) %}
+            <a href="?ansicht=ueberblick&amp;days={{ days }}" {% if detail.history_days == days %}class="active" aria-current="true"{% endif %}>{{ days }} Tage</a>
+            {% endfor %}
+        </nav>
+    </div>
     {% if detail.timeline %}
-    {# Compact timeline bar (UI-redesign stage 2 polish) -- the same
-       entries as the list below, as proportionally-sized horizontal
-       segments (fleet/ui_apartment.py::_timeline_width_percents), newest
-       on the left. Decorative only: every entry's full text stays in the
-       list underneath and in this bar's own native tooltip, so a
-       screen reader or a no-CSS client loses nothing by this div's
-       presence. #}
-    <div class="timeline-bar" role="presentation" aria-hidden="true">
+    {# The same entries as the list below, as proportionally sized segments
+       (fleet/ui_apartment.py::_timeline_width_percents), newest on the left.
+       Decorative only: every entry's text stays in the list underneath. No
+       inline `style` (CSP) -- each width is one of the fixed `.tl-w-*`
+       classes in fleet-ui.css. #}
+    <div class="health-bars proportional" role="presentation" aria-hidden="true">
         {% for entry in detail.timeline %}
-        {# No inline `style` -- this application's CSP sends no `style-src
-           'unsafe-inline'` (fleet/ui_routes.py's security-headers
-           middleware), so each segment's width is one of the fixed
-           `.tl-w-*` percent classes (fleet-ui.css, generated 1..100)
-           rather than a computed inline width. #}
-        <span class="timeline-bar__segment tl-w-{{ [entry.width_percent | round | int, 1] | max }} {{ 'timeline-bar__segment--gap' if entry.is_gap else 'timeline-bar__segment--contact' }}"
-              title="{{ entry.label }}, {{ entry.when_text }}{% if entry.duration_text %} ({{ entry.duration_text }}){% endif %}"></span>
+        <i class="tl-w-{{ [entry.width_percent | round | int, 1] | max }}{% if entry.is_gap %} missing{% endif %}" title="{{ entry.label }}, {{ entry.when_text }}{% if entry.duration_text %} ({{ entry.duration_text }}){% endif %}"></i>
         {% endfor %}
     </div>
-    <ol class="timeline">
-        {% for entry in detail.timeline %}
-        <li class="timeline__entry {{ 'timeline__entry--gap' if entry.is_gap else 'timeline__entry--contact' }}">
-            <span class="timeline__label">{{ entry.label }}</span>
-            <span class="timeline__when">{{ entry.when_text }}</span>
-            {% if entry.duration_text %}<span class="timeline__duration">({{ entry.duration_text }})</span>{% endif %}
-            {% if entry.heartbeat_count is not none %}
-            <span class="timeline__count">{{ entry.heartbeat_count }} Herzschläge</span>
-            {% endif %}
-            {% if entry.caught_up_count %}
-            <span class="apartment-tile__tag">{{ entry.caught_up_count }} nachgeliefert</span>
-            {% endif %}
-        </li>
-        {% endfor %}
-    </ol>
+    <div class="progress-meta"><span>Jetzt</span><span>vor {{ detail.history_days }} Tagen</span></div>
+    {% for entry in detail.timeline %}
+    <div class="list-row{% if entry.is_gap %} is-gap{% endif %}">
+        <span>{{ entry.label }}<small>{{ entry.when_text }}{% if entry.duration_text %} · {{ entry.duration_text }}{% endif %}{% if entry.heartbeat_count is not none %} · {{ entry.heartbeat_count }} Herzschläge{% endif %}</small></span>
+        {% if entry.is_gap %}<span class="badge error">Keine Rückmeldung</span>{% elif entry.caught_up_count %}<span class="badge gray">{{ entry.caught_up_count }} nachgeliefert</span>{% endif %}
+    </div>
+    {% endfor %}
     {% else %}
-    <p>Keine Heartbeats im gewählten Zeitraum.</p>
+    <div class="empty-state">{{ icons.icon("clock") }}<p>Keine Heartbeats im gewählten Zeitraum.</p></div>
     {% endif %}
 </section>
 
-<section aria-labelledby="faults-heading">
+<section class="panel" aria-labelledby="faults-heading">
     <h2 id="faults-heading">Störungen</h2>
-    <h3>Offen</h3>
+    <h3 class="sub-head">Offen</h3>
     {% if detail.open_faults %}
-    <ul>
-        {% for fault in detail.open_faults %}
-        <li>
-            {{ fault.kind_label }} ({{ fault.zone }}), {{ fault.since_text }}
-            {% if fault.acknowledged_by %}
-            <span class="apartment-tile__tag">quittiert von {{ fault.acknowledged_by }}</span>
-            {% if fault.acknowledged_note %}
-            <br><span class="apartment-detail__note">Hinweis: {{ fault.acknowledged_note }}</span>
-            {% endif %}
-            {% endif %}
-            <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/faults/acknowledge">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <input type="hidden" name="fault_kind" value="{{ fault.fault_kind }}">
-                <input type="hidden" name="zone" value="{{ fault.zone }}">
-                <input type="hidden" name="since" value="{{ fault.since.isoformat() }}">
-                <label><span class="field-label-text">Hinweis<span class="field-optional"> (optional)</span></span>
-                    <input type="text" name="note" maxlength="500" value="{{ fault.acknowledged_note or '' }}">
-                </label>
-                <button type="submit">{{ "Erneut quittieren" if fault.acknowledged_by else "Quittieren" }}</button>
-            </form>
-        </li>
-        {% endfor %}
-    </ul>
+    {% for fault in detail.open_faults %}
+    <div class="fault-item">
+        <div class="list-row">
+            <div>
+                <b>{{ fault.kind_label }}</b>
+                <small>Zone {{ fault.zone }} · {{ fault.since_text }}</small>
+            </div>
+            {% if fault.acknowledged_by %}<span class="badge gray">quittiert von {{ fault.acknowledged_by }}</span>{% else %}<span class="badge error">Offen</span>{% endif %}
+        </div>
+        {% if fault.acknowledged_note %}<p class="subtitle">Hinweis: {{ fault.acknowledged_note }}</p>{% endif %}
+        <form class="ack-form" method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/faults/acknowledge">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="fault_kind" value="{{ fault.fault_kind }}">
+            <input type="hidden" name="zone" value="{{ fault.zone }}">
+            <input type="hidden" name="since" value="{{ fault.since.isoformat() }}">
+            <label class="fld"><span class="field-label-text">Hinweis<span class="field-optional"> (optional)</span></span>
+                <input class="fld-control" type="text" name="note" maxlength="500" value="{{ fault.acknowledged_note or '' }}">
+            </label>
+            <button class="button primary" type="submit">{{ icons.icon("check") }}{{ "Erneut quittieren" if fault.acknowledged_by else "Quittieren" }}</button>
+        </form>
+    </div>
+    {% endfor %}
     {% else %}
-    <p>Keine offenen Störungen.</p>
+    <div class="empty-state">{{ icons.icon("check") }}<p>Keine offenen Störungen.</p></div>
     {% endif %}
 
-    <h3>Vergangen</h3>
+    <h3 class="sub-head">Vergangen</h3>
     {% if detail.past_faults %}
-    <ul>
-        {% for fault in detail.past_faults %}
-        <li>{{ fault.kind_label }} – {{ fault.key }} ({{ fault.severity }}), {{ fault.received_text }}</li>
-        {% endfor %}
-    </ul>
+    {% for fault in detail.past_faults %}
+    <div class="list-row">
+        <span>{{ fault.kind_label }}<small>{{ fault.key }} · {{ fault.received_text }}</small></span>
+        <span class="badge gray">{{ fault.severity }}</span>
+    </div>
+    {% endfor %}
     {% else %}
-    <p>Keine vergangenen Meldungen im gewählten Zeitraum.</p>
+    <p class="subtitle">Keine vergangenen Meldungen im gewählten Zeitraum.</p>
     {% endif %}
 </section>
 
-<section aria-labelledby="devices-heading">
-    <h2 id="devices-heading">Batterie und Signal</h2>
+<section class="panel panel-wide" aria-labelledby="devices-heading">
+    <div class="section-head">
+        <h2 id="devices-heading">Batterie &amp; Signal</h2>
+        {% if not detail.never_reported %}<span class="tiny muted">{{ detail.per_device | length }} {{ "Gerät" if detail.per_device | length == 1 else "Geräte" }} · letzter gemeldeter Stand</span>{% endif %}
+    </div>
     {% if detail.never_reported %}
-    <p>Noch keine Daten.</p>
+    <div class="empty-state">{{ icons.icon("battery") }}<p>Noch keine Daten.</p></div>
     {% else %}
-    <dl>
-        <dt>Schwächste Batterie</dt>
-        <dd>{{ detail.weakest_battery_percent }} %</dd>
-        <dt>Schlechteste Signalqualität</dt>
-        <dd>{{ detail.worst_signal_quality }} %</dd>
-        <dt>Stille Geräte</dt>
-        <dd>{{ detail.silent_devices }}</dd>
-        <dt>Zigbee-Bridge</dt>
-        <dd>{{ detail.zigbee_bridge }}</dd>
-    </dl>
-    <h3>Je Gerät</h3>
+    <div class="stat-row">
+        <div><span class="muted">Schwächste Batterie</span><b>{{ detail.weakest_battery_percent }} %</b></div>
+        <div><span class="muted">Schlechteste Signalqualität</span><b>{{ detail.worst_signal_quality }} %</b></div>
+        <div><span class="muted">Stille Geräte</span><b>{{ detail.silent_devices }}</b></div>
+        <div><span class="muted">Zigbee-Bridge</span><b>{{ detail.zigbee_bridge }}</b></div>
+    </div>
     {% if detail.per_device %}
-    <table>
-        <thead>
-            <tr><th scope="col">Gerät</th><th scope="col">Batterie</th><th scope="col">Signal</th></tr>
-        </thead>
-        <tbody>
-            {% for device in detail.per_device %}
-            <tr>
-                <td>{{ device.label or device.device_id }}</td>
-                <td>{{ device.battery_percent ~ " %" if device.battery_percent is not none else "–" }}</td>
-                <td>{{ device.signal_quality ~ " %" if device.signal_quality is not none else "–" }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    {% for device in detail.per_device %}
+    <div class="list-row">
+        <div>{{ device.label or device.device_id }}{% if device.label %}<small>{{ device.device_id }}</small>{% endif %}</div>
+        <div class="row-actions">
+            <span>{{ device.battery_percent ~ " % Batterie" if device.battery_percent is not none else "Batterie unbekannt" }}</span>
+            <span class="tiny muted">{{ device.signal_quality ~ " % Signal" if device.signal_quality is not none else "Signal unbekannt" }}</span>
+        </div>
+    </div>
+    {% endfor %}
     {% else %}
-    <p class="apartment-detail__note">
-        Keine Angaben je Gerät (der Agent dieser Wohnung sendet diese Liste
-        noch nicht).
-    </p>
+    <p class="subtitle">Keine Angaben je Gerät (der Agent dieser Wohnung sendet diese Liste noch nicht).</p>
     {% endif %}
     {% endif %}
 </section>
 
-<section aria-labelledby="alarms-heading">
+<section class="panel panel-wide" aria-labelledby="alarms-heading">
     <h2 id="alarms-heading">Alarme</h2>
     {% if detail.alarms %}
-    <ul>
-        {% for alarm in detail.alarms %}
-        <li>
-            {{ alarm.kind_label }} –
-            {% if alarm.open %}
-            offen, ausgelöst {{ alarm.raised_text }}
-            {% else %}
-            behoben, ausgelöst {{ alarm.raised_text }}, beendet {{ alarm.cleared_text }}
-            {% endif %}
-        </li>
-        {% endfor %}
-    </ul>
+    {% for alarm in detail.alarms %}
+    <div class="list-row">
+        <span>{{ alarm.kind_label }}<small>{% if alarm.open %}ausgelöst {{ alarm.raised_text }}{% else %}ausgelöst {{ alarm.raised_text }}, beendet {{ alarm.cleared_text }}{% endif %}</small></span>
+        {% if alarm.open %}<span class="badge error">offen</span>{% else %}<span class="badge gray">behoben</span>{% endif %}
+    </div>
+    {% endfor %}
     {% else %}
-    <p>Keine Alarme.</p>
+    <div class="empty-state">{{ icons.icon("check") }}<p>Keine Alarme.</p></div>
     {% endif %}
 </section>
 
@@ -193,234 +185,225 @@
 {% endif %}
 
 {% if active_tab == "wartung" %}
-<div class="apartment-grid">
+{% if bundle_cleanup_failed %}
+{# Cross-review fix (2026-10-02): the tenant change itself (token rotation,
+   history deletion) already succeeded by the time this notice can appear --
+   it only ever means some diagnostic bundle blob file could not be removed
+   from disk; see the server log for which one. #}
+<div class="notice error" role="alert">
+    {{ icons.icon("alert") }}
+    <div><b>Mieterwechsel durchgeführt.</b><p>Mindestens eine Diagnose-Sicherung konnte nicht gelöscht werden – siehe Server-Log.</p></div>
+</div>
+{% endif %}
+{% set command_icons = {"report_now": "wifi", "fetch_logs": "list", "diagnostic_bundle": "box", "agent_restart": "update", "backup_now": "plus"} %}
 
-<section aria-labelledby="commands-heading">
-    <h2 id="commands-heading">Befehle</h2>
+<div class="split">
+
+<section class="panel" aria-labelledby="commands-heading">
+    <h2 id="commands-heading">Diagnose &amp; Wartung</h2>
+    <p class="subtitle">Wartungsauftrag an die Basisstation senden. Jeder Auftrag wird vorher bestätigt.</p>
     {% if detail.retired %}
-    <p>Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.</p>
+    <p class="subtitle">Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.</p>
     {% else %}
-    <ul class="command-buttons">
-        {% for value, label in detail.available_commands %}
-        <li><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ value | urlpath }}/confirm">{{ label }}</a></li>
+    <div class="action-grid">
+        {% for value, label in detail.available_commands if value != "backup_now" %}
+        <a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ value | urlpath }}/confirm">{{ icons.icon(command_icons.get(value, "settings")) }}{{ label }}</a>
         {% endfor %}
-    </ul>
+    </div>
     {% endif %}
 
-    <h3>Verlauf</h3>
+    <h3 class="sub-head">Verlauf</h3>
     {% if detail.commands %}
-    <ul class="command-history">
+    <ul class="command-log">
         {% for cmd in detail.commands %}
         <li>
-            <span class="command-history__type">{{ cmd.command_label }}</span>
-            <span class="apartment-tile__tag">{{ cmd.status_label }}</span>
-            <span class="command-history__meta">von {{ cmd.created_by }}, erstellt {{ cmd.created_text }}, läuft ab {{ cmd.expires_text }}</span>
-            {% if cmd.duration_text %}<span class="command-history__meta">Dauer: {{ cmd.duration_text }}</span>{% endif %}
-            {% if cmd.error_text %}<p class="command-history__error">{{ cmd.error_text }}</p>{% endif %}
+            <div class="list-row">
+                <span>{{ cmd.command_label }}<small>von {{ cmd.created_by }}, erstellt {{ cmd.created_text }}, läuft ab {{ cmd.expires_text }}{% if cmd.duration_text %} · Dauer: {{ cmd.duration_text }}{% endif %}</small></span>
+                <span class="badge{% if cmd.status_label == 'fehlgeschlagen' or cmd.status_label == 'abgelaufen ohne Ergebnis' %} error{% elif cmd.status_label != 'erfolgreich' %} gray{% endif %}">{{ cmd.status_label }}</span>
+            </div>
+            {% if cmd.error_text %}<p class="log-error">{{ cmd.error_text }}</p>{% endif %}
             {% if cmd.log_excerpt %}
-            <div class="command-history__log">
-                <p class="command-history__meta">Erfasst {{ cmd.log_excerpt.captured_text }}, Quelle: {{ cmd.log_excerpt.source }} – {{ cmd.log_excerpt.dropped_lines }} Zeile(n) entfernt</p>
+            <div class="log-block">
+                <p class="tiny muted">Erfasst {{ cmd.log_excerpt.captured_text }}, Quelle: {{ cmd.log_excerpt.source }} – {{ cmd.log_excerpt.dropped_lines }} Zeile(n) entfernt</p>
                 {% if cmd.log_excerpt.lines %}
-                <pre class="command-history__log-lines">{{ cmd.log_excerpt.lines | join("\n") }}</pre>
+                <pre class="log-lines">{{ cmd.log_excerpt.lines | join("\n") }}</pre>
                 {% else %}
-                <p>Keine Zeilen entsprachen der Positivliste.</p>
+                <p class="subtitle">Keine Zeilen entsprachen der Positivliste.</p>
                 {% endif %}
             </div>
             {% endif %}
             {% if cmd.bundle %}
-            <div class="command-history__log">
-                <p class="command-history__meta">Diagnosepaket erstellt {{ cmd.bundle.created_text }}, {{ cmd.bundle.size_text }}</p>
-                <p class="command-history__meta">Hash: {{ cmd.bundle.content_hash }}</p>
-                <a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ cmd.bundle.command_id | urlpath }}/bundle/download">Herunterladen</a>
-                <p class="command-history__meta">Entschlüsseln: <code>{{ cmd.bundle.age_decrypt_command }}</code></p>
+            <div class="log-block">
+                <p class="tiny muted">Diagnosepaket erstellt {{ cmd.bundle.created_text }}, {{ cmd.bundle.size_text }}</p>
+                <p class="tiny muted">Hash: <code class="id-text">{{ cmd.bundle.content_hash }}</code></p>
+                <a class="button mt-12" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ cmd.bundle.command_id | urlpath }}/bundle/download">{{ icons.icon("download") }}Herunterladen</a>
+                <p class="tiny muted mt-12">Entschlüsseln: <code class="id-text">{{ cmd.bundle.age_decrypt_command }}</code></p>
             </div>
             {% endif %}
         </li>
         {% endfor %}
     </ul>
     {% else %}
-    <p>Keine Befehle für diese Wohnung.</p>
+    <p class="subtitle">Keine Befehle für diese Wohnung.</p>
     {% endif %}
 </section>
 
-<section aria-labelledby="backups-heading">
-    <h2 id="backups-heading">Sicherungen</h2>
-    {% if detail.backups %}
-    <ul class="backup-list">
-        {% for backup in detail.backups %}
-        <li>
-            <span class="backup-list__kind">{{ backup.kind_label }}</span>
-            <span class="command-history__meta">{{ backup.created_text }}, {{ backup.size_text }}</span>
-            <span class="command-history__meta">Hash: {{ backup.content_hash }}</span>
-            <a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/backups/{{ backup.backup_id | urlpath }}/download">Herunterladen</a>
-            {% if backup.age_decrypt_command %}
-            <p class="command-history__meta">Entschlüsseln: <code>{{ backup.age_decrypt_command }}</code></p>
-            {% endif %}
-        </li>
+<div class="stack">
+<section class="panel" aria-labelledby="backups-heading">
+    <div class="section-head">
+        <h2 id="backups-heading">Sicherungen</h2>
+        {% if not detail.retired %}
+        {% for value, label in detail.available_commands if value == "backup_now" %}
+        <a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ value | urlpath }}/confirm">{{ icons.icon("plus") }}Sichern</a>
         {% endfor %}
-    </ul>
+        {% endif %}
+    </div>
+    {% if detail.backups %}
+    {% for backup in detail.backups %}
+    <div class="list-row">
+        <span>{{ backup.kind_label }}<small>{{ backup.created_text }} · {{ backup.size_text }}</small><small>Hash: <code class="id-text">{{ backup.content_hash }}</code></small>{% if backup.age_decrypt_command %}<small>Entschlüsseln: <code class="id-text">{{ backup.age_decrypt_command }}</code></small>{% endif %}</span>
+        <a class="icon-button" href="/ui/apartments/{{ apartment_id | urlpath }}/backups/{{ backup.backup_id | urlpath }}/download" aria-label="{{ backup.kind_label }} vom {{ backup.created_text }} herunterladen">{{ icons.icon("download") }}</a>
+    </div>
+    {% endfor %}
     {% else %}
-    <p>Keine Sicherungen für diese Wohnung.</p>
+    <div class="empty-state">{{ icons.icon("box") }}<p>Keine Sicherungen für diese Wohnung.</p></div>
     {% endif %}
 </section>
 
-<section aria-labelledby="restore-heading">
+<section class="panel" aria-labelledby="restore-heading">
     <h2 id="restore-heading">Wiederherstellen</h2>
-    {# P5.5b, section 15.2/15.3's "Decided afterward" paragraph
-       (2026-09-28): only offered once a device is assigned *and* has
-       already reported its own age recipient – there is nothing this
-       form could encrypt to otherwise. #}
+    {# P5.5b, section 15.2/15.3's "Decided afterward" paragraph (2026-09-28):
+       only offered once a device is assigned *and* has already reported its
+       own age recipient -- there is nothing this form could encrypt to
+       otherwise. #}
     {% if detail.restore_pending %}
-    <p>Eine Wiederherstellung wartet bereits auf das Gerät ({{ detail.restore_pending_expires_text }}).</p>
+    <p class="subtitle">Eine Wiederherstellung wartet bereits auf das Gerät ({{ detail.restore_pending_expires_text }}).</p>
     {% elif not detail.restore_device_recipient %}
-    <p>Kein Gerät mit gemeldetem Schlüssel für diese Wohnung – keine Wiederherstellung möglich.</p>
+    <p class="subtitle">Kein Gerät mit gemeldetem Schlüssel für diese Wohnung – keine Wiederherstellung möglich.</p>
     {% elif not detail.restore_operational_backups %}
-    <p>Keine Betriebsdaten-Sicherung für diese Wohnung vorhanden.</p>
+    <p class="subtitle">Keine Betriebsdaten-Sicherung für diese Wohnung vorhanden.</p>
     {% else %}
+    <p class="subtitle">Die Sicherung wird im Browser für die Basisstation verschlüsselt. Der Schlüssel verlässt Ihren Rechner nicht.</p>
     <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/restore"
           id="restore-form" data-recipient="{{ detail.restore_device_recipient }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        {# The ciphertext this form actually submits – written by
-           fleet/static/ui/restore_form.js just before submit, never by
-           the landlord directly. #}
+        {# The ciphertext this form actually submits -- written by
+           fleet/static/ui/restore_form.js just before submit, never by the
+           landlord directly. #}
         <input type="hidden" name="key_block_b64" id="restore-key-block" value="">
-        <label for="restore-backup-id"><span class="field-label-text">Sicherung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span></label>
-        <select name="backup_id" id="restore-backup-id" required>
+        <label class="fld" for="restore-backup-id"><span class="field-label-text">Sicherung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span></label>
+        <select class="fld-control" name="backup_id" id="restore-backup-id" required>
             {% for backup in detail.restore_operational_backups %}
             <option value="{{ backup.backup_id }}">{{ backup.created_text }} ({{ backup.size_text }})</option>
             {% endfor %}
         </select>
-        <label for="restore-key-plaintext"><span class="field-label-text">Schlüssel des Vermieters<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span></label>
-        {# No `name` attribute (owner decision): this field is never part
-           of the form submission, with or without JavaScript. #}
-        <input type="password" id="restore-key-plaintext" autocomplete="off">
-        <p id="restore-error" role="alert"></p>
-        <button type="submit">Wiederherstellung anstoßen</button>
+        <label class="fld" for="restore-key-plaintext"><span class="field-label-text">Schlüssel des Vermieters<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span></label>
+        {# No `name` attribute (owner decision): this field is never part of
+           the form submission, with or without JavaScript. #}
+        <input class="fld-control" type="password" id="restore-key-plaintext" autocomplete="off">
+        <p id="restore-error" class="fld-error" role="alert"></p>
+        <button class="button primary mt-16" type="submit">{{ icons.icon("update") }}Wiederherstellung anstoßen</button>
     </form>
-    {# Owner decision (a), cross-review, 2026-09-28: this protects against
-       a leaked database, logs, server backups, or passive reading of the
-       fleet – it does NOT protect against an actively taken-over fleet
+    {# Owner decision (a), cross-review, 2026-09-28: this protects against a
+       leaked database, logs, server backups, or passive reading of the
+       fleet -- it does NOT protect against an actively taken-over fleet
        server serving a modified script at the next restore (accepted
        deliberately, spec section 15.3's own "limit of the browser-side
-       encryption" paragraph). The landlord compares this value against
-       the one named in the operating manual before trusting the form. #}
-    <p class="command-history__meta">
+       encryption" paragraph). The landlord compares this value against the
+       one named in the operating manual before trusting the form. #}
+    <p class="tiny muted mt-16">
         Prüfsumme des Verschlüsselungsskripts (sha256, siehe Betriebshandbuch):
-        <code>{{ detail.restore_vendor_js_sha256 }}</code>
+        <code class="id-text">{{ detail.restore_vendor_js_sha256 }}</code>
     </p>
     {% endif %}
 </section>
+</div>
 
-{# Danger zone (brief: "tenant change in a separated danger zone with
-   confirmation") – same single link to the existing, unchanged
-   confirmation page as before this stage; only its visual grouping (a
-   distinct, clearly marked zone, set apart from the routine maintenance
-   actions above) is new. #}
-<section class="danger-zone" aria-labelledby="tenant-change-heading">
-    <h2 id="tenant-change-heading">Mieterwechsel</h2>
-    <p class="danger-zone__hint">Setzt Zugangsdaten und Verlauf dieser Wohnung zurück – nicht rückgängig zu machen.</p>
-    {% if bundle_cleanup_failed %}
-    {# Cross-review fix (2026-10-02): the tenant change itself (token
-       rotation, history deletion) already succeeded by the time this
-       notice can appear – it only ever means some diagnostic bundle
-       blob file could not be removed from disk; see the server log for
-       which one. #}
-    <p class="error" role="alert">Mieterwechsel durchgeführt. Mindestens eine Diagnose-Sicherung konnte nicht gelöscht werden – siehe Server-Log.</p>
-    {% endif %}
-    <p><a class="command-button button--danger" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">Mieterwechsel durchführen</a></p>
+<section class="panel panel-wide" aria-labelledby="tenant-change-heading">
+    <h2 id="tenant-change-heading">Wohnung übergeben</h2>
+    <p class="subtitle">Mieterwechsel und Gerätetausch werden als eigene, geführte Vorgänge behandelt. Der Mieterwechsel setzt Zugangsdaten und Verlauf dieser Wohnung zurück – nicht rückgängig zu machen.</p>
+    <div class="action-grid">
+        <a class="button danger" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">{{ icons.icon("key") }}Mieterwechsel durchführen</a>
+        <a class="button" href="/ui/inventory/apartments/{{ apartment_id | urlpath }}/replace-device">{{ icons.icon("server") }}Basisstation austauschen</a>
+    </div>
 </section>
 
 </div>
 {% endif %}
 
 {% if active_tab == "technik" %}
-<div class="apartment-grid">
+<div class="split">
 
-<section aria-labelledby="version-heading">
-    <h2 id="version-heading">Version und System</h2>
+<section class="panel" aria-labelledby="version-heading">
+    <h2 id="version-heading">Basisstation</h2>
     {% if detail.never_reported %}
-    <p>Noch keine Daten.</p>
+    <div class="empty-state">{{ icons.icon("server") }}<p>Noch keine Daten.</p></div>
     {% else %}
-    <dl>
-        <dt>Agent</dt>
-        <dd>{{ detail.agent_version }}</dd>
-        <dt>thermoctl</dt>
-        <dd>{{ detail.thermoctl_version }}</dd>
-        <dt>Protokollversion</dt>
-        <dd>
-            {{ detail.protocol_version }}
-            {%- if detail.outdated %}
-            <span class="apartment-tile__tag">veraltete Protokollversion</span>
-            {%- endif %}
-        </dd>
-        <dt>Modus</dt>
-        <dd>{{ detail.mode }}</dd>
-        <dt>thermoctl erreichbar</dt>
-        <dd>{{ "Ja" if detail.thermoctl_reachable else "Nein" }}</dd>
-        <dt>Laufzeit</dt>
-        <dd>{{ detail.uptime_text }}</dd>
-        <dt>Freier Speicher</dt>
-        <dd>{{ detail.memory_free_percent }} %</dd>
-        <dt>Freier Plattenplatz</dt>
-        <dd>{{ detail.disk_free_percent }} %</dd>
-        <dt>Uhrabweichung</dt>
-        <dd>{{ detail.clock_drift_s }} s</dd>
-        <dt>Letzte Regelentscheidung</dt>
-        <dd>{{ detail.last_decision_text }}</dd>
-        <dt>Zonen</dt>
-        <dd>{{ detail.zones }}</dd>
-        <dt>Zonen ohne Messwert</dt>
-        <dd>{{ detail.zones_without_reading }}</dd>
-        <dt>Zonen mit Wärmebedarf</dt>
-        <dd>{{ detail.zones_with_heat_demand }}</dd>
-    </dl>
+    <div class="list-row"><span class="muted">Modus</span><span>{{ detail.mode }}</span></div>
+    <div class="list-row"><span class="muted">thermoctl erreichbar</span><span>{{ "Ja" if detail.thermoctl_reachable else "Nein" }}</span></div>
+    <div class="list-row"><span class="muted">Laufzeit</span><span>{{ detail.uptime_text }}</span></div>
+    <div class="list-row"><span class="muted">Freier Speicher</span><span>{{ detail.memory_free_percent }} %</span></div>
+    <div class="list-row"><span class="muted">Freier Plattenplatz</span><span>{{ detail.disk_free_percent }} %</span></div>
+    <div class="list-row"><span class="muted">Uhrabweichung</span><span>{{ detail.clock_drift_s }} s</span></div>
+    <div class="list-row"><span class="muted">Letzte Regelentscheidung</span><span>{{ detail.last_decision_text }}</span></div>
+    <div class="list-row"><span class="muted">Zonen</span><span>{{ detail.zones }}</span></div>
+    <div class="list-row"><span class="muted">Zonen ohne Messwert</span><span>{{ detail.zones_without_reading }}</span></div>
+    <div class="list-row"><span class="muted">Zonen mit Wärmebedarf</span><span>{{ detail.zones_with_heat_demand }}</span></div>
     {% endif %}
 </section>
 
-<section aria-labelledby="desired-state-heading">
-    <h2 id="desired-state-heading">Sollzustand (Container-Updates)</h2>
-    <p class="error" role="alert">
-        Update-Ausführung ist derzeit abgeschaltet (fail-closed Vorprüfung des Agenten,
-        Pilotbetrieb erforderlich).
-    </p>
-    {% if not detail.retired %}
-    <p><a class="command-button" href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">Sollzustand bearbeiten</a></p>
+<section class="panel" aria-labelledby="desired-state-heading">
+    <div class="section-head">
+        <h2 id="desired-state-heading">Software &amp; Sollzustand</h2>
+    </div>
+    {% if not detail.never_reported %}
+    <div class="list-row"><span>Agent</span><span>{{ detail.agent_version }}</span></div>
+    <div class="list-row"><span>thermoctl</span><span>{{ detail.thermoctl_version }}</span></div>
+    <div class="list-row"><span>Protokollversion</span><span>{{ detail.protocol_version }}{% if detail.outdated %} <span class="badge warn">veraltete Protokollversion</span>{% endif %}</span></div>
     {% endif %}
 
+    <div class="notice warn mt-16">
+        {{ icons.icon("alert") }}
+        <div>
+            <b>Update-Ausführung ist derzeit abgeschaltet</b>
+            <p>Fail-closed Vorprüfung des Agenten, Pilotbetrieb erforderlich. Ein gesetzter Sollzustand löst derzeit keine Aktualisierung am Gerät aus.</p>
+        </div>
+    </div>
+
     {% if detail.desired_state %}
-    <p>Aktuelle Revision: {{ detail.desired_state.revision }}, gesetzt von {{ detail.desired_state.created_by }} am {{ detail.desired_state.created_text }}</p>
-    <p>Grund: {{ detail.desired_state.reason }}</p>
-    <ul>
-        {% for service in detail.desired_state.services %}
-        <li>
-            <strong>{{ service.label }}</strong>: {{ service.version }}
-            (<code class="digest" title="{{ service.digest }}">{{ service.digest | shortdigest }}</code>
-            <button type="button" class="copy-button" data-copy="{{ service.digest }}" aria-label="Digest von {{ service.label }} kopieren">Kopieren</button>)
-        </li>
-        {% endfor %}
-    </ul>
-    <p>Fenster: {{ detail.desired_state.window_from }}–{{ detail.desired_state.window_until }} Uhr, nicht unter {{ detail.desired_state.window_not_below_outdoor_temp_c }} °C</p>
+    <p class="subtitle">Aktuelle Revision: {{ detail.desired_state.revision }}, gesetzt von {{ detail.desired_state.created_by }} am {{ detail.desired_state.created_text }}</p>
+    <p class="subtitle">Grund: {{ detail.desired_state.reason }}</p>
+    {% for service in detail.desired_state.services %}
+    <div class="list-row">
+        <span>{{ service.label }}<small>Version {{ service.version }}</small></span>
+        <span class="row-actions-tight">
+            <code class="digest" title="{{ service.digest }}">{{ service.digest | shortdigest }}</code>
+            <button type="button" class="button small copy-button" data-copy="{{ service.digest }}" aria-label="Digest von {{ service.label }} kopieren">Kopieren</button>
+        </span>
+    </div>
+    {% endfor %}
+    <p class="subtitle">Fenster: {{ detail.desired_state.window_from }}–{{ detail.desired_state.window_until }} Uhr, nicht unter {{ detail.desired_state.window_not_below_outdoor_temp_c }} °C</p>
     {% else %}
-    <p>Kein Sollzustand gesetzt.</p>
+    <p class="subtitle">Kein Sollzustand gesetzt.</p>
     {% endif %}
 
     {% if detail.desired_state_outcome %}
-    <h3>Letztes gemeldetes Ergebnis</h3>
-    <p>
-        Revision {{ detail.desired_state_outcome.revision }}:
-        <span class="apartment-tile__tag">{{ "erfolgreich" if detail.desired_state_outcome.successful else "fehlgeschlagen" }}</span>
-        {% if detail.desired_state_outcome.service_label %}({{ detail.desired_state_outcome.service_label }}){% endif %}
-        – {{ detail.desired_state_outcome.reason }} (gemeldet {{ detail.desired_state_outcome.reported_text }})
-    </p>
+    <h3 class="sub-head">Letztes gemeldetes Ergebnis</h3>
+    <div class="list-row">
+        <span>Revision {{ detail.desired_state_outcome.revision }}{% if detail.desired_state_outcome.service_label %} ({{ detail.desired_state_outcome.service_label }}){% endif %}<small>{{ detail.desired_state_outcome.reason }} (gemeldet {{ detail.desired_state_outcome.reported_text }})</small></span>
+        <span class="badge{% if not detail.desired_state_outcome.successful %} error{% endif %}">{{ "erfolgreich" if detail.desired_state_outcome.successful else "fehlgeschlagen" }}</span>
+    </div>
     {% endif %}
 
     {% if detail.desired_state_history %}
-    <h3>Verlauf</h3>
-    <ul>
-        {% for revision in detail.desired_state_history %}
-        <li>Revision {{ revision.revision }} von {{ revision.created_by }} am {{ revision.created_text }}: {{ revision.reason }}</li>
-        {% endfor %}
-    </ul>
+    <h3 class="sub-head">Verlauf</h3>
+    {% for revision in detail.desired_state_history %}
+    <div class="list-row"><span>Revision {{ revision.revision }}<small>von {{ revision.created_by }} am {{ revision.created_text }}: {{ revision.reason }}</small></span></div>
+    {% endfor %}
+    {% endif %}
+
+    {% if not detail.retired %}
+    <div class="mt-20"><a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">{{ icons.icon("settings") }}Sollzustand bearbeiten</a></div>
     {% endif %}
 </section>
 

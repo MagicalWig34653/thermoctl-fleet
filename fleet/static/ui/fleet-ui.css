@@ -210,6 +210,165 @@ tbody tr[data-detail]:hover{background:#f8faf4}
 .notice svg{color:#b98059}
 .notice p{color:#93816e;font-size:11px;margin-top:3px}
 
+/* -- Wohnung detail, rebuilt page (phase 2a): links as tabs, ranges, bars, rows -- */
+.tabs a{border-bottom:2px solid transparent;padding:12px 0;color:var(--muted);font-size:12px;margin-bottom:-1px}
+.tabs a:hover{color:var(--ink)}
+.tabs a.active{border-color:#47734c;color:#365d3b;font-weight:600}
+.detail-top h1{overflow-wrap:anywhere}
+.id-text{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;overflow-wrap:anywhere}
+code.id-text{background:#f3f5f0;border-radius:4px;padding:1px 5px}
+.range-links{display:flex;gap:4px}
+.range-links a{font-size:11px;color:var(--muted);padding:3px 8px;border-radius:5px}
+.range-links a:hover{background:#eef2ea}
+.range-links a.active{background:var(--mint);color:#365d3b;font-weight:600}
+.health-bars.proportional i{flex:0 1 auto;min-width:4px}
+.health-bars.proportional{margin-top:6px}
+.health-bars.proportional .tl-w-1{flex-basis:1%}
+.health-bars.proportional .tl-w-2{flex-basis:2%}
+.health-bars.proportional .tl-w-3{flex-basis:3%}
+.health-bars.proportional .tl-w-4{flex-basis:4%}
+.health-bars.proportional .tl-w-5{flex-basis:5%}
+.health-bars.proportional .tl-w-6{flex-basis:6%}
+.health-bars.proportional .tl-w-7{flex-basis:7%}
+.health-bars.proportional .tl-w-8{flex-basis:8%}
+.health-bars.proportional .tl-w-9{flex-basis:9%}
+.health-bars.proportional .tl-w-10{flex-basis:10%}
+.health-bars.proportional .tl-w-11{flex-basis:11%}
+.health-bars.proportional .tl-w-12{flex-basis:12%}
+.health-bars.proportional .tl-w-13{flex-basis:13%}
+.health-bars.proportional .tl-w-14{flex-basis:14%}
+.health-bars.proportional .tl-w-15{flex-basis:15%}
+.health-bars.proportional .tl-w-16{flex-basis:16%}
+.health-bars.proportional .tl-w-17{flex-basis:17%}
+.health-bars.proportional .tl-w-18{flex-basis:18%}
+.health-bars.proportional .tl-w-19{flex-basis:19%}
+.health-bars.proportional .tl-w-20{flex-basis:20%}
+.health-bars.proportional .tl-w-21{flex-basis:21%}
+.health-bars.proportional .tl-w-22{flex-basis:22%}
+.health-bars.proportional .tl-w-23{flex-basis:23%}
+.health-bars.proportional .tl-w-24{flex-basis:24%}
+.health-bars.proportional .tl-w-25{flex-basis:25%}
+.health-bars.proportional .tl-w-26{flex-basis:26%}
+.health-bars.proportional .tl-w-27{flex-basis:27%}
+.health-bars.proportional .tl-w-28{flex-basis:28%}
+.health-bars.proportional .tl-w-29{flex-basis:29%}
+.health-bars.proportional .tl-w-30{flex-basis:30%}
+.health-bars.proportional .tl-w-31{flex-basis:31%}
+.health-bars.proportional .tl-w-32{flex-basis:32%}
+.health-bars.proportional .tl-w-33{flex-basis:33%}
+.health-bars.proportional .tl-w-34{flex-basis:34%}
+.health-bars.proportional .tl-w-35{flex-basis:35%}
+.health-bars.proportional .tl-w-36{flex-basis:36%}
+.health-bars.proportional .tl-w-37{flex-basis:37%}
+.health-bars.proportional .tl-w-38{flex-basis:38%}
+.health-bars.proportional .tl-w-39{flex-basis:39%}
+.health-bars.proportional .tl-w-40{flex-basis:40%}
+.health-bars.proportional .tl-w-41{flex-basis:41%}
+.health-bars.proportional .tl-w-42{flex-basis:42%}
+.health-bars.proportional .tl-w-43{flex-basis:43%}
+.health-bars.proportional .tl-w-44{flex-basis:44%}
+.health-bars.proportional .tl-w-45{flex-basis:45%}
+.health-bars.proportional .tl-w-46{flex-basis:46%}
+.health-bars.proportional .tl-w-47{flex-basis:47%}
+.health-bars.proportional .tl-w-48{flex-basis:48%}
+.health-bars.proportional .tl-w-49{flex-basis:49%}
+.health-bars.proportional .tl-w-50{flex-basis:50%}
+.health-bars.proportional .tl-w-51{flex-basis:51%}
+.health-bars.proportional .tl-w-52{flex-basis:52%}
+.health-bars.proportional .tl-w-53{flex-basis:53%}
+.health-bars.proportional .tl-w-54{flex-basis:54%}
+.health-bars.proportional .tl-w-55{flex-basis:55%}
+.health-bars.proportional .tl-w-56{flex-basis:56%}
+.health-bars.proportional .tl-w-57{flex-basis:57%}
+.health-bars.proportional .tl-w-58{flex-basis:58%}
+.health-bars.proportional .tl-w-59{flex-basis:59%}
+.health-bars.proportional .tl-w-60{flex-basis:60%}
+.health-bars.proportional .tl-w-61{flex-basis:61%}
+.health-bars.proportional .tl-w-62{flex-basis:62%}
+.health-bars.proportional .tl-w-63{flex-basis:63%}
+.health-bars.proportional .tl-w-64{flex-basis:64%}
+.health-bars.proportional .tl-w-65{flex-basis:65%}
+.health-bars.proportional .tl-w-66{flex-basis:66%}
+.health-bars.proportional .tl-w-67{flex-basis:67%}
+.health-bars.proportional .tl-w-68{flex-basis:68%}
+.health-bars.proportional .tl-w-69{flex-basis:69%}
+.health-bars.proportional .tl-w-70{flex-basis:70%}
+.health-bars.proportional .tl-w-71{flex-basis:71%}
+.health-bars.proportional .tl-w-72{flex-basis:72%}
+.health-bars.proportional .tl-w-73{flex-basis:73%}
+.health-bars.proportional .tl-w-74{flex-basis:74%}
+.health-bars.proportional .tl-w-75{flex-basis:75%}
+.health-bars.proportional .tl-w-76{flex-basis:76%}
+.health-bars.proportional .tl-w-77{flex-basis:77%}
+.health-bars.proportional .tl-w-78{flex-basis:78%}
+.health-bars.proportional .tl-w-79{flex-basis:79%}
+.health-bars.proportional .tl-w-80{flex-basis:80%}
+.health-bars.proportional .tl-w-81{flex-basis:81%}
+.health-bars.proportional .tl-w-82{flex-basis:82%}
+.health-bars.proportional .tl-w-83{flex-basis:83%}
+.health-bars.proportional .tl-w-84{flex-basis:84%}
+.health-bars.proportional .tl-w-85{flex-basis:85%}
+.health-bars.proportional .tl-w-86{flex-basis:86%}
+.health-bars.proportional .tl-w-87{flex-basis:87%}
+.health-bars.proportional .tl-w-88{flex-basis:88%}
+.health-bars.proportional .tl-w-89{flex-basis:89%}
+.health-bars.proportional .tl-w-90{flex-basis:90%}
+.health-bars.proportional .tl-w-91{flex-basis:91%}
+.health-bars.proportional .tl-w-92{flex-basis:92%}
+.health-bars.proportional .tl-w-93{flex-basis:93%}
+.health-bars.proportional .tl-w-94{flex-basis:94%}
+.health-bars.proportional .tl-w-95{flex-basis:95%}
+.health-bars.proportional .tl-w-96{flex-basis:96%}
+.health-bars.proportional .tl-w-97{flex-basis:97%}
+.health-bars.proportional .tl-w-98{flex-basis:98%}
+.health-bars.proportional .tl-w-99{flex-basis:99%}
+.health-bars.proportional .tl-w-100{flex-basis:100%}
+.list-row>:first-child{min-width:0}
+.list-row b{font-weight:600}
+.list-row .badge{flex-shrink:0}
+.empty-state{display:flex;flex-direction:column;align-items:center;gap:8px;padding:26px 10px;color:var(--muted);text-align:center;font-size:13px}
+.empty-state svg{width:22px;height:22px;color:#6f9a80}
+.sub-head{margin:24px 0 2px;font-size:11px;letter-spacing:1.4px;text-transform:uppercase;color:var(--muted);font-weight:650}
+.panel h2+.sub-head,.section-head+.sub-head{margin-top:12px}
+.fault-item{border-bottom:1px solid var(--line);padding-bottom:16px}
+.fault-item .list-row{border-bottom:0;padding-bottom:6px}
+.ack-form{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
+.ack-form .fld{flex:1;min-width:200px;margin-top:6px}
+.ack-form .button{margin-bottom:0}
+.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;padding:6px 0 16px;border-bottom:1px solid var(--line)}
+.stat-row div{display:flex;flex-direction:column;gap:3px;font-size:12px}
+.stat-row b{font-size:20px;font-weight:600;letter-spacing:-.5px}
+.stack{display:grid;gap:20px;align-content:start}
+.command-log{list-style:none;margin:0;padding:0}
+.command-log>li{border-bottom:1px solid var(--line)}
+.command-log>li:last-child{border-bottom:0}
+.command-log .list-row{border-bottom:0}
+.log-error{color:var(--red);font-size:12px;margin:0 0 12px}
+.log-block{background:#f7f8f4;border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:0 0 16px}
+.log-lines{margin:8px 0 0;max-height:260px;overflow:auto;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.button.danger{color:var(--red);border-color:#e8cdc6}
+.button.danger:hover{background:var(--redbg)}
+.button.small{padding:4px 9px;min-height:28px;font-size:11px}
+.digest{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;background:#f3f5f0;border-radius:4px;padding:2px 6px}
+.mt-12{margin-top:12px}
+.notice.error{background:var(--redbg);border-color:#ecc9c1}
+.notice.error svg{color:var(--red)}
+.notice.error p{color:#8a5a52}
+.notice.warn{background:var(--amberbg);border-color:#ecdcb9}
+.notice.warn svg{color:var(--amber)}
+.notice.warn p{color:#85703f}
+.notice b{font-weight:600}
+.apt-icon-gap{gap:8px}
+@media(max-width:900px){
+.stat-row{grid-template-columns:1fr 1fr}
+.section-head{flex-wrap:wrap}
+.detail-top{flex-wrap:wrap}
+.tabs{overflow-x:auto}
+.tabs a{white-space:nowrap}
+.list-row{align-items:flex-start}
+.list-row .row-actions{flex-direction:column;align-items:flex-end;gap:4px}
+}
+
 /* ======================================================================
  * SECTION 7 -- PAGE: Einrichtung (installation steps)
  * ====================================================================== */
@@ -242,6 +401,42 @@ dialog::backdrop{background:#1b302e55;backdrop-filter:blur(3px)}
 .skip:focus{top:10px}
 body.menu-open .sidebar{transform:translateX(0)}
 .menu-shade{display:none}
+
+/* -- confirmation pages and form fields (phase 2a): the draft's dialog look as a page -- */
+.confirm-card{background:#fff;border:1px solid #dce3d3;border-radius:14px;padding:28px;max-width:520px;box-shadow:0 12px 40px #18361e14}
+.confirm-card.wide{max-width:720px}
+.confirm-card .eyebrow{margin-bottom:8px}
+.confirm-card h1{font-size:26px;letter-spacing:-1px}
+.confirm-card .subtitle{font-size:13px;margin-top:10px}
+.confirm-card .notice{margin:18px 0 0}
+.confirm-card .dialog-actions{margin-top:26px}
+.fld{display:block;font-size:12px;margin-top:16px}
+.fld-control{display:block;width:100%;margin-top:6px;border:1px solid #d5dcd0;border-radius:7px;padding:10px 11px;background:#fff;color:var(--ink);font-size:13px;max-width:100%}
+.fld-control:focus{border-color:#76b49b;outline:3px solid #76b49b55;outline-offset:0}
+.fld-control.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.fld-error{color:var(--red);font-size:12px;margin-top:8px}
+.fld-error:empty{display:none}
+.field-required{color:var(--red)}
+.field-optional{color:var(--muted);font-weight:400}
+.fld-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.confirm-group{border:1px solid var(--line);border-radius:10px;padding:6px 18px 18px;margin:18px 0 0;min-width:0}
+.confirm-group legend{font-size:13px;font-weight:600;padding:0 8px;margin-left:-8px}
+.consequence-list{list-style:none;margin:20px 0 0;padding:0;display:grid;gap:12px}
+.consequence-list li{display:flex;gap:12px;font-size:13px;line-height:1.5}
+.consequence-list svg{color:#6f9a80;margin-top:2px}
+.summary-block{margin-top:18px;border:1px solid var(--line);border-radius:10px;padding:2px 16px}
+.digest-details{margin-top:12px;font-size:12px;color:var(--muted)}
+.digest-details summary{cursor:pointer}
+.digest-details ul{margin:8px 0 0;padding-left:18px;display:grid;gap:6px}
+.button.danger-solid{background:var(--red);border-color:var(--red);color:#fff}
+.button.danger-solid:hover{background:#9d3f34}
+.inline-link{text-decoration:underline}
+@media(max-width:650px){
+.confirm-card{padding:20px}
+.fld-grid{grid-template-columns:1fr}
+.confirm-card .dialog-actions{flex-direction:column-reverse}
+.confirm-card .dialog-actions .button{width:100%}
+}
 
 /* ======================================================================
  * SECTION 10 -- PAGE: Updates (rollout block)

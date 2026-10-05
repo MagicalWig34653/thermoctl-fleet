@@ -1,40 +1,49 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% import "_confirm.html" as confirm %}
 
-{% block title %}Befehl bestätigen – thermoctl-fleet{% endblock %}
+{% block title %}Befehl bestätigen – thermoctl fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Wohnungen <span class="crumb-sep">/</span> Befehl bestätigen{% endblock %}
 
 {% block content %}
-{# Stage-1 command confirmation (P5.1b, section 9: "the four to seven
-   allowed commands as buttons with confirmation"). This page only ever
-   names the apartment and the command in words and asks for a mandatory
-   reason -- the POST below is the only place Storage.create_command is
-   ever called. #}
-<p><a href="/ui/apartments/{{ apartment_id | urlpath }}">&larr; Zurück zur Wohnung</a></p>
-<h1>Befehl bestätigen</h1>
+{# Stage-1 command confirmation (P5.1b, section 9: "the four to seven allowed
+   commands as buttons with confirmation"). This page only ever names the
+   apartment and the command in words and asks for a mandatory reason -- the
+   POST below is the only place Storage.create_command is ever called. #}
+<a class="text-button back" href="/ui/apartments/{{ apartment_id | urlpath }}">{{ icons.icon("back") }}Zurück zur Wohnung</a>
 
-<p>
-    Wohnung <strong>{{ apartment_id }}</strong>{% if apartment_label and apartment_label != apartment_id %} ({{ apartment_label }}){% endif %}
-    erhält den Befehl <strong>{{ command_label }}</strong>.
-</p>
+<div class="confirm-card">
+    <div class="eyebrow">Wartung</div>
+    <h1>Befehl bestätigen</h1>
+    <p class="subtitle">
+        Wohnung {{ confirm.apartment_ref(apartment_id, apartment_label) }}
+        erhält den Befehl <strong>{{ command_label }}</strong>.
+    </p>
 
-{% if retired %}
-<p class="error" role="alert">Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.</p>
-{% else %}
+    {% if retired %}
+    <div class="notice error" role="alert">{{ icons.icon("alert") }}<div><b>Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.</b></div></div>
+    {% else %}
 
-{% if error %}
-<p class="error" role="alert">{{ error }}</p>
-{% endif %}
-
-<form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ command | urlpath }}/confirm">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    {% if requires_lines %}
-    <label for="lines"><span class="field-label-text">Anzahl Zeilen ({{ min_lines }}–{{ max_lines }})<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-        <input type="text" id="lines" name="lines" inputmode="numeric" value="{{ default_lines }}" required>
-    </label>
+    {% if error %}
+    <div class="notice error" role="alert">{{ icons.icon("alert") }}<div><b>{{ error }}</b></div></div>
     {% endif %}
-    <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-        <input type="text" id="reason" name="reason" required>
-    </label>
-    <button type="submit">Bestätigen: {{ command_label }}</button>
-</form>
-{% endif %}
+
+    <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ command | urlpath }}/confirm">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% if requires_lines %}
+        <label class="fld" for="lines"><span class="field-label-text">Anzahl Zeilen ({{ min_lines }}–{{ max_lines }}){{ confirm.required() }}</span>
+            <input class="fld-control" type="text" id="lines" name="lines" inputmode="numeric" value="{{ default_lines }}" required>
+        </label>
+        {% endif %}
+        <label class="fld" for="reason"><span class="field-label-text">Grund{{ confirm.required() }}</span>
+            <input class="fld-control" type="text" id="reason" name="reason" required>
+        </label>
+        <div class="dialog-actions">
+            <a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}">Abbrechen</a>
+            <button class="button primary" type="submit">Bestätigen: {{ command_label }}</button>
+        </div>
+    </form>
+    {% endif %}
+</div>
 {% endblock %}

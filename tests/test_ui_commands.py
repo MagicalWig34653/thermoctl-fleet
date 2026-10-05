@@ -692,7 +692,7 @@ def _befehle_section(html: str) -> str:
 
 
 def _history_section(html: str) -> str:
-    start = html.index("<h3>Verlauf</h3>")
+    start = html.index('<h3 class="sub-head">Verlauf</h3>')
     return html[start:]
 
 
