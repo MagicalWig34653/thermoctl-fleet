@@ -1,0 +1,13 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<component name="ProjectRunConfigurationManager">
+  <configuration name="Website-Screenshots erzeugen" type="PythonConfigurationType" folderName="Werkzeuge" factoryName="Python">
+    <option name="IS_MODULE_SDK" value="true" />
+    <option name="SDK_HOME" value="" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="MODULE_MODE" value="true" />
+    <option name="SCRIPT_NAME" value="tools.docs_screenshots" />
+    <option name="PARAMETERS" value="" />
+    <option name="EMULATE_TERMINAL" value="false" />
+    <method v="2" />
+  </configuration>
+</component>

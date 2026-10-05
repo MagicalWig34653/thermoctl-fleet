@@ -2,6 +2,17 @@
 
 Last updated: 2026-10-04.
 
+## Shared PyCharm run configurations and local demo fleet (2026-10-04)
+
+Added grouped `.run/` configurations for the demo fleet, tests, Python and
+Go checks, flash and website tools, and the existing Mac test VM commands.
+`python -m tools.dev_fleet` keeps its generated key, migrated SQLite database,
+fictional seed data, and admin-created demo login under gitignored `.dev/`.
+The key and login file are created mode 0600; reset requires confirmation
+unless `--yes` is passed. Local WebAuthn origin and blob-storage directories
+are configured for the HTTP development server. Target, XML, state reuse,
+reset, and file permissions have dedicated tests.
+
 ## Flash tool: main-session read-back of the cross-platform refactor + TUI (2026-10-05) **SR**
 
 Read back the Linux and Windows disk-eligibility rules (only external/

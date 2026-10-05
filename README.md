@@ -107,6 +107,23 @@ Check the watchdog (own toolchain, see
 cd watchdog && go vet ./... && go test ./...
 ```
 
+## Entwickeln mit PyCharm
+
+Open the repository with the project interpreter and use the shared `.run/`
+configurations (grouped in PyCharm):
+
+- **Fleet:** `Fleet – Dev-Server (Demo-Daten)`, `Fleet – Dev-Server zurücksetzen`.
+  The launcher creates a private, gitignored `.dev/` database, demo login,
+  and TOTP key, then prints the login and serves the UI on localhost:8000.
+- **Tests:** `Tests – alle`, `Tests – schnell (ohne Coverage)`.
+- **Prüfungen:** `Ruff`, `Mypy`, `Image-Konfiguration prüfen`, `Watchdog – Go-Tests`.
+- **Werkzeuge:** `Flash-Tool (Terminal-Oberfläche)`, `Flash-Tool – Laufwerke anzeigen`,
+  `Website-Screenshots erzeugen`, `Website lokal ansehen`.
+- **Mac-Test-VM:** `Status`, `Erstellen`, `Starten`, `Registrieren`, `Logs`, `Stoppen`.
+
+The same local fleet starts outside PyCharm with `python -m tools.dev_fleet`.
+Use `--reset` to recreate it and `--no-reload` to disable source watching.
+
 ## Documentation website
 
 A German-language documentation site for landlords/operators -- explains the
