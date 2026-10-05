@@ -221,8 +221,11 @@ code.id-text{background:#f3f5f0;border-radius:4px;padding:1px 5px}
 .range-links a{font-size:11px;color:var(--muted);padding:3px 8px;border-radius:5px}
 .range-links a:hover{background:#eef2ea}
 .range-links a.active{background:var(--mint);color:#365d3b;font-weight:600}
-.health-bars.proportional i{flex:0 1 auto;min-width:4px}
-.health-bars.proportional{margin-top:6px}
+.health-bars.proportional i{flex:0 1 auto;min-width:4px;border-radius:0}
+.health-bars.proportional{margin-top:6px;gap:0;height:30px;border-radius:3px;overflow:hidden;-webkit-mask-image:repeating-linear-gradient(90deg,#000 0 calc(100% / 42 - 4px),transparent 0 calc(100% / 42));mask-image:repeating-linear-gradient(90deg,#000 0 calc(100% / 42 - 4px),transparent 0 calc(100% / 42))}
+.split.align-start{align-items:start}
+.inline-details summary{cursor:pointer;display:inline}
+.inline-details code{display:block;margin-top:4px}
 .health-bars.proportional .tl-w-1{flex-basis:1%}
 .health-bars.proportional .tl-w-2{flex-basis:2%}
 .health-bars.proportional .tl-w-3{flex-basis:3%}

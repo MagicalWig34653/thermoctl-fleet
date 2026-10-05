@@ -913,6 +913,11 @@ def test_every_section_renders_from_real_stored_data(
     # past faults (from the events table) -- never titel/text
     assert "Fensteralarm" in overview_body  # derived kind from the "fenster:" prefix
     assert "fenster:bad" in overview_body
+    # The severity is shown as a German label, never the raw protocol tag,
+    # and the last heartbeat's age is the "Letzter Kontakt" row.
+    assert '<span class="badge gray">Warnung</span>' in overview_body
+    assert ">warnung<" not in overview_body
+    assert "Letzter Kontakt" in overview_body
     assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in overview_body
     assert "MARKER_TEXT_SHOULD_NOT_APPEAR" not in overview_body
     # battery/signal
@@ -1277,3 +1282,25 @@ def test_tenant_change_is_a_marked_destructive_link_to_its_confirmation_page(
     )
     section = response.text[response.text.index('id="tenant-change-heading"') :]
     assert "<form" not in section.split("</section>")[0]
+
+
+def test_severity_labels_cover_the_known_severities_and_keep_unknown_ones() -> None:
+    from fleet.ui_apartment import SEVERITY_LABELS
+
+    assert SEVERITY_LABELS["stoerung"] == "Störung"
+    assert SEVERITY_LABELS.get("neu", "neu") == "neu"
+
+
+def test_single_heartbeat_is_not_pluralised(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    storage.save_heartbeat(
+        APARTMENT, _make_heartbeat(APARTMENT, sent_at=RECENT_TIME), RECENT_TIME
+    )
+    _login(client, password, totp_secret)
+
+    body = client.get(f"/ui/apartments/{APARTMENT}?ansicht=ueberblick").text
+
+    assert "1 Herzschlag<" in body
+    assert "1 Herzschläge" not in body
