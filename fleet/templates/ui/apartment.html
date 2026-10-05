@@ -60,7 +60,7 @@
 </div>
 {% endif %}
 
-<div class="split">
+<div class="split align-start">
 
 <section class="panel" aria-labelledby="history-heading">
     <div class="section-head">
@@ -83,9 +83,12 @@
         {% endfor %}
     </div>
     <div class="progress-meta"><span>Jetzt</span><span>vor {{ detail.history_days }} Tagen</span></div>
+    {% if detail.last_contact_text %}
+    <div class="list-row"><span>Letzter Kontakt</span><b>{{ detail.last_contact_text }}</b></div>
+    {% endif %}
     {% for entry in detail.timeline %}
     <div class="list-row{% if entry.is_gap %} is-gap{% endif %}">
-        <span>{{ entry.label }}<small>{{ entry.when_text }}{% if entry.duration_text %} · {{ entry.duration_text }}{% endif %}{% if entry.heartbeat_count is not none %} · {{ entry.heartbeat_count }} Herzschläge{% endif %}</small></span>
+        <span>{{ entry.label }}<small>{{ entry.when_text }}{% if entry.duration_text %} · {{ entry.duration_text }}{% endif %}{% if entry.heartbeat_count is not none %} · {{ entry.heartbeat_count }} {{ "Herzschlag" if entry.heartbeat_count == 1 else "Herzschläge" }}{% endif %}</small></span>
         {% if entry.is_gap %}<span class="badge error">Keine Rückmeldung</span>{% elif entry.caught_up_count %}<span class="badge gray">{{ entry.caught_up_count }} nachgeliefert</span>{% endif %}
     </div>
     {% endfor %}
@@ -129,7 +132,7 @@
     {% for fault in detail.past_faults %}
     <div class="list-row">
         <span>{{ fault.kind_label }}<small>{{ fault.key }} · {{ fault.received_text }}</small></span>
-        <span class="badge gray">{{ fault.severity }}</span>
+        <span class="badge gray">{{ fault.severity_label or fault.severity }}</span>
     </div>
     {% endfor %}
     {% else %}
@@ -197,7 +200,7 @@
 {% endif %}
 {% set command_icons = {"report_now": "wifi", "fetch_logs": "list", "diagnostic_bundle": "box", "agent_restart": "update", "backup_now": "plus"} %}
 
-<div class="split">
+<div class="split align-start">
 
 <section class="panel" aria-labelledby="commands-heading">
     <h2 id="commands-heading">Diagnose &amp; Wartung</h2>
@@ -261,8 +264,11 @@
     {% if detail.backups %}
     {% for backup in detail.backups %}
     <div class="list-row">
-        <span>{{ backup.kind_label }}<small>{{ backup.created_text }} · {{ backup.size_text }}</small><small>Hash: <code class="id-text">{{ backup.content_hash }}</code></small>{% if backup.age_decrypt_command %}<small>Entschlüsseln: <code class="id-text">{{ backup.age_decrypt_command }}</code></small>{% endif %}</span>
+        <span>{{ backup.kind_label }}<small>{{ backup.created_text }} · {{ backup.size_text }}</small><small>Hash: <code class="id-text" title="{{ backup.content_hash }}">{{ backup.content_hash | shortdigest }}</code></small>{% if backup.age_decrypt_command %}<small><details class="inline-details"><summary>Entschlüsseln</summary><code class="id-text">{{ backup.age_decrypt_command }}</code></details></small>{% endif %}</span>
+        <span class="row-actions-tight">
+        <button type="button" class="button small copy-button" data-copy="{{ backup.content_hash }}" aria-label="Hash kopieren">Hash kopieren</button>
         <a class="icon-button" href="/ui/apartments/{{ apartment_id | urlpath }}/backups/{{ backup.backup_id | urlpath }}/download" aria-label="{{ backup.kind_label }} vom {{ backup.created_text }} herunterladen">{{ icons.icon("download") }}</a>
+        </span>
     </div>
     {% endfor %}
     {% else %}
@@ -418,7 +424,7 @@
 <script src="/ui/static/vendor/age-encryption.vendor.js"></script>
 <script src="/ui/static/restore_form.js"></script>
 {% endif %}
-{% if detail and active_tab == "technik" and detail.desired_state %}
+{% if detail and ((active_tab == "technik" and detail.desired_state) or (active_tab == "wartung" and detail.backups)) %}
 <script src="/ui/static/copy.js"></script>
 {% endif %}
 {% endblock %}
