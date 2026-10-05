@@ -157,7 +157,7 @@
     <li><strong>Fleet-Dienst</strong> – Cloud. FastAPI; nimmt Heartbeats und Ereignisse an, verteilt Befehle, bedient die Web-UI.</li>
     <li><strong>SQLite</strong> – Cloud. Inventar, Zustände, Audit-Log – keine Rohdaten der Wohnung.</li>
     <li><strong>Backup-Blobspeicher</strong> – Cloud. Nur opake, auf dem Gerät verschlüsselte Blöcke; die Cloud kann sie nicht lesen.</li>
-    <li><strong>Web-UI</strong> – Cloud. Haus, Wohnung, Aufgaben, Inventar; keine Temperaturkurven, keine Mieterdaten.</li>
+    <li><strong>Web-UI</strong> – Cloud. Übersicht, Wohnungen, Einrichtung, Updates; keine Temperaturkurven, keine Mieterdaten.</li>
     <li><strong>Alarm-Kanäle</strong> – Cloud. Webhook, SMTP oder Log – konfigurierbar, mehrere gleichzeitig möglich.</li>
     <li><strong>Browser des Vermieters</strong> – eigene Zone. Passkey/TOTP-Anmeldung; verschlüsselt den Restore-Schlüssel lokal, bevor er die Cloud erreicht.</li>
   </ul>
@@ -178,7 +178,7 @@
       <ol>
         <li>thermoctl erkennt eine der sechs Störungsarten und trägt sie in <code>open_faults</code> des nächsten Heartbeats ein.</li>
         <li>Agent überträgt die Störung unverändert, ohne Klartext aus thermoctls eigenem Text.</li>
-        <li>Fleet-Dienst erzeugt ein Envelope aus <code>kind</code>/<code>key</code> und zeigt es in der Aufgabenliste.</li>
+        <li>Fleet-Dienst erzeugt ein Envelope aus <code>kind</code>/<code>key</code> und zeigt es im Posteingang „Was zu tun ist“ der Übersicht.</li>
         <li>Der Vermieter quittiert im Web-UI – die Quittierung gilt nur für das aktuelle Auftreten; tritt die Störung erneut auf, erscheint sie wieder.</li>
       </ol>
     </details>

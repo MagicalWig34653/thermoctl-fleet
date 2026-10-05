@@ -60,7 +60,7 @@
       Verifizierungscode an.
     </li>
     <li>
-      <strong>Zuordnen.</strong> In der Fleet-Oberfläche, unter Inventar, erscheint das
+      <strong>Zuordnen.</strong> In der Fleet-Oberfläche, unter Einrichtung, erscheint das
       Gerät mit demselben Verifizierungscode. Erst diese Bestätigung gibt die
       Konfiguration frei – gebunden an den Schlüssel genau dieses Geräts.
     </li>
@@ -79,22 +79,28 @@
   Wartezeit auf den Image-Download. Was noch von Hand zu tun bleibt: hinfahren, Gerät
   tauschen, den Zigbee-Funkstick mit umstecken.</p>
 
-  <h2 id="in-der-oberflaeche">Vorbereiten in der Fleet-Oberfläche</h2>
+  <h2 id="in-der-oberflaeche">Vorbereiten unter „Einrichtung“</h2>
   <p>
-    Unter Inventar wählen Sie ein Gerät und klicken „Vorbereiten“. Die Oberfläche erzeugt
-    dabei einen frischen, einmaligen Registrierungscode und zeigt ihn <strong>genau
-    einmal</strong> an – er wird nirgends protokolliert und nie im Klartext gespeichert,
-    nur sein Hash. Sind <code>FLEET_PUBLIC_URL</code> und <code>FLEET_CERT_FINGERPRINT</code>
-    gesetzt (siehe <a href="einstieg.html#env">Einstieg</a>), erzeugt die Seite direkt den
-    fertigen Inhalt für <code>agent-registration.json</code> zum Herunterladen. Fehlt eine
-    der beiden Variablen, zeigt die Seite einen klaren Hinweis statt eines erfundenen
-    Platzhalterwerts.
+    Der Bereich „Einrichtung“ (vormals „Inventar“) gliedert sich in drei Reiter:
+    „Objekte &amp; Wohnungen“, „Basisstationen“ und „Neue Basisstation
+    vorbereiten“ – der dritte eine geführte Schrittliste (Gerät registrieren →
+    Vorbereiten → Ausliefern → Bestätigen), deren Schritte jeweils zum passenden
+    Formular im Reiter „Basisstationen“ oder zur Bestätigungsliste verlinken; neue
+    Routen gibt es dafür keine. Unter „Basisstationen“ wählen Sie ein Gerät und
+    klicken „Vorbereiten“. Die Oberfläche erzeugt dabei einen frischen, einmaligen
+    Registrierungscode und zeigt ihn <strong>genau einmal</strong> an – er wird
+    nirgends protokolliert und nie im Klartext gespeichert, nur sein Hash. Sind
+    <code>FLEET_PUBLIC_URL</code> und <code>FLEET_CERT_FINGERPRINT</code> gesetzt
+    (siehe <a href="einstieg.html#env">Einstieg</a>), erzeugt die Seite direkt den
+    fertigen Inhalt für <code>agent-registration.json</code> zum Herunterladen.
+    Fehlt eine der beiden Variablen, zeigt die Seite einen klaren Hinweis statt
+    eines erfundenen Platzhalterwerts.
   </p>
   <p>Für ein Gerät, das vorher in einer anderen Wohnung lief, verlangt das Formular die
   Bestätigung „Gerät wurde zurückgesetzt“ – nur für Geräte im Status „auf Lager“.</p>
   <figure class="shot">
-    <img class="screenshot" src="../assets/img/inventory-light.png" alt="Inventaransicht mit Immobilien, Wohnungen und Geräten" loading="lazy">
-    <figcaption>Die Inventaransicht mit den Demo-Wohnungen.</figcaption>
+    <img class="screenshot" src="../assets/img/einrichtung-light.png" alt="Einrichtung, Reiter „Objekte &amp; Wohnungen“: Immobilien und Wohnungen mit ihren Formularen zum Anlegen" loading="lazy">
+    <figcaption>Einrichtung, Reiter „Objekte &amp; Wohnungen“, mit den Demo-Wohnungen.</figcaption>
   </figure>
 
   <h2 id="wifi">Wenn das Gerät nur WLAN hat</h2>
@@ -241,7 +247,7 @@ tools/mac-test-vm enroll</code></pre>
       beziehungsweise <code>tools/mac-test-vm logs</code> und bestätigen Sie das Gerät.</li>
     <li>Starten Sie danach mit <code>tools/mac-test-vm finish</code> den eigentlichen
       Agenten. Mit <code>tools/mac-test-vm logs</code> verfolgen Sie seine Meldungen;
-      im Fleet-Inventar sehen Sie das registrierte Gerät.</li>
+      unter Einrichtung sehen Sie das registrierte Gerät.</li>
   </ol>
   <pre><code>tools/mac-test-vm logs
 # Nach dem Lesen der Logs mit Ctrl+C zurück zum Terminal

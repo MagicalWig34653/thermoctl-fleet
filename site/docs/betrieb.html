@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Täglicher Betrieb – thermoctl-fleet</title>
-<meta name="description" content="Dashboard, Störungen, Alarme, Befehle, Backups, Restore, Rollouts und Mieterwechsel im täglichen Betrieb von thermoctl-fleet.">
+<meta name="description" content="Übersicht, Wohnungsseite, Störungen, Alarme, Befehle, Backups, Restore, Updates und Mieterwechsel im täglichen Betrieb von thermoctl-fleet.">
 <link rel="icon" href="../assets/icon/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="../assets/icon/apple-touch-icon.png">
 <link rel="stylesheet" href="../assets/css/style.css">
@@ -37,41 +37,66 @@
 <div>
   <h1>Täglicher Betrieb</h1>
   <p>
-    Drei Ansichten, nicht mehr (Abschnitt 9 der Spezifikation): das Haus, eine Wohnung,
-    die Aufgabenliste. Wer nichts zu tun hat, sieht eine ruhige Oberfläche – das ist
-    Absicht.
+    Vier Bereiche, nicht mehr: <strong>Übersicht</strong>, <strong>Wohnungen</strong>,
+    <strong>Einrichtung</strong>, <strong>Updates</strong> – auf dem Desktop eine
+    Seitenleiste links, auf dem Smartphone eine Tableiste unten, dieselbe
+    Reihenfolge an beiden Stellen. Der tägliche Ablauf ist fast immer derselbe:
+    Übersicht öffnen, den Posteingang „Was zu tun ist“ abarbeiten, entweder inline
+    oder durch Öffnen der betroffenen Wohnung. Wer nichts zu tun hat, sieht eine
+    ruhige Oberfläche – das ist Absicht.
   </p>
 
-  <h2 id="dashboard">Das Haus</h2>
+  <h2 id="uebersicht">Übersicht</h2>
   <p>
-    Eine Kachel pro Wohnung: Name, letzter Kontakt, Modus, offene Störungen, Version.
-    Sortiert nach Handlungsbedarf, nicht nach Nummer.
+    Die Startseite beantwortet eine Frage: Was braucht jetzt den Vermieter? Ein Satz
+    oben nennt, wie viele Wohnungen betroffen sind. Darunter der Posteingang
+    „Was zu tun ist“: eine Zeile je Punkt – meldet sich nicht, offene Störung,
+    Batterie schwach, veraltete Version, ein Rollout, das auf Entscheidung wartet.
+    Jede Zeile führt über „Ansehen“ (teils „Ansehen und quittieren“ bzw. „…und
+    entscheiden“) genau dorthin, wo die eigentliche Aktion schon liegt – quittiert
+    wird auf der Wohnungsseite selbst, entschieden auf der Rollout-Seite; nichts
+    davon wird im Posteingang noch einmal nachgebaut. Ist der Posteingang leer,
+    steht dort nur ein ruhiger Satz. Darunter folgt die kompakte Lageübersicht nach
+    Gebäude und Stockwerk, eine Kachel pro Wohnung – eine unauffällige Wohnung
+    erscheint ausschließlich hier, nie im Posteingang.
   </p>
   <figure class="shot">
-    <img class="screenshot" src="../assets/img/dashboard-light.png" alt="Fleet-Übersicht mit mehreren Wohnungskacheln, eine davon mit Alarm" loading="lazy">
-    <figcaption>Die Haus-Ansicht mit mehreren Demo-Wohnungen.</figcaption>
+    <img class="screenshot" src="../assets/img/uebersicht-light.png" alt="Übersicht mit Situationssatz, Posteingang „Was zu tun ist“ und kompakter Lageübersicht nach Stockwerken" loading="lazy">
+    <figcaption>Die Übersicht mit mehreren Demo-Wohnungen: der Posteingang zeigt fünf offene Punkte, darunter die Lageübersicht nach Stockwerk.</figcaption>
   </figure>
 
-  <h2 id="wohnungsansicht">Eine Wohnung</h2>
+  <h2 id="wohnungen">Wohnungen</h2>
   <p>
-    Heartbeat-Verlauf der letzten Tage (Erreichbarkeit, nicht Temperatur), offene und
-    vergangene Störungen, Batterie- und Signalwerte pro Gerät, Version, sowie die vier bis
-    sieben erlaubten Befehle als Schaltflächen mit Bestätigung.
+    Eine flache, durchsuch- und filterbare Liste aller Wohnungen – nach Name oder
+    Liegenschaft per Suchfeld, zusätzlich nach Liegenschaft und nach Zustand. Alle
+    drei Filter sind ein einfaches <code>GET</code>-Formular: eine gewöhnliche
+    Seite, kein JavaScript nötig.
   </p>
   <figure class="shot">
-    <img class="screenshot" src="../assets/img/apartment-light.png" alt="Detailansicht einer Demo-Wohnung mit offener Störung" loading="lazy">
-    <figcaption>Die Wohnungsansicht am Beispiel von „Musterstraße 1, WE 5“ mit einem offenen Sensorfehler.</figcaption>
+    <img class="screenshot" src="../assets/img/wohnungen-light.png" alt="Wohnungsliste mit Suchfeld, Liegenschafts- und Zustandsfilter" loading="lazy">
+    <figcaption>Die Wohnungsliste (Demo-Bestand).</figcaption>
   </figure>
 
-  <h2 id="aufgaben">Aufgaben</h2>
+  <h2 id="wohnungsseite">Eine Wohnung: drei Reiter</h2>
   <p>
-    Was ansteht: fällige Batterierunden, ausstehende Updates, unbestätigte
-    Störungen – die Liste, von der aus tatsächlich gearbeitet wird. Wer nichts
-    zu tun hat, sieht hier eine leere Liste statt einer Kachel pro Wohnung.
+    Kopfzeile mit Zustand und der einen nächsten Handlung, darunter drei Reiter –
+    <strong>Überblick</strong>, <strong>Wartung</strong>, <strong>Technik</strong>.
+    Jeder Reiter rendert serverseitig nur seinen eigenen Inhalt
+    (<code>?ansicht=ueberblick|wartung|technik</code>), die anderen beiden werden
+    nicht etwa nur per CSS versteckt mitgeladen – auch über eine langsame
+    Verbindung lädt jeweils nur, was gerade zu sehen ist.
   </p>
   <figure class="shot">
-    <img class="screenshot" src="../assets/img/tasks-light.png" alt="Aufgabenliste mit fälligen Punkten" loading="lazy">
-    <figcaption>Die Aufgabenansicht (Demo-Bestand).</figcaption>
+    <img class="screenshot" src="../assets/img/wohnung-ueberblick-light.png" alt="Wohnungsseite, Reiter Überblick: Erreichbarkeit, offene Störung, Batterie- und Signalwerte, Alarme" loading="lazy">
+    <figcaption><strong>Überblick:</strong> Erreichbarkeitsverlauf, offene und vergangene Störungen, Batterie und Signal je Gerät, Alarme – am Beispiel von „Musterstraße 1, WE 5“ mit einem offenen Sensorfehler.</figcaption>
+  </figure>
+  <figure class="shot">
+    <img class="screenshot" src="../assets/img/wohnung-wartung-light.png" alt="Wohnungsseite, Reiter Wartung: Befehle, Verlauf, Sicherungen, Wiederherstellen und die abgesetzte Mieterwechsel-Zone" loading="lazy">
+    <figcaption><strong>Wartung:</strong> Befehle und ihr Verlauf, Sicherungen, Wiederherstellen – und, als eigene, rot umrandete Zone unten, der Mieterwechsel (siehe <a href="#mieterwechsel">unten</a>).</figcaption>
+  </figure>
+  <figure class="shot">
+    <img class="screenshot" src="../assets/img/wohnung-technik-light.png" alt="Wohnungsseite, Reiter Technik: Version und System, Soll-Zustand mit Digests" loading="lazy">
+    <figcaption><strong>Technik:</strong> Agent- und thermoctl-Version, Protokollversion und Modus, Soll-Zustand mit gekürzten Digests und Kopieren-Knopf.</figcaption>
   </figure>
 
   <h2 id="stoerungen">Störungen und Quittierung</h2>
@@ -126,25 +151,41 @@
     Gerät verschlüsselt, und von der Cloud nur durchgereicht – nie gespeichert.
   </p>
 
-  <h2 id="rollouts">Gestaffelte Rollouts</h2>
+  <h2 id="einrichtung">Einrichtung</h2>
   <p>
-    Updates laufen über Soll-Zustand, nie als Fernsteuerungsbefehl für eine einzelne
-    Wohnung. Ein Rollout schaltet Wohnung für Wohnung weiter, mit Rückfallpfad auf die
-    alte Version, falls nach dem Update 15 Minuten lang kein Heartbeat ankommt.
+    Drei Unterbereiche, als Reiter: <strong>Objekte &amp; Wohnungen</strong>
+    (Immobilien und Wohnungen anlegen), <strong>Basisstationen</strong> (Geräte
+    registrieren, vorbereiten, ersetzen) und <strong>Neue Basisstation
+    vorbereiten</strong> – eine geführte Schrittliste (Gerät registrieren →
+    Vorbereiten → Ausliefern → Bestätigen), jeder Schritt verlinkt zum
+    passenden Formular im jeweils anderen Reiter oder zur
+    Bestätigungsliste. Details zum Ablauf: <a href="wohnung.html">Wohnung
+    hinzufügen</a>.
+  </p>
+
+  <h2 id="updates">Updates</h2>
+  <p>
+    Container-Updates laufen über Soll-Zustand, nie als Fernsteuerungsbefehl für
+    eine einzelne Wohnung. Ein Rollout schaltet Wohnung für Wohnung weiter, mit
+    Rückfallpfad auf die alte Version, falls nach dem Update 15 Minuten lang kein
+    Heartbeat ankommt. Ein gestoppter Rollout wartet auf eine Entscheidung
+    (fortsetzen oder abbrechen) – tritt dieser Fall ein, erscheint er zusätzlich
+    als eigene Zeile im Posteingang der Übersicht.
   </p>
   <figure class="shot">
-    <img class="screenshot" src="../assets/img/rollouts-light.png" alt="Übersicht laufender und vergangener Rollouts" loading="lazy">
-    <figcaption>Ein Demo-Rollout über zwei Wohnungen.</figcaption>
+    <img class="screenshot" src="../assets/img/updates-light.png" alt="Updates-Seite mit laufenden und vergangenen Rollouts" loading="lazy">
+    <figcaption>Ein Demo-Rollout über zwei Wohnungen, gestoppt nach einem fehlgeschlagenen Update.</figcaption>
   </figure>
 
   <h2 id="mieterwechsel">Mieterwechsel</h2>
   <p>
-    Eine ausdrückliche Aktion in der Oberfläche (Bestätigung, Pflichtgrund, protokolliert)
-    rotiert den Gerätetoken der Wohnung – der Agent holt den neuen über eine signierte
-    Herausforderung mit seinem bestehenden Geräteschlüssel, kein privater Schlüssel
-    verlässt dabei je das Gerät – und löscht die Heartbeats, Ereignisse, Störungen,
-    Alarme, Befehlsprotokoll-Auszüge und Diagnosebündel der Wohnung. Verschlüsselte
-    Backups bleiben, unter eigener Aufbewahrungsfrist.
+    Eine ausdrückliche Aktion auf der Wohnungsseite, Reiter „Wartung“, dort in einer
+    eigenen, rot umrandeten Zone abgesetzt (Bestätigung, Pflichtgrund, protokolliert).
+    Sie rotiert den Gerätetoken der Wohnung – der Agent holt den neuen über eine
+    signierte Herausforderung mit seinem bestehenden Geräteschlüssel, kein privater
+    Schlüssel verlässt dabei je das Gerät – und löscht die Heartbeats, Ereignisse,
+    Störungen, Alarme, Befehlsprotokoll-Auszüge und Diagnosebündel der Wohnung.
+    Verschlüsselte Backups bleiben, unter eigener Aufbewahrungsfrist.
   </p>
 
   <h2 id="anmeldung">Anmeldung</h2>
