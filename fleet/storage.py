@@ -1362,6 +1362,19 @@ class ApartmentOverview:
     # already loaded as part of the same `ApartmentRecord` row `get_house_
     # overview` reads for `list_apartment_ids` below, so no extra query.
     label: str | None = None
+    # UI-redesign stage 1: the building-visual's grouping data (section
+    # 20.1's own inventory fields, already stored for P4.1 -- nothing new
+    # is read here, only carried alongside the rest of the same row/join so
+    # `fleet.ui_house` does not need a second query per apartment).
+    # `property_name`/`property_address` are `None` for an apartment with
+    # no `property_id` (the pre-P4.1 shape every P1.1-P3.x test still
+    # produces via `set_apartment_token` alone) -- `fleet.ui_house` falls
+    # back to a plain, ungrouped list for those, never draws a building.
+    floor: str | None = None
+    orientation: str | None = None
+    property_id: int | None = None
+    property_name: str | None = None
+    property_address: str | None = None
 
 
 def _naive_utc(value: datetime) -> datetime:
@@ -4212,8 +4225,20 @@ class Storage:
         """
 
         with self.session() as session:
-            id_label_pairs = list(
-                session.execute(select(ApartmentRecord.id, ApartmentRecord.label))
+            rows = list(
+                session.execute(
+                    select(
+                        ApartmentRecord.id,
+                        ApartmentRecord.label,
+                        ApartmentRecord.floor,
+                        ApartmentRecord.orientation,
+                        ApartmentRecord.property_id,
+                        PropertyRecord.name,
+                        PropertyRecord.address,
+                    ).outerjoin(
+                        PropertyRecord, ApartmentRecord.property_id == PropertyRecord.id
+                    )
+                )
             )
         open_alarms = self._get_open_not_reporting_alarms()
         return [
@@ -4222,8 +4247,21 @@ class Storage:
                 latest=self.get_latest_heartbeat(apartment_id),
                 open_alarm=open_alarms.get(apartment_id),
                 label=label,
+                floor=floor,
+                orientation=orientation,
+                property_id=property_id,
+                property_name=property_name,
+                property_address=property_address,
             )
-            for apartment_id, label in id_label_pairs
+            for (
+                apartment_id,
+                label,
+                floor,
+                orientation,
+                property_id,
+                property_name,
+                property_address,
+            ) in rows
         ]
 
     # -- apartment detail (P3.2, section 9's second view) -------------------------
@@ -5398,7 +5436,7 @@ class Storage:
             if previous_assignment is not None:
                 if not replace_previous:
                     raise ValueError(
-                        f"Wohnung {apartment_id!r} hat bereits ein aktives Gerät -- "
+                        f"Wohnung {apartment_id!r} hat bereits ein aktives Gerät – "
                         "Ersetzen muss ausdrücklich bestätigt werden."
                     )
                 if previous_device_target_state not in ("faulty", "in_storage"):
@@ -6502,7 +6540,7 @@ class Storage:
             )
             if not result.rowcount:
                 raise ValueError(
-                    f"Gerät {device_id!r} wurde inzwischen anderweitig bearbeitet -- "
+                    f"Gerät {device_id!r} wurde inzwischen anderweitig bearbeitet – "
                     "bitte erneut versuchen."
                 )
 
@@ -6606,7 +6644,7 @@ class Storage:
 
         if target_state not in REMOVE_DEVICE_TARGET_STATES:
             raise ValueError(
-                f"Unbekannter Zielzustand {target_state!r} -- nur "
+                f"Unbekannter Zielzustand {target_state!r} – nur "
                 f"{list(REMOVE_DEVICE_TARGET_STATES)} sind erlaubt."
             )
         if not reason.strip():

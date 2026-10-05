@@ -483,10 +483,10 @@ def test_apartment_page_shows_desired_state_and_inactive_notice(
         data={**_valid_form(), "csrf_token": csrf_token, "reason": "test"},
     )
 
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=technik")
 
     assert response.status_code == 200
-    assert "derzeit inaktiv" in response.text
+    assert "derzeit abgeschaltet" in response.text
     assert _VALID_DIGEST_A in response.text
 
 

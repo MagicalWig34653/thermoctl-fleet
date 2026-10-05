@@ -652,7 +652,7 @@ def test_apartment_page_error_text_is_escaped(
     )
 
     _login(client, password, totp_secret)
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
     assert "<script>alert(1)</script>" not in response.text
@@ -674,15 +674,21 @@ def test_apartment_page_never_shows_another_apartments_commands(
     )
 
     _login(client, password, totp_secret)
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
     assert "Keine Befehle für diese Wohnung." in _history_section(response.text)
 
 
 def _befehle_section(html: str) -> str:
+    # UI-redesign stage 2: "Befehle" (commands-heading) is followed, on the
+    # same "Wartung" tab, by "Sicherungen" (backups-heading) -- bounding
+    # the slice there keeps this helper scoped to the commands section
+    # alone, not sweeping in the danger zone's own "Mieterwechsel
+    # durchführen" command-button further down the same tab.
     start = html.index('id="commands-heading"')
-    return html[start:]
+    end = html.index('id="backups-heading"')
+    return html[start:end]
 
 
 def _history_section(html: str) -> str:
@@ -696,7 +702,7 @@ def test_apartment_page_hides_buttons_for_a_retired_apartment(
     _make_apartment(storage, state="retired")
     _login(client, password, totp_secret)
 
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
     section = _befehle_section(response.text)
@@ -811,7 +817,7 @@ def test_apartment_page_shows_log_excerpt_and_dropped_count_escaped(
     )
 
     _login(client, password, totp_secret)
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
 
     assert response.status_code == 200
     assert "harmlose Zeile" in response.text

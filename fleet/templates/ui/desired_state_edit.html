@@ -56,10 +56,10 @@
     <fieldset>
         <legend>{{ service.label }}</legend>
         <p>Quelle (Information, nicht änderbar): <code>{{ service.image }}</code></p>
-        <label for="version_{{ service.name }}">Version
+        <label for="version_{{ service.name }}"><span class="field-label-text">Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="version_{{ service.name }}" name="version_{{ service.name }}" value="{{ service.version }}" maxlength="{{ max_version_length }}" required>
         </label>
-        <label for="digest_{{ service.name }}">Digest (sha256:…)
+        <label for="digest_{{ service.name }}"><span class="field-label-text">Digest (sha256:…)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="digest_{{ service.name }}" name="digest_{{ service.name }}" value="{{ service.digest }}" pattern="sha256:[0-9a-f]{64}" required>
         </label>
     </fieldset>
@@ -67,13 +67,13 @@
 
     <fieldset>
         <legend>Aktualisierungsfenster</legend>
-        <label for="window_from">Von (HH:MM)
+        <label for="window_from"><span class="field-label-text">Von (HH:MM)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="window_from" name="window_from" value="{{ window_from }}" pattern="[0-2][0-9]:[0-5][0-9]" required>
         </label>
-        <label for="window_until">Bis (HH:MM)
+        <label for="window_until"><span class="field-label-text">Bis (HH:MM)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="window_until" name="window_until" value="{{ window_until }}" pattern="[0-2][0-9]:[0-5][0-9]" required>
         </label>
-        <label for="window_temp">Nicht unter Außentemperatur (°C)
+        <label for="window_temp"><span class="field-label-text">Nicht unter Außentemperatur (°C)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="window_temp" name="window_temp" value="{{ window_temp }}" inputmode="decimal" required>
         </label>
     </fieldset>

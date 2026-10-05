@@ -8,14 +8,14 @@
 
 <p>
     Ein Rollout aktualisiert genau <strong>einen</strong> Dienst (thermoctl <em>oder</em>
-    Zigbee2MQTT <em>oder</em> Mosquitto <em>oder</em> Agent -- niemals gemischt, section 13)
+    Zigbee2MQTT <em>oder</em> Mosquitto <em>oder</em> Agent – niemals gemischt)
     für eine geordnete Liste von Wohnungen. Eine Wohnung dieser Liste ist die
     <strong>Testwohnung</strong> dieses Rollouts: markieren Sie sie unten explizit, oder
-    lassen Sie die Markierung weg -- dann ist die erste Wohnung der Liste die Testwohnung.
+    lassen Sie die Markierung weg – dann ist die erste Wohnung der Liste die Testwohnung.
     Die Testwohnung läuft zuerst; die übrigen Wohnungen frühestens 48 Stunden nachdem die
     Testwohnung erfolgreich zurückgemeldet hat. Dies ist unabhängig vom Pilotbetrieb-Flag
     der Wohnung (das weiterhin nur die geräteseitige Freischaltung in <code>agent/</code>
-    steuert, z. B. für <code>open_access</code>) -- eine Wohnung ohne Pilotbetrieb kann
+    steuert, z. B. für <code>open_access</code>) – eine Wohnung ohne Pilotbetrieb kann
     ganz normal die Testwohnung eines Rollouts sein.
 </p>
 
@@ -26,27 +26,27 @@
 <form method="post" action="/ui/rollouts/new">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
-    <label for="service">Dienst
-        <select id="service" name="service">
+    <label for="service"><span class="field-label-text">Dienst<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+        <select id="service" name="service" required>
             {% for name, label in service_options %}
             <option value="{{ name }}" {% if name == service %}selected{% endif %}>{{ label }}</option>
             {% endfor %}
         </select>
     </label>
 
-    <label for="version">Version
-        <input type="text" id="version" name="version" value="{{ version }}" maxlength="{{ max_version_length }}">
+    <label for="version"><span class="field-label-text">Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+        <input type="text" id="version" name="version" value="{{ version }}" maxlength="{{ max_version_length }}" required>
     </label>
 
-    <label for="digest">Digest (sha256:...)
-        <input type="text" id="digest" name="digest" value="{{ digest }}">
+    <label for="digest"><span class="field-label-text">Digest (sha256:...)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+        <input type="text" id="digest" name="digest" value="{{ digest }}" pattern="sha256:[0-9a-f]{64}" required>
     </label>
 
-    <label for="stagger_hours">Wartezeit nach Pilot (Stunden)
+    <label for="stagger_hours"><span class="field-label-text">Wartezeit nach Pilot (Stunden)<span class="field-optional"> (optional)</span></span>
         <input type="text" id="stagger_hours" name="stagger_hours" value="{{ stagger_hours }}">
     </label>
 
-    <label for="timeout_hours">Zeitüberschreitung je Wohnung (Stunden)
+    <label for="timeout_hours"><span class="field-label-text">Zeitüberschreitung je Wohnung (Stunden)<span class="field-optional"> (optional)</span></span>
         <input type="text" id="timeout_hours" name="timeout_hours" value="{{ timeout_hours }}">
     </label>
 
@@ -62,8 +62,8 @@
             <input type="radio" name="test_apartment_id" value="{{ apartment.apartment_id }}"
                 {% if apartment.apartment_id == selected_test_apartment_id %}checked{% endif %}>
             {{ apartment.label }} ({{ apartment.apartment_id }})
-            {% if apartment.pilot_mode %} -- Pilotbetrieb (Gerät){% endif %}
-            {% if not apartment.has_desired_state %} -- kein Sollzustand gesetzt{% endif %}
+            {% if apartment.pilot_mode %} – Pilotbetrieb (Gerät){% endif %}
+            {% if not apartment.has_desired_state %} – kein Sollzustand gesetzt{% endif %}
         </label><br>
         {% endfor %}
     </fieldset>

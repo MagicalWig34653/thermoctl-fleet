@@ -8,12 +8,12 @@
 
 <p class="error" role="alert">
     Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten, Pilotbetrieb
-    des jeweiligen Geräts erforderlich) -- dieser Rollout stoppt bei der Testwohnung, bis
+    des jeweiligen Geräts erforderlich) – dieser Rollout stoppt bei der Testwohnung, bis
     thermoctl eine Gesundheits-/Außentemperatur-API liefert.
 </p>
 
 <p>Status: <strong>{{ detail.state_label }}</strong>
-    {% if detail.stopped_reason %}-- {{ detail.stopped_reason }}{% endif %}</p>
+    {% if detail.stopped_reason %} – {{ detail.stopped_reason }}{% endif %}</p>
 <p>Digest: {{ detail.digest }}</p>
 <p>Wartezeit nach Testwohnung: {{ detail.stagger_hours }} h. Zeitüberschreitung je Wohnung: {{ detail.timeout_hours }} h.</p>
 {% if detail.pilot_converged_text %}
@@ -25,7 +25,7 @@
 {% if detail.can_resume %}
 <form method="post" action="/ui/rollouts/{{ detail.rollout_id | urlpath }}/resume">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="resume_reason">Grund für Fortsetzen (Pflichtfeld)
+    <label for="resume_reason"><span class="field-label-text">Grund für Fortsetzen<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="resume_reason" name="reason" required>
     </label>
     <button type="submit">Fortsetzen</button>
@@ -34,10 +34,10 @@
 {% if detail.can_cancel %}
 <form method="post" action="/ui/rollouts/{{ detail.rollout_id | urlpath }}/cancel">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="cancel_reason">Grund für Abbruch (Pflichtfeld)
+    <label for="cancel_reason"><span class="field-label-text">Grund für Abbruch<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="cancel_reason" name="reason" required>
     </label>
-    <button type="submit">Abbrechen</button>
+    <button type="submit" class="button--danger">Abbrechen</button>
 </form>
 {% endif %}
 
@@ -61,10 +61,10 @@
             <td><a href="/ui/apartments/{{ apartment.apartment_id | urlpath }}">{{ apartment.apartment_id }}</a></td>
             <td>{% if apartment.is_pilot %}ja{% else %}nein{% endif %}</td>
             <td>{{ apartment.status_label }}</td>
-            <td>{{ apartment.revision if apartment.revision is not none else "-" }}</td>
-            <td>{{ apartment.started_text or "-" }}</td>
-            <td>{{ apartment.converged_text or "-" }}</td>
-            <td>{{ apartment.last_outcome_reason or "-" }}</td>
+            <td>{{ apartment.revision if apartment.revision is not none else "–" }}</td>
+            <td>{{ apartment.started_text or "–" }}</td>
+            <td>{{ apartment.converged_text or "–" }}</td>
+            <td>{{ apartment.last_outcome_reason or "–" }}</td>
         </tr>
         {% endfor %}
     </tbody>

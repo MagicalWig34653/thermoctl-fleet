@@ -1,21 +1,25 @@
 {% extends "base.html" %}
 
-{% block title %}Inventar – thermoctl-fleet{% endblock %}
+{% block title %}Einrichtung – thermoctl-fleet{% endblock %}
 
 {% block content %}
-{# "Inventar" (P4.1, section 9's fourth, quiet view) -- properties,
-   apartments (each with its current device, if any), and devices not in
-   service. Already German-rendered and derived by
-   fleet/ui_inventory.py::build_inventory_view; this template only
-   iterates and prints. #}
-<h1>Inventar</h1>
+{# Inventory view model supplies the objects and devices for these three
+   server-rendered sections. Forms and their submitted fields are unchanged. #}
+<h1>Einrichtung</h1>
 
 {% if error %}
 <p class="error" role="alert">{{ error }}</p>
 {% endif %}
 
-<section>
-    <h2>Liegenschaften und Wohnungen</h2>
+<nav class="inventory-subnav" aria-label="Einrichtung: Bereiche">
+    <a href="/ui/inventory?bereich=objekte" {% if bereich == "objekte" %}aria-current="page"{% endif %}>Objekte &amp; Wohnungen</a>
+    <a href="/ui/inventory?bereich=basisstationen" {% if bereich == "basisstationen" %}aria-current="page"{% endif %}>Basisstationen</a>
+    <a href="/ui/inventory?bereich=vorbereiten" {% if bereich == "vorbereiten" %}aria-current="page"{% endif %}>Neue Basisstation vorbereiten</a>
+</nav>
+
+{% if bereich == "objekte" %}
+<section aria-labelledby="inventory-objects-heading">
+    <h2 id="inventory-objects-heading">Liegenschaften und Wohnungen</h2>
     {% if view.property_groups %}
     {% for group in view.property_groups %}
     <article class="inventory-property">
@@ -27,10 +31,7 @@
             {% for apartment in group.apartments %}
             <li>
                 <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
-                – {{ apartment.state }}
-                {% if apartment.floor %}, {{ apartment.floor }}{% endif %}
-                {% if apartment.orientation %}, {{ apartment.orientation }}{% endif %}
-                , {{ apartment.heating_circuits }} Heizkreis(e)
+                – {{ apartment.state_label }}{% if apartment.floor %}, {{ apartment.floor }}{% endif %}{% if apartment.orientation %}, {{ apartment.orientation }}{% endif %}, {{ apartment.heating_circuits }} Heizkreis{% if apartment.heating_circuits != 1 %}e{% endif %}
                 {% if apartment.pilot_mode %}<span class="apartment-tile__tag">Pilotbetrieb</span>{% endif %}
                 <br>
                 Gerät:
@@ -62,7 +63,7 @@
             {% for apartment in view.unassigned_apartments %}
             <li>
                 <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
-                – {{ apartment.state }}
+                – {{ apartment.state_label }}
                 &nbsp;<a href="{{ apartment.edit_href }}">Bearbeiten</a>
                 {% if apartment.replace_device_href %}
                 &nbsp;<a href="{{ apartment.replace_device_href }}">Gerät ausbauen/tauschen</a>
@@ -74,33 +75,82 @@
     {% endif %}
 </section>
 
-<section>
-    <h2>Geräte nicht im Einsatz</h2>
+<div class="inventory-form-grid">
+<article class="inventory-form-card">
+    <h2>Liegenschaft anlegen</h2>
+    <form method="post" action="/ui/inventory/properties">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="property_name"><span class="field-label-text">Name<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+            <input type="text" id="property_name" name="name" required>
+        </label>
+        <label for="property_address"><span class="field-label-text">Adresse<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+            <input type="text" id="property_address" name="address" required>
+        </label>
+        <label for="property_notes"><span class="field-label-text">Notizen (keine Mieterdaten!)<span class="field-optional"> (optional)</span></span>
+            <input type="text" id="property_notes" name="notes">
+        </label>
+        <button type="submit">Anlegen</button>
+    </form>
+</article>
+<article class="inventory-form-card">
+    <h2>Wohnung anlegen</h2>
+    <form method="post" action="/ui/inventory/apartments">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="apartment_id"><span class="field-label-text">Wohnungs-ID (dauerhaft, z. B. house7-a03)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+            <input type="text" id="apartment_id" name="id" pattern="[a-z0-9-]+" required>
+        </label>
+        <label for="apartment_property_id"><span class="field-label-text">Liegenschaft<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+            <select id="apartment_property_id" name="property_id" required>
+                {% for group in view.property_groups %}
+                <option value="{{ group.id }}">{{ group.name }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label for="apartment_label"><span class="field-label-text">Bezeichnung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+            <input type="text" id="apartment_label" name="label" required>
+        </label>
+        <label for="apartment_floor"><span class="field-label-text">Etage<span class="field-optional"> (optional)</span></span>
+            <input type="text" id="apartment_floor" name="floor">
+        </label>
+        <label for="apartment_orientation"><span class="field-label-text">Ausrichtung<span class="field-optional"> (optional)</span></span>
+            <input type="text" id="apartment_orientation" name="orientation">
+        </label>
+        <label for="apartment_heating_circuits"><span class="field-label-text">Anzahl Heizkreise<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+            <input type="text" id="apartment_heating_circuits" name="heating_circuits" inputmode="numeric" required>
+        </label>
+        <button type="submit">Anlegen</button>
+    </form>
+</article>
+</div>
+{% elif bereich == "basisstationen" %}
+<section aria-labelledby="inventory-devices-heading">
+    <h2 id="inventory-devices-heading">Geräte nicht im Einsatz</h2>
     <nav aria-label="Filter">
-        <a href="/ui/inventory">Alle</a>
-        <a href="/ui/inventory?filter=in_storage">Im Lager</a>
-        <a href="/ui/inventory?filter=faulty">Defekt</a>
+        <a href="/ui/inventory?bereich=basisstationen">Alle</a>
+        <a href="/ui/inventory?bereich=basisstationen&amp;filter=in_storage">Im Lager</a>
+        <a href="/ui/inventory?bereich=basisstationen&amp;filter=faulty">Defekt</a>
     </nav>
     <p><a href="/ui/inventory/devices/confirm">Geräteregistrierungen bestätigen</a></p>
     {% if view.devices_not_in_service %}
     <ul class="inventory-devices">
         {% for device in view.devices_not_in_service %}
-        <li>{{ device.id }} ({{ device.model }}) – {{ device.state }}, seit {{ device.acquisition_date }},
+        <li>{{ device.id }} ({{ device.model }}) – {{ device.state_label }}, seit {{ device.acquisition_date }},
             Image {{ device.image_version }}, Watchdog {{ device.watchdog_version }}
             {% if device.prepare_href %}
             &nbsp;<a href="{{ device.prepare_href }}">Vorbereiten</a>
             {% endif %}
             {% if device.allowed_target_states %}
+            <h3>Gerätezustand ändern</h3>
             <form method="post" action="{{ device.state_action_href }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <label>Neuer Zustand
+                <label><span class="field-label-text">Neuer Zustand<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
                     <select name="target_state" required>
-                        {% for target in device.allowed_target_states %}
-                        <option value="{{ target }}">{{ target }}</option>
+                        {% for target, target_label in device.allowed_target_states %}
+                        <option value="{{ target }}">{{ target_label }}</option>
                         {% endfor %}
                     </select>
                 </label>
-                <label>Grund
+                <label><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
                     <input type="text" name="reason" required>
                 </label>
                 <button type="submit">Zustand ändern</button>
@@ -113,74 +163,60 @@
     <p>Keine Geräte in dieser Ansicht.</p>
     {% endif %}
 </section>
-
-<section>
-    <h2>Liegenschaft anlegen</h2>
-    <form method="post" action="/ui/inventory/properties">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <label for="property_name">Name
-            <input type="text" id="property_name" name="name" required>
-        </label>
-        <label for="property_address">Adresse
-            <input type="text" id="property_address" name="address" required>
-        </label>
-        <label for="property_notes">Notizen (keine Mieterdaten!)
-            <input type="text" id="property_notes" name="notes">
-        </label>
-        <button type="submit">Anlegen</button>
-    </form>
-</section>
-
-<section>
-    <h2>Wohnung anlegen</h2>
-    <form method="post" action="/ui/inventory/apartments">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <label for="apartment_id">Wohnungs-ID (dauerhaft, z. B. house7-a03)
-            <input type="text" id="apartment_id" name="id" pattern="[a-z0-9-]+" required>
-        </label>
-        <label for="apartment_property_id">Liegenschaft
-            <select id="apartment_property_id" name="property_id" required>
-                {% for group in view.property_groups %}
-                <option value="{{ group.id }}">{{ group.name }}</option>
-                {% endfor %}
-            </select>
-        </label>
-        <label for="apartment_label">Bezeichnung
-            <input type="text" id="apartment_label" name="label" required>
-        </label>
-        <label for="apartment_floor">Etage
-            <input type="text" id="apartment_floor" name="floor">
-        </label>
-        <label for="apartment_orientation">Ausrichtung
-            <input type="text" id="apartment_orientation" name="orientation">
-        </label>
-        <label for="apartment_heating_circuits">Anzahl Heizkreise
-            <input type="text" id="apartment_heating_circuits" name="heating_circuits" inputmode="numeric" required>
-        </label>
-        <button type="submit">Anlegen</button>
-    </form>
-</section>
-
-<section>
+<article class="inventory-form-card" id="device-register-form">
     <h2>Gerät registrieren</h2>
     <form method="post" action="/ui/inventory/devices">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <label for="device_id">Seriennummer / Hardware-ID
+        <label for="device_id"><span class="field-label-text">Seriennummer / Hardware-ID<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="device_id" name="id" required>
         </label>
-        <label for="device_model">Modell
+        <label for="device_model"><span class="field-label-text">Modell<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="device_model" name="model" required>
         </label>
-        <label for="device_acquisition_date">Anschaffungsdatum (JJJJ-MM-TT)
+        <label for="device_acquisition_date"><span class="field-label-text">Anschaffungsdatum (JJJJ-MM-TT)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="device_acquisition_date" name="acquisition_date" required>
         </label>
-        <label for="device_image_version">Image-Version
+        <label for="device_image_version"><span class="field-label-text">Image-Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="device_image_version" name="image_version" required>
         </label>
-        <label for="device_watchdog_version">Watchdog-Version
+        <label for="device_watchdog_version"><span class="field-label-text">Watchdog-Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="device_watchdog_version" name="watchdog_version" required>
         </label>
         <button type="submit">Registrieren</button>
     </form>
+</article>
+{% else %}
+<section class="setup-flow" aria-labelledby="setup-flow-heading">
+    <h2 id="setup-flow-heading">Neue Basisstation vorbereiten</h2>
+    {# A guided step flow – numbered steps are justified here (brief:
+       "numbered markers ... are a sequence"), unlike anywhere else in
+       this application, because preparing a device genuinely *is* one:
+       register, prepare a one-time code, hand the station to the
+       installer, confirm once it reports back. Every step links straight
+       into the existing, unchanged route/form for that step
+       (fleet/ui_routes.py's P4.2/P4.2b/P4.3 routes) – nothing new is
+       built here, only the order these forms already have to happen in
+       is made explicit. #}
+    <ol class="setup-flow__steps">
+        <li>
+            <strong>Gerät registrieren</strong> – Seriennummer, Modell und
+            Versionen eintragen (<a href="/ui/inventory?bereich=basisstationen#device-register-form">Gerät registrieren</a>).
+        </li>
+        <li>
+            <strong>Vorbereiten</strong> – beim registrierten Gerät unter
+            "Geräte nicht im Einsatz" auf "Vorbereiten" klicken; der
+            einmalige Registrierungscode wird dort genau einmal angezeigt.
+        </li>
+        <li>
+            <strong>Ausliefern</strong> – Basisstation mit diesem Code vor
+            Ort in Betrieb nehmen; sie meldet sich danach selbst.
+        </li>
+        <li>
+            <strong>Bestätigen</strong> – unter
+            <a href="/ui/inventory/devices/confirm">"Geräteregistrierungen bestätigen"</a>
+            den Bestätigungscode prüfen und der Wohnung zuordnen.
+        </li>
+    </ol>
 </section>
+{% endif %}
 {% endblock %}

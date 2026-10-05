@@ -323,6 +323,69 @@ def test_two_runs_separated_by_a_gap_produce_run_gap_run(storage: Storage) -> No
     assert gap.duration_text is not None
 
 
+def test_timeline_bar_width_percent_is_proportional_to_elapsed_time_and_sums_to_100(
+    storage: Storage,
+) -> None:
+    """UI-redesign stage 2 polish ("Überblick" tab's compact timeline bar,
+    `fleet.ui_apartment._timeline_width_percents`): each entry's
+    `width_percent` reflects its own real duration (a long gap reads as a
+    much wider segment than a short run), and the whole row sums to 100 --
+    not one share per *row* regardless of how long that row actually
+    lasted, which would misrepresent a two-week gap as the same width as
+    a five-minute one."""
+
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+
+    # First run: 3 heartbeats, 2 min apart -- spans 4 min.
+    first_run_start = BASE_TIME
+    for i in range(3):
+        sent_at = first_run_start + timedelta(minutes=2 * i)
+        storage.save_heartbeat(APARTMENT, _make_heartbeat(APARTMENT, sent_at=sent_at), sent_at)
+
+    # A 56-minute gap, then a second run: 4 heartbeats, 2 min apart --
+    # spans 6 min. The gap (56 min) dwarfs both runs (4 min, 6 min).
+    second_run_start = first_run_start + timedelta(hours=1)
+    for i in range(4):
+        sent_at = second_run_start + timedelta(minutes=2 * i)
+        storage.save_heartbeat(APARTMENT, _make_heartbeat(APARTMENT, sent_at=sent_at), sent_at)
+
+    last_sent_at = second_run_start + timedelta(minutes=2 * 3)
+    detail = build_apartment_detail(storage, APARTMENT, last_sent_at + timedelta(minutes=1), 1)
+
+    assert detail is not None
+    assert len(detail.timeline) == 3
+    percents = [entry.width_percent for entry in detail.timeline]
+    assert sum(percents) == pytest.approx(100.0, abs=0.5)
+
+    gap = next(entry for entry in detail.timeline if entry.is_gap)
+    runs = [entry for entry in detail.timeline if not entry.is_gap]
+    # The 56-minute gap must be visibly dominant over either 4-/6-minute
+    # run, not merely "a bit more" -- otherwise this is just row-counting
+    # again with extra steps.
+    assert gap.width_percent > max(run.width_percent for run in runs) * 2
+
+    longer_run = next(run for run in runs if run.heartbeat_count == 4)  # spans 6 min
+    shorter_run = next(run for run in runs if run.heartbeat_count == 3)  # spans 4 min
+    assert longer_run.width_percent > shorter_run.width_percent
+
+
+def test_timeline_bar_width_percent_never_collapses_a_single_heartbeat_run_to_zero(
+    storage: Storage,
+) -> None:
+    """A run of exactly one heartbeat has a zero-second span (`_close_run`'s
+    own "a single point in time, not a zero-length range" case) -- its bar
+    segment must still be visible, not divide-by-zero away to nothing."""
+
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    storage.save_heartbeat(APARTMENT, _make_heartbeat(APARTMENT, sent_at=BASE_TIME), BASE_TIME)
+
+    detail = build_apartment_detail(storage, APARTMENT, BASE_TIME + timedelta(minutes=1), 1)
+
+    assert detail is not None
+    assert len(detail.timeline) == 1
+    assert detail.timeline[0].width_percent == pytest.approx(100.0)
+
+
 def test_caught_up_count_is_per_run_not_global(storage: Storage) -> None:
     """Two separate runs, each with a different number of caught-up
     heartbeats -- `caught_up_count` must be scoped to the run it belongs
@@ -499,6 +562,25 @@ def test_per_device_values_are_shown_with_no_inventory_label(storage: Storage) -
     assert detail.per_device[0].signal_quality == 70
 
 
+def test_format_zigbee_bridge_translates_the_known_example_value() -> None:
+    from fleet.ui_apartment import _format_zigbee_bridge
+
+    assert _format_zigbee_bridge("connected") == "verbunden"
+
+
+def test_format_zigbee_bridge_marks_an_unrecognized_value_as_technical() -> None:
+    """`DeviceState.zigbee_bridge` is "deliberately free text, no enum"
+    (protocol/heartbeat.py's own comment) -- any value besides the
+    specification's own "connected" example must not be silently printed
+    as if it were polished German UI copy."""
+
+    from fleet.ui_apartment import _format_zigbee_bridge
+
+    result = _format_zigbee_bridge("mqtt_timeout")
+    assert "mqtt_timeout" in result
+    assert result != "mqtt_timeout"
+
+
 def test_per_device_is_empty_when_the_agent_does_not_send_it(storage: Storage) -> None:
     storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
     storage.save_heartbeat(
@@ -525,7 +607,10 @@ def test_battery_signal_version_system_and_control_fields(storage: Storage) -> N
     assert detail.weakest_battery_percent == 62
     assert detail.worst_signal_quality == 47
     assert detail.silent_devices == 0
-    assert detail.zigbee_bridge == "connected"
+    # Text-hygiene pass (UI-redesign stage 2 polish): the protocol's own
+    # "connected" example value is translated to German for display, not
+    # left as an English leftover (fleet.ui_apartment._format_zigbee_bridge).
+    assert detail.zigbee_bridge == "verbunden"
     assert detail.agent_version == "0.2.1"
     assert detail.thermoctl_version == "0.9.5"
     assert detail.protocol_version == PROTOCOL_VERSION
@@ -736,7 +821,7 @@ def test_unknown_apartment_is_404_with_the_same_layout(
 
     assert response.status_code == 404
     assert "nicht bekannt" in response.text
-    assert "Das Haus" in response.text  # base.html's own nav entry
+    assert "Übersicht" in response.text  # base.html's own nav entry
 
 
 def test_apartment_created_via_inventory_without_a_token_is_200_not_404(
@@ -803,36 +888,54 @@ def test_every_section_renders_from_real_stored_data(
     )
 
     _login(client, password, totp_secret)
-    response = client.get(f"/ui/apartments/{APARTMENT}")
+    # UI-redesign stage 2: "Eine Wohnung" is now three tabs
+    # (`?ansicht=ueberblick`/`wartung`/`technik`) -- every section this
+    # test used to find on one page is still there, just split across the
+    # tab its own content now belongs to (see fleet/ui_routes.py's
+    # `APARTMENT_TABS` and apartment.html's own docstring).
+    ueberblick = client.get(f"/ui/apartments/{APARTMENT}?ansicht=ueberblick")
+    wartung = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
+    technik = client.get(f"/ui/apartments/{APARTMENT}?ansicht=technik")
 
-    assert response.status_code == 200
-    body = response.text
+    assert ueberblick.status_code == 200
+    assert wartung.status_code == 200
+    assert technik.status_code == 200
+    overview_body = ueberblick.text
+    maintenance_body = wartung.text
+    technical_body = technik.text
+
     # heartbeat history
-    assert "Erreichbarkeit" in body
-    assert "Erreichbar" in body
+    assert "Erreichbarkeit" in overview_body
+    assert "Erreichbar" in overview_body
     # open faults
-    assert "Fensteralarm" in body
-    assert "kueche" in body
+    assert "Fensteralarm" in overview_body
+    assert "kueche" in overview_body
     # past faults (from the events table) -- never titel/text
-    assert "Fensteralarm" in body  # derived kind from the "fenster:" prefix
-    assert "fenster:bad" in body
-    assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in body
-    assert "MARKER_TEXT_SHOULD_NOT_APPEAR" not in body
+    assert "Fensteralarm" in overview_body  # derived kind from the "fenster:" prefix
+    assert "fenster:bad" in overview_body
+    assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in overview_body
+    assert "MARKER_TEXT_SHOULD_NOT_APPEAR" not in overview_body
     # battery/signal
-    assert "Schwächste Batterie" in body
-    assert "62" in body
-    # version
-    assert "0.1.0" in body
-    assert "0.9.5" in body
+    assert "Schwächste Batterie" in overview_body
+    assert "62" in overview_body
     # alarms
-    assert "Meldet sich nicht" in body
-    # commands (P5.1b): one button per CommandType value, no in-page form
-    # (buttons are GET links to the confirmation page) except the base
-    # layout's own logout form.
-    assert "Sofort melden" in body
-    assert "command-button" in body
-    assert "Keine Befehle für diese Wohnung." in body
-    assert "<form" not in body or "csrf_token" in body  # only the logout form, if any
+    assert "Meldet sich nicht" in overview_body
+    # these three tabs never leak the raw event titel/text either
+    assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in maintenance_body
+    assert "MARKER_TITEL_SHOULD_NOT_APPEAR" not in technical_body
+
+    # version (Technik tab)
+    assert "0.1.0" in technical_body
+    assert "0.9.5" in technical_body
+
+    # commands (P5.1b, Wartung tab): one button per CommandType value, no
+    # in-page form (buttons are GET links to the confirmation page) except
+    # the base layout's own logout form and the fault-acknowledge form
+    # (Überblick tab only).
+    assert "Sofort melden" in maintenance_body
+    assert "command-button" in maintenance_body
+    assert "Keine Befehle für diese Wohnung." in maintenance_body
+    assert "<form" not in maintenance_body or "csrf_token" in maintenance_body
 
 
 def test_events_never_show_titel_or_text_even_with_no_prefix_match(
@@ -1091,3 +1194,77 @@ def test_build_desired_state_outcome_display_known_service_maps_to_its_label() -
     display = build_desired_state_outcome_display(record)
 
     assert display.service_label == "Zigbee2MQTT"
+
+
+# -- UI-redesign stage 2: apartment tabs ("?ansicht=") -------------------------
+
+
+def test_default_tab_is_ueberblick(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}")
+
+    assert response.status_code == 200
+    assert 'href="?ansicht=ueberblick" aria-current="page"' in response.text
+    assert "history-heading" in response.text
+    assert "commands-heading" not in response.text
+    assert "version-heading" not in response.text
+
+
+def test_wartung_tab_shows_commands_and_hides_overview_sections(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
+
+    assert response.status_code == 200
+    assert 'href="?ansicht=wartung" aria-current="page"' in response.text
+    assert "commands-heading" in response.text
+    assert "tenant-change-heading" in response.text
+    assert "history-heading" not in response.text
+    assert "version-heading" not in response.text
+
+
+def test_technik_tab_shows_version_and_hides_commands(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=technik")
+
+    assert response.status_code == 200
+    assert 'href="?ansicht=technik" aria-current="page"' in response.text
+    assert "version-heading" in response.text
+    assert "desired-state-heading" in response.text
+    assert "commands-heading" not in response.text
+    assert "history-heading" not in response.text
+
+
+def test_unknown_ansicht_value_falls_back_to_ueberblick(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=does-not-exist")
+
+    assert response.status_code == 200
+    assert 'href="?ansicht=ueberblick" aria-current="page"' in response.text
+
+
+def test_danger_zone_is_a_distinct_section_within_wartung(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
+
+    assert response.status_code == 200
+    assert 'class="danger-zone"' in response.text

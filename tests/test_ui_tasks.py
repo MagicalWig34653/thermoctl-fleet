@@ -522,175 +522,18 @@ def test_unauthenticated_tasks_view_redirects_to_login(client: TestClient) -> No
     assert "Aufgaben" not in response.text
 
 
-def test_tasks_view_shows_a_battery_round_entry(
+def test_authenticated_tasks_view_redirects_to_overview(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:
-    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
-    storage.save_heartbeat(
-        APARTMENT_A,
-        _make_heartbeat(APARTMENT_A, sent_at=BASE_TIME, weakest_battery_percent=5),
-        BASE_TIME,
-    )
+    """UI-redesign stage 2: "Aufgaben" no longer has its own page -- its
+    three groups moved into the "Übersicht" action inbox
+    (`fleet.ui_overview.build_overview`, exercised by its own
+    `tests/test_ui_overview.py`). This old URL must keep working (CLAUDE.md
+    hard constraint), as a 303 to its new home, not a second render of the
+    same content."""
 
     _login(client, password, totp_secret)
-    response = client.get("/ui/tasks")
+    response = client.get("/ui/tasks", follow_redirects=False)
 
-    assert response.status_code == 200
-    assert APARTMENT_A in response.text
-    assert "5&nbsp;%" in response.text
-    assert f'href="/ui/apartments/{quote(APARTMENT_A, safe="")}"' in response.text
-
-
-def test_tasks_view_shows_an_update_entry(
-    client: TestClient,
-    storage: Storage,
-    password: str,
-    totp_secret: str,
-    user_id: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(storage_module, "PROTOCOL_VERSION", 2)
-    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
-    storage.save_heartbeat(
-        APARTMENT_A,
-        _make_heartbeat(APARTMENT_A, sent_at=BASE_TIME, protocol_version=1),
-        BASE_TIME,
-    )
-
-    _login(client, password, totp_secret)
-    response = client.get("/ui/tasks")
-
-    assert response.status_code == 200
-    assert "veraltete Protokollversion" in response.text
-
-
-def test_tasks_view_shows_an_unconfirmed_fault_entry(
-    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
-) -> None:
-    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
-    storage.save_heartbeat(
-        APARTMENT_A,
-        _make_heartbeat(
-            APARTMENT_A,
-            sent_at=BASE_TIME,
-            open_faults=[
-                {"kind": "bridge_fault", "since": BASE_TIME.isoformat(), "zone": "flur"}
-            ],
-        ),
-        BASE_TIME,
-    )
-
-    _login(client, password, totp_secret)
-    response = client.get("/ui/tasks")
-
-    # The route uses the real clock (`datetime.now(UTC)`), not an injected
-    # one -- `BASE_TIME` is a fixed date safely in the past, so the fault is
-    # overdue against any real "now" this test could plausibly run at.
-    assert response.status_code == 200
-    assert "Bridge-Fehler" in response.text
-    assert "flur" in response.text
-
-
-def test_tasks_view_marks_a_stale_row_with_text_not_colour_alone(
-    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
-) -> None:
-    """P3.4a: an apartment with an open "not reporting" alarm still shows
-    its battery task, marked `stale` (CSS-only, `.task-list__stale`), with
-    a second-line German hint that is plain text -- present in the markup
-    independently of any colour/CSS, per the work package's accessibility
-    requirement."""
-
-    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
-    storage.save_heartbeat(
-        APARTMENT_A,
-        _make_heartbeat(APARTMENT_A, sent_at=BASE_TIME, weakest_battery_percent=5),
-        BASE_TIME,
-    )
-    storage.raise_alarm(APARTMENT_A, "not_reporting", "high", BASE_TIME + timedelta(minutes=6))
-
-    _login(client, password, totp_secret)
-    response = client.get("/ui/tasks")
-
-    assert response.status_code == 200
-    assert "5&nbsp;%" in response.text
-    assert 'class="task-list__stale"' in response.text
-    assert "task-list__stale-hint" in response.text
-    assert "Wohnung meldet sich nicht" in response.text
-    assert "vor" in response.text  # heartbeat age, part of the rendered hint
-    # No inline style/script anywhere on the page -- CSS lives only in
-    # fleet/static/ui/fleet-ui.css (CLAUDE.md/work package constraint).
-    assert "style=" not in response.text
-    assert "<script" not in response.text
-
-
-def test_tasks_view_shows_the_empty_state_for_every_group(
-    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
-) -> None:
-    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
-    storage.save_heartbeat(
-        APARTMENT_A, _make_heartbeat(APARTMENT_A, sent_at=BASE_TIME), BASE_TIME
-    )
-
-    _login(client, password, totp_secret)
-    response = client.get("/ui/tasks")
-
-    assert response.status_code == 200
-    assert response.text.count("Nichts fällig.") == 3
-
-
-def test_tasks_view_escapes_an_apartment_id_with_html_special_characters(
-    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
-) -> None:
-    dangerous_id = "<script>alert(1)</script>"
-    storage.set_apartment_token(dangerous_id, secrets.token_urlsafe(32))
-    storage.save_heartbeat(
-        dangerous_id,
-        _make_heartbeat(dangerous_id, sent_at=BASE_TIME, weakest_battery_percent=5),
-        BASE_TIME,
-    )
-
-    _login(client, password, totp_secret)
-    response = client.get("/ui/tasks")
-
-    assert response.status_code == 200
-    assert "<script>alert(1)</script>" not in response.text
-    assert "&lt;script&gt;" in response.text
-
-
-def test_tasks_view_contains_no_section_6_data(
-    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
-) -> None:
-    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
-    storage.save_heartbeat(
-        APARTMENT_A,
-        _make_heartbeat(
-            APARTMENT_A,
-            sent_at=BASE_TIME,
-            weakest_battery_percent=5,
-            open_faults=[
-                {"kind": "tenant_report", "since": BASE_TIME.isoformat(), "zone": "wohnzimmer"}
-            ],
-        ),
-        BASE_TIME,
-    )
-
-    _login(client, password, totp_secret)
-    response = client.get("/ui/tasks")
-
-    assert response.status_code == 200
-    forbidden_markers = ["°C", "Sollwert", "Zeitplan", "Mieter:", "Kontakt:"]
-    for marker in forbidden_markers:
-        assert marker not in response.text
-
-
-def test_tasks_view_carries_the_security_headers(
-    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
-) -> None:
-    _login(client, password, totp_secret)
-    response = client.get("/ui/tasks")
-
-    assert response.status_code == 200
-    assert response.headers["Content-Security-Policy"] == "default-src 'self'; script-src 'self'"
-    assert response.headers["X-Frame-Options"] == "DENY"
-    assert response.headers["Referrer-Policy"] == "no-referrer"
-    assert response.headers["Cache-Control"] == "no-store"
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/"

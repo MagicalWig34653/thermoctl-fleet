@@ -49,6 +49,7 @@ from fleet.ui_apartment import (
     DesiredStateServiceDisplay,
     build_apartment_detail,
 )
+from fleet.ui_apartments_list import build_apartments_list_view
 from fleet.ui_auth import (
     PRE_SESSION_CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
@@ -70,9 +71,11 @@ from fleet.ui_auth import (
     webauthn_begin_throttle_key,
     webauthn_begin_throttle_threshold,
 )
+from fleet.ui_format import format_local_datetime
 from fleet.ui_house import build_house_overview
 from fleet.ui_inventory import (
     APARTMENT_ID_PATTERN,
+    APARTMENT_STATE_LABELS,
     DEFAULT_APARTMENT_STATE,
     MAX_APARTMENT_ID_LENGTH,
     MAX_DEVICE_ID_LENGTH,
@@ -88,12 +91,12 @@ from fleet.ui_inventory import (
     build_inventory_view,
     build_replace_device_view,
 )
+from fleet.ui_overview import build_overview
 from fleet.ui_rollout import (
     ROLLOUT_SERVICE_LABELS,
     build_rollout_detail,
     build_rollout_list,
 )
-from fleet.ui_tasks import build_task_overview
 from protocol.commands import CommandType
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 from protocol.heartbeat import FaultKind
@@ -114,6 +117,19 @@ templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 # to `/ui/apartments/{id}` -- `index.html` (P3.1) and nowhere yet in
 # `apartment.html` itself, which only ever links relatively (`?days=...`).
 templates.env.filters["urlpath"] = lambda value: quote(str(value), safe="")
+
+# "Technik" tab (UI-redesign stage 2): a digest/hash is shown shortened
+# with a copy affordance (brief) -- the full value is still always in the
+# DOM (this filter only changes what is *printed*, `fleet/static/ui/copy.js`
+# copies the untouched full string carried separately in the same
+# element's `data-copy` attribute), so nothing here ever discards the
+# real value, only how much of it is shown inline.
+def _short_digest(value: str) -> str:
+    text = str(value)
+    return text if len(text) <= 24 else f"{text[:12]}…{text[-8:]}"
+
+
+templates.env.filters["shortdigest"] = _short_digest
 
 _STATIC_DIR = Path(__file__).parent / "static" / "ui"
 # Serves `fleet/static/ui/fleet-ui.css` (and any future same-origin asset)
@@ -586,46 +602,78 @@ def index(
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
-    """"Das Haus" (P3.1, section 9's first view) -- one tile per apartment,
-    sorted by trouble (see `fleet/ui_house.py`'s module docstring for the
-    ordering rule and its reasoning). All derivation/German rendering
-    happens in `fleet.ui_house.build_house_overview`; this route only wires
-    the authenticated request to it and renders the template."""
+    """"Übersicht" (UI-redesign stage 2, information-architecture area 1)
+    -- the new start page, replacing the separate "Das Haus" (P3.1) and
+    "Aufgaben" (P3.4) views (see `fleet.ui_overview`'s own docstring for
+    the full reasoning). One sentence ("Alles in Ordnung" / "N Wohnungen
+    brauchen Sie jetzt"), the action inbox, then the unchanged
+    building/site-map visual. All derivation/German rendering happens in
+    `fleet.ui_overview.build_overview`; this route only wires the
+    authenticated request to it and renders the template."""
 
-    tiles = build_house_overview(storage, datetime.now(UTC))
+    overview = build_overview(storage, datetime.now(UTC))
     response = templates.TemplateResponse(
         request,
         "index.html",
         {
             "ui_session": authenticated,
             "csrf_token": authenticated.session.csrf_token,
-            "tiles": tiles,
+            "overview": overview,
         },
     )
     response.headers["Cache-Control"] = "no-store"
     return response
 
 
-@router.get("/tasks", response_class=HTMLResponse)
-def tasks(
+@router.get("/tasks")
+def tasks_redirect(
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+) -> RedirectResponse:
+    """"Aufgaben" (P3.4) no longer has its own page -- its three groups
+    (battery rounds, updates, unconfirmed faults) are now part of the
+    "Übersicht" action inbox (`index` above, `fleet.ui_overview
+    .build_overview`). This old URL keeps working, per the owner's own
+    hard constraint ("every existing route keeps working -- old URLs
+    either still render or 303-redirect to their new home"), by
+    redirecting to the page that absorbed it rather than rendering a
+    second, now-orphaned copy of the same data.
+
+    **Still behind `require_ui_user`, same as before this change** -- an
+    unauthenticated request must keep getting redirected to `/ui/login`
+    (not to `/ui/`, which would itself then redirect to login a second
+    time), exactly the same observable behaviour `/ui/tasks` already had.
+    """
+
+    del authenticated  # only its side effect (the redirect-to-login raise) matters here
+    return RedirectResponse(url="/ui/", status_code=303)
+
+
+@router.get("/apartments", response_class=HTMLResponse)
+def apartments_list(
     request: Request,
+    q: str = "",
+    property: str = "",  # noqa: A002 -- matches the `?property=` query parameter name
+    state: str = "",
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
-    """"Aufgaben" (P3.4, section 9's third view) -- what is due: battery
-    rounds, updates, unconfirmed faults. All derivation/German rendering
-    happens in `fleet.ui_tasks.build_task_overview`; this route only wires
-    the authenticated request to it and renders the template, exactly the
-    same shape as `index` above for "Das Haus"."""
+    """"Wohnungen" (UI-redesign stage 2, information-architecture area 2)
+    -- a searchable (`?q=`), filterable (`?property=`, `?state=`) flat list
+    of every apartment, reusing `fleet.ui_house.build_house_overview`'s
+    already-sorted tiles (see `fleet.ui_apartments_list`'s own docstring).
+    Every filter is a plain `GET` query parameter -- this page works
+    without JavaScript, a plain `<form method="get">` round-trips exactly
+    these three parameters."""
 
-    overview = build_task_overview(storage, datetime.now(UTC))
+    tiles = build_house_overview(storage, datetime.now(UTC))
+    view = build_apartments_list_view(tiles, query=q, property_filter=property, state_filter=state)
     response = templates.TemplateResponse(
         request,
-        "tasks.html",
+        "apartments_list.html",
         {
             "ui_session": authenticated,
             "csrf_token": authenticated.session.csrf_token,
-            "overview": overview,
+            "view": view,
         },
     )
     response.headers["Cache-Control"] = "no-store"
@@ -671,8 +719,19 @@ def _inventory_response(
     device_filter: str | None,
     error: str | None,
     status_code: int = 200,
+    bereich: str | None = None,
 ) -> HTMLResponse:
     view = build_inventory_view(storage, device_filter)
+    if bereich not in {"objekte", "basisstationen", "vorbereiten"}:
+        requested = request.query_params.get("bereich")
+        if requested in {"objekte", "basisstationen", "vorbereiten"}:
+            bereich = requested
+        elif device_filter is not None:
+            bereich = "basisstationen"
+        elif request.url.path.startswith("/ui/inventory/devices"):
+            bereich = "basisstationen"
+        else:
+            bereich = "objekte"
     response = templates.TemplateResponse(
         request,
         "inventory.html",
@@ -681,6 +740,7 @@ def _inventory_response(
             "csrf_token": authenticated.session.csrf_token,
             "view": view,
             "error": error,
+            "bereich": bereich,
         },
         status_code=status_code,
     )
@@ -692,6 +752,7 @@ def _inventory_response(
 def inventory(
     request: Request,
     filter: str | None = None,
+    bereich: str | None = None,
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
@@ -702,7 +763,9 @@ def inventory(
     value is silently treated as "no filter", see
     `fleet.ui_inventory.build_inventory_view`)."""
 
-    return _inventory_response(request, storage, authenticated, device_filter=filter, error=None)
+    return _inventory_response(
+        request, storage, authenticated, device_filter=filter, error=None, bereich=bereich
+    )
 
 
 @router.post("/inventory/properties")
@@ -743,7 +806,7 @@ def create_property_submit(
         )
 
     storage.create_property(name.strip(), address.strip(), notes.strip() or None)
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 @router.post("/inventory/apartments")
@@ -834,7 +897,7 @@ def create_apartment_submit(
             request, storage, authenticated, device_filter=None, error=str(exc), status_code=400
         )
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 @router.post("/inventory/devices")
@@ -906,7 +969,7 @@ def register_device_submit(
             request, storage, authenticated, device_filter=None, error=str(exc), status_code=400
         )
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=basisstationen", status_code=303)
 
 
 @router.get("/inventory/apartments/{apartment_id}/edit", response_class=HTMLResponse)
@@ -933,7 +996,9 @@ def apartment_edit_form(
             "ui_session": authenticated,
             "csrf_token": authenticated.session.csrf_token,
             "apartment": record,
-            "apartment_states": [state.value for state in ApartmentState],
+            "apartment_states": [
+                (state.value, APARTMENT_STATE_LABELS[state.value]) for state in ApartmentState
+            ],
             "error": None,
         },
     )
@@ -981,7 +1046,9 @@ def apartment_edit_submit(
                 "ui_session": authenticated,
                 "csrf_token": authenticated.session.csrf_token,
                 "apartment": record,
-                "apartment_states": [s.value for s in ApartmentState],
+                "apartment_states": [
+                    (s.value, APARTMENT_STATE_LABELS[s.value]) for s in ApartmentState
+                ],
                 "error": message,
             },
             status_code=400,
@@ -1024,7 +1091,7 @@ def apartment_edit_submit(
         ui_username=authenticated.user.username,
         reason=reason.strip(),
     )
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 # -----------------------------------------------------------------------------
@@ -1143,7 +1210,9 @@ def device_prepare_submit(
         ).model_dump_json(indent=2)
 
     registration = storage.get_active_registration_for_device(device_id)
-    expires_at = registration.expires_at.isoformat() if registration is not None else ""
+    expires_at = (
+        format_local_datetime(registration.expires_at) if registration is not None else ""
+    )
 
     response = templates.TemplateResponse(
         request,
@@ -1257,7 +1326,7 @@ def device_confirm_submit(
             request, storage, authenticated, error=str(exc), status_code=400
         )
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 # -----------------------------------------------------------------------------
@@ -1401,7 +1470,7 @@ def replace_device_submit(
     except ValueError as exc:
         return _error(str(exc))
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 @router.post("/inventory/devices/{device_id}/state")
@@ -1465,7 +1534,7 @@ def device_state_submit(
             status_code=400,
         )
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=basisstationen", status_code=303)
 
 
 # -----------------------------------------------------------------------------
@@ -2793,11 +2862,32 @@ def fault_acknowledge_submit(
 # segment like `/ui/apartments/export` that was meant for a different,
 # more specific route. `/tasks` above is unaffected (a different top-level
 # `/ui/...` path, not a `/ui/apartments/...` suffix).
+#: The three tabs of "Eine Wohnung" (UI-redesign stage 2) -- "Überblick"
+#: (faults with acknowledge, reachability timeline, battery/signal per
+#: device), "Wartung" (commands, backups, restore, tenant change in a
+#: separated danger zone), "Technik" (versions, system values, desired
+#: state). Server-rendered via `?ansicht=`, not JavaScript (brief: "tabs
+#: must work without JS") -- `apartment.html` shows only the active tab's
+#: sections and marks its own nav link `aria-current="page"`.
+APARTMENT_TABS = ("ueberblick", "wartung", "technik")
+_DEFAULT_APARTMENT_TAB = "ueberblick"
+
+
+def _normalize_apartment_tab(value: str | None) -> str:
+    """An unknown/missing `?ansicht=` value falls back to the default tab
+    rather than 404ing or 422ing -- the same "don't punish a stale or
+    hand-typed URL" rule this module's other query parameters (e.g.
+    `days` on this same route) already follow."""
+
+    return value if value in APARTMENT_TABS else _DEFAULT_APARTMENT_TAB
+
+
 @router.get("/apartments/{apartment_id:path}", response_class=HTMLResponse)
 def apartment_detail(
     request: Request,
     apartment_id: str,
     days: str | None = None,
+    ansicht: str | None = None,
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
@@ -2846,6 +2936,7 @@ def apartment_detail(
     # only ever in the server log, never echoed back into a URL a browser
     # history/referrer could carry.
     bundle_cleanup_failed = request.query_params.get("bundle_cleanup_failed") is not None
+    active_tab = _normalize_apartment_tab(ansicht)
     response = templates.TemplateResponse(
         request,
         "apartment.html",
@@ -2855,6 +2946,7 @@ def apartment_detail(
             "apartment_id": apartment_id,
             "detail": detail,
             "bundle_cleanup_failed": bundle_cleanup_failed,
+            "active_tab": active_tab,
         },
         status_code=200 if detail is not None else 404,
     )

@@ -26,7 +26,7 @@ from fastapi.testclient import TestClient
 import fleet.storage as storage_module
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
-from fleet.ui_house import FAULT_KIND_LABELS, build_house_overview
+from fleet.ui_house import FAULT_KIND_LABELS, build_house_overview, group_tiles_by_property
 from protocol import FaultKind, Heartbeat
 from protocol.version import PROTOCOL_VERSION
 from tests.conftest import store_encrypted_totp_secret
@@ -372,6 +372,209 @@ def test_get_house_overview_reports_only_the_open_not_reporting_alarm(storage: S
 
 def test_get_house_overview_is_empty_with_no_apartments_registered(storage: Storage) -> None:
     assert storage.get_house_overview() == []
+
+
+def test_get_house_overview_carries_property_and_floor_data(storage: Storage) -> None:
+    """UI-redesign stage 1: `get_house_overview` now also carries the
+    property/floor/orientation data the building visual needs -- an
+    apartment created via `create_apartment` (P4.1's inventory flow, not
+    the bare `set_apartment_token` every other fixture here uses) must come
+    back with its property's name/address alongside its own floor."""
+
+    prop = storage.create_property(name="Musterstraße 1", address="Musterstraße 1, Musterstadt")
+    storage.create_apartment(
+        APARTMENT_A,
+        property_id=prop.id,
+        label="WE 3",
+        floor="2. OG",
+        orientation="Süd",
+        state="occupied",
+        heating_circuits=4,
+        pilot_mode=False,
+    )
+    storage.set_apartment_token(APARTMENT_B, secrets.token_urlsafe(32))  # no property at all
+
+    overview = storage.get_house_overview()
+    by_id = {row.apartment_id: row for row in overview}
+
+    assert by_id[APARTMENT_A].property_id == prop.id
+    assert by_id[APARTMENT_A].property_name == "Musterstraße 1"
+    assert by_id[APARTMENT_A].property_address == "Musterstraße 1, Musterstadt"
+    assert by_id[APARTMENT_A].floor == "2. OG"
+    assert by_id[APARTMENT_A].orientation == "Süd"
+
+    assert by_id[APARTMENT_B].property_id is None
+    assert by_id[APARTMENT_B].property_name is None
+    assert by_id[APARTMENT_B].floor is None
+
+
+# -- ApartmentTile.short_label (UI-redesign stage 2 polish: compact site
+# map, "Alle Wohnungen") -----------------------------------------------------
+
+
+def test_short_label_uses_the_part_after_the_last_comma_in_a_landlord_label(
+    storage: Storage,
+) -> None:
+    """A landlord's own `label` is typically "<address>, WE <n>" (the demo
+    seed data in `tools/docs_screenshots.py`) -- the compact site-map block
+    prints only the "WE <n>" tail, never the whole address, so several
+    blocks fit side by side on one floor row."""
+
+    prop = storage.create_property(name="Musterstraße 1", address="Musterstraße 1, Musterstadt")
+    storage.create_apartment(
+        APARTMENT_A,
+        property_id=prop.id,
+        label="Musterstraße 1, WE 3",
+        floor="2. OG",
+        orientation="Süd",
+        state="occupied",
+        heating_circuits=4,
+        pilot_mode=False,
+    )
+
+    tiles = build_house_overview(storage, BASE_TIME)
+
+    assert tiles[0].short_label == "WE 3"
+
+
+def test_short_label_falls_back_to_the_apartment_id_without_a_comma(storage: Storage) -> None:
+    """No landlord-authored label at all (bare `set_apartment_token`,
+    `label` defaults to the apartment id itself) -- the short label is the
+    id unchanged, never truncated blindly (two different apartments must
+    never end up displaying identically)."""
+
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
+
+    tiles = build_house_overview(storage, BASE_TIME)
+
+    assert tiles[0].short_label == APARTMENT_A
+
+
+# -- fleet.ui_house.group_tiles_by_property (UI-redesign stage 1) ------------
+
+
+def test_group_tiles_by_property_draws_a_floor_stack_when_every_apartment_has_a_floor(
+    storage: Storage,
+) -> None:
+    prop = storage.create_property(name="Musterstraße 1", address="Musterstraße 1")
+    storage.create_apartment(
+        APARTMENT_A,
+        property_id=prop.id,
+        label="WE 1",
+        floor="EG",
+        orientation="Süd",
+        state="occupied",
+        heating_circuits=2,
+        pilot_mode=False,
+    )
+    storage.create_apartment(
+        APARTMENT_B,
+        property_id=prop.id,
+        label="WE 7",
+        floor="DG",
+        orientation="West",
+        state="occupied",
+        heating_circuits=2,
+        pilot_mode=False,
+    )
+
+    tiles = build_house_overview(storage, BASE_TIME)
+    groups = group_tiles_by_property(tiles)
+
+    assert len(groups) == 1
+    group = groups[0]
+    assert group.property_name == "Musterstraße 1"
+    assert group.has_floor_data is True
+    # "DG" sorts above "EG" in the top-down floor order (_KNOWN_FLOOR_ORDER).
+    assert [floor.floor_label for floor in group.floors] == ["DG", "EG"]
+    assert [tile.apartment_id for tile in group.floors[0].tiles] == [APARTMENT_B]
+    assert [tile.apartment_id for tile in group.floors[1].tiles] == [APARTMENT_A]
+
+
+def test_group_tiles_by_property_falls_back_to_a_plain_list_when_one_floor_is_missing(
+    storage: Storage,
+) -> None:
+    prop = storage.create_property(name="Musterstraße 1", address="Musterstraße 1")
+    storage.create_apartment(
+        APARTMENT_A,
+        property_id=prop.id,
+        label="WE 1",
+        floor="EG",
+        orientation="Süd",
+        state="occupied",
+        heating_circuits=2,
+        pilot_mode=False,
+    )
+    storage.create_apartment(
+        APARTMENT_B,
+        property_id=prop.id,
+        label="WE 7",
+        floor=None,  # the one gap that forces the whole property to fall back
+        orientation=None,
+        state="occupied",
+        heating_circuits=2,
+        pilot_mode=False,
+    )
+
+    tiles = build_house_overview(storage, BASE_TIME)
+    groups = group_tiles_by_property(tiles)
+
+    assert len(groups) == 1
+    assert groups[0].has_floor_data is False
+    assert len(groups[0].floors) == 1
+    assert {tile.apartment_id for tile in groups[0].floors[0].tiles} == {APARTMENT_A, APARTMENT_B}
+
+
+def test_group_tiles_by_property_puts_apartments_without_a_property_in_their_own_group(
+    storage: Storage,
+) -> None:
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
+
+    tiles = build_house_overview(storage, BASE_TIME)
+    groups = group_tiles_by_property(tiles)
+
+    assert len(groups) == 1
+    assert groups[0].property_id is None
+    assert groups[0].property_name is None
+    assert groups[0].has_floor_data is False
+    assert [tile.apartment_id for tile in groups[0].floors[0].tiles] == [APARTMENT_A]
+
+
+def test_group_tiles_by_property_sorts_an_unrecognized_floor_label_after_known_ones(
+    storage: Storage,
+) -> None:
+    """`_floor_sort_key`'s "doesn't block the page" fallback (see its own
+    docstring): a free-text floor the known order does not recognize still
+    renders, sorted after every recognized floor rather than raising or
+    being dropped."""
+
+    prop = storage.create_property(name="Musterstraße 1", address="Musterstraße 1")
+    storage.create_apartment(
+        APARTMENT_A,
+        property_id=prop.id,
+        label="WE 1",
+        floor="EG",
+        orientation="Süd",
+        state="occupied",
+        heating_circuits=2,
+        pilot_mode=False,
+    )
+    storage.create_apartment(
+        APARTMENT_B,
+        property_id=prop.id,
+        label="WE 9",
+        floor="Zwischengeschoss",
+        orientation=None,
+        state="occupied",
+        heating_circuits=2,
+        pilot_mode=False,
+    )
+
+    tiles = build_house_overview(storage, BASE_TIME)
+    groups = group_tiles_by_property(tiles)
+
+    assert groups[0].has_floor_data is True
+    assert [floor.floor_label for floor in groups[0].floors] == ["EG", "Zwischengeschoss"]
 
 
 # -- HTTP-level: authentication, security headers, rendered content -----------

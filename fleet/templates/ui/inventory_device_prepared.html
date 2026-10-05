@@ -4,8 +4,8 @@
 
 {% block content %}
 {# Result page for "Vorbereiten" (P4.2, section 20.2 step 2, 15.3 step 1)
-   -- shows the one-time registration code exactly once (never logged,
-   never stored in plain text -- only its hash, see
+   – shows the one-time registration code exactly once (never logged,
+   never stored in plain text – only its hash, see
    fleet/storage.py::Storage.prepare_device). #}
 <h1>Gerät {{ device_id }} vorbereitet</h1>
 
@@ -22,7 +22,7 @@
 <pre>{{ registration_file_json }}</pre>
 {% else %}
 <p class="error" role="alert">
-    FLEET_PUBLIC_URL und/oder FLEET_CERT_FINGERPRINT sind nicht gesetzt -- der
+    FLEET_PUBLIC_URL und/oder FLEET_CERT_FINGERPRINT sind nicht gesetzt – der
     vollständige Inhalt für <code>agent-registration.json</code> kann hier
     nicht angezeigt werden. Bitte diese Umgebungsvariablen konfigurieren und
     Adresse/Fingerabdruck sowie den obigen Registrierungscode von Hand

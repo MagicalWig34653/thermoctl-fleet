@@ -198,7 +198,7 @@ def _stale_hint(now: datetime, overview: ApartmentOverview) -> str | None:
     heartbeat_age = _relative_duration(now, overview.latest.received_at)
     alarm_age = _relative_duration(now, overview.open_alarm.raised_at)
     return (
-        f"Wohnung meldet sich nicht (seit {alarm_age}) -- "
+        f"Wohnung meldet sich nicht (seit {alarm_age}) – "
         f"Stand der letzten Meldung vor {heartbeat_age}"
     )
 

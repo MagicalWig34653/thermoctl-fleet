@@ -11,7 +11,7 @@
     <input type="hidden" name="pre_csrf" value="{{ pre_csrf }}">
     <input type="hidden" name="webauthn_assertion" id="webauthn-assertion" value="">
     <input type="hidden" name="webauthn_challenge_id" id="webauthn-challenge-id" value="">
-    <label for="username">Benutzername
+    <label for="username"><span class="field-label-text">Benutzername<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="username" name="username" autocomplete="username" required autofocus>
     </label>
     {% if passwordless_available %}
@@ -19,15 +19,15 @@
        FLEET_UI_PASSWORDLESS_NETWORKS a passkey alone suffices -- the
        password field stays for the TOTP path, but is no longer required. #}
     <p class="hint" id="passwordless-hint">Du bist in einem bekannten Netz: Mit Passkey brauchst du kein Passwort und keinen Bestätigungscode – Benutzername eingeben und „Mit Passkey anmelden“ wählen.</p>
-    <label for="password">Passwort (nur ohne Passkey nötig)
+    <label for="password"><span class="field-label-text">Passwort (nur ohne Passkey nötig)<span class="field-optional"> (optional)</span></span>
         <input type="password" id="password" name="password" autocomplete="current-password">
     </label>
     {% else %}
-    <label for="password">Passwort
+    <label for="password"><span class="field-label-text">Passwort<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="password" id="password" name="password" autocomplete="current-password" required>
     </label>
     {% endif %}
-    <label for="totp_code">Bestätigungscode (Authenticator-App)
+    <label for="totp_code"><span class="field-label-text">Bestätigungscode (Authenticator-App)<span class="field-optional"> (optional)</span></span>
         <input type="text" id="totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code">
     </label>
     <button type="submit">Anmelden</button>

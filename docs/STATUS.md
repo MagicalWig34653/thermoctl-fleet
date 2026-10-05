@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-10-04.
+Last updated: 2026-10-05.
 
 ## Shared PyCharm run configurations and local demo fleet (2026-10-04)
 
@@ -305,6 +305,298 @@ changed shell script (`image/common/firstboot-wifi.sh`,
 .check_image_config` exits 0; full suite 2076 tests, 0 failures/errors, 1
 pre-existing/unrelated skip. `watchdog/` was not touched by this task, so
 `go vet`/`go test` were not re-run.
+
+## UI redesign: final owner-approved polish (2026-10-05)
+
+Required "*" and "(optional)" now sit next to the label (screen readers get
+"Pflichtfeld"); inventory lines read "Bewohnt, EG, Ost, 5 Heizkreise"
+(proper singular/plural); "Einrichtung" is split into three server-side
+sub-areas (`?bereich=`: Objekte & Wohnungen, Basisstationen, Neue
+Basisstation vorbereiten) with forms in cards, redirects land in the right
+sub-area; the rollout inbox reason "Wohnung '<id>': agent rejected" renders
+as "Wohnung <id>: Vom Agenten abgelehnt.". Main-session read-back: every
+changed template keeps an identical multiset of form `action`/`method`/
+`name` attributes and hidden inputs (scripted before/after comparison);
+ruff/mypy clean; full pytest tests="2331" failures="0" errors="0"
+skipped="3"; docs/ui-redesign/ screenshots regenerated and reviewed.
+
+## Fleet UI redesign, stage 2 polish pass (2026-10-05)
+
+The owner approved stage 2's structure (below) and asked for a polish
+pass, then to see it again: a compact site map, text hygiene across every
+template/view-builder, a tidier apartment "Überblick" tab, and "die
+Formulare richtig formatieren" across every form in the application.
+
+- **"Alle Wohnungen" site map is now compact.** The old per-apartment
+  card (next-step text, last-contact line, open-fault list -- the same
+  detail already duplicated in the inbox above) is replaced by a small
+  labelled block: short name + status icon + colour, several per floor
+  row, a whole ~20-apartment house fitting on one screen
+  (`fleet/templates/ui/_unit_macros.html::apartment_block`, new `.unit-
+  block` CSS). The short name (`fleet.ui_house.ApartmentTile.short_label`,
+  `_short_label`) is the part after the last comma of a landlord's own
+  "<address>, WE n" label, falling back to the apartment id -- never
+  truncated blindly. Full detail (status, next step, since-when) stays in
+  the block's native `title` tooltip and one click away; nothing is lost,
+  only moved. Mobile: blocks wrap via `flex-wrap`, still compact.
+- **Text hygiene across every fleet UI template and view builder**:
+  - A single shared helper, `fleet/ui_format.py::format_local_datetime`/
+    `format_local_date`, replaces three different ad hoc renderings
+    (`"%Y-%m-%d %H:%M UTC"` in `ui_apartment.py`/`ui_rollout.py`, raw
+    `.isoformat()` in `ui_routes.py`/`ui_inventory.py`) with one German
+    local-time format (`"04.10.2026, 19:46 Uhr"`, Europe/Berlin,
+    DST-aware via `zoneinfo`). Existing relative "vor 5 Min." text is
+    unchanged.
+  - `fleet.ui_format.format_technical_reason` maps the small set of fixed
+    literal strings the agent is known to echo back (`ReconcileOutcome
+    .reason`/`DesiredStateOutcome.reason`/`Rollout.stopped_reason`/
+    `RolloutApartmentRecord.last_outcome_reason`) to German, and marks
+    anything else as "Technischer Hinweis (Agent): ..." rather than
+    silently printing raw, often-English agent/log text as if it were
+    polished UI copy (the rollout inbox's "agent rejected" example from
+    the work order). A landlord-authored "Grund" (desired-state edit,
+    rollout start/resume/cancel) is never touched -- only the agent-
+    echoed fields are. `fleet.ui_apartment._format_zigbee_bridge` applies
+    the same pattern to `DeviceState.zigbee_bridge` ("deliberately free
+    text, no enum" per its own protocol comment) -- "connected" ->
+    "verbunden".
+  - `ApartmentState`/`DeviceLifecycle` are, by their own docstrings,
+    "Values in English (section 20.1/22.4)" for the *stored* value -- the
+    inventory pages used to print that stored value directly
+    (`apartment.state`, `device.state`, and the state-change `<select>`'s
+    own `<option>` text). `fleet.ui_inventory.APARTMENT_STATE_LABELS`/
+    `DEVICE_LIFECYCLE_LABELS` (closed, "covers every member or the test
+    fails" -- same convention as `fleet.ui_house.FAULT_KIND_LABELS`) now
+    supply a German label everywhere a state is *displayed*; every
+    `<option value="...">` keeps the unchanged English value, only its
+    visible text changed.
+  - Every remaining `" -- "` in user-facing text (templates and Python
+    f-strings alike, Jinja/docstring comments left alone) -> `" – "`;
+    bare `"-"` placeholder cells -> `"–"`; the three ad hoc
+    `"(Pflichtfeld)"` labels removed in favour of the new, consistent
+    required-marker (see below).
+- **Apartment "Überblick" tab**: every top-level section is now a
+  bordered card with consistent spacing (`.apartment-grid > section`,
+  one `gap` mechanism, not card padding stacked on top of the old
+  `main section + section` margin); the danger zone keeps its own
+  `--signal` border via a more specific override. "Erreichbarkeit" gets
+  a compact, proportional timeline bar above the existing text list
+  (`fleet/ui_apartment.py::TimelineEntry.width_percent`/
+  `_timeline_width_percents`, derived from the same `sent_at` values
+  already read for the text, not new data) -- gap/contact segments sized
+  by real elapsed time, not by row count, with a visual 3% floor so no
+  segment disappears. No inline `style` (this app's CSP sends no
+  `style-src 'unsafe-inline'`): width is one of 100 generated `.tl-w-N`
+  percent classes.
+- **Forms, "richtig formatiert" across the whole application**: labels
+  stayed block-level/above their input (already the base pattern, kept);
+  per-field width tiers (short/medium/long) keyed by the input's own
+  fixed `name` attribute via CSS attribute selectors -- no template
+  diffs needed, every form sharing a field name (e.g. `digest`/
+  `digest_{{ service }}`) is covered by one rule; a CSS-driven required/
+  optional marker (`label:has(input:required)::after` -> " *",
+  `:optional` -> " (optional)") replaces the old, inconsistent inline
+  "(Pflichtfeld)" text; `<fieldset>`/`<legend>` (already used on two
+  forms) now get a visible border; button variants -- default `<button>`
+  filled/primary, `.button--secondary`, `.button--danger` (applied to
+  every destructive action: Mieterwechsel, Gerät ausbauen, Rollout
+  abbrechen, Passkey entfernen) -- `a.command-button` keeps its existing
+  outlined look (filling every item of a multi-button row equally loud
+  would fight this file's own "quiet is the default" rule); an empty
+  `.error` placeholder (`#webauthn-error` et al., filled by JS only on
+  an actual error) no longer renders as an empty red box
+  (`.error:empty { display: none }`). `version`/`digest`/`service` on
+  "Neuer Rollout" gained HTML `required`/`pattern` matching what the
+  route already enforces server-side (no backend change). Every form's
+  `action`/`method`/field `name`s/CSRF token/hidden inputs are
+  byte-identical to before this pass.
+- **Screenshots**: `tools/docs_screenshots.py`'s `capture_ui_redesign_ia`
+  extended with three more pages the owner explicitly asked to see --
+  "Konto" (`/ui/account/webauthn`, passkey registration form), "Neuer
+  Rollout" (`/ui/rollouts/new`), and the stopped demo rollout's own
+  detail page (reached by following the "Updates" list's own link, not
+  a hard-coded id) for its Fortsetzen/Abbrechen forms. All 44
+  `docs/ui-redesign/*.png` (1440 + 390, light + dark) regenerated.
+  **Three critique rounds** against the real rendered pages: (1) an
+  empty `#webauthn-register-error` placeholder rendered as a visible
+  red-bordered empty box on "Konto" -> `.error:empty` fix above; (2)
+  `Zigbee-Bridge: connected` and, on "Einrichtung", raw `occupied`/`ok`
+  apartment states (the latter a demo-seed typo not matching
+  `ApartmentState` at all) -> the German-label fixes above, plus
+  correcting the seed fixture's stray `state="ok"` to the real
+  `DEFAULT_APARTMENT_STATE` value; (3) a dark-mode pass confirmed both
+  fixes render correctly and found no further issues.
+- **Tests**: new `tests/test_ui_format.py` (every helper); new
+  `ApartmentTile.short_label`/timeline-bar/`_format_zigbee_bridge`/
+  `APARTMENT_STATE_LABELS`/`DEVICE_LIFECYCLE_LABELS` coverage added to
+  the existing `test_ui_house.py`/`test_ui_apartment.py`/
+  `test_ui_inventory.py` modules (no new test modules needed -- every
+  change extends an existing view builder). Three wording assertions
+  updated because they pinned exactly the presentation this pass changed
+  on purpose (`detail.zigbee_bridge == "connected"` ->  `"verbunden"`,
+  `"retired" in ...` -> `"Außer Betrieb" in ...`); no security/CSRF/
+  authorization/data-minimisation assertion touched.
+
+## Fleet UI redesign, stage 2: information architecture rebuild (2026-10-04)
+
+The owner rejected stage 1 (below) as only a reskin: "Es soll komplett
+neu gemacht werden. Nicht nur die Farben, sondern die Struktur komplett
+neu bauen." Stage 2 rebuilds the IA itself -- full concept and page
+inventory in **`docs/ui-redesign-ia.md`**, which is now the authoritative
+document for the fleet UI's structure (stage 1's plan document stays only
+for the colour/type reasoning it owns, superseded everywhere else).
+
+- **Four areas replace five flat pages**: Übersicht ("Das Haus" + the old
+  "Aufgaben" merged), Wohnungen (new), Einrichtung (was "Inventar", same
+  URL), Updates (was "Rollouts", same URL). Desktop: left sidebar.
+  Mobile (< 760px): fixed bottom tab bar, same four links. Active area
+  computed once in `base.html` from `request.url.path`, not per-route.
+- **Übersicht** (`fleet/ui_overview.py`, new module) -- one-sentence
+  headline, then an "action inbox" (`InboxItem`: what, which apartment,
+  since when, one link to the exact place the real action lives), then
+  the unchanged `fleet.ui_house` building/site-map visual. `/ui/tasks`
+  303-redirects here (still behind `require_ui_user`). Inbox sourcing
+  (alarm/never-reported from `ApartmentTile.status`, fault/battery/update
+  from `fleet.ui_tasks.build_task_overview`, rollout-stopped from
+  `fleet.ui_rollout.build_rollout_list`) and the deliberate omission of a
+  "failed command" row (no fleet-wide query exists yet -- see "Open
+  points" below) are reasoned through in that module's own docstring.
+- **Wohnungen** (`fleet/ui_apartments_list.py`, new module, `GET
+  /ui/apartments`) -- a flat, searchable (`?q=`)/filterable
+  (`?property=`, `?state=`) list over the same tiles `build_house_overview`
+  already produces. Plain `GET` query parameters -- works without JS.
+- **Apartment page, three tabs** (`?ansicht=ueberblick|wartung|technik`,
+  `fleet/ui_routes.py::_normalize_apartment_tab`, default/fallback
+  `ueberblick`) -- every existing section/form/field/hidden input/CSRF
+  token is unchanged, only grouped: Überblick (history, faults, battery/
+  signal, alarms), Wartung (commands, backups, restore, then tenant
+  change as a separated, red-bordered danger zone), Technik (version/
+  system, desired state, each service's digest shortened via a new
+  `shortdigest` Jinja filter with a "Kopieren" button -- `fleet/static/ui
+  /copy.js`, same-origin, progressive enhancement only, full digest
+  always present via `title="..."`). Server-rendered per tab (only the
+  active tab's markup is sent), not CSS-hidden -- works without JS.
+- **Einrichtung** gets one new section, a numbered "Neue Basisstation
+  vorbereiten" step list reusing the existing register/prepare/confirm
+  routes/forms unchanged -- no new route. Numbered markers used nowhere
+  else in the application (self-review in `docs/ui-redesign-ia.md`).
+- **Wording**: every remaining visible "section 13"/English leftover
+  removed (`desired_state_confirm.html`, `rollout_new.html`); "derzeit
+  inaktiv" -> "derzeit abgeschaltet" everywhere, consistently.
+- **Tests**: two new test modules (`tests/test_ui_overview.py`,
+  `tests/test_ui_apartments_list.py`, unit + HTTP, including data-
+  minimisation/CSRF/security-header coverage matching the existing
+  pattern), new apartment-tab tests in `tests/test_ui_apartment.py`.
+  Every existing test that asserted on now-moved content (commands/
+  backups/restore/tenant-change/desired-state on the apartment page,
+  "Aufgaben"'s three HTTP tests, two heading-text assertions) was updated
+  to navigate to its new tab/page -- no security/CSRF/authorization/
+  data-minimisation assertion was weakened; `tests/test_ui_throttle.py`'s
+  `_make_request` (a bare ASGI scope with no `path` key, used to unit-test
+  `login_submit` directly) surfaced a real bug in `base.html`'s new
+  `request.url.path` read, fixed by guarding that whole computation behind
+  `ui_session` (the only case it is ever used).
+- **Screenshots**: `tools/docs_screenshots.py` extended -- `APARTMENTS`
+  grew from 3 to 5 (two now share "2. OG", two share "EG", for the site
+  map's "several units per floor" requirement; one battery-low, one
+  outdated+alarm, one never-reported, for inbox diversity), a stopped
+  rollout added to the seed, and a new `capture_ui_redesign_ia()`
+  function captures every page/tab at 1440px/390px, light/dark, into
+  `docs/ui-redesign/` (replacing the stage-1 images there). `capture()`
+  itself (feeds `site/`'s screenshots) updated for the new routes; its
+  own filenames (`dashboard-*`, `tasks-*`, ...) kept stable so `site/`'s
+  existing references keep working, even though "Aufgaben" no longer has
+  a distinct page (both filenames now capture the same Übersicht).
+  **Four screenshot critique rounds** against the real rendered pages are
+  recorded in `docs/ui-redesign-ia.md`'s own self-review section (a
+  sidebar active-state contrast fix, an Überblick-tab grid fix, and two
+  rounds fixing a Playwright full-page-screenshot artifact with the new
+  fixed mobile bottom nav).
+- **Open points, not guessed at**:
+  - "Failed command" has no row in the Übersicht inbox yet -- would need
+    a new fleet-wide "most recent failed command per apartment" storage
+    query (`fleet/storage.py` only offers `list_commands_for_apartment`,
+    one apartment at a time); left out of this change rather than adding
+    an unreviewed query alongside the IA rebuild.
+  - `site/`'s own marketing copy (page text describing "Das Haus"/
+    "Aufgaben"/"Inventar"/"Rollouts" by name) was not rewritten -- only
+    its screenshots regenerate correctly against the new UI. Updating the
+    site's prose to match the new area names is a separate, smaller
+    follow-up.
+
+## Fleet UI redesign, stage 1: house overview + apartment detail (2026-10-04)
+
+The owner found the fleet web UI ("ziemlich unschön") hard to scan for
+"which apartment needs me right now". Stage 1 of a full redesign (plan in
+`docs/ui-redesign-plan.md`) rebuilds two screens for real -- `fleet/
+templates/ui/index.html` ("Das Haus") and `fleet/templates/ui/apartment
+.html` -- plus the shared `base.html` nav and `fleet/static/ui/fleet-ui
+.css`; every other template is untouched and keeps today's look for now.
+
+- **Palette/type**: six named colour tokens per theme derived from the app
+  icon (`branding/thermoctl-fleet.icon`), light and dark via `@media
+  (prefers-color-scheme: dark)`. Type is **Archivo** (SIL OFL 1.1),
+  self-hosted as static TTF under `fleet/static/ui/fonts/` (`OFL.txt`
+  alongside) -- no CDN, no external request, compatible with the existing
+  `script-src 'self'`/`default-src 'self'` CSP.
+- **The building visual** ("Das Haus"'s memorable element): apartments now
+  group by property and, where every apartment in a property has a
+  recorded floor, draw as a top-down floor stack (`fleet/ui_house.py
+  ::group_tiles_by_property`, new `PropertyGroup`/`FloorGroup`). One
+  missing floor in a property falls the whole property back to a plain
+  list; apartments with no property land in their own trailing,
+  ungrouped section. One semantic list (property → floor → apartment) is
+  styled as the floor stack via CSS grid -- there is no separate
+  "accessible" markup, the same structure *is* the screen-reader fallback.
+- **Five-category status replaces the old binary quiet/trouble split**:
+  `alarm`/`fault`/`outdated`/`never_reported`/`ok`, each with a German
+  label and (where there is something to do) a plain-language next step
+  (`fleet/ui_house.py::STATUS_LABELS`/`NEXT_STEP_TEXT`). The apartment
+  detail page shows the same status via a new `ApartmentDetail.status`/
+  `status_label`/`next_step_text` (`fleet/ui_apartment.py::_detail_status`,
+  reusing the house view's own labels so the two pages never disagree).
+  Status is still never colour alone -- icon shape (circle/square/
+  triangle/diamond/dashed ring) plus text, same rule the original P3.0 CSS
+  already stated.
+- **Apartment detail** gets a two-column reading grid above 960px (history/
+  faults/battery-signal/version/alarms on the left, tenant-change/commands/
+  desired-state/backups/restore on the right) via CSS `grid-column`
+  assignment on the existing `<section>` elements by their own
+  `aria-labelledby` -- no section renamed, reordered in the DOM, or given a
+  different field/form/hidden-input; collapses to today's single column
+  below that width.
+- **Storage/view-model change**: `Storage.get_house_overview` now also
+  reads `floor`/`orientation`/`property_id`/`property_name`/
+  `property_address` via an outer join to `properties` (new fields on
+  `ApartmentOverview`, all optional/defaulted, so every existing caller/
+  test keeps working). `ApartmentTile` gained matching optional fields
+  plus `status`/`status_label`/`next_step_text`; `quiet` is unchanged.
+
+**Self-review bug caught in round 1 of screenshot critique**: the dark
+theme's `--ink` (text colour) and `--paper` (page background) tokens both
+resolved to the same navy, rendering every redesigned page unreadable in
+dark mode. Fixed by giving `--ink` its own light off-white value in the
+dark block. **Round 2**: the apartment page's right column towered over
+the left one (plain, unstyled `<dl>` fact lists, one line per field) --
+added a compact label/value grid for `<dl>`/`<table>` inside `.apartment-
+grid` and moved "Batterie und Signal"/"Version und System"/"Alarme" to the
+left column (content-weight balance, not just meaning) to close the gap;
+also gave `button`/`input[type=text|password]`/`a.command-button` their
+first real styling (token-based border/colour), previously plain browser
+defaults everywhere.
+
+Verified: `ruff check fleet/` and `mypy fleet/` both exit 0; full suite
+2288 tests, 0 failures/errors, 3 pre-existing/unrelated skips (plus 12 new
+tests for `fleet.ui_house.group_tiles_by_property`/the storage join, all
+passing, `fleet/ui_house.py` at 100% line coverage). Screenshots (seeded
+via `tools/docs_screenshots.py`'s own `seed()`/`create_ui_user()`/
+`start_server()`, Playwright/Chromium in a scratch venv) at 1440px/390px,
+light/dark, under `docs/ui-redesign/`.
+
+**Open for stage 2** (not started): `tasks.html`, `inventory.html`, the
+various confirm/form pages, and login/account all still use the pre-
+redesign look -- they inherit the new base tokens/type/button styling
+(shared CSS, not duplicated) but none of their own layouts changed.
 
 ## CI fix: flash-tool tests no longer need macOS (2026-10-03)
 

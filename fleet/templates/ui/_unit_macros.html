@@ -1,0 +1,19 @@
+{#
+"Alle Wohnungen" compact site map (index.html's building visual, UI-
+redesign stage 2 polish). Deliberately the *only* markup shape used there
+-- one small, labelled block per apartment, several side by side on a
+floor so a ~20-apartment house fits on one screen (brief). All the detail
+a tile used to carry here before this pass (next step, last contact, open
+faults) now lives either in the action inbox above (next step) or one
+click away on the apartment page -- repeating it per block is exactly what
+made the old building visual too tall to be a "site map". The same detail
+is not lost, only moved: it is still in the DOM as the link's `title`
+(a native tooltip, works with no CSS/JS) and reachable via the link
+itself.
+#}
+{% macro apartment_block(tile) %}
+<a class="unit-block unit-block--{{ tile.status }}" href="/ui/apartments/{{ tile.apartment_id | urlpath }}" title="{{ tile.apartment_id }}{% if tile.label and tile.label != tile.apartment_id %} ({{ tile.label }}){% endif %} – {{ tile.status_label }}{% if tile.alarm_since_text %}, {{ tile.alarm_since_text }}{% endif %}{% if tile.next_step_text %}. {{ tile.next_step_text }}{% endif %}">
+    <span class="status-icon status-icon--{{ tile.status }}" aria-hidden="true"></span>
+    <span class="unit-block__label">{{ tile.short_label }}</span>
+</a>
+{% endmacro %}

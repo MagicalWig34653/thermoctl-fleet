@@ -72,6 +72,7 @@ from fleet.device_lifecycle import (
     allowed_manual_target_states,
 )
 from fleet.storage import ApartmentRecord, DeviceRecord, PropertyRecord, Storage
+from fleet.ui_format import format_local_date, format_local_datetime
 from protocol.inventory import ApartmentState, DeviceLifecycle
 
 # Section 20.1: "a permanent id (`house7-a03`, never changes)" -- restricted
@@ -162,6 +163,36 @@ def device_confirm_href(device_id: str) -> str:
 # _inventory.py`'s column lengths).
 _PREPARABLE_DEVICE_STATES = {DeviceLifecycle.REGISTERED.value, DeviceLifecycle.IN_STORAGE.value}
 
+# Text-hygiene pass (UI-redesign stage 2 polish): `ApartmentState`/
+# `DeviceLifecycle` are, by their own docstrings, "Values in English
+# (section 20.1/22.4)" -- a deliberate, closed, specification-defined
+# vocabulary for the *stored* value (form option `value=`, the database
+# column, `fleet.rollout`'s own state checks) -- but nothing says the
+# *landlord-facing label* has to be the same English word. One German
+# label per member, same "covers every member or a lookup fails loudly"
+# rule `fleet.ui_house.FAULT_KIND_LABELS` already follows -- see
+# `tests/test_ui_inventory.py::test_apartment_state_labels_cover_every_
+# apartment_state`/`..._device_lifecycle`. `.get(..., state)` in the two
+# builders below is defense in depth only, for a legacy/malformed value
+# already in a database from before this closed vocabulary was enforced
+# -- never hit for a value this application itself ever writes.
+APARTMENT_STATE_LABELS: dict[str, str] = {
+    ApartmentState.OCCUPIED.value: "Bewohnt",
+    ApartmentState.VACANT.value: "Leerstand",
+    ApartmentState.RENOVATING.value: "Renovierung",
+    ApartmentState.RETIRED.value: "Außer Betrieb",
+}
+
+DEVICE_LIFECYCLE_LABELS: dict[str, str] = {
+    DeviceLifecycle.REGISTERED.value: "Registriert",
+    DeviceLifecycle.PREPARED.value: "Vorbereitet",
+    DeviceLifecycle.REPORTED.value: "Gemeldet",
+    DeviceLifecycle.IN_SERVICE.value: "Im Einsatz",
+    DeviceLifecycle.IN_STORAGE.value: "Im Lager",
+    DeviceLifecycle.FAULTY.value: "Defekt",
+    DeviceLifecycle.DECOMMISSIONED.value: "Außer Dienst",
+}
+
 
 @dataclass(frozen=True)
 class ApartmentRow:
@@ -173,6 +204,7 @@ class ApartmentRow:
     floor: str | None
     orientation: str | None
     state: str
+    state_label: str
     heating_circuits: int
     pilot_mode: bool
     current_device_id: str | None
@@ -199,6 +231,7 @@ class DeviceRow:
     id: str
     model: str
     state: str
+    state_label: str
     acquisition_date: str
     image_version: str
     watchdog_version: str
@@ -209,8 +242,10 @@ class DeviceRow:
     # P4.3: only the manual transitions `fleet.device_lifecycle` allows
     # *from this device's current state* -- an empty list (e.g. for a
     # `decommissioned` device, a terminal state) means the template renders
-    # no state-change form at all for this row.
-    allowed_target_states: list[str]
+    # no state-change form at all for this row. `(value, label)` pairs --
+    # `value` is the unchanged English `DeviceLifecycle` member the
+    # `<option value="...">` submits, `label` is its German text.
+    allowed_target_states: list[tuple[str, str]]
     state_action_href: str
 
 
@@ -250,7 +285,10 @@ class InventoryView:
     unassigned_apartments: list[ApartmentRow]
     devices_not_in_service: list[DeviceRow]
     active_filter: str | None
-    apartment_states: list[str]
+    # `(value, label)` pairs -- `value` is the unchanged English
+    # `ApartmentState` member the `<option value="...">` submits, `label`
+    # is its German text (see `APARTMENT_STATE_LABELS` above).
+    apartment_states: list[tuple[str, str]]
 
 
 @dataclass(frozen=True)
@@ -261,6 +299,7 @@ class ShelfDeviceRow:
     id: str
     model: str
     state: str
+    state_label: str
     prepare_href: str
 
 
@@ -283,7 +322,9 @@ class ReplaceDeviceView:
     current_assignment_id: int
     current_device_id: str
     current_device_model: str
-    target_states: list[str]
+    # `(value, label)` pairs, same convention as `DeviceRow.
+    # allowed_target_states` above.
+    target_states: list[tuple[str, str]]
     shelf_devices: list[ShelfDeviceRow]
 
 
@@ -295,6 +336,7 @@ def _apartment_row(storage: Storage, apartment: ApartmentRecord) -> ApartmentRow
         floor=apartment.floor,
         orientation=apartment.orientation,
         state=apartment.state,
+        state_label=APARTMENT_STATE_LABELS.get(apartment.state, apartment.state),
         heating_circuits=apartment.heating_circuits,
         pilot_mode=apartment.pilot_mode,
         current_device_id=device.id if device is not None else None,
@@ -310,13 +352,17 @@ def _device_row(device: DeviceRecord) -> DeviceRow:
         id=device.id,
         model=device.model,
         state=device.state,
-        acquisition_date=device.acquisition_date.isoformat(),
+        state_label=DEVICE_LIFECYCLE_LABELS.get(device.state, device.state),
+        acquisition_date=format_local_date(device.acquisition_date),
         image_version=device.image_version,
         watchdog_version=device.watchdog_version,
         prepare_href=(
             device_prepare_href(device.id) if device.state in _PREPARABLE_DEVICE_STATES else None
         ),
-        allowed_target_states=allowed_manual_target_states(device.state),
+        allowed_target_states=[
+            (target, DEVICE_LIFECYCLE_LABELS.get(target, target))
+            for target in allowed_manual_target_states(device.state)
+        ],
         state_action_href=device_state_href(device.id),
     )
 
@@ -359,7 +405,9 @@ def build_confirm_view(storage: Storage) -> ConfirmView:
                 model=device.model,
                 fingerprint=_display_fingerprint(registration.public_key),
                 reported_at=(
-                    registration.reported_at.isoformat() if registration.reported_at else ""
+                    format_local_datetime(registration.reported_at)
+                    if registration.reported_at
+                    else ""
                 ),
                 confirm_href=device_confirm_href(device.id),
             )
@@ -422,7 +470,9 @@ def build_inventory_view(storage: Storage, device_filter: str | None) -> Invento
         unassigned_apartments=unassigned_apartments,
         devices_not_in_service=devices_not_in_service,
         active_filter=active_filter,
-        apartment_states=[state.value for state in ApartmentState],
+        apartment_states=[
+            (state.value, APARTMENT_STATE_LABELS[state.value]) for state in ApartmentState
+        ],
     )
 
 
@@ -456,6 +506,7 @@ def build_replace_device_view(storage: Storage, apartment_id: str) -> ReplaceDev
             id=candidate.id,
             model=candidate.model,
             state=candidate.state,
+            state_label=DEVICE_LIFECYCLE_LABELS.get(candidate.state, candidate.state),
             prepare_href=device_prepare_href(candidate.id),
         )
         for candidate in storage.list_devices()
@@ -468,14 +519,19 @@ def build_replace_device_view(storage: Storage, apartment_id: str) -> ReplaceDev
         current_assignment_id=assignment.id,
         current_device_id=device.id,
         current_device_model=device.model,
-        target_states=list(REMOVE_DEVICE_TARGET_STATES),
+        target_states=[
+            (target, DEVICE_LIFECYCLE_LABELS.get(target, target))
+            for target in REMOVE_DEVICE_TARGET_STATES
+        ],
         shelf_devices=shelf,
     )
 
 
 __all__ = [
     "APARTMENT_ID_PATTERN",
+    "APARTMENT_STATE_LABELS",
     "DEFAULT_APARTMENT_STATE",
+    "DEVICE_LIFECYCLE_LABELS",
     "FILTER_FAULTY",
     "FILTER_IN_STORAGE",
     "MAX_APARTMENT_ID_LENGTH",

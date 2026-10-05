@@ -27,11 +27,11 @@
 <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ command | urlpath }}/confirm">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     {% if requires_lines %}
-    <label for="lines">Anzahl Zeilen ({{ min_lines }}–{{ max_lines }})
+    <label for="lines"><span class="field-label-text">Anzahl Zeilen ({{ min_lines }}–{{ max_lines }})<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="lines" name="lines" inputmode="numeric" value="{{ default_lines }}" required>
     </label>
     {% endif %}
-    <label for="reason">Grund (Pflichtfeld)
+    <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="reason" name="reason" required>
     </label>
     <button type="submit">Bestätigen: {{ command_label }}</button>

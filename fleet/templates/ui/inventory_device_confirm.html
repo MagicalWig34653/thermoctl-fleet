@@ -22,25 +22,24 @@
     <p>Gemeldet: {{ row.reported_at }}</p>
     <form method="post" action="{{ row.confirm_href }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <label for="apartment_id_{{ row.device_id }}">Wohnung
+        <label for="apartment_id_{{ row.device_id }}"><span class="field-label-text">Wohnung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <select id="apartment_id_{{ row.device_id }}" name="apartment_id" required>
                 {% for apartment in apartments %}
                 <option value="{{ apartment.id }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</option>
                 {% endfor %}
             </select>
         </label>
-        <label for="verification_code_{{ row.device_id }}">Bestätigungscode (vom Gerät angezeigt)
+        <label for="verification_code_{{ row.device_id }}"><span class="field-label-text">Bestätigungscode (vom Gerät angezeigt)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="verification_code_{{ row.device_id }}" name="verification_code" required>
         </label>
-        <label for="reason_{{ row.device_id }}">Grund
+        <label for="reason_{{ row.device_id }}"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="reason_{{ row.device_id }}" name="reason" required>
         </label>
         <label>
             <input type="checkbox" name="replace_previous" value="1">
             Bisheriges Gerät der Wohnung ersetzen (falls dort bereits eines aktiv ist)
         </label>
-        <label for="previous_device_target_state_{{ row.device_id }}">
-            Zielzustand für das bisherige Gerät (nur bei Ersetzen)
+        <label for="previous_device_target_state_{{ row.device_id }}"><span class="field-label-text">Zielzustand für das bisherige Gerät (nur bei Ersetzen)<span class="field-optional"> (optional)</span></span>
             <select id="previous_device_target_state_{{ row.device_id }}"
                     name="previous_device_target_state">
                 <option value="in_storage">Im Lager</option>
