@@ -434,6 +434,10 @@ _REBUILT_PAGES: tuple[tuple[str, str], ...] = (
     ("/ui/?ansicht=liste", "uebersicht-liste"),
     ("/ui/apartments", "wohnungen"),
     ("/ui/tasks", "aufgaben"),
+    ("/ui/inventory", "einrichtung"),
+    ("/ui/rollouts", "updates"),
+    ("/ui/rollouts/new", "updates-neu"),
+    ("/ui/account/webauthn", "konto"),
 )
 
 _VIEWPORTS: tuple[int, ...] = (1440, 390)
