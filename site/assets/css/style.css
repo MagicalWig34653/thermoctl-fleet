@@ -180,6 +180,8 @@ code {
   background: var(--code-bg);
   padding: 0.15em 0.4em;
   border-radius: 4px;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 pre {
@@ -205,6 +207,8 @@ th, td {
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 th {
   color: var(--text-muted);
@@ -647,7 +651,7 @@ nav.docs-index li {
 
 .docs-layout {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 220px minmax(0, 1fr);
   gap: 32px;
   align-items: start;
 }
@@ -680,7 +684,7 @@ nav.docs-index li {
 
 @media (max-width: 760px) {
   .docs-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .docs-layout aside {
     position: static;

@@ -161,9 +161,9 @@ const ARCH_NODES = [
   },
   {
     id: "webui", zone: "cloud", order: 3, x: 780, y: 487, w: 172, h: 64,
-    title: "Web-UI", sub: "Haus, Wohnung, Aufgaben, Inventar",
+    title: "Web-UI", sub: "Übersicht, Wohnungen, Einrichtung, Updates",
     panel: {
-      what: "Die drei Ansichten aus Abschnitt 9 (Haus, Wohnung, Aufgaben) plus Inventar (Abschnitt 20.4).",
+      what: "Die vier Bereiche der Oberfläche: Übersicht (Abschnitt 9, inklusive Posteingang und Lageübersicht), Wohnungen, Einrichtung (Abschnitt 20.4) und Updates.",
       allowed: "Zeigt Gesundheitsdaten, Störungen, Versionen, die vier bis sieben erlaubten Befehle als Schaltflächen mit Bestätigung. Zeigt nie ein Konfigurationsdialog, der in die Wohnung schreibt.",
       data: "Keine Raumtemperatur-Diagramme, keine Mieterbeziehung.",
       principle: "'Kein Ersatz für die Wohnungsansicht' -- der Mieter sieht diese Oberfläche nie.",
@@ -238,7 +238,7 @@ const ARCH_STORIES = [
     steps: [
       { text: "thermoctl erkennt eine der sechs Störungsarten und trägt sie in open_faults ein.", nodes: ["thermoctl"], edges: [] },
       { text: "Der Agent überträgt sie unverändert im nächsten Heartbeat -- ohne thermoctls eigenen Klartext.", nodes: ["agent", "fleet"], edges: ["e-thermoctl-agent", "e-agent-fleet-heartbeat"] },
-      { text: "Der Fleet-Dienst erzeugt ein Envelope aus kind/key und zeigt es in der Aufgabenliste.", nodes: ["fleet", "db", "webui"], edges: ["e-fleet-db", "e-fleet-webui"] },
+      { text: "Der Fleet-Dienst erzeugt ein Envelope aus kind/key und zeigt es im Posteingang \"Was zu tun ist\" der Übersicht.", nodes: ["fleet", "db", "webui"], edges: ["e-fleet-db", "e-fleet-webui"] },
       { text: "Der Vermieter quittiert im Web-UI -- nur für das aktuelle Auftreten.", nodes: ["browser", "webui"], edges: ["e-webui-browser"] },
     ],
   },

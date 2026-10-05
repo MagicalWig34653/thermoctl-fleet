@@ -2,6 +2,66 @@
 
 Last updated: 2026-10-05.
 
+## Marketing website updated to the rebuilt fleet UI (2026-10-05)
+
+The GitHub Pages site (`site/`) still described the pre-redesign UI (`docs/
+ui-redesign-ia.md`, merged on `main`): "Das Haus"/"Aufgaben"/"Inventar"/
+"Rollouts" instead of Übersicht/Wohnungen/Einrichtung/Updates, and
+screenshots under those old names. Brought in sync:
+
+- `tools/docs_screenshots.py`'s `capture()` (feeds `site/assets/img/`, kept
+  separate from `capture_ui_redesign_ia()`, which feeds `docs/ui-redesign/`
+  for the IA document itself and was left untouched) now captures the new
+  named set -- `uebersicht`, `wohnungen`, `wohnung-ueberblick`,
+  `wohnung-wartung`, `wohnung-technik`, `einrichtung`, `updates`, `login` --
+  light + dark, desktop (1280px, unchanged), plus two mobile (390px) shots
+  (`uebersicht-mobil`, `wohnung-ueberblick-mobil`) using the same
+  `_shoot_full_page` helper `capture_ui_redesign_ia` already had (avoids
+  Playwright's `full_page=True` double-painting the fixed mobile bottom tab
+  bar). The old `dashboard-*`/`tasks-*`/`apartment-*`/`inventory-*`/
+  `rollouts-*` files are deleted; nothing in `site/` references them anymore.
+  `tests/test_docs_screenshots.py` needed no changes -- `capture` is
+  `# pragma: no cover` and fully monkeypatched in the `main()` orchestration
+  tests, so its internal rewrite isn't exercised there by design (same
+  reasoning as before this change).
+- Every site page that described the UI was rewritten to the four-area
+  structure: `site/docs/betrieb.html` (full rewrite of the "Übersicht" /
+  "Wohnungen" / "Eine Wohnung: drei Reiter" / "Einrichtung" / "Updates"
+  sections, each with its new screenshot embedded), `site/index.html` (hero
+  screenshot + caption), `site/docs/wohnung.html` (the "Einrichtung" step
+  now correctly describes its three *sub-tabs*, "Objekte & Wohnungen" /
+  "Basisstationen" / "Neue Basisstation vorbereiten" -- confirmed against
+  `fleet/templates/ui/inventory.html`'s actual `?bereich=` tabs, which do
+  not match `docs/ui-redesign-ia.md`'s original plan of one inline step list
+  without sub-tabs; the implementation evidently moved on from that document
+  and the site now describes the implementation, not the superseded plan),
+  `site/docs/benutzer.html` (unchanged apart from nav, its one screenshot
+  already used the still-correct `login-*` name), `site/architektur.html`
+  and `site/assets/js/architecture-data.js` (Web-UI node panel/sub-label and
+  the fault-story step text). `site/docs/faq.html` and `site/docs/
+  glossar.html` needed no changes -- neither mentions the old page names.
+- Fixed a pre-existing horizontal-scroll bug at 360px on four docs pages
+  (`benutzer.html`, `betrieb.html`, `einstieg.html`, `wohnung.html`,
+  confirmed present on `main` before this change too, via a throwaway
+  Playwright check against `git show HEAD:site/docs/*.html`): `.docs-layout`'s
+  CSS grid used a bare `1fr` track, which (per the CSS grid min-width:auto
+  default) grows to the *content*'s width rather than shrinking to the
+  viewport when a table cell or inline `<code>` held an unbreakable string;
+  changed to `minmax(0, 1fr)` at both breakpoints, plus `overflow-wrap`/
+  `word-break` on `code`, `th`, `td` so long inline code/table content wraps
+  instead of forcing the row wider. `pre` (command blocks) already
+  contained its own overflow correctly via `overflow-x: auto` and needed no
+  change.
+- Verified: internal link check (every `href`/`src`/`srcset` across all ten
+  `site/**/*.html` resolves to an existing file) written ad hoc for this
+  pass (not committed as a tool -- a throwaway script, per the task); a
+  Playwright 360px-width scroll check across all ten pages now reports no
+  overflow; `index.html` and `docs/betrieb.html` rendered and visually
+  reviewed at 1280px and 390px; every regenerated screenshot spot-checked
+  against the actual rendered page it documents. `ruff check .`, `mypy .`
+  (`Success: no issues found in 187 source files`), and
+  `pytest tests/test_docs_screenshots.py --no-cov` (40 passed) all clean.
+
 ## Fix 2: PyCharm run-configuration editor showed a blank pane (2026-10-05)
 
 Owner: configs still did not run and most opened as an empty white editor

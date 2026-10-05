@@ -414,6 +414,35 @@ def _webp_path_for(png_path: Path) -> Path:
     return png_path.with_suffix(".webp")
 
 
+# Pages captured for `site/` at desktop width, by `(path, filename stem)`
+# -- the rebuilt information architecture's four areas plus the three
+# apartment tabs (docs/ui-redesign-ia.md). Named after the new structure
+# throughout; no page keeps an old name ("dashboard", "tasks", "apartment",
+# "inventory", "rollouts") since the areas themselves were renamed, not
+# just restyled.
+_SITE_PAGES: tuple[tuple[str, str], ...] = (
+    ("/ui/", "uebersicht"),
+    ("/ui/apartments", "wohnungen"),
+    (f"/ui/apartments/{APARTMENTS[_WE5].id}?ansicht=ueberblick", "wohnung-ueberblick"),
+    (f"/ui/apartments/{APARTMENTS[_WE5].id}?ansicht=wartung", "wohnung-wartung"),
+    (f"/ui/apartments/{APARTMENTS[_WE5].id}?ansicht=technik", "wohnung-technik"),
+    ("/ui/inventory", "einrichtung"),
+    ("/ui/rollouts", "updates"),
+)
+
+# A couple of representative mobile shots, bottom tab bar included -- not
+# every page (the brief asks for "1-2 mobile shots", not a full mobile
+# set): the one page every visit starts on, and the apartment page with
+# its tab nav, which is the one other place the responsive layout changes
+# shape materially (sidebar -> bottom bar, two columns -> one).
+_SITE_MOBILE_PAGES: tuple[tuple[str, str], ...] = (
+    ("/ui/", "uebersicht-mobil"),
+    (f"/ui/apartments/{APARTMENTS[_WE5].id}?ansicht=ueberblick", "wohnung-ueberblick-mobil"),
+)
+
+_SITE_MOBILE_WIDTH = 390
+
+
 # Drives a real browser (Playwright/Chromium) against a real, already
 # running fleet server -- a unit test would only re-mock Playwright, not
 # exercise anything for real; see the module docstring.
@@ -454,28 +483,40 @@ def capture(  # pragma: no cover
             )
             page.wait_for_load_state("networkidle")
 
-            # UI-redesign stage 2: "Das Haus" -> "Übersicht" (now also
-            # absorbs what used to be the separate "Aufgaben" page, hence
-            # kept under the existing `dashboard-*`/`tasks-*` filenames so
-            # `site/` keeps its own references working -- both now show
-            # the same page, since the old "Aufgaben" URL redirects here).
-            page.goto(f"{base_url}/ui/", wait_until="networkidle")
-            page.screenshot(path=str(IMG_DIR / f"dashboard-{scheme}.png"), full_page=True)
-            page.screenshot(path=str(IMG_DIR / f"tasks-{scheme}.png"), full_page=True)
-
-            # One apartment -- "Überblick" tab (the default, unchanged URL).
-            page.goto(f"{base_url}/ui/apartments/{APARTMENTS[_WE5].id}", wait_until="networkidle")
-            page.screenshot(path=str(IMG_DIR / f"apartment-{scheme}.png"), full_page=True)
-
-            # "Inventar" -> "Einrichtung" (same URL, `/ui/inventory`).
-            page.goto(f"{base_url}/ui/inventory", wait_until="networkidle")
-            page.screenshot(path=str(IMG_DIR / f"inventory-{scheme}.png"), full_page=True)
-
-            # "Rollouts" -> "Updates" (same URL, `/ui/rollouts`).
-            page.goto(f"{base_url}/ui/rollouts", wait_until="networkidle")
-            page.screenshot(path=str(IMG_DIR / f"rollouts-{scheme}.png"), full_page=True)
+            for path, stem in _SITE_PAGES:
+                page.goto(f"{base_url}{path}", wait_until="networkidle")
+                page.screenshot(path=str(IMG_DIR / f"{stem}-{scheme}.png"), full_page=True)
 
             context.close()
+
+            # Mobile shots -- own context/login (a fresh TOTP step is
+            # needed either way between captures), own narrow viewport, the
+            # same `_shoot_full_page` device `capture_ui_redesign_ia` uses
+            # below to avoid `full_page=True` double-painting the fixed
+            # bottom tab bar (see that function's own docstring).
+            _wait_for_fresh_totp_window()
+            mobile_context = browser.new_context(
+                viewport={"width": _SITE_MOBILE_WIDTH, "height": 900},
+                color_scheme=scheme,
+            )
+            mobile_page = mobile_context.new_page()
+            mobile_page.goto(f"{base_url}/ui/login", wait_until="networkidle")
+            mobile_page.fill("#username", username)
+            mobile_page.fill("#password", password)
+            mobile_page.fill("#totp_code", totp.now())
+            mobile_page.click(
+                "#login-form button[type=submit], "
+                "#login-form button:not(#webauthn-login-button)"
+            )
+            mobile_page.wait_for_load_state("networkidle")
+
+            for path, stem in _SITE_MOBILE_PAGES:
+                mobile_page.goto(f"{base_url}{path}", wait_until="networkidle")
+                _shoot_full_page(
+                    mobile_page, IMG_DIR / f"{stem}-{scheme}.png", _SITE_MOBILE_WIDTH
+                )
+
+            mobile_context.close()
 
         browser.close()
 
