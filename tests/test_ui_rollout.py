@@ -241,6 +241,9 @@ def test_new_form_get_renders_apartments(
     # An apartment with no current desired state is still listed, but
     # called out -- `Storage.create_rollout` would refuse to enroll it.
     assert "kein Sollzustand" in response.text
+    assert "So läuft ein Rollout ab" in response.text
+    assert f"Property {PILOT_APARTMENT}" in response.text
+    assert f"Property {OTHER_APARTMENT}" in response.text
     # A retired apartment is not offered at all.
     assert retired_apartment not in response.text
     # P5.4e: each apartment offers a radio button to mark it as this
@@ -807,3 +810,8 @@ def test_rollout_list_view_renders(
     response = client.get("/ui/rollouts")
     assert response.status_code == 200
     assert "thermoctl" in response.text
+    assert "● Rollout läuft" in response.text
+    assert "Wohnungen im Rollout" in response.text
+    assert "Bei einem Fehler wird die Verteilung angehalten" in response.text
+    assert f'href="/ui/apartments/{PILOT_APARTMENT}"' in response.text
+    assert "Wartet" in response.text

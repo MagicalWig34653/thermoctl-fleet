@@ -11,18 +11,13 @@
 <p class="back"><a class="text-button" href="/ui/rollouts">&larr; Zurück zur Übersicht</a></p>
 <h2 class="subpage-title">Neuer Rollout</h2>
 
-<p>
-    Ein Rollout aktualisiert genau <strong>einen</strong> Dienst (thermoctl <em>oder</em>
-    Zigbee2MQTT <em>oder</em> Mosquitto <em>oder</em> Agent – niemals gemischt)
-    für eine geordnete Liste von Wohnungen. Eine Wohnung dieser Liste ist die
-    <strong>Testwohnung</strong> dieses Rollouts: markieren Sie sie unten explizit, oder
-    lassen Sie die Markierung weg – dann ist die erste Wohnung der Liste die Testwohnung.
-    Die Testwohnung läuft zuerst; die übrigen Wohnungen frühestens 48 Stunden nachdem die
-    Testwohnung erfolgreich zurückgemeldet hat. Dies ist unabhängig vom Pilotbetrieb-Flag
-    der Wohnung (das weiterhin nur die geräteseitige Freischaltung in <code>agent/</code>
-    steuert, z. B. für <code>open_access</code>) – eine Wohnung ohne Pilotbetrieb kann
-    ganz normal die Testwohnung eines Rollouts sein.
-</p>
+<p>Wählen Sie einen Dienst und die Wohnungen für die schrittweise Verteilung aus.</p>
+<details class="rollout-explainer"><summary>So läuft ein Rollout ab</summary><ol>
+    <li>Ein Rollout aktualisiert genau einen Dienst: thermoctl, Zigbee2MQTT, Mosquitto oder Agent.</li>
+    <li>Die markierte Testwohnung läuft zuerst. Ohne Markierung wird die erste ausgewählte Wohnung getestet.</li>
+    <li>Weitere Wohnungen folgen frühestens 48 Stunden nach der erfolgreichen Rückmeldung der Testwohnung.</li>
+    <li>Die Testwohnung ist unabhängig vom Pilotbetrieb-Flag. Dieses steuert nur geräteseitige Freigaben wie <code>open_access</code>; auch eine Wohnung ohne Pilotbetrieb kann Testwohnung sein.</li>
+</ol></details>
 
 {% if error %}
 <p class="error" role="alert">{{ error }}</p>
@@ -39,37 +34,39 @@
         </select>
     </label>
 
-    <label for="version"><span class="field-label-text">Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+    <div class="rollout-form-pair"><label for="version"><span class="field-label-text">Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="version" name="version" value="{{ version }}" maxlength="{{ max_version_length }}" required>
     </label>
 
     <label for="digest"><span class="field-label-text">Digest (sha256:...)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="digest" name="digest" value="{{ digest }}" pattern="sha256:[0-9a-f]{64}" required>
-    </label>
+    </label></div>
 
-    <label for="stagger_hours"><span class="field-label-text">Wartezeit nach Pilot (Stunden)<span class="field-optional"> (optional)</span></span>
+    <div class="rollout-form-pair"><label for="stagger_hours"><span class="field-label-text">Wartezeit nach Pilot (Stunden)<span class="field-optional"> (optional)</span></span>
         <input type="text" id="stagger_hours" name="stagger_hours" value="{{ stagger_hours }}">
     </label>
 
     <label for="timeout_hours"><span class="field-label-text">Zeitüberschreitung je Wohnung (Stunden)<span class="field-optional"> (optional)</span></span>
         <input type="text" id="timeout_hours" name="timeout_hours" value="{{ timeout_hours }}">
-    </label>
+    </label></div>
 
     <fieldset class="rollout-selection">
         <legend>
             Wohnungen (Häkchen: in den Rollout aufnehmen; Punkt: als Testwohnung markieren --
             ohne Markierung ist die erste ausgewählte Wohnung dieser Liste die Testwohnung)
         </legend>
-        {% for apartment in apartments %}
-        <label>
-            <input type="checkbox" name="apartment_ids" value="{{ apartment.apartment_id }}"
-                {% if apartment.apartment_id in selected_apartment_ids %}checked{% endif %}>
-            <input type="radio" name="test_apartment_id" value="{{ apartment.apartment_id }}"
-                {% if apartment.apartment_id == selected_test_apartment_id %}checked{% endif %}>
-            {{ apartment.label }} ({{ apartment.apartment_id }})
-            {% if apartment.pilot_mode %} – Pilotbetrieb (Gerät){% endif %}
-            {% if not apartment.has_desired_state %} – kein Sollzustand gesetzt{% endif %}
-        </label><br>
+        <div class="rollout-selection-key muted">Häkchen: aufnehmen · Punkt: Testwohnung</div>
+        {% for property_name, property_apartments in apartments | groupby('property_name') %}
+        <div class="rollout-property-group"><h3>{{ property_name }}</h3>
+        {% for apartment in property_apartments %}
+        <div class="rollout-choice">
+            <label><input type="checkbox" name="apartment_ids" value="{{ apartment.apartment_id }}" {% if apartment.apartment_id in selected_apartment_ids %}checked{% endif %}><span class="visually-hidden">{{ apartment.label }} in Rollout aufnehmen</span></label>
+            <label><input type="radio" name="test_apartment_id" value="{{ apartment.apartment_id }}" {% if apartment.apartment_id == selected_test_apartment_id %}checked{% endif %}><span class="visually-hidden">{{ apartment.label }} als Testwohnung markieren</span></label>
+            <span class="rollout-choice-label"><strong>{{ apartment.label }}</strong><small>{{ apartment.apartment_id }}</small></span>
+            {% if apartment.pilot_mode %}<span class="badge gray">Pilotbetrieb (Gerät)</span>{% endif %}
+            {% if not apartment.has_desired_state %}<span class="badge gray">kein Sollzustand gesetzt</span>{% endif %}
+        </div>
+        {% endfor %}</div>
         {% endfor %}
     </fieldset>
 

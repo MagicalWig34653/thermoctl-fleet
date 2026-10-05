@@ -53,14 +53,14 @@
     <tbody>
         {% for apartment in detail.apartments %}
         <tr>
-            <td>{{ apartment.position }}</td>
-            <td><a href="/ui/apartments/{{ apartment.apartment_id | urlpath }}">{{ apartment.apartment_id }}</a></td>
-            <td>{% if apartment.is_pilot %}ja{% else %}nein{% endif %}</td>
-            <td><span class="badge {{ 'gray' if apartment.status == 'queued' else 'error' if apartment.status in ('failed', 'timed_out') else 'warn' if apartment.status == 'in_progress' else '' }}">{{ apartment.status_label }}</span></td>
-            <td>{{ apartment.revision if apartment.revision is not none else "–" }}</td>
-            <td>{{ apartment.started_text or "–" }}</td>
-            <td>{{ apartment.converged_text or "–" }}</td>
-            <td>{{ apartment.last_outcome_reason or "–" }}</td>
+            <td data-label="Position">{{ apartment.position }}</td>
+            <td data-label="Wohnung"><a href="/ui/apartments/{{ apartment.apartment_id | urlpath }}">{{ apartment.apartment_id }}</a></td>
+            <td data-label="Testwohnung">{% if apartment.is_pilot %}ja{% else %}nein{% endif %}</td>
+            <td data-label="Status"><span class="badge {{ 'gray' if apartment.status == 'queued' else 'error' if apartment.status in ('failed', 'timed_out') else 'warn' if apartment.status == 'in_progress' else '' }}">{{ apartment.status_label }}</span></td>
+            <td data-label="Revision">{{ apartment.revision if apartment.revision is not none else "–" }}</td>
+            <td data-label="Gestartet">{{ apartment.started_text or "–" }}</td>
+            <td data-label="Erfolgreich seit">{{ apartment.converged_text or "–" }}</td>
+            <td data-label="Letzte Rückmeldung">{{ apartment.last_outcome_reason or "–" }}</td>
         </tr>
         {% endfor %}
     </tbody>

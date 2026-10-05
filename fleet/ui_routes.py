@@ -2151,6 +2151,9 @@ def _rollout_new_response(
     status_code: int = 200,
 ) -> HTMLResponse:
     apartments = []
+    property_names: dict[int | None, str] = {
+        property_.id: property_.name for property_ in storage.list_properties()
+    }
     for apartment in storage.list_apartments():
         if apartment.state == "retired":
             continue
@@ -2158,6 +2161,7 @@ def _rollout_new_response(
             {
                 "apartment_id": apartment.id,
                 "label": apartment.label,
+                "property_name": property_names.get(apartment.property_id, "Ohne Liegenschaft"),
                 "pilot_mode": apartment.pilot_mode,
                 "has_desired_state": storage.get_desired_state(apartment.id) is not None,
             }
