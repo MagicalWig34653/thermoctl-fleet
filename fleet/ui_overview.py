@@ -1,4 +1,4 @@
-""""Übersicht" -- the fleet UI's new start page (UI-redesign stage 2),
+""" "Übersicht" -- the fleet UI's new start page (UI-redesign stage 2),
 replacing the separate "Das Haus" (P3.1, `fleet/ui_house.py`) and "Aufgaben"
 (P3.4, `fleet/ui_tasks.py`) views with one page that answers the single
 question the owner's rebuilt information architecture asks of a start
@@ -72,6 +72,7 @@ from fleet.ui_house import (
     PropertyGroup,
     build_house_overview,
     group_tiles_by_property,
+    place_name,
 )
 from fleet.ui_portfolio import (
     ActivityEntry,
@@ -116,6 +117,8 @@ class InboxItem:
     # of red. Presentation only -- no triage decision hides in these.
     icon: str = "alert"
     warn: bool = False
+    # The apartment the row is about (None for a rollout row).
+    apartment_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -151,13 +154,13 @@ def _apartment_href(apartment_id: str, *, ansicht: str | None = None) -> str:
 
 def _tile_item(tile: ApartmentTile) -> InboxItem:
     assert tile.status in (_KIND_ALARM, _KIND_NEVER_REPORTED)
-    has_label = tile.label and tile.label != tile.apartment_id
-    label = f"{tile.apartment_id} ({tile.label})" if has_label else tile.apartment_id
+    label = place_name(tile)
     since_text = tile.alarm_since_text if tile.status == _KIND_ALARM else tile.last_contact_text
     return InboxItem(
         kind=tile.status,
         title=tile.status_label,
         subtitle=label,
+        apartment_id=tile.apartment_id,
         since_text=since_text,
         action_label="Ansehen",
         action_href=_apartment_href(tile.apartment_id, ansicht="ueberblick"),
@@ -166,11 +169,12 @@ def _tile_item(tile: ApartmentTile) -> InboxItem:
     )
 
 
-def _fault_item(task: FaultTask) -> InboxItem:
+def _fault_item(task: FaultTask, names: dict[str, str]) -> InboxItem:
     return InboxItem(
         kind=_KIND_FAULT,
         title=task.kind_label,
-        subtitle=f"{task.apartment_id} – {task.zone}",
+        subtitle=f"{names.get(task.apartment_id, task.apartment_id)} – {task.zone}",
+        apartment_id=task.apartment_id,
         since_text=task.since_text,
         action_label="Ansehen und quittieren",
         action_href=_apartment_href(task.apartment_id, ansicht="ueberblick"),
@@ -179,11 +183,12 @@ def _fault_item(task: FaultTask) -> InboxItem:
     )
 
 
-def _battery_item(task: BatteryTask) -> InboxItem:
+def _battery_item(task: BatteryTask, names: dict[str, str]) -> InboxItem:
     return InboxItem(
         kind=_KIND_BATTERY,
         title="Batterie schwach",
-        subtitle=f"{task.apartment_id} – {task.battery_percent} %",
+        subtitle=f"{names.get(task.apartment_id, task.apartment_id)} – {task.battery_percent} %",
+        apartment_id=task.apartment_id,
         since_text=task.last_contact_text,
         action_label="Ansehen",
         action_href=_apartment_href(task.apartment_id, ansicht="ueberblick"),
@@ -193,14 +198,15 @@ def _battery_item(task: BatteryTask) -> InboxItem:
     )
 
 
-def _update_item(task: UpdateTask) -> InboxItem:
+def _update_item(task: UpdateTask, names: dict[str, str]) -> InboxItem:
     return InboxItem(
         kind=_KIND_UPDATE,
         title="Veraltete Protokollversion",
         subtitle=(
-            f"{task.apartment_id} – Agent {task.agent_version}, "
-            f"thermoctl {task.thermoctl_version}"
+            f"{names.get(task.apartment_id, task.apartment_id)} – "
+            f"Agent {task.agent_version}, thermoctl {task.thermoctl_version}"
         ),
+        apartment_id=task.apartment_id,
         since_text=None,
         action_label="Ansehen",
         action_href=_apartment_href(task.apartment_id, ansicht="technik"),
@@ -243,11 +249,12 @@ def build_overview(storage: Storage, now: datetime) -> OverviewData:
     task_overview: TaskOverview = build_task_overview(storage, now)
     rollouts = build_rollout_list(storage)
 
+    names = {tile.apartment_id: place_name(tile) for tile in tiles}
     inbox: list[InboxItem] = []
     inbox.extend(_tile_item(tile) for tile in tiles if tile.status == _KIND_ALARM)
-    inbox.extend(_fault_item(task) for task in task_overview.unconfirmed_faults)
-    inbox.extend(_update_item(task) for task in task_overview.updates)
-    inbox.extend(_battery_item(task) for task in task_overview.battery_rounds)
+    inbox.extend(_fault_item(task, names) for task in task_overview.unconfirmed_faults)
+    inbox.extend(_update_item(task, names) for task in task_overview.updates)
+    inbox.extend(_battery_item(task, names) for task in task_overview.battery_rounds)
     inbox.extend(_tile_item(tile) for tile in tiles if tile.status == _KIND_NEVER_REPORTED)
     inbox.extend(_rollout_item(entry) for entry in rollouts if entry.state == "stopped")
 
@@ -255,11 +262,7 @@ def build_overview(storage: Storage, now: datetime) -> OverviewData:
     # apartment with two overdue faults is still one apartment to visit,
     # not two. A rollout is not an apartment, so it never contributes to
     # this count (its own row still appears in the inbox).
-    affected_apartments = {
-        item.subtitle.split(" – ", 1)[0].split(" (", 1)[0]
-        for item in inbox
-        if item.kind != _KIND_ROLLOUT
-    }
+    affected_apartments = {item.apartment_id for item in inbox if item.apartment_id is not None}
 
     kind_counts: dict[str, int] = {}
     for item in inbox:

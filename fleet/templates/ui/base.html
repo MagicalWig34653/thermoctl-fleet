@@ -85,7 +85,6 @@ one helper from real data, never hard-coded.
             <a class="account" href="/ui/account/webauthn" {% if active_area == "konto" %}aria-current="page"{% endif %}>
                 <span class="avatar" aria-hidden="true">{{ initials }}</span>
                 <span class="account-text"><span>{{ ui_session.user.username }}</span><small>Konto &amp; Passkeys</small></span>
-                <span class="account-gear">{{ icons.icon("settings") }}</span>
             </a>
             <form class="logout-form" method="post" action="/ui/logout">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

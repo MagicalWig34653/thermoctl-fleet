@@ -34,12 +34,12 @@ caller's imports.
             {% for row in rows %}
             <tr>
                 <td>
-                    <a class="unit-title row-link" href="{{ row.href }}">
+                    <a class="unit-title row-link" href="{{ row.href }}" title="{{ row.apartment_id }}">
                         <span class="unit-icon">{{ icons.icon("home") }}</span>
-                        <span>{{ row.apartment_id }}{% if row.label and row.label != row.apartment_id %} ({{ row.label }}){% endif %}{% if row.floor %}<small>{{ row.floor }}</small>{% endif %}</span>
+                        <span>{{ row.label or row.apartment_id }}{% if row.floor %}<small>{{ row.floor }}</small>{% endif %}</span>
                     </a>
                 </td>
-                <td>{{ row.property_name or "Ohne Liegenschaft" }}</td>
+                <td class="muted-cell">{{ row.property_name or "Ohne Liegenschaft" }}</td>
                 <td class="status-cell"><span class="badge{% if row.tone %} {{ row.tone }}{% endif %}">{{ "!" if row.tone == "error" else "◔" if row.tone == "warn" else "✓" }} {{ row.status_label }}</span></td>
                 <td class="muted">{{ row.last_contact_text }}</td>
                 <td class="chevron-cell"><a href="{{ row.href }}" tabindex="-1" aria-hidden="true">{{ icons.icon("chevron") }}</a></td>

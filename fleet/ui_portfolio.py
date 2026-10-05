@@ -21,7 +21,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fleet.storage import Storage
-from fleet.ui_house import FAULT_KIND_LABELS, ApartmentTile, PropertyGroup, status_tone
+from fleet.ui_house import FAULT_KIND_LABELS, ApartmentTile, PropertyGroup, place_name, status_tone
 from fleet.ui_rollout import RolloutListEntry
 from protocol.heartbeat import FaultKind
 
@@ -81,14 +81,8 @@ def _window_state(tile: ApartmentTile) -> str:
     return status_tone(tile.status)
 
 
-def _tile_name(tile: ApartmentTile) -> str:
-    if tile.label and tile.label != tile.apartment_id:
-        return f"{tile.apartment_id} ({tile.label})"
-    return tile.apartment_id
-
-
 def _window(tile: ApartmentTile) -> WindowView:
-    name = _tile_name(tile)
+    name = place_name(tile)
     floor = f", {tile.floor}" if tile.floor else ""
     return WindowView(
         href=f"/ui/apartments/{quote(tile.apartment_id, safe='')}",
@@ -271,8 +265,7 @@ def _location(tiles_by_id: dict[str, ApartmentTile], apartment_id: str) -> str:
     tile = tiles_by_id.get(apartment_id)
     if tile is None:
         return apartment_id
-    name = tile.label or tile.apartment_id
-    return f"{tile.property_name} · {name}" if tile.property_name else name
+    return place_name(tile)
 
 
 def build_activity(

@@ -480,3 +480,26 @@ def test_rollout_card_for_a_stopped_rollout_asks_for_a_decision() -> None:
 def test_active_rollout_count_counts_running_and_stopped_only() -> None:
     assert active_rollout_count(["running", "stopped", "completed", "cancelled"]) == 2
     assert active_rollout_count([]) == 0
+
+
+def test_place_name_prefers_property_and_label_over_the_technical_id(storage: Storage) -> None:
+    prop = storage.create_property("Lindenstraße 12", "x")
+    storage.create_apartment(
+        "lindenstr12-w03",
+        property_id=prop.id,
+        label="Wohnung 03",
+        floor="EG",
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=False,
+    )
+    _add_apartment(storage, "bare", None, None, heartbeat=False)
+    storage.set_apartment_token("bare", "t" * 40)
+    tiles = {t.apartment_id: t for t in _tiles(storage)}
+
+    from fleet.ui_house import place_name
+
+    assert place_name(tiles["lindenstr12-w03"]) == "Lindenstraße 12 · Wohnung 03"
+    assert "lindenstr12" not in place_name(tiles["lindenstr12-w03"])
+    assert place_name(tiles["bare"]) == "bare"  # no label, no property: the id as last resort

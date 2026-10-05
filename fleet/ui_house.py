@@ -63,6 +63,15 @@ FAULT_KIND_LABELS: dict[FaultKind, str] = {
 }
 
 
+def place_name(tile: ApartmentTile) -> str:
+    """The human name of an apartment for cards and feeds: `"Property ·
+    Label"` when both exist (the draft's "Lindenstraße 12 · Wohnung 03"),
+    else the label, else the technical id as the last resort."""
+
+    name = tile.label or tile.apartment_id
+    return f"{tile.property_name} · {name}" if tile.property_name and tile.label else name
+
+
 def status_tone(status: str) -> str:
     """The draft's visual tone of a tile status: `""` (fine), `"warn"`
     (amber -- only an outdated version) or `"error"` (red -- every other
@@ -435,5 +444,6 @@ __all__ = [
     "PropertyGroup",
     "build_house_overview",
     "group_tiles_by_property",
+    "place_name",
     "status_tone",
 ]

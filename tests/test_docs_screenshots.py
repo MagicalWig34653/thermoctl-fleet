@@ -42,11 +42,14 @@ import tools.docs_screenshots as docs_screenshots
 from fleet.storage import Storage, create_storage, upgrade
 from protocol.heartbeat import FaultKind
 from tools.docs_screenshots import (
-    _BW1,
-    _BW2,
-    _WE5,
-    _WE6,
+    _ALARM,
+    _BATTERY,
+    _FAULT,
+    _OK,
+    _RECOVERED,
+    _ROLLOUT,
     APARTMENTS,
+    PROPERTIES,
     _free_port,
     _parse_totp_secret,
     _seconds_until_next_totp_step,
@@ -70,57 +73,64 @@ def storage(tmp_path: Path) -> Storage:
 # --------------------------------------------------------------------------
 
 
-def test_seed_creates_the_fictional_property_and_apartments(tmp_path: Path) -> None:
+def _seeded(tmp_path: Path) -> Storage:
     url = f"sqlite:///{tmp_path}/seed-test.db"
     seed(url)
-    storage = create_storage(url)
+    return create_storage(url)
+
+
+def test_seed_creates_three_fictional_properties_with_six_six_and_four_apartments(
+    tmp_path: Path,
+) -> None:
+    storage = _seeded(tmp_path)
 
     properties = storage.list_properties()
-    assert len(properties) == 1
-    assert properties[0].name == "Musterstraße 1 & Beispielweg 9"
+    assert [p.name for p in properties] == [p.name for p in PROPERTIES]
+    assert len(APARTMENTS) == 16
+    by_property = [
+        len(storage.list_apartments_by_property(prop.id)) for prop in storage.list_properties()
+    ]
+    assert by_property == [6, 6, 4]
 
-    apartments = storage.list_apartments()
-    assert {apartment.id for apartment in apartments} == {entry.id for entry in APARTMENTS}
+    assert {a.id for a in storage.list_apartments()} == {entry.id for entry in APARTMENTS}
     for entry in APARTMENTS:
         record = storage.get_apartment(entry.id)
         assert record is not None
         assert record.label == entry.label
-        assert record.property_id == properties[0].id
+        assert record.property_id == properties[entry.property_index].id
         assert record.pilot_mode is False
 
 
-def test_seed_apartment_1_has_a_healthy_heartbeat_with_no_open_faults(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
+def test_seed_apartments_are_healthy_except_the_named_cases(tmp_path: Path) -> None:
+    storage = _seeded(tmp_path)
 
-    latest = storage.get_latest_heartbeat(APARTMENTS[0].id)
+    healthy = storage.get_latest_heartbeat(APARTMENTS[_OK].id)
+    assert healthy is not None
+    assert healthy.heartbeat.open_faults == []
+    assert healthy.heartbeat.thermoctl.reachable is True
+
+    from fleet.ui_house import build_house_overview
+
+    tiles = {t.apartment_id: t for t in build_house_overview(storage, datetime.now(UTC))}
+    not_ok = {apartment_id for apartment_id, tile in tiles.items() if tile.status != "ok"}
+    assert not_ok == {APARTMENTS[_ALARM].id, APARTMENTS[_FAULT].id}
+    # 15 of 16 base stations reachable.
+    assert sum(1 for t in tiles.values() if t.status not in ("alarm", "never_reported")) == 15
+
+
+def test_seed_battery_apartment_is_under_the_threshold(tmp_path: Path) -> None:
+    storage = _seeded(tmp_path)
+
+    latest = storage.get_latest_heartbeat(APARTMENTS[_BATTERY].id)
     assert latest is not None
     assert latest.heartbeat.open_faults == []
-    assert latest.heartbeat.thermoctl.reachable is True
-    assert latest.heartbeat.devices.weakest_battery_percent == 78
+    assert latest.heartbeat.devices.weakest_battery_percent == 12
 
 
-def test_seed_we6_has_a_weak_battery_and_no_open_faults(tmp_path: Path) -> None:
-    """WE6 (shares "2. OG" with WE3) is this demo fleet's one "Batterie
-    schwach" case -- under `fleet.ui_tasks.BATTERY_LOW_PERCENT` (20)."""
+def test_seed_fault_apartment_has_one_open_sensor_fault(tmp_path: Path) -> None:
+    storage = _seeded(tmp_path)
 
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
-
-    latest = storage.get_latest_heartbeat(APARTMENTS[_WE6].id)
-    assert latest is not None
-    assert latest.heartbeat.open_faults == []
-    assert latest.heartbeat.devices.weakest_battery_percent == 15
-
-
-def test_seed_we5_has_one_open_sensor_fault(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
-
-    latest = storage.get_latest_heartbeat(APARTMENTS[_WE5].id)
+    latest = storage.get_latest_heartbeat(APARTMENTS[_FAULT].id)
     assert latest is not None
     assert len(latest.heartbeat.open_faults) == 1
     fault = latest.heartbeat.open_faults[0]
@@ -128,72 +138,60 @@ def test_seed_we5_has_one_open_sensor_fault(tmp_path: Path) -> None:
     assert fault.zone == "Bad"
 
 
-def test_seed_bw1_has_an_open_not_reporting_alarm_and_is_outdated(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
+def test_seed_alarm_apartment_has_one_open_not_reporting_alarm(tmp_path: Path) -> None:
+    storage = _seeded(tmp_path)
 
-    alarms = storage.list_alarms_for_apartment(APARTMENTS[_BW1].id)
+    alarms = storage.list_alarms_for_apartment(APARTMENTS[_ALARM].id)
     assert len(alarms) == 1
     assert alarms[0].kind == "not_reporting"
     assert alarms[0].urgency == "high"
     assert alarms[0].cleared_at is None
 
-    # The house overview categorizes BW1 as "in trouble" (an open alarm)
-    # -- the one behaviour the demo data exists to show off. It is also
-    # one version behind (`outdated=True`), so the "Übersicht" action
-    # inbox shows both an alarm row and an "Updates" row for it.
-    overview_by_id = {o.apartment_id: o for o in storage.get_house_overview()}
-    overview = overview_by_id[APARTMENTS[_BW1].id]
+    overview = {o.apartment_id: o for o in storage.get_house_overview()}[APARTMENTS[_ALARM].id]
     assert overview.open_alarm is not None
-    assert overview.latest is not None
-    assert overview.latest.outdated is True
 
 
-def test_seed_bw2_never_reported(tmp_path: Path) -> None:
-    """Beispielweg 9, WE2 (shares "EG" with WE1) is this demo fleet's
-    "noch nie gemeldet" case -- no heartbeat saved for it at all."""
+def test_seed_has_a_recovered_outage_for_the_activity_feed(tmp_path: Path) -> None:
+    storage = _seeded(tmp_path)
 
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
-
-    assert storage.get_latest_heartbeat(APARTMENTS[_BW2].id) is None
+    alarms = storage.list_alarms_for_apartment(APARTMENTS[_RECOVERED].id)
+    assert len(alarms) == 1
+    assert alarms[0].cleared_at is not None
 
 
-def test_seed_apartment_1_has_an_operational_data_backup(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
+def test_seed_every_apartment_has_a_recent_backup(tmp_path: Path) -> None:
+    storage = _seeded(tmp_path)
 
-    backups = storage.list_backups_for_apartment(APARTMENTS[0].id)
+    now = datetime.now(UTC)
+    latest = storage.latest_backup_at_by_apartment()
+    assert set(latest) == {entry.id for entry in APARTMENTS}
+    assert all(now - moment < timedelta(hours=24) for moment in latest.values())
+    backups = storage.list_backups_for_apartment(APARTMENTS[_OK].id)
     assert len(backups) == 1
     assert backups[0].kind == "operational_data"
     assert backups[0].size_bytes == 4_194_304
     assert backups[0].content_hash == "sha256:" + "ab" * 32
 
 
-def test_seed_apartments_1_and_2_have_a_desired_state_revision(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
+def test_seed_rollout_apartments_have_a_desired_state_and_others_do_not(
+    tmp_path: Path,
+) -> None:
+    storage = _seeded(tmp_path)
 
-    for entry in APARTMENTS[:2]:
+    rollout_ids = {APARTMENTS[i].id for i in _ROLLOUT}
+    for entry in APARTMENTS:
         record = storage.get_desired_state(entry.id)
-        assert record is not None
-        assert record.revision == 1
-        assert record.created_by == "demo"
-        history = storage.desired_state_history(entry.id)
-        assert len(history) == 1
+        if entry.id in rollout_ids:
+            assert record is not None
+            assert record.revision == 1
+            assert record.created_by == "demo"
+            assert len(storage.desired_state_history(entry.id)) == 1
+        else:
+            assert record is None
 
-    # The third apartment deliberately gets no desired state.
-    assert storage.get_desired_state(APARTMENTS[2].id) is None
 
-
-def test_seed_creates_a_rollout_across_apartments_1_and_2(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
+def test_seed_creates_one_running_rollout_at_partial_progress(tmp_path: Path) -> None:
+    storage = _seeded(tmp_path)
 
     rollouts = storage.list_rollouts()
     assert len(rollouts) == 1
@@ -201,9 +199,12 @@ def test_seed_creates_a_rollout_across_apartments_1_and_2(tmp_path: Path) -> Non
     assert rollout.service == "thermoctl"
     assert rollout.version == "0.9.6"
     assert rollout.digest == "sha256:" + "cd" * 32
+    assert rollout.state == "running"
 
-    rollout_apartment_ids = {a.apartment_id for a in storage.rollout_apartments(rollout.id)}
-    assert rollout_apartment_ids == {APARTMENTS[0].id, APARTMENTS[1].id}
+    records = storage.rollout_apartments(rollout.id)
+    assert {r.apartment_id for r in records} == {APARTMENTS[i].id for i in _ROLLOUT}
+    statuses = sorted(r.status for r in records)
+    assert statuses == ["converged"] * 4 + ["in_progress", "queued"]
 
 
 def test_seed_is_readable_through_the_house_overview_ui_builder(tmp_path: Path) -> None:
@@ -213,37 +214,31 @@ def test_seed_is_readable_through_the_house_overview_ui_builder(tmp_path: Path) 
 
     from fleet.ui_house import build_house_overview
 
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
+    storage = _seeded(tmp_path)
 
     tiles = build_house_overview(storage, datetime.now(UTC) + timedelta(minutes=1))
     tiles_by_id = {tile.apartment_id: tile for tile in tiles}
     assert set(tiles_by_id) == {entry.id for entry in APARTMENTS}
 
-    assert tiles_by_id[APARTMENTS[_WE5].id].open_faults != []
-    assert tiles_by_id[APARTMENTS[_BW1].id].alarm_since_text is not None
-    assert tiles_by_id[APARTMENTS[_BW2].id].never_reported is True
+    assert tiles_by_id[APARTMENTS[_FAULT].id].open_faults != []
+    assert tiles_by_id[APARTMENTS[_ALARM].id].alarm_since_text is not None
 
 
 def test_seed_is_readable_through_the_apartment_detail_ui_builder(tmp_path: Path) -> None:
     from fleet.ui_apartment import build_apartment_detail
 
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
-
+    storage = _seeded(tmp_path)
     now = datetime.now(UTC) + timedelta(minutes=1)
 
-    fault_detail = build_apartment_detail(storage, APARTMENTS[_WE5].id, now, days=None)
+    fault_detail = build_apartment_detail(storage, APARTMENTS[_FAULT].id, now, days=None)
     assert fault_detail is not None
-    assert fault_detail.label == APARTMENTS[_WE5].label
+    assert fault_detail.label == APARTMENTS[_FAULT].label
     assert len(fault_detail.open_faults) == 1
 
-    we6_detail = build_apartment_detail(storage, APARTMENTS[_WE6].id, now, days=None)
-    assert we6_detail is not None
-    assert we6_detail.desired_state is not None
-    assert we6_detail.desired_state.revision == 1
+    rollout_detail = build_apartment_detail(storage, APARTMENTS[_ROLLOUT[0]].id, now, days=None)
+    assert rollout_detail is not None
+    assert rollout_detail.desired_state is not None
+    assert rollout_detail.desired_state.revision == 1
 
     # Unknown apartment id -> None (same contract `fleet/ui_routes.py`
     # relies on to turn this into a 404).
@@ -253,19 +248,34 @@ def test_seed_is_readable_through_the_apartment_detail_ui_builder(tmp_path: Path
 def test_seed_is_readable_through_the_rollout_ui_builders(tmp_path: Path) -> None:
     from fleet.ui_rollout import build_rollout_detail, build_rollout_list
 
-    url = f"sqlite:///{tmp_path}/seed-test.db"
-    seed(url)
-    storage = create_storage(url)
+    storage = _seeded(tmp_path)
 
     entries = build_rollout_list(storage)
     assert len(entries) == 1
     assert entries[0].version == "0.9.6"
-    assert entries[0].total_apartments == 2
+    assert entries[0].total_apartments == 6
+    assert entries[0].converged_apartments == 4
 
     detail = build_rollout_detail(storage, entries[0].rollout_id)
     assert detail is not None
     assert detail.service == "thermoctl"
-    assert {a.apartment_id for a in detail.apartments} == {APARTMENTS[0].id, APARTMENTS[1].id}
+    assert {a.apartment_id for a in detail.apartments} == {APARTMENTS[i].id for i in _ROLLOUT}
+
+
+def test_seed_overview_matches_the_design_draft_shape(tmp_path: Path) -> None:
+    from fleet.ui_overview import build_overview
+
+    storage = _seeded(tmp_path)
+
+    overview = build_overview(storage, datetime.now(UTC))
+    assert overview.metrics.apartment_count == 16
+    assert overview.metrics.reachable_count == 15
+    assert overview.metrics.backup_count == 16
+    assert len(overview.inbox) == 3  # unreachable, sensor fault, weak battery
+    assert overview.rollout is not None
+    assert (overview.rollout.converged, overview.rollout.total) == (4, 6)
+    assert [len(b.segments) for b in overview.buildings] == [6, 6, 4]
+    assert len(overview.activity) >= 3
 
 
 def test_seed_is_idempotent_in_shape_but_not_rerunnable_on_the_same_db(tmp_path: Path) -> None:
@@ -386,7 +396,7 @@ def test_wait_for_fresh_totp_window_uses_real_time_by_default(monkeypatch: objec
 @pytest.mark.parametrize(
     ("png_path", "expected"),
     [
-        (Path("site/assets/img/login-light.png"), Path("site/assets/img/login-light.webp")),
+        (Path("docs/ui-redesign/login-1440.png"), Path("docs/ui-redesign/login-1440.webp")),
         (Path("dashboard-dark.png"), Path("dashboard-dark.webp")),
     ],
 )
@@ -508,8 +518,12 @@ def test_apartments_demo_data_has_fictional_addresses_only() -> None:
     address and reading below is fictional") -- a cheap, static check that
     a future edit cannot accidentally slip a real address past."""
 
+    assert {p.name for p in PROPERTIES} == {"Lindenstraße 12", "Gartenweg 8", "Parkallee 3"}
+    for prop in PROPERTIES:
+        assert prop.address.endswith("12345 Musterstadt")
     for entry in APARTMENTS:
-        assert "Musterstraße" in entry.label or "Beispielweg" in entry.label
+        assert entry.id.startswith(("lindenstr12-", "gartenweg8-", "parkallee3-"))
+        assert entry.label.startswith("Wohnung ")
 
 
 # --------------------------------------------------------------------------
@@ -733,3 +747,18 @@ def test_main_kills_the_server_if_a_clean_wait_times_out(monkeypatch: object) ->
     assert fake_server.killed is True
     names = [call[0] for call in calls]
     assert names.index("wait") < names.index("kill") < names.index("optimize_images")
+
+
+def test_main_help_is_non_destructive(monkeypatch: object, capsys: object) -> None:
+    """`--help` must print usage and exit before seeding, starting a
+    server or writing anything."""
+
+    calls: list[tuple[str, ...]] = []
+    _patch_main_collaborators(monkeypatch, calls)
+
+    with pytest.raises(SystemExit) as excinfo:
+        docs_screenshots.main(["--help"])
+
+    assert excinfo.value.code == 0
+    assert calls == []
+    assert "docs" in capsys.readouterr().out  # type: ignore[attr-defined]
