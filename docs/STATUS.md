@@ -2,6 +2,23 @@
 
 Last updated: 2026-10-05.
 
+## Fix: PyCharm run configurations did not start (2026-10-05)
+
+Owner report: "Die Pycharm run configs laufen irgendwie nicht". Root
+causes: the Python and pytest configurations lacked the
+`<module name="thermoctl-fleet" />` element (with `IS_MODULE_SDK=true`
+PyCharm resolves the interpreter through the module and refuses to start
+without it) and `ADD_CONTENT_ROOTS`/`ADD_SOURCE_ROOTS` (so `tools.*` was
+not importable); the shell configurations had no `INTERPRETER_PATH`
+(now `/bin/bash`, matching `tools/mac-test-vm`'s shebang). Added
+`PYTHONUNBUFFERED=1`. "Website-Screenshots erzeugen" also needs Playwright
+and Pillow: new optional extra `docs` (README install line now
+`.[dev,fleet,agent,flash,docs]`). `tests/test_run_configs.py` now asserts
+the module element, content roots and shell interpreter. Every
+configuration's launch was simulated outside PyCharm (project venv,
+project root on PYTHONPATH): all start; ruff/mypy clean; full pytest
+tests="2431" failures="0" errors="0" skipped="1".
+
 ## Shared PyCharm run configurations and local demo fleet (2026-10-04)
 
 Added grouped `.run/` configurations for the demo fleet, tests, Python and

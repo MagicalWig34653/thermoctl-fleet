@@ -1,12 +1,19 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <component name="ProjectRunConfigurationManager">
   <configuration name="Tests – alle" type="tests" folderName="Tests" factoryName="py.test">
+    <module name="thermoctl-fleet" />
     <option name="IS_MODULE_SDK" value="true" />
     <option name="SDK_HOME" value="" />
     <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
     <option name="_new_target" value="&quot;$PROJECT_DIR$/tests&quot;" />
     <option name="_new_targetType" value="&quot;PATH&quot;" />
     <option name="_new_additionalArguments" value="&quot;&quot;" />
+    <option name="PARENT_ENVS" value="true" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="_new_keywords" value="&quot;&quot;" />
+    <option name="_new_parameters" value="&quot;&quot;" />
     <method v="2" />
   </configuration>
 </component>
