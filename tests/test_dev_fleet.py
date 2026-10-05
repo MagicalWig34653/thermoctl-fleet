@@ -11,7 +11,7 @@ from argon2 import PasswordHasher
 
 from fleet.storage import create_storage
 from fleet.totp_crypto import decrypt_totp_secret, load_totp_key
-from tools import dev_fleet
+from tools import dev_fleet, docs_screenshots
 
 
 def test_first_start_creates_private_state_and_real_account(
@@ -38,7 +38,7 @@ def test_first_start_creates_private_state_and_real_account(
     uri = login.split("TOTP provisioning URI: ", 1)[1].strip()
     storage = create_storage(f"sqlite:///{state / 'fleet-dev.db'}")
     assert len(storage.list_properties()) == 1
-    assert len(storage.list_apartments()) == 3
+    assert len(storage.list_apartments()) == len(docs_screenshots.APARTMENTS)
     user = storage.get_ui_user_by_username(username)
     assert user is not None
     assert PasswordHasher().verify(user.password_hash, password)
