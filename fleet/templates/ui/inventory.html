@@ -57,6 +57,7 @@
         </ul>
     </details>
     {% endif %}
+    <div class="inventory-create-row">
     <details class="inventory-create"><summary class="button">{{ icons.icon("plus") }} Liegenschaft anlegen</summary>
         <div class="inventory-form-card">
             <h2>Liegenschaft anlegen</h2>
@@ -69,9 +70,7 @@
             </form>
         </div>
     </details>
-</section><aside class="panel panel-aside"><div class="eyebrow mb-12">Neue Installation</div><h2>Eine Wohnung anschließen.</h2><p class="subtitle">Wohnung zuordnen, Basisstation vorbereiten und die erste Verbindung bestätigen.</p><a class="button primary mt-23" href="/ui/inventory?bereich=vorbereiten">Einrichtung starten {{ icons.icon("arrow") }}</a></aside></div>
-
-<details class="inventory-create inventory-create--apartment panel"><summary class="button">{{ icons.icon("plus") }} Wohnung anlegen</summary>
+<details class="inventory-create inventory-create--apartment"><summary class="button">{{ icons.icon("plus") }} Wohnung anlegen</summary>
 <div class="inventory-form-card">
     <h2>Wohnung anlegen</h2>
     <form class="ui-form" method="post" action="/ui/inventory/apartments">
@@ -102,6 +101,9 @@
     </form>
 </div>
 </details>
+    </div>
+</section><aside class="panel panel-aside"><div class="eyebrow mb-12">Neue Installation</div><h2>Eine Wohnung anschließen.</h2><p class="subtitle">Wohnung zuordnen, Basisstation vorbereiten und die erste Verbindung bestätigen.</p><a class="button primary mt-23" href="/ui/inventory?bereich=vorbereiten">Einrichtung starten {{ icons.icon("arrow") }}</a></aside></div>
+
 {% elif bereich == "basisstationen" %}
 <section class="panel inventory-device-panel" aria-labelledby="inventory-devices-heading">
     <div class="section-head"><h2 id="inventory-devices-heading">Basisstationen im Lager</h2><a class="button primary" href="#device-register-form">Gerät registrieren {{ icons.icon("plus") }}</a></div>
