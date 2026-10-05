@@ -68,8 +68,15 @@ def place_name(tile: ApartmentTile) -> str:
     Label"` when both exist (the draft's "Lindenstraße 12 · Wohnung 03"),
     else the label, else the technical id as the last resort."""
 
-    name = tile.label or tile.apartment_id
-    return f"{tile.property_name} · {name}" if tile.property_name and tile.label else name
+    return place_text(tile.property_name, tile.label, tile.apartment_id)
+
+
+def place_text(property_name: str | None, label: str | None, apartment_id: str) -> str:
+    """`place_name` for callers that have the three parts but no tile (the
+    apartment page): `"Property · Label"`, else the label, else the id."""
+
+    name = label or apartment_id
+    return f"{property_name} · {name}" if property_name and label else name
 
 
 def status_tone(status: str) -> str:

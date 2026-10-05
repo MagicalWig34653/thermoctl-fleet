@@ -427,8 +427,8 @@ def _webp_path_for(png_path: Path) -> Path:
 
 # Pages of the rebuilt UI captured for docs/ui-redesign/ (light theme only,
 # at both widths): `(path, filename stem)`. Pages that still run on the
-# legacy stylesheet (apartment detail, Einrichtung, Updates, Konto) are
-# left out until phase 2 rebuilds them.
+# legacy stylesheet (Einrichtung, Updates, Konto) are left out until their
+# rebuild lands.
 _REBUILT_PAGES: tuple[tuple[str, str], ...] = (
     ("/ui/", "uebersicht"),
     ("/ui/?ansicht=liste", "uebersicht-liste"),
@@ -438,6 +438,13 @@ _REBUILT_PAGES: tuple[tuple[str, str], ...] = (
     ("/ui/rollouts", "updates"),
     ("/ui/rollouts/new", "updates-neu"),
     ("/ui/account/webauthn", "konto"),
+    # Apartment detail: the one with an open sensor fault (Überblick,
+    # Wartung with its backup) and one inside the running rollout (Technik,
+    # which carries a desired state), plus one confirmation page.
+    ("/ui/apartments/lindenstr12-w06?ansicht=ueberblick", "wohnung-ueberblick"),
+    ("/ui/apartments/lindenstr12-w06?ansicht=wartung", "wohnung-wartung"),
+    ("/ui/apartments/gartenweg8-w01?ansicht=technik", "wohnung-technik"),
+    ("/ui/apartments/lindenstr12-w06/commands/report_now/confirm", "befehl-bestaetigen"),
 )
 
 _VIEWPORTS: tuple[int, ...] = (1440, 390)

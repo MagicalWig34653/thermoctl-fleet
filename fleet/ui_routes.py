@@ -72,7 +72,7 @@ from fleet.ui_auth import (
     webauthn_begin_throttle_threshold,
 )
 from fleet.ui_format import format_local_datetime
-from fleet.ui_house import build_house_overview
+from fleet.ui_house import build_house_overview, place_text, status_tone
 from fleet.ui_inventory import (
     APARTMENT_ID_PATTERN,
     APARTMENT_STATE_LABELS,
@@ -2962,6 +2962,25 @@ def apartment_detail(
     # history/referrer could carry.
     bundle_cleanup_failed = request.query_params.get("bundle_cleanup_failed") is not None
     active_tab = _normalize_apartment_tab(ansicht)
+    # Human heading of the page (rebuilt UI): "Liegenschaft · Wohnung", floor
+    # as eyebrow. Presentation only -- the technical id stays secondary text.
+    place = apartment_id
+    floor: str | None = None
+    tone = ""
+    if detail is not None:
+        record = storage.get_apartment(apartment_id)
+        property_record = (
+            storage.get_property(record.property_id)
+            if record is not None and record.property_id is not None
+            else None
+        )
+        place = place_text(
+            property_record.name if property_record is not None else None,
+            detail.label,
+            apartment_id,
+        )
+        floor = record.floor if record is not None else None
+        tone = status_tone(detail.status)
     response = templates.TemplateResponse(
         request,
         "apartment.html",
@@ -2972,6 +2991,9 @@ def apartment_detail(
             "detail": detail,
             "bundle_cleanup_failed": bundle_cleanup_failed,
             "active_tab": active_tab,
+            "place": place,
+            "floor": floor,
+            "tone": tone,
         },
         status_code=200 if detail is not None else 404,
     )

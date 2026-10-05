@@ -1,63 +1,93 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% import "_confirm.html" as confirm %}
 
-{% block title %}Sollzustand bestätigen – thermoctl-fleet{% endblock %}
+{% block title %}Sollzustand bestätigen – thermoctl fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Wohnungen <span class="crumb-sep">/</span> Sollzustand bestätigen{% endblock %}
 
 {% block content %}
-{# P5.4b: step two of two – the actual write (Storage.create_desired_state_revision)
-   only ever happens on the POST this form submits to, never on step one. #}
-<p><a href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">&larr; Zurück zur Bearbeitung</a></p>
-<h1>Sollzustand bestätigen</h1>
+{# P5.4b: step two of two -- the actual write
+   (Storage.create_desired_state_revision) only ever happens on the POST this
+   form submits to, never on step one. #}
+<a class="text-button back" href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">{{ icons.icon("back") }}Zurück zur Bearbeitung</a>
 
-<p>
-    Wohnung <strong>{{ apartment_id }}</strong>{% if apartment_label and apartment_label != apartment_id %} ({{ apartment_label }}){% endif %}
-    erhält die neue Sollzustand-Revision.
-</p>
+<div class="confirm-card wide">
+    <div class="eyebrow">Software</div>
+    <h1>Sollzustand bestätigen</h1>
+    <p class="subtitle">
+        Wohnung {{ confirm.apartment_ref(apartment_id, apartment_label) }}
+        erhält die neue Sollzustand-Revision.
+    </p>
 
-<p class="error" role="alert">
-    Update-Ausführung ist derzeit inaktiv (fail-closed Vorprüfung des Agenten, Pilotbetrieb erforderlich).
-</p>
+    <div class="notice warn" role="alert">
+        {{ icons.icon("alert") }}
+        <div><b>Update-Ausführung ist derzeit inaktiv</b>
+        <p>Fail-closed Vorprüfung des Agenten, Pilotbetrieb erforderlich.</p></div>
+    </div>
 
-{% if active_rollout_id %}
-<p class="error" role="alert">
-    Diese Wohnung ist Teil des laufenden Rollouts
-    <a href="/ui/rollouts/{{ active_rollout_id | urlpath }}">{{ active_rollout_id }}</a>.
-    Eine manuelle Änderung hier stoppt diesen Rollout beim nächsten Durchlauf
-    des Rollout-Workers.
-</p>
-{% endif %}
+    {% if active_rollout_id %}
+    <div class="notice warn" role="alert">
+        {{ icons.icon("alert") }}
+        <div><b>Laufender Rollout</b>
+        <p>Diese Wohnung ist Teil des laufenden Rollouts
+        <a class="inline-link" href="/ui/rollouts/{{ active_rollout_id | urlpath }}">{{ active_rollout_id }}</a>.
+        Eine manuelle Änderung hier stoppt diesen Rollout beim nächsten Durchlauf
+        des Rollout-Workers.</p></div>
+    </div>
+    {% endif %}
 
-{% if both_thermoctl_and_zigbee_changed %}
-<p class="error" role="alert">
-    Warnung: thermoctl und Zigbee2MQTT ändern sich in dieser Revision beide. Der Agent
-    aktualisiert je Durchlauf nur einen Dienst – das ist in der Fleet-Oberfläche nicht
-    erzwungen, wird hier aber angezeigt, weil ein eigenes Zigbee2MQTT-Release
-    empfohlen wird.
-</p>
-{% endif %}
+    {% if both_thermoctl_and_zigbee_changed %}
+    <div class="notice warn" role="alert">
+        {{ icons.icon("alert") }}
+        <div><b>Warnung</b>
+        <p>thermoctl und Zigbee2MQTT ändern sich in dieser Revision beide. Der Agent
+        aktualisiert je Durchlauf nur einen Dienst – das ist in der Fleet-Oberfläche nicht
+        erzwungen, wird hier aber angezeigt, weil ein eigenes Zigbee2MQTT-Release
+        empfohlen wird.</p></div>
+    </div>
+    {% endif %}
 
-<ul>
-    {% for service in services %}
-    <li><strong>{{ service.label }}</strong>: {{ service.version }} ({{ service.digest }})</li>
-    {% endfor %}
-</ul>
-<p>Fenster: {{ window_from }}–{{ window_until }} Uhr, nicht unter {{ window_temp }} °C</p>
+    <div class="summary-block">
+        {% for service in services %}
+        <div class="list-row">
+            <span><strong>{{ service.label }}</strong><small>Version {{ service.version }}</small></span>
+            <code class="digest" title="{{ service.digest }}">{{ service.digest | shortdigest }}</code>
+        </div>
+        {% endfor %}
+        <div class="list-row"><span class="muted">Fenster</span><span>{{ window_from }}–{{ window_until }} Uhr, nicht unter {{ window_temp }} °C</span></div>
+    </div>
+    {# The full digest of every service stays in the page text (not only in
+       the tooltip), so the landlord confirms exactly what gets written. #}
+    <details class="digest-details">
+        <summary>Vollständige Digests anzeigen</summary>
+        <ul>
+            {% for service in services %}
+            <li><strong>{{ service.label }}</strong>: {{ service.version }} (<code class="id-text">{{ service.digest }}</code>)</li>
+            {% endfor %}
+        </ul>
+    </details>
 
-{% if error %}
-<p class="error" role="alert">{{ error }}</p>
-{% endif %}
+    {% if error %}
+    <div class="notice error" role="alert">{{ icons.icon("alert") }}<div><b>{{ error }}</b></div></div>
+    {% endif %}
 
-<form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/confirm">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    {% for service in services %}
-    <input type="hidden" name="version_{{ service.name }}" value="{{ service.version }}">
-    <input type="hidden" name="digest_{{ service.name }}" value="{{ service.digest }}">
-    {% endfor %}
-    <input type="hidden" name="window_from" value="{{ window_from }}">
-    <input type="hidden" name="window_until" value="{{ window_until }}">
-    <input type="hidden" name="window_temp" value="{{ window_temp }}">
-    <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-        <input type="text" id="reason" name="reason" required>
-    </label>
-    <button type="submit">Bestätigen</button>
-</form>
+    <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/confirm">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% for service in services %}
+        <input type="hidden" name="version_{{ service.name }}" value="{{ service.version }}">
+        <input type="hidden" name="digest_{{ service.name }}" value="{{ service.digest }}">
+        {% endfor %}
+        <input type="hidden" name="window_from" value="{{ window_from }}">
+        <input type="hidden" name="window_until" value="{{ window_until }}">
+        <input type="hidden" name="window_temp" value="{{ window_temp }}">
+        <label class="fld" for="reason"><span class="field-label-text">Grund{{ confirm.required() }}</span>
+            <input class="fld-control" type="text" id="reason" name="reason" required>
+        </label>
+        <div class="dialog-actions">
+            <a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">Zurück</a>
+            <button class="button primary" type="submit">Bestätigen</button>
+        </div>
+    </form>
+</div>
 {% endblock %}

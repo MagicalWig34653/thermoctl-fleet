@@ -1,36 +1,46 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% import "_confirm.html" as confirm %}
 
-{% block title %}Mieterwechsel bestätigen – thermoctl-fleet{% endblock %}
+{% block title %}Mieterwechsel bestätigen – thermoctl fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Wohnungen <span class="crumb-sep">/</span> Mieterwechsel{% endblock %}
 
 {% block content %}
 {# Tenant change (P6.1, section 12: "Decided afterward" 2026-10-01). This
-   page only ever names the apartment and spells out what the action does
-   in words -- the POST below is the only place
+   page only ever names the apartment and spells out what the action does in
+   words -- the POST below is the only place
    Storage.rotate_apartment_token_for_tenant_change is ever called. #}
-<p><a href="/ui/apartments/{{ apartment_id | urlpath }}">&larr; Zurück zur Wohnung</a></p>
-<h1>Mieterwechsel bestätigen</h1>
+<a class="text-button back" href="/ui/apartments/{{ apartment_id | urlpath }}">{{ icons.icon("back") }}Zurück zur Wohnung</a>
 
-<p>
-    Für Wohnung <strong>{{ apartment_id }}</strong>{% if apartment_label and apartment_label != apartment_id %} ({{ apartment_label }}){% endif %}
-    wird ein Mieterwechsel durchgeführt:
-</p>
-<ul>
-    <li>Das Gerätetoken dieser Wohnung wird sofort ungültig. Das Gerät holt sich über eine
-        signierte Challenge mit seinem vorhandenen Geräteschlüssel automatisch ein neues Token.</li>
-    <li>Heartbeats, Ereignisse, Störungen, Alarme und gespeicherte Log-Auszüge dieser Wohnung
-        werden gelöscht.</li>
-    <li>Sicherungen und das Audit-Log bleiben unverändert erhalten.</li>
-</ul>
+<div class="confirm-card">
+    <div class="eyebrow">Wohnung übergeben</div>
+    <h1>Mieterwechsel bestätigen</h1>
+    <p class="subtitle">
+        Für Wohnung {{ confirm.apartment_ref(apartment_id, apartment_label) }}
+        wird ein Mieterwechsel durchgeführt:
+    </p>
+    <ul class="consequence-list">
+        <li>{{ icons.icon("key") }}<span>Das Gerätetoken dieser Wohnung wird sofort ungültig. Das Gerät holt sich über eine
+            signierte Challenge mit seinem vorhandenen Geräteschlüssel automatisch ein neues Token.</span></li>
+        <li>{{ icons.icon("alert") }}<span>Heartbeats, Ereignisse, Störungen, Alarme und gespeicherte Log-Auszüge dieser Wohnung
+            werden gelöscht.</span></li>
+        <li>{{ icons.icon("shield") }}<span>Sicherungen und das Audit-Log bleiben unverändert erhalten.</span></li>
+    </ul>
 
-{% if error %}
-<p class="error" role="alert">{{ error }}</p>
-{% endif %}
+    {% if error %}
+    <div class="notice error" role="alert">{{ icons.icon("alert") }}<div><b>{{ error }}</b></div></div>
+    {% endif %}
 
-<form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-        <input type="text" id="reason" name="reason" required>
-    </label>
-    <button type="submit" class="button--danger">Mieterwechsel bestätigen</button>
-</form>
+    <form method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="fld" for="reason"><span class="field-label-text">Grund{{ confirm.required() }}</span>
+            <input class="fld-control" type="text" id="reason" name="reason" required>
+        </label>
+        <div class="dialog-actions">
+            <a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}">Abbrechen</a>
+            <button class="button danger-solid" type="submit">Mieterwechsel bestätigen</button>
+        </div>
+    </form>
+</div>
 {% endblock %}
