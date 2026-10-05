@@ -24,7 +24,18 @@ def test_shared_run_configurations_have_valid_local_targets() -> None:
         names.add(name)
         options = {item.get("name"): item.get("value", "") for item in config.findall("option")}
         assert all(not re.search(r"/(?:Users|home)/[^/]+/", value) for value in options.values())
-        assert not config.findall("envs/env")
+        # Only harmless env vars -- never anything that could be a secret.
+        envs = {env.get("name"): env.get("value") for env in config.findall("envs/env")}
+        assert envs in ({}, {"PYTHONUNBUFFERED": "1"})
+        if config.get("type") in {"PythonConfigurationType", "tests"}:
+            # Without the module element PyCharm cannot resolve "use the
+            # project interpreter" (IS_MODULE_SDK) and refuses to start; without
+            # content roots on PYTHONPATH `tools.*` modules are not importable.
+            module_element = config.find("module")
+            assert module_element is not None
+            assert module_element.get("name") == "thermoctl-fleet"
+            assert options["ADD_CONTENT_ROOTS"] == "true"
+            assert options["ADD_SOURCE_ROOTS"] == "true"
         if config.get("type") == "PythonConfigurationType":
             assert options["IS_MODULE_SDK"] == "true"
             assert options["SDK_HOME"] == ""
@@ -45,6 +56,8 @@ def test_shared_run_configurations_have_valid_local_targets() -> None:
             assert config.get("type") == "ShConfigurationType"
             assert config.get("factoryName") == "Shell Script"
             assert options["EXECUTE_SCRIPT_FILE"] == ("true" if options["SCRIPT_PATH"] else "false")
+            # PyCharm needs an explicit interpreter; the repo's scripts are bash.
+            assert options["INTERPRETER_PATH"] == "/bin/bash"
             if options["SCRIPT_PATH"]:
                 assert (REPO_ROOT / options["SCRIPT_PATH"].replace("$PROJECT_DIR$/", "")).is_file()
                 assert options["SCRIPT_OPTIONS"] in {
