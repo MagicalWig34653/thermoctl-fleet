@@ -1,56 +1,43 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% import "_cards.html" as cards %}
 
-{% block title %}Wohnungen – thermoctl-fleet{% endblock %}
+{% block title %}Wohnungen – thermoctl fleet{% endblock %}
+{% block main_class %}{% endblock %}
 
 {% block content %}
-{# "Wohnungen" (UI-redesign stage 2, information-architecture area 2) --
-   a searchable/filterable flat list, derived by
-   fleet/ui_apartments_list.py::build_apartments_list_view. Filters are a
-   plain GET form -- works without JavaScript; a client-side script may
-   later enhance this into live filtering (brief), none exists yet. #}
-<h1>Wohnungen</h1>
+{# "Wohnungen" -- the draft's list view, derived by
+   fleet/ui_apartments_list.py::build_apartments_list_view. The filters are a
+   plain GET form (q / property / state) -- works without JavaScript; with
+   JavaScript, shell.js submits it when a select changes. #}
+<div class="page-heading">
+    <div>
+        <div class="eyebrow">Mein Portfolio</div>
+        <h1>Wohnungen</h1>
+        <p class="subtitle">Alle Basisstationen, ihr Zustand und der letzte Kontakt.</p>
+    </div>
+    <a class="button primary" href="/ui/inventory">{{ icons.icon("plus") }}Wohnung einrichten</a>
+</div>
 
-<form method="get" action="/ui/apartments" class="apartments-filter">
-    <label for="apartments-q"><span class="field-label-text">Suche<span class="field-optional"> (optional)</span></span>
-        <input type="text" id="apartments-q" name="q" value="{{ view.query }}" placeholder="Wohnung oder Liegenschaft">
+<form class="toolbar" method="get" action="/ui/apartments" role="search" data-autosubmit>
+    <label class="search" for="apartments-q">
+        {{ icons.icon("search") }}
+        <input id="apartments-q" name="q" value="{{ view.query }}" placeholder="Wohnung oder Adresse suchen …" aria-label="Wohnungen durchsuchen" autocomplete="off">
     </label>
-    <label for="apartments-property"><span class="field-label-text">Liegenschaft<span class="field-optional"> (optional)</span></span>
-        <select id="apartments-property" name="property">
-            {% for option in view.property_options %}
-            <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
-            {% endfor %}
-        </select>
-    </label>
-    <label for="apartments-state"><span class="field-label-text">Zustand<span class="field-optional"> (optional)</span></span>
-        <select id="apartments-state" name="state">
-            {% for option in view.state_options %}
-            <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
-            {% endfor %}
-        </select>
-    </label>
-    <button type="submit">Filtern</button>
+    <select id="apartments-property" name="property" aria-label="Liegenschaft filtern">
+        {% for option in view.property_options %}
+        <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+    </select>
+    <select id="apartments-state" name="state" aria-label="Zustand filtern">
+        {% for option in view.state_options %}
+        <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+    </select>
+    <button class="button primary" type="submit">Filtern</button>
 </form>
 
-{% if view.rows %}
-<ul class="apartments-list">
-    {% for row in view.rows %}
-    <li class="apartments-list__row">
-        <a class="apartments-list__link" href="{{ row.href }}">
-            <span class="status-icon status-icon--{{ row.status }}" aria-hidden="true"></span>
-            <span class="apartments-list__id">{{ row.apartment_id }}{% if row.label and row.label != row.apartment_id %} ({{ row.label }}){% endif %}</span>
-            <span class="apartments-list__meta">{{ row.property_name or "Ohne Liegenschaft" }}</span>
-            <span class="apartments-list__meta">{{ row.status_label }}</span>
-            <span class="apartments-list__meta">{{ row.last_contact_text }}</span>
-        </a>
-    </li>
-    {% endfor %}
-</ul>
-{% else %}
-<p class="inbox-empty">
-    Keine Wohnung entspricht dieser Suche.
-    {% if view.query or view.property_options | selectattr("selected", "equalto", true) | selectattr("value", "ne", "") | list or view.state_options | selectattr("selected", "equalto", true) | selectattr("value", "ne", "") | list %}
-    <a href="/ui/apartments">Alle {{ view.total_count }} Wohnungen anzeigen.</a>
-    {% endif %}
-</p>
-{% endif %}
+{% set filtered = view.query or (view.property_options | selectattr("selected", "equalto", true) | selectattr("value", "ne", "") | list) or (view.state_options | selectattr("selected", "equalto", true) | selectattr("value", "ne", "") | list) %}
+{{ cards.apartment_table(view.rows, "Keine Wohnung entspricht dieser Suche." if filtered else "Noch keine Wohnungen eingerichtet.") }}
+<p class="tiny muted results-count">{{ view.rows | length }} von {{ view.total_count }} {{ "Wohnung" if view.total_count == 1 else "Wohnungen" }}{% if filtered %} · <a href="/ui/apartments">Filter zurücksetzen</a>{% endif %}</p>
 {% endblock %}

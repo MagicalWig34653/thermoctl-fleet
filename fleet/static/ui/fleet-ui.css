@@ -1,1532 +1,484 @@
-/* Fleet UI base styling (P3.0).
+/* Fleet UI design system -- ported from the owner's design draft
+ * (fleet-entwurf/index.html + auth.css). Light theme only.
  *
- * A separate file, not an inline <style> block in base.html (cross-review
- * round 2): the security-headers middleware in fleet/ui_routes.py sends
- * `Content-Security-Policy: default-src 'self'` on every /ui response,
- * with no `'unsafe-inline'` for style-src -- a strict CSP that also blocks
- * the page's own inline CSS is not a defense, it is an unstyled page. This
- * file is same-origin, served under /ui/static/ (see the StaticFiles
- * mount in fleet/ui_routes.py), which `default-src 'self'` already allows
- * without any policy relaxation.
- */
-
-/* UI-redesign stage 1 (docs/ui-redesign-plan.md) -- self-hosted type,
- * colour tokens, the shared header/nav, the "Das Haus" building visual,
- * and the apartment-detail two-column grid. Everything above this block
- * (the original P3.0-P6.2 rules) is left in place for the templates this
- * stage does not touch yet (tasks.html, inventory.html, the various
- * confirm/form pages) -- see that plan's own "what this stage covers"
- * note. Component classes shared with those untouched templates
- * (`.apartment-tile__tag`, `button`, `input[type=...]`, `.hint`/`.error`)
- * are restyled in place via the new tokens below rather than duplicated,
- * so the whole application reads as one system even though only two
- * pages were rebuilt.
- */
-
-@font-face {
-    font-family: "Archivo";
-    font-style: normal;
-    font-weight: 400;
-    font-display: swap;
-    src: url("/ui/static/fonts/Archivo-Regular.ttf") format("truetype");
-}
-
-@font-face {
-    font-family: "Archivo";
-    font-style: normal;
-    font-weight: 500;
-    font-display: swap;
-    src: url("/ui/static/fonts/Archivo-Medium.ttf") format("truetype");
-}
-
-@font-face {
-    font-family: "Archivo";
-    font-style: normal;
-    font-weight: 600;
-    font-display: swap;
-    src: url("/ui/static/fonts/Archivo-SemiBold.ttf") format("truetype");
-}
-
-@font-face {
-    font-family: "Archivo";
-    font-style: normal;
-    font-weight: 700;
-    font-display: swap;
-    src: url("/ui/static/fonts/Archivo-Bold.ttf") format("truetype");
-}
-
-:root {
-    color-scheme: light dark;
-
-    /* Named tokens -- see docs/ui-redesign-plan.md's "Colour" section for
-     * the WCAG/"never colour alone" reasoning behind each one. Light
-     * values here, dark values in the `prefers-color-scheme: dark` block
-     * below -- no manual theme toggle exists in this application, so the
-     * OS preference (already declared via `color-scheme` above) is the
-     * only switch. */
-    --ink: #1b2430;
-    --paper: #f7f5f1;
-    --surface: #ffffff;
-    --line: #8a8f98;
-    --flame: #e85a1a;
-    --amber: #9a5c08;
-    --teal: #237567;
-    --signal: #c62e1f;
-    --focus-ring: #1b2430;
-}
-
-@media (prefers-color-scheme: dark) {
-    :root {
-        /* `--ink` is the dark theme's *text* colour (a warm off-white, not
-         * pure white -- less glare against the graphite-navy `--paper`
-         * background); the two must never collide, see the P3.0 bug this
-         * comment replaced (dark-theme text and background both resolved
-         * to the same navy, rendering every page unreadable). */
-        --ink: #e8eaf0;
-        --paper: #0f1626;
-        --surface: #182134;
-        --line: #5b6578;
-        --flame: #ff8a3d;
-        --amber: #ffb347;
-        --teal: #6fd6c8;
-        --signal: #ff8577;
-        --focus-ring: #ffd36e;
-    }
-}
-
-body {
-    font-family: "Archivo", system-ui, sans-serif;
-    margin: 0;
-    padding: 0;
-    line-height: 1.5;
-    background: var(--paper);
-    color: var(--ink);
-}
-
-h1, h2, h3 {
-    font-weight: 600;
-    line-height: 1.25;
-}
-
-h1 { font-size: 1.8rem; }
-h2 { font-size: 1.2rem; }
-h3 { font-size: 1.05rem; }
-
-a {
-    color: var(--flame);
-}
-
-:focus-visible {
-    outline: 3px solid var(--focus-ring);
-    outline-offset: 2px;
-}
-
-header nav,
-.app-nav {
-    display: flex;
-    gap: 1.25rem;
-    align-items: center;
-    padding: 0.75rem 1rem;
-    border-bottom: 1px solid var(--line);
-    flex-wrap: wrap;
-}
-
-header nav a,
-.app-nav a {
-    text-decoration: none;
-    font-weight: 500;
-}
-
-header nav form,
-.app-nav__logout {
-    margin-inline-start: auto;
-}
-
-.app-header__bar {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    background: var(--surface);
-}
-
-.app-header__brand {
-    font-weight: 700;
-    padding: 0.75rem 1rem 0.75rem 1.25rem;
-    white-space: nowrap;
-}
-
-.app-nav {
-    flex: 1;
-    border-bottom: none;
-}
-
-main {
-    padding: 1rem 1.25rem 3rem;
-    max-width: 72rem;
-    margin: 0 auto;
-}
-
-@media (max-width: 42rem) {
-    .app-header__bar {
-        flex-direction: column;
-        align-items: stretch;
-    }
-    .app-header__brand {
-        padding: 0.75rem 1rem 0.25rem;
-    }
-    .app-nav {
-        padding: 0.25rem 0.5rem 0.75rem;
-        gap: 0.75rem;
-        row-gap: 0.4rem;
-    }
-}
-
-.hint {
-    border: 1px solid currentColor;
-    padding: 0.75rem 1rem;
-    border-radius: 0.25rem;
-    opacity: 0.85;
-}
-
-.error {
-    border: 1px solid var(--signal);
-    padding: 0.75rem 1rem;
-    border-radius: 0.25rem;
-    color: var(--signal);
-}
-
-/* A handful of error placeholders (`#webauthn-error`, `#webauthn-
- * register-error`) exist in the DOM up front for `webauthn.js` to fill
- * in client-side and start out empty -- an empty red-bordered box reads
- * as a layout bug, not "no error", so it is hidden until it actually has
- * text (forms pass, "inline validation messages ... shown next to the
- * field": absence of a message means no box at all, not an empty one). */
-.error:empty {
-    display: none;
-}
-
-label {
-    display: block;
-    margin-top: 0.75rem;
-    font-weight: 500;
-}
-
-input[type=text],
-input[type=password],
-input[type=date],
-select,
-textarea {
-    display: block;
-    width: 100%;
-    max-width: 20rem; /* "medium" default -- see the per-field overrides below */
-    padding: 0.45rem 0.55rem;
-    margin-top: 0.35rem;
-    border: 1px solid var(--line);
-    border-radius: 0.35rem;
-    background: var(--surface);
-    color: var(--ink);
-    font: inherit;
-    box-sizing: border-box;
-}
-
-/* Forms pass (UI-redesign stage 2 polish, "die Formulare richtig
- * formatieren"): consistent widths *per input*, keyed by the field's own
- * `name` attribute. Field names are fixed (CLAUDE.md: every form's field
- * names stay byte-identical) so one rule here covers every template that
- * happens to share a name, with no template edits needed. Three tiers --
- * short (a code/number/date/short id), medium (the 20rem default above,
- * for a name/label/single-line text), long (a digest or other content
- * that benefits from the page's own ~34rem measure, docs/ui-redesign-
- * plan.md's "Type" section). `input[name^="..."]` matches the per-service
- * `version_{{ name }}`/`digest_{{ name }}` fields on "Sollzustand
- * bearbeiten" too, not only the bare `version`/`digest` fields elsewhere. */
-input[name="totp_code"],
-input[name="floor"],
-input[name="orientation"],
-input[name="lines"],
-input[name="stagger_hours"],
-input[name="timeout_hours"],
-input[name="window_from"],
-input[name="window_until"],
-input[name="window_temp"],
-input[name="watchdog_version"],
-input[name="acquisition_date"],
-input[name^="version"] {
-    max-width: 9rem;
-}
-
-input[name="digest"],
-input[name^="digest_"],
-input[name="q"],
-input[name="reason"],
-input[name="note"],
-input[name="notes"],
-input[name="address"],
-input[name="verification_code"] {
-    max-width: 34rem;
-}
-
-/* Helper text under a field (brief: "helper text under fields") -- a
- * plain, quiet line directly below the input it belongs to. Existing
- * inline parenthetical hints ("(JJJJ-MM-TT)", "(sha256:...)") stay in the
- * label text itself where the hint *is* the expected format of the very
- * next input (so it reads right before typing); `.field-hint` is for the
- * handful of forms that spell the same thing out as its own line. */
-.field-hint {
-    display: block;
-    margin-top: 0.3rem;
-    font-size: 0.85rem;
-    opacity: 0.75;
-    max-width: 34rem;
-}
-
-/* Keep field status beside its label, before the control. */
-.field-required {
-    color: var(--signal);
-}
-
-.field-optional {
-    font-size: 0.8rem;
-    font-weight: 400;
-    opacity: 0.65;
-}
-
-.visually-hidden {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-}
-
-fieldset {
-    border: 1px solid var(--line);
-    border-radius: 0.4rem;
-    padding: 0.75rem 1rem 1rem;
-    margin: 1.25rem 0 0;
-}
-
-fieldset > fieldset {
-    margin-top: 1rem;
-}
-
-legend {
-    font-weight: 600;
-    padding: 0 0.3rem;
-}
-
-/* Button variants (brief: "primary/secondary/danger button styles").
- * `<button>` (a form's own submit action -- always the one primary thing
- * a form does) gets a filled flame look by default. `a.command-button`
- * keeps its existing outlined look unchanged (`ul.command-buttons` holds
- * several side by side -- filling all of them equally loud would fight
- * this file's own "quiet is the default, trouble has to compete for
- * attention" rule, docs/ui-redesign-plan.md's principle 1); `.button--
- * secondary`/`.button--danger` are modifiers either element can opt into.
- * `.button--danger` reuses the same `--signal` colour the status system
- * already uses for "alarm" -- never the only signal, the label itself
- * already says "...durchführen"/"ausbauen"/"entfernen" (never colour
- * alone, this file's existing rule). */
-button {
-    display: inline-block;
-    padding: 0.5rem 1.1rem;
-    margin-top: 1rem;
-    border: 1px solid var(--flame);
-    border-radius: 0.35rem;
-    background: var(--flame);
-    color: var(--surface);
-    font: inherit;
-    font-weight: 500;
-    text-align: center;
-    cursor: pointer;
-}
-
-button:hover {
-    filter: brightness(0.92);
-}
-
-.button--secondary,
-button.button--secondary {
-    background: transparent;
-    border-color: var(--line);
-    color: var(--ink);
-}
-
-.button--danger,
-button.button--danger,
-a.command-button.button--danger {
-    background: var(--signal);
-    border-color: var(--signal);
-    color: var(--surface);
-}
-
-a.command-button.button--danger:hover {
-    color: var(--surface);
-    border-color: var(--signal);
-    filter: brightness(0.92);
-}
-
-a.skip-link {
-    position: absolute;
-    left: -999px;
-}
-
-a.skip-link:focus {
-    left: 1rem;
-    top: 1rem;
-}
-
-/* "Das Haus" (P3.1) -- "whoever has nothing to do sees a quiet surface"
- * (section 9): a fine apartment's tile (.apartment-tile--quiet) is visibly
- * calmer -- lower contrast border, no accent -- than one with trouble
- * (.apartment-tile--trouble), whose left border stands out. Status itself
- * is always conveyed by text ("Meldet sich nicht", "veraltete
- * Protokollversion", the fault list) as well, never by colour alone.
- */
-ul.apartment-tiles {
-    list-style: none;
-    margin: 1rem 0 0;
-    padding: 0;
-    display: grid;
-    gap: 1rem;
-    grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
-}
-
-.apartment-tile {
-    border: 1px solid #8888;
-    border-inline-start-width: 0.3rem;
-    border-radius: 0.25rem;
-    padding: 0.75rem 1rem;
-}
-
-.apartment-tile--quiet {
-    border-inline-start-color: #8888;
-}
-
-.apartment-tile--trouble {
-    border-inline-start-color: #c00;
-}
-
-.apartment-tile h2 {
-    margin: 0 0 0.5rem;
-    font-size: 1.1rem;
-}
-
-.apartment-tile__alarm {
-    font-weight: bold;
-    margin: 0 0 0.5rem;
-}
-
-.apartment-tile__facts {
-    margin: 0;
-}
-
-.apartment-tile__facts dt {
-    font-weight: bold;
-    margin-top: 0.5rem;
-}
-
-.apartment-tile__facts dd {
-    margin-inline-start: 0;
-}
-
-.apartment-tile__faults {
-    margin: 0;
-    padding-inline-start: 1.25rem;
-}
-
-.apartment-tile__tag {
-    display: inline-block;
-    border: 1px solid currentColor;
-    border-radius: 0.25rem;
-    padding: 0 0.35rem;
-    font-size: 0.85em;
-}
-
-/* "Eine Wohnung" (P3.2) -- the heartbeat-history timeline
- * (.timeline / .timeline__entry) and its sections. Same "never colour
- * alone" rule as P3.1's tiles: a gap entry is distinguished by its own
- * "Lücke" label and border accent together, not by colour by itself.
- */
-main section + section {
-    margin-top: 1.5rem;
-}
-
-main section h2 {
-    font-size: 1.05rem;
-    margin-bottom: 0.5rem;
-}
-
-ol.timeline {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-}
-
-.timeline__entry {
-    border-inline-start: 0.25rem solid #8888;
-    padding: 0.25rem 0.75rem;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    align-items: baseline;
-}
-
-.timeline__entry--gap {
-    border-inline-start-color: #c00;
-}
-
-.timeline__label {
-    font-weight: bold;
-}
-
-.timeline__duration,
-.timeline__count {
-    opacity: 0.8;
-}
-
-.apartment-detail__note {
-    font-size: 0.9em;
-    opacity: 0.8;
-}
-
-/* "Aufgaben" (P3.4) -- three task groups, each a plain list, "Nichts
- * fällig." for an empty one (same "quiet surface" idea as P3.1's tiles,
- * here without any colour coding -- a task list is already ordered by
- * what needs doing, it does not also need a red/green split).
- */
-.task-group {
-    margin: 2rem 0 0;
-}
-
-.task-group:first-of-type {
-    margin-top: 1rem;
-}
-
-.task-group h2 {
-    margin: 0 0 0.5rem;
-    font-size: 1.1rem;
-}
-
-.task-group__empty {
-    opacity: 0.7;
-}
-
-ul.task-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: grid;
-    gap: 0.5rem;
-}
-
-.task-list li {
-    border: 1px solid #8888;
-    border-radius: 0.25rem;
-    padding: 0.5rem 0.75rem;
-}
-
-/* A stale row (P3.4a, decision 2026-09-26): the apartment's underlying
- * heartbeat/fault value is real but read while it was last reachable, the
- * apartment now has an open "not reporting" alarm. The dashed border is a
- * secondary cue only -- `.task-list__stale-hint`'s literal German text
- * ("... Wohnung meldet sich nicht") is what actually carries the meaning,
- * per this package's own accessibility requirement (text, not colour
- * alone).
- */
-.task-list li.task-list__stale {
-    border-style: dashed;
-}
-
-.task-list__stale-hint {
-    display: inline-block;
-    margin-top: 0.25rem;
-    font-size: 0.9em;
-    opacity: 0.8;
-}
-
-/* "Inventar" (P4.1) -- properties, apartments, devices. A quiet view, per
- * section 20.4 ("the questions that are not urgent") -- no colour coding,
- * plain lists and cards, same as "Aufgaben"'s task list above.
- */
-.inventory-property {
-    border: 1px solid #8888;
-    border-radius: 0.25rem;
-    padding: 0.75rem 1rem;
-    margin-top: 1rem;
-}
-
-.inventory-property h3 {
-    margin-top: 0;
-}
-
-.inventory-subnav {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    border-bottom: 1px solid var(--line);
-    margin: 1.5rem 0 2rem;
-}
-
-.inventory-subnav a {
-    display: inline-block;
-    padding: 0.7rem 0.9rem;
-    min-height: 44px;
-}
-
-.inventory-subnav a[aria-current="page"] {
-    border-bottom: 3px solid var(--flame);
-    font-weight: 700;
-}
-
-.inventory-form-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
-    gap: 1rem;
-    margin-top: 1.5rem;
-}
-
-.inventory-form-card {
-    border: 1px solid var(--line);
-    border-radius: 0.25rem;
-    padding: 1rem;
-    margin: 1.5rem 0;
-}
-
-.inventory-form-grid .inventory-form-card {
-    margin: 0;
-}
-
-.inventory-form-card h2 {
-    margin-top: 0;
-}
-
-ul.inventory-apartments,
-ul.inventory-devices {
-    list-style: none;
-    margin: 0.5rem 0 0;
-    padding: 0;
-    display: grid;
-    gap: 0.5rem;
-}
-
-ul.inventory-apartments li,
-ul.inventory-devices li {
-    border: 1px solid #8888;
-    border-radius: 0.25rem;
-    padding: 0.5rem 0.75rem;
-}
-
-.inventory-devices h3 {
-    font-size: 1rem;
-    margin-bottom: 0.5rem;
-}
-
-/* Stage-1 command buttons with confirmation (P5.1b) -- one button per
- * CommandType value, and the "Befehle" history list below them. Same
- * "never colour alone" rule as everywhere else in this file: status is
- * conveyed by its own German text (offen/zugestellt/abgelaufen ohne
- * Ergebnis/erfolgreich/fehlgeschlagen), reusing `.apartment-tile__tag`'s
- * existing pill styling rather than a new, redundant one.
- */
-ul.command-buttons {
-    list-style: none;
-    margin: 0.5rem 0 0;
-    padding: 0;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-}
-
-a.command-button {
-    display: inline-block;
-    border: 1px solid #8888;
-    border-radius: 0.25rem;
-    padding: 0.4rem 0.9rem;
-    text-decoration: none;
-}
-
-ul.command-history {
-    list-style: none;
-    margin: 0.5rem 0 0;
-    padding: 0;
-    display: grid;
-    gap: 0.5rem;
-}
-
-ul.command-history li {
-    border: 1px solid #8888;
-    border-radius: 0.25rem;
-    padding: 0.5rem 0.75rem;
-}
-
-.command-history__type {
-    font-weight: bold;
-}
-
-.command-history__meta {
-    display: block;
-    opacity: 0.8;
-    font-size: 0.9em;
-}
-
-.command-history__error {
-    margin: 0.35rem 0 0;
-    font-size: 0.9em;
-    word-break: break-word;
-}
-
-/* P5.5a: the backups list reuses `.command-history`'s own row/meta
- * styling (same "one section, one look" reasoning as the command history
- * above) -- only the list itself and the kind label get their own rule,
- * since they are the only two backup-specific classes the template uses.
- */
-ul.backup-list {
-    list-style: none;
-    margin: 0.5rem 0 0;
-    padding: 0;
-    display: grid;
-    gap: 0.5rem;
-}
-
-ul.backup-list li {
-    border: 1px solid #8888;
-    border-radius: 0.25rem;
-    padding: 0.5rem 0.75rem;
-}
-
-.backup-list__kind {
-    font-weight: bold;
-}
-
-.command-history__log {
-    margin: 0.5rem 0 0;
-}
-
-.command-history__log-lines {
-    font-family: monospace;
-    font-size: 0.85em;
-    white-space: pre-wrap;
-    word-break: break-word;
-    background: #8881;
-    border-radius: 0.25rem;
-    padding: 0.5rem;
-    max-height: 24rem;
-    overflow-y: auto;
-    margin: 0.35rem 0 0;
-}
-
-/* P6.2: the "remove this passkey" form sits inline next to its label in
-   the credential list, not stacked as its own block -- kept here rather
-   than an inline style= attribute (CSP has no 'unsafe-inline' for styles
-   either, see this file's own header comment). */
-.inline-form {
-    display: inline;
-}
-
-/* "Das Haus" (P3.1, UI-redesign stage 1; made compact in stage 2 polish,
- * see `.unit-block` below) -- the house summary line, the per-property
- * building visual, and the one shared apartment-block markup
- * (`.unit-block`) used both inside the floor-stack grid and inside the
- * plain fallback list. See docs/ui-redesign-plan.md's "Layout concept"
- * for the original reasoning (one semantic structure, styled two ways,
- * not two markups) -- still true, only the block's own size changed.
- */
-.house-summary {
-    font-size: 1.05rem;
-    margin: 0.25rem 0 1.5rem;
-}
-
-.property-group {
-    margin-top: 2rem;
-}
-
-.property-group h2 {
-    margin: 0 0 0.75rem;
-}
-
-/* "Alle Wohnungen" compact site map (UI-redesign stage 2 polish): a
- * building drawn as floor rows, several small apartment blocks per floor,
- * sized so a ~20-apartment house fits on one screen -- see
- * `_unit_macros.html`'s own comment for why the per-tile detail that used
- * to live here moved to the action inbox/a tooltip/one click away. */
-.building {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    border: 1px solid var(--line);
-    border-radius: 0.5rem;
-    padding: 0.6rem 0.75rem;
-    background: var(--surface);
-}
-
-.building__floor {
-    display: grid;
-    grid-template-columns: 3rem 1fr;
-    gap: 0.5rem;
-    align-items: center;
-}
-
-.building__floor-label {
-    font-weight: 600;
-    font-size: 0.78rem;
-    opacity: 0.75;
-}
-
-.building__units {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.35rem;
-}
-
-/* Fallback for a property with no recorded floor data -- same compact
- * blocks, wrapped in a row instead of grouped by floor (brief: "still
- * compact" applies here too, this is not a lesser rendering). */
-ul.unit-list {
-    list-style: none;
-    margin: 0.5rem 0 0;
-    padding: 0;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.35rem;
-}
-
-ul.unit-list li {
-    display: contents;
-}
-
-/* One apartment, as a small labelled block -- status conveyed by the
- * left accent bar *and* the icon shape *and* the native tooltip's German
- * status word (never colour alone, same rule the original P3.1 CSS
- * already stated). Deliberately tiny and uniform so many sit side by
- * side on one floor row; the full status/next-step text that used to be
- * printed on every block now lives in the `title` attribute (tooltip,
- * works without CSS/JS) and one click away on the apartment page. */
-.unit-block {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3rem;
-    min-width: 2.75rem;
-    min-height: 1.75rem;
-    border: 1px solid var(--line);
-    border-inline-start-width: 0.25rem;
-    border-radius: 0.3rem;
-    padding: 0.25rem 0.5rem;
-    text-decoration: none;
-    color: inherit;
-    background: var(--paper);
-    font-size: 0.8rem;
-    line-height: 1.1;
-}
-
-.unit-block--ok {
-    border-inline-start-color: var(--teal);
-    opacity: 0.85;
-}
-
-.unit-block--fault { border-inline-start-color: var(--amber); }
-.unit-block--outdated { border-inline-start-color: var(--amber); }
-.unit-block--alarm { border-inline-start-color: var(--signal); }
-.unit-block--never_reported { border-inline-start-color: var(--line); border-style: dashed; }
-
-.unit-block__label {
-    font-weight: 600;
-    white-space: nowrap;
-}
-
-.unit__status--heading {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 1rem;
-    font-weight: 500;
-    margin: 0.1rem 0;
-}
-
-.apartment-heading__next-step {
-    font-size: 0.9rem;
-    font-weight: 500;
-}
-
-/* Status icon -- shape + colour together (never colour alone): circle
- * (ok), square (outdated), triangle (fault), diamond (alarm), a dashed
- * ring (never reported, matching the dashed card border above). */
-.status-icon {
-    display: inline-block;
-    width: 0.65rem;
-    height: 0.65rem;
-    flex: none;
-}
-
-.status-icon--ok {
-    border-radius: 50%;
-    background: var(--teal);
-}
-
-.status-icon--outdated {
-    border-radius: 0.1rem;
-    background: var(--amber);
-}
-
-.status-icon--fault {
-    background: var(--amber);
-    clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
-}
-
-.status-icon--alarm {
-    background: var(--signal);
-    transform: rotate(45deg);
-}
-
-.status-icon--never_reported {
-    border-radius: 50%;
-    border: 0.12rem dashed var(--line);
-    background: transparent;
-}
-
-/* Apartment detail heading + two-column grid (UI-redesign stage 1). The
- * grid assigns each *existing* <section> to a column by its own
- * `aria-labelledby` (DOM order and every id/name/hidden field inside each
- * section stay exactly as before -- only the visual column changes);
- * below the breakpoint every section returns to today's single column,
- * in today's order. */
-.apartment-heading {
-    margin-bottom: 1rem;
-}
-
-.apartment-heading h1 {
-    margin-bottom: 0.4rem;
-}
-
-/* Clear cards per section (UI-redesign stage 2 polish, "Überblick": tidy
- * layout, consistent spacing) -- every top-level `<section>` of the
- * apartment page's grid (any tab) gets the same quiet card treatment, so
- * "Erreichbarkeit", "Störungen", "Batterie und Signal", "Alarme", etc.
- * read as clearly separate, evenly spaced blocks instead of one long
- * unbroken scroll held apart only by `<h2>` margins. The danger zone
- * keeps its own distinct `--signal` border (unchanged) rather than this
- * neutral one. */
-.apartment-grid > section {
-    border: 1px solid var(--line);
-    border-radius: 0.5rem;
-    padding: 1rem 1.1rem;
-    background: var(--surface);
-}
-
-/* Higher specificity than the generic card rule above on purpose -- the
- * danger zone keeps its own distinct `--signal` border, never the
- * neutral one every other card gets (CLAUDE.md-adjacent "never colour
- * alone" rule: the border colour is paired with its own explicit German
- * warning text, unchanged below). */
-.apartment-grid > section.danger-zone {
-    border-color: var(--signal);
-}
-
-.apartment-grid > section > h2:first-child,
-.apartment-grid > section > h2:first-of-type {
-    margin-top: 0;
-}
-
-.apartment-grid {
-    display: flex;
-    flex-direction: column;
-    gap: 1.1rem;
-}
-
-/* The generic `main section + section { margin-top: 1.5rem }` rule
- * (P3.2, above) would otherwise add on top of this grid's own `gap` --
- * one spacing mechanism per container, not two stacked on each other. */
-main .apartment-grid > section + section {
-    margin-top: 0;
-}
-
-/* The apartment-detail sections' `<dl>` fact lists (Batterie/Signal,
- * Version und System, ...) had no styling of their own before this stage
- * (browser default dt-block/dd-block stacking, each pair several lines
- * tall) -- a compact label/value grid keeps the already-dense right
- * column from towering over the left one, without changing a single field
- * or value the template prints. */
-.apartment-grid dl {
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    column-gap: 1rem;
-    row-gap: 0.3rem;
-    margin: 0.6rem 0 0;
-}
-
-.apartment-grid dl dt {
-    font-weight: 500;
-    opacity: 0.75;
-}
-
-.apartment-grid dl dd {
-    margin: 0;
-}
-
-.apartment-grid table {
-    border-collapse: collapse;
-    margin-top: 0.5rem;
-}
-
-.apartment-grid th,
-.apartment-grid td {
-    text-align: left;
-    padding: 0.3rem 0.75rem 0.3rem 0;
-}
-
-/* Buttons and text inputs, restyled with the new tokens (shared across
- * every page, not just the two rebuilt this stage -- see this file's own
- * top-of-file note on why that is in scope). The button's own primary/
- * secondary/danger look is the forms-pass rule near the top of this file
- * (UI-redesign stage 2 polish, "button { ... }") -- not restated here. */
-a.command-button {
-    border-color: var(--line);
-    font-weight: 500;
-}
-
-a.command-button:hover {
-    border-color: var(--flame);
-    color: var(--flame);
-}
-
-@media (min-width: 60rem) {
-    /* UI-redesign stage 2: each *tab* now holds only its own sections (see
-     * apartment.html's own docstring) -- the two-column split is therefore
-     * per tab, not a single fixed left/right split across every section
-     * on the page the way stage 1 had it. */
-    .apartment-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 1.1rem 2rem;
-        align-items: start;
-    }
-
-    .apartment-grid > section {
-        min-width: 0;
-    }
-
-    /* "Überblick": the time-range nav spans both columns above them;
-     * history+faults left, battery/signal+alarms right (round-1 screenshot
-     * critique -- an *unstyled* two-column grid left this to accidental
-     * auto-placement, which happened to read fine but was not a decision;
-     * it is one now). */
-    .apartment-grid > nav {
-        grid-column: 1 / -1;
-    }
-
-    .apartment-grid > section[aria-labelledby="history-heading"],
-    .apartment-grid > section[aria-labelledby="faults-heading"] {
-        grid-column: 1;
-    }
-
-    .apartment-grid > section[aria-labelledby="devices-heading"],
-    .apartment-grid > section[aria-labelledby="alarms-heading"] {
-        grid-column: 2;
-    }
-
-    /* "Wartung": commands/history on the left, backups+restore on the
-     * right; the danger zone spans both columns at the bottom, set apart
-     * from the routine maintenance actions above it. */
-    .apartment-grid > section[aria-labelledby="commands-heading"] {
-        grid-column: 1;
-        grid-row: 1;
-    }
-
-    .apartment-grid > section[aria-labelledby="backups-heading"],
-    .apartment-grid > section[aria-labelledby="restore-heading"] {
-        grid-column: 2;
-    }
-
-    .apartment-grid > section.danger-zone {
-        grid-column: 1 / -1;
-    }
-
-    /* "Technik": versions/system values on the left, desired state on the
-     * right -- "Sollzustand" alone, with its service list, roughly matches
-     * the left column's own height. */
-    .apartment-grid > section[aria-labelledby="version-heading"] {
-        grid-column: 1;
-    }
-
-    .apartment-grid > section[aria-labelledby="desired-state-heading"] {
-        grid-column: 2;
-    }
-}
-
-/* ==========================================================================
- * UI-redesign stage 2 (docs/ui-redesign-ia.md): navigation shell (sidebar
- * desktop / bottom tab bar mobile), the Übersicht action inbox, the
- * Wohnungen filter list, apartment tabs, the Wartung danger zone, and the
- * Technik digest/copy affordance -- plan/wireframes in that document.
- * The >= 760px breakpoint below is the brief's own ("desktop = ... sidebar
- * ...; mobile (< 760 px) = bottom tab bar").
- * ========================================================================== */
-
-.app-shell {
-    display: flex;
-    min-height: 100vh;
-}
-
-.app-sidenav {
-    display: none;
-}
-
-.app-column {
-    flex: 1;
-    min-width: 0;
-}
-
-.app-topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.75rem 1.25rem;
-    border-bottom: 1px solid var(--line);
-    background: var(--surface);
-}
-
-.app-topbar__brand {
-    font-weight: 700;
-}
-
-.app-topbar__user,
-.app-sidenav__user {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-}
-
-.app-topbar__user form,
-.app-sidenav__user form {
-    margin: 0;
-}
-
-.app-topbar__user button,
-.app-sidenav__user button {
-    margin-top: 0;
-}
-
-.app-main {
-    padding: 1rem 1.25rem 5.5rem;
-    max-width: 72rem;
-}
-
-.app-bottom-nav {
-    position: fixed;
-    inset-inline: 0;
-    bottom: 0;
-    display: flex;
-    justify-content: space-between;
-    background: var(--surface);
-    border-top: 1px solid var(--line);
-    padding: 0.4rem 0.5rem env(safe-area-inset-bottom, 0.4rem);
-    z-index: 10;
-}
-
-.app-bottom-nav a {
-    flex: 1;
-    text-align: center;
-    text-decoration: none;
-    font-size: 0.85rem;
-    font-weight: 500;
-    padding: 0.5rem 0.25rem;
-    min-height: 2.75rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 0.35rem;
-}
-
-.app-bottom-nav a[aria-current="page"] {
-    background: var(--paper);
-    color: var(--flame);
-}
-
-@media (min-width: 47.5rem) {
-    /* 760px -- the brief's own breakpoint. */
-    .app-shell {
-        max-width: 84rem;
-        margin: 0 auto;
-    }
-
-    .app-sidenav {
-        display: flex;
-        flex-direction: column;
-        gap: 0.9rem;
-        width: 14rem;
-        flex: none;
-        padding: 1.25rem 1rem;
-        border-inline-end: 1px solid var(--line);
-        background: var(--surface);
-    }
-
-    .app-sidenav__brand {
-        font-weight: 700;
-        margin-bottom: 0.5rem;
-    }
-
-    .app-sidenav a {
-        text-decoration: none;
-        font-weight: 500;
-        padding: 0.4rem 0.5rem 0.4rem 0.65rem;
-        border-radius: 0.35rem;
-        border-inline-start: 0.2rem solid transparent;
-    }
-
-    /* Round-1 screenshot critique (docs/ui-redesign-ia.md): a background
-     * of `--paper` on `--surface` alone was too close in value to read as
-     * "active" at a glance -- the same left-accent-bar device the status
-     * system already uses (`.unit`, `.inbox-item`) makes it unambiguous,
-     * not a second, competing way of marking "selected". */
-    .app-sidenav a[aria-current="page"] {
-        background: var(--paper);
-        color: var(--flame);
-        border-inline-start-color: var(--flame);
-    }
-
-    .app-sidenav__user {
-        margin-top: auto;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 0.5rem;
-        padding-top: 1rem;
-        border-top: 1px solid var(--line);
-    }
-
-    .app-topbar {
-        display: none;
-    }
-
-    .app-bottom-nav {
-        display: none;
-    }
-
-    .app-main {
-        padding-bottom: 3rem;
-    }
-}
-
-/* "Übersicht" -- the one-sentence headline, then the action inbox. */
-.overview-headline {
-    font-size: 1.15rem;
-    font-weight: 600;
-    margin: 0.25rem 0 1.5rem;
-}
-
-.inbox {
-    margin-bottom: 2rem;
-}
-
-.inbox-list {
-    list-style: none;
-    margin: 0.75rem 0 0;
-    padding: 0;
-    display: grid;
-    gap: 0.6rem;
-}
-
-.inbox-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    flex-wrap: wrap;
-    border: 1px solid var(--line);
-    border-inline-start-width: 0.3rem;
-    border-radius: 0.4rem;
-    padding: 0.7rem 0.9rem;
-    background: var(--surface);
-}
-
-.inbox-item--alarm { border-inline-start-color: var(--signal); }
-.inbox-item--fault,
-.inbox-item--update,
-.inbox-item--battery { border-inline-start-color: var(--amber); }
-.inbox-item--never_reported { border-inline-start-color: var(--line); border-style: dashed; }
-.inbox-item--rollout { border-inline-start-color: var(--flame); }
-
-.inbox-item__body {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-}
-
-.inbox-item__title {
-    font-weight: 600;
-}
-
-.inbox-item__subtitle {
-    font-size: 0.95rem;
-}
-
-.inbox-item__meta {
-    font-size: 0.85rem;
-    opacity: 0.8;
-}
-
-.inbox-item__action {
-    flex: none;
-    white-space: nowrap;
-}
-
-.inbox-empty {
-    margin-top: 0.75rem;
-}
-
-.site-map .property-group:first-of-type {
-    margin-top: 0.5rem;
-}
-
-/* "Wohnungen" -- the filter form (plain GET) and the flat result list. */
-.apartments-filter {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 1rem;
-    align-items: end;
-    margin-bottom: 1.25rem;
-}
-
-.apartments-filter label {
-    margin-top: 0;
-    font-size: 0.9rem;
-    font-weight: 500;
-}
-
-.apartments-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: grid;
-    gap: 0.5rem;
-}
-
-.apartments-list__link {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    text-decoration: none;
-    color: inherit;
-    border: 1px solid var(--line);
-    border-radius: 0.4rem;
-    padding: 0.6rem 0.9rem;
-    background: var(--surface);
-}
-
-.apartments-list__id {
-    font-weight: 600;
-}
-
-.apartments-list__meta {
-    font-size: 0.85rem;
-    opacity: 0.8;
-}
-
-/* Apartment tabs ("Überblick"/"Wartung"/"Technik") -- server-rendered via
- * `?ansicht=`, aria-current marks the active one (works without JS). */
-.apartment-tabs {
-    display: flex;
-    gap: 0.5rem;
-    border-bottom: 1px solid var(--line);
-    margin-bottom: 1.25rem;
-}
-
-.apartment-tabs a {
-    text-decoration: none;
-    font-weight: 500;
-    padding: 0.5rem 0.9rem;
-    border-bottom: 2px solid transparent;
-}
-
-.apartment-tabs a[aria-current="page"] {
-    color: var(--flame);
-    border-bottom-color: var(--flame);
-}
-
-/* "Wartung" danger zone -- tenant change, set apart with its own accent
- * and an explicit, plain-language warning (never colour alone). */
-.danger-zone {
-    border: 1px solid var(--signal);
-    border-radius: 0.4rem;
-    padding: 0.9rem 1rem;
-    margin-top: 1rem;
-}
-
-.danger-zone__hint {
-    font-size: 0.9rem;
-    opacity: 0.85;
-}
-
-/* "Technik" digest + copy affordance. */
-code.digest {
-    font-size: 0.85rem;
-}
-
-.copy-button {
-    font-size: 0.8rem;
-    padding: 0.15rem 0.5rem;
-    margin-top: 0;
-}
-
-/* "Einrichtung" guided step flow -- the one place numbered steps are
- * used (see inventory.html's own comment on why that is justified here). */
-.setup-flow {
-    margin-bottom: 2rem;
-}
-
-.setup-flow__steps {
-    padding-inline-start: 1.4rem;
-}
-
-.setup-flow__steps li {
-    margin-bottom: 0.5rem;
-}
-
-/* Reachability timeline bar (UI-redesign stage 2 polish, apartment.html's
- * "Überblick" tab) -- one `flex-basis` percent class per integer 1..100,
- * generated rather than an inline `style="width: ..."` (this application's
- * CSP sends no `style-src 'unsafe-inline'`, see fleet/ui_routes.py's
- * security-headers middleware and this file's own header comment on why an
- * inline style is treated the same as an inline script here: a page CSP
- * cannot itself bypass). Each segment's own width is computed in Python
- * (fleet/ui_apartment.py::_timeline_width_percents), rounded to the nearest
- * whole percent by the template, and matched to one of these classes. */
-.timeline-bar {
-    display: flex;
-    width: 100%;
-    height: 0.9rem;
-    border-radius: 0.25rem;
-    overflow: hidden;
-    margin: 0.35rem 0 0.75rem;
-    border: 1px solid var(--line);
-}
-
-.timeline-bar__segment {
-    flex-shrink: 0;
-    flex-grow: 0;
-    height: 100%;
-}
-
-.timeline-bar__segment--contact {
-    background: var(--teal);
-}
-
-.timeline-bar__segment--gap {
-    background: var(--signal);
-}
-
-.timeline-bar__segment + .timeline-bar__segment {
-    border-inline-start: 1px solid var(--paper);
-}
-
-.tl-w-1 { flex-basis: 1%; }
-.tl-w-2 { flex-basis: 2%; }
-.tl-w-3 { flex-basis: 3%; }
-.tl-w-4 { flex-basis: 4%; }
-.tl-w-5 { flex-basis: 5%; }
-.tl-w-6 { flex-basis: 6%; }
-.tl-w-7 { flex-basis: 7%; }
-.tl-w-8 { flex-basis: 8%; }
-.tl-w-9 { flex-basis: 9%; }
-.tl-w-10 { flex-basis: 10%; }
-.tl-w-11 { flex-basis: 11%; }
-.tl-w-12 { flex-basis: 12%; }
-.tl-w-13 { flex-basis: 13%; }
-.tl-w-14 { flex-basis: 14%; }
-.tl-w-15 { flex-basis: 15%; }
-.tl-w-16 { flex-basis: 16%; }
-.tl-w-17 { flex-basis: 17%; }
-.tl-w-18 { flex-basis: 18%; }
-.tl-w-19 { flex-basis: 19%; }
-.tl-w-20 { flex-basis: 20%; }
-.tl-w-21 { flex-basis: 21%; }
-.tl-w-22 { flex-basis: 22%; }
-.tl-w-23 { flex-basis: 23%; }
-.tl-w-24 { flex-basis: 24%; }
-.tl-w-25 { flex-basis: 25%; }
-.tl-w-26 { flex-basis: 26%; }
-.tl-w-27 { flex-basis: 27%; }
-.tl-w-28 { flex-basis: 28%; }
-.tl-w-29 { flex-basis: 29%; }
-.tl-w-30 { flex-basis: 30%; }
-.tl-w-31 { flex-basis: 31%; }
-.tl-w-32 { flex-basis: 32%; }
-.tl-w-33 { flex-basis: 33%; }
-.tl-w-34 { flex-basis: 34%; }
-.tl-w-35 { flex-basis: 35%; }
-.tl-w-36 { flex-basis: 36%; }
-.tl-w-37 { flex-basis: 37%; }
-.tl-w-38 { flex-basis: 38%; }
-.tl-w-39 { flex-basis: 39%; }
-.tl-w-40 { flex-basis: 40%; }
-.tl-w-41 { flex-basis: 41%; }
-.tl-w-42 { flex-basis: 42%; }
-.tl-w-43 { flex-basis: 43%; }
-.tl-w-44 { flex-basis: 44%; }
-.tl-w-45 { flex-basis: 45%; }
-.tl-w-46 { flex-basis: 46%; }
-.tl-w-47 { flex-basis: 47%; }
-.tl-w-48 { flex-basis: 48%; }
-.tl-w-49 { flex-basis: 49%; }
-.tl-w-50 { flex-basis: 50%; }
-.tl-w-51 { flex-basis: 51%; }
-.tl-w-52 { flex-basis: 52%; }
-.tl-w-53 { flex-basis: 53%; }
-.tl-w-54 { flex-basis: 54%; }
-.tl-w-55 { flex-basis: 55%; }
-.tl-w-56 { flex-basis: 56%; }
-.tl-w-57 { flex-basis: 57%; }
-.tl-w-58 { flex-basis: 58%; }
-.tl-w-59 { flex-basis: 59%; }
-.tl-w-60 { flex-basis: 60%; }
-.tl-w-61 { flex-basis: 61%; }
-.tl-w-62 { flex-basis: 62%; }
-.tl-w-63 { flex-basis: 63%; }
-.tl-w-64 { flex-basis: 64%; }
-.tl-w-65 { flex-basis: 65%; }
-.tl-w-66 { flex-basis: 66%; }
-.tl-w-67 { flex-basis: 67%; }
-.tl-w-68 { flex-basis: 68%; }
-.tl-w-69 { flex-basis: 69%; }
-.tl-w-70 { flex-basis: 70%; }
-.tl-w-71 { flex-basis: 71%; }
-.tl-w-72 { flex-basis: 72%; }
-.tl-w-73 { flex-basis: 73%; }
-.tl-w-74 { flex-basis: 74%; }
-.tl-w-75 { flex-basis: 75%; }
-.tl-w-76 { flex-basis: 76%; }
-.tl-w-77 { flex-basis: 77%; }
-.tl-w-78 { flex-basis: 78%; }
-.tl-w-79 { flex-basis: 79%; }
-.tl-w-80 { flex-basis: 80%; }
-.tl-w-81 { flex-basis: 81%; }
-.tl-w-82 { flex-basis: 82%; }
-.tl-w-83 { flex-basis: 83%; }
-.tl-w-84 { flex-basis: 84%; }
-.tl-w-85 { flex-basis: 85%; }
-.tl-w-86 { flex-basis: 86%; }
-.tl-w-87 { flex-basis: 87%; }
-.tl-w-88 { flex-basis: 88%; }
-.tl-w-89 { flex-basis: 89%; }
-.tl-w-90 { flex-basis: 90%; }
-.tl-w-91 { flex-basis: 91%; }
-.tl-w-92 { flex-basis: 92%; }
-.tl-w-93 { flex-basis: 93%; }
-.tl-w-94 { flex-basis: 94%; }
-.tl-w-95 { flex-basis: 95%; }
-.tl-w-96 { flex-basis: 96%; }
-.tl-w-97 { flex-basis: 97%; }
-.tl-w-98 { flex-basis: 98%; }
-.tl-w-99 { flex-basis: 99%; }
-.tl-w-100 { flex-basis: 100%; }
-
-@media (prefers-reduced-motion: reduce) {
-    * {
-        transition: none !important;
-        animation: none !important;
-    }
-}
+ * CSP: this file is the only stylesheet of the UI (plus legacy.css for the
+ * pages not yet redesigned); templates carry no style="" attributes and no
+ * <style> blocks. Every value the draft set inline is a class here.
+ * The login/2FA pages use their own auth.css (same tokens, own layout).
+ *
+ * Sections are numbered and commented so later phases can find what they
+ * reuse. Rules are kept in the draft's cascade order. */
+
+/* ======================================================================
+ * SECTION 1 -- TOKENS & BASE (colour tokens, type, reset, focus ring, svg icon sizing)
+ * ====================================================================== */
+:root{--bg:#f5f6f3;--paper:#fff;--ink:#243d37;--muted:#77827c;--line:#e5e9e3;--green:#31755d;--mint:#e8f2e9;--red:#b74c40;--redbg:#fcf0ed;--amber:#a77527;--amberbg:#faf3e4;--side:232px}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+button,input,select{font:inherit}
+button,a,input,select{-webkit-tap-highlight-color:transparent}
+button,a{touch-action:manipulation}
+button{cursor:pointer}
+a{color:inherit;text-decoration:none}
+button{color:inherit}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #76b49b;outline-offset:3px}
+button:disabled{cursor:default;opacity:.5}
+svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.65;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+h1,h2,h3,p{margin:0}
+h1{font-size:32px;letter-spacing:-1.3px;font-weight:600;line-height:1.25}
+h2{font-size:18px;letter-spacing:-.4px;font-weight:600}
+h3{font-size:15px;font-weight:600}
+.muted{color:var(--muted)}
+.tiny{font-size:11px}
+.eyebrow{font-size:10px;letter-spacing:1.8px;font-weight:650;color:var(--muted);text-transform:uppercase}
+
+/* ======================================================================
+ * SECTION 2 -- APP SHELL (sidebar, brand, workspace card, nav, account block, topbar, mobile menu)
+ * ====================================================================== */
+.sidebar{position:fixed;inset:0 auto 0 0;width:var(--side);background:#edf0e9;border-right:1px solid #e1e6dc;padding:30px 19px;display:flex;flex-direction:column;z-index:20}
+.brand{display:flex;align-items:center;gap:11px;padding:0 12px}
+.brandmark{width:36px;height:39px;display:grid;place-items:center;background:#24463b;color:#d2edd9;border-radius:10px}
+.brandmark svg{width:25px;height:25px}
+.brandword{font-size:19px;font-weight:620;letter-spacing:-.7px}
+.brandword small{font-size:11px;font-weight:450;letter-spacing:2px;display:block;margin-top:-4px;color:#7b897e}
+.workspace{margin:33px 0 28px;border:1px solid #dbe1d5;border-radius:8px;background:#f6f7f2;padding:11px 12px;display:flex;align-items:center;gap:10px}
+.workspace span{font-size:12px;font-weight:550}
+.workspace small{font-size:10px;display:block;color:var(--muted);font-weight:400}
+.nav-caption{padding:0 13px;margin:15px 0 9px}
+.nav-link{display:flex;align-items:center;gap:12px;padding:11px 13px;margin:4px 0;border-radius:7px;font-size:13px;color:#67756b;transition:.15s}
+.nav-link:hover{background:#e3e9df}
+.nav-link.active{background:#dce8da;color:#264a36;font-weight:600}
+.nav-link .count{margin-left:auto;background:#fff9;color:#526348;font-size:10px;border-radius:5px;padding:1px 6px}
+.sidebar-bottom{margin-top:auto}
+.service-note{margin:20px 12px;padding-top:17px;border-top:1px solid #dbe1d5;font-size:10px;color:#7d897d}
+.dot{display:inline-block;width:6px;height:6px;background:#559777;border-radius:50%;margin-right:6px}
+.account{display:flex;align-items:center;gap:10px;padding:13px 10px 0;border-top:1px solid #dbe1d5}
+.avatar{height:32px;width:32px;border-radius:50%;background:#dce4d6;display:grid;place-items:center;font-size:10px;font-weight:600}
+.account span{font-size:12px}
+.account small{display:block;font-size:10px;color:var(--muted)}
+.shell{margin-left:var(--side)}
+.topbar{height:72px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 40px;background:#fafbf8}
+.breadcrumb{font-size:12px;color:#8b938c}
+.breadcrumb b{font-weight:500;color:#4b5c51}
+.top-actions{display:flex;align-items:center;gap:18px}
+.icon-button{background:transparent;border:0;display:grid;place-items:center;padding:7px;border-radius:6px}
+.icon-button:hover{background:#e7ece3}
+
+/* ======================================================================
+ * SECTION 3 -- SHARED COMPONENTS (page heading, eyebrow, buttons, badges, panels)
+ * ====================================================================== */
+.main{padding:34px 40px 25px;max-width:1530px;margin:auto}
+.page-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:27px}
+.page-heading .eyebrow{margin-bottom:8px}
+.subtitle{color:var(--muted);font-size:13px;margin-top:8px}
+.button{display:inline-flex;justify-content:center;align-items:center;gap:8px;border:1px solid #dce2d8;background:#fff;border-radius:7px;padding:9px 13px;font-size:12px;font-weight:550;white-space:nowrap;min-height:37px}
+.button:hover{background:#f0f4ec}
+.button.primary{background:#2f513e;border-color:#2f513e;color:#fff}
+.button.primary:hover{background:#244532}
+.button svg{width:15px;height:15px}
+.text-button{border:0;background:transparent;color:#47745a;font-size:12px;display:inline-flex;align-items:center;gap:6px;padding:5px 0}
+.text-button:hover{text-decoration:underline}
+.text-button svg{width:14px;height:14px}
+
+/* ======================================================================
+ * SECTION 4 -- PAGE: Uebersicht (metrics, "Hier braucht es Sie" issue cards, building cards, feed, rollout panel)
+ * ====================================================================== */
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:10px;background:var(--paper);padding:21px 0;margin-bottom:27px}
+.metric{padding:0 24px;border-right:1px solid var(--line)}
+.metric:last-child{border:0}
+.metric-label{font-size:11px;color:#788276;display:flex;justify-content:space-between;align-items:center}
+.metric-label svg{width:16px;color:#98a591}
+.metric-number{font-size:32px;font-weight:520;letter-spacing:-1.5px;margin-top:7px;line-height:1.25}
+.metric-number small{font-size:16px;color:#a3aaa0;font-weight:400;letter-spacing:0}
+.metric-foot{font-size:10px;margin-top:5px;color:#899282}
+.metric-foot.ok{color:#52815f}
+.metric-foot.warn{color:var(--amber)}
+.section-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;gap:12px}
+.section-title{display:flex;align-items:center;gap:9px}
+.counter{padding:2px 6px;font-size:10px;background:#e9ece5;color:#6d7868;border-radius:5px}
+.attention{margin-bottom:29px}
+.issues{display:grid;grid-template-columns:repeat(3,1fr);gap:13px}
+.issue{border:1px solid var(--line);border-radius:9px;background:white;padding:17px 18px;cursor:pointer;transition:transform .15s,border-color .15s;text-align:left}
+.issue:hover{transform:translateY(-2px);border-color:#b6c6b0}
+.issue-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.issue-symbol{width:29px;height:29px;border-radius:8px;display:grid;place-items:center;background:var(--redbg);color:var(--red)}
+.issue-symbol.warn{background:var(--amberbg);color:var(--amber)}
+.issue-symbol svg{width:16px}
+.issue time{font-size:10px;color:#899085}
+.issue h3{font-size:13px;margin-bottom:4px}
+.issue p{font-size:11px;color:#828c7e}
+.issue-bottom{display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-top:12px;border-top:1px solid #eff1eb;font-size:10px;color:#62725c}
+.issue-bottom svg{width:14px}
+
+/* ======================================================================
+ * SHARED: segmented toggle (Gebaeude / Liste)
+ * ====================================================================== */
+.segmented{display:inline-flex;gap:3px;border:1px solid var(--line);background:#edf0e9;padding:3px;border-radius:7px}
+.segmented button{border:0;background:transparent;padding:5px 10px;border-radius:4px;font-size:10px;color:#819078;display:flex;align-items:center;gap:5px}
+.segmented button.active{background:white;color:#435d38;box-shadow:0 1px 3px #1a2a1710}
+.segmented svg{width:13px;height:13px}
+.buildings{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}
+.building{border:1px solid var(--line);background:#fff;border-radius:10px;overflow:hidden}
+.building-heading{padding:19px 19px 14px;display:flex;justify-content:space-between;align-items:start}
+.building-heading h3{font-size:13px}
+.building-heading p{font-size:10px;color:#8a9384;margin-top:4px}
+.building-heading svg{color:#8d9b83;width:17px}
+.building-picture{height:169px;margin:0 14px;background:#f4f6f0;border-radius:6px;position:relative;display:flex;align-items:flex-end;justify-content:center;overflow:hidden}
+.building-picture:before{content:'';position:absolute;bottom:25px;left:22px;right:22px;border-top:1px solid #dce3d4}
+.house{position:relative;width:164px;height:129px;border:1px solid #c4d0bd;background:#e8edde;margin-bottom:25px;padding:14px 13px 0;z-index:1;border-radius:3px 3px 0 0;box-shadow:7px 5px 0 #dde5d577}
+.house:before{content:'';position:absolute;top:-6px;left:-4px;right:-4px;height:6px;border:1px solid #bdcbb5;background:#dae4ce}
+.house-floor{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:9px}
+.window{height:24px;position:relative;background:#fcfdf7;border:1px solid #bcccb0;border-radius:2px;display:flex;align-items:center;justify-content:center;color:#829774;font-size:8px;padding:0;box-shadow:inset 0 -3px #e1e8d8}
+.window:after{content:'';height:100%;width:1px;background:#d2ddc7;position:absolute;left:50%}
+.window:hover{outline:2px solid #84a572;z-index:2}
+.window.error{background:#f4d7cd;border-color:#c28f7c;box-shadow:inset 0 -3px #e8bdb0}
+.window.warn{background:#f8e7bc;border-color:#c8b27e;box-shadow:inset 0 -3px #ebd59f}
+.window .window-dot{width:5px;height:5px;background:#689a61;border-radius:50%;position:absolute;right:4px;top:4px;z-index:2}
+.window.error .window-dot{background:#b96751}
+.window.warn .window-dot{background:#b18c37}
+.house.two{width:179px;height:117px;background:#e8ebdf}
+.house.three{width:150px;height:100px;background:#e5e9df}
+.tree{position:absolute;left:24px;bottom:25px;width:1px;height:42px;background:#bccbb0}
+.tree:before{content:'';position:absolute;width:25px;height:39px;border-radius:50%;background:#dce6d1;left:-12px;bottom:12px}
+.tree.right{left:auto;right:27px;height:32px}
+.building-footer{padding:16px 19px}
+.building-status{display:flex;align-items:center;justify-content:space-between;font-size:10px}
+.badge{display:inline-flex;align-items:center;gap:5px;border-radius:4px;padding:3px 7px;color:#4e7955;background:#eef5e9;font-size:10px;white-space:nowrap}
+.badge.error{color:var(--red);background:var(--redbg)}
+.badge.warn{color:var(--amber);background:var(--amberbg)}
+.badge.gray{color:#7b8276;background:#f0f1ed}
+.status-bar{height:4px;display:flex;gap:3px;margin-top:13px}
+.status-bar span{height:100%;border-radius:2px;background:#a9c79b;flex:1}
+.status-bar .error{background:#d89784}
+.status-bar .warn{background:#d9bd7b}
+.bottom-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:20px;margin-top:27px}
+.panel{background:#fff;border:1px solid var(--line);border-radius:10px;padding:21px}
+.activity-row{display:flex;align-items:center;gap:11px;padding:13px 0;border-bottom:1px solid #eff1eb;font-size:11px}
+.activity-row:last-child{border:0;padding-bottom:0}
+.activity-icon{width:27px;height:27px;display:grid;place-items:center;border:1px solid #e5e9e0;border-radius:50%;color:#7f9472}
+.activity-icon svg{width:13px;height:13px}
+.activity-row time{margin-left:auto;color:#92988c;font-size:10px;white-space:nowrap}
+.activity-row small{display:block;color:#91998a;font-size:10px}
+.update-panel{background:#eaf0e3;position:relative;overflow:hidden}
+.update-panel p{font-size:11px;color:#788769;margin:8px 0 16px;max-width:250px}
+.update-panel .eyebrow{color:#799066;margin-bottom:8px}
+.update-progress{height:5px;background:#d5dfca;border-radius:5px;margin:15px 0 8px;overflow:hidden}
+.update-progress span{display:block;width:66.67%;height:100%;background:#7f9e68}
+.progress-meta{display:flex;justify-content:space-between;font-size:10px;color:#71865e}
+.footer{display:flex;justify-content:space-between;color:#a0a79b;font-size:10px;margin-top:27px}
+
+/* ======================================================================
+ * SECTION 5 -- PAGE: Wohnungen (toolbar, search, filters, table)
+ * ====================================================================== */
+.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:20px;flex-wrap:wrap}
+.search{display:flex;align-items:center;gap:9px;min-width:240px;flex:1;border:1px solid var(--line);border-radius:7px;padding:9px 12px;background:white}
+.search svg{width:15px;color:#87957e}
+.search input{width:100%;border:0;outline:0;color:var(--ink);background:transparent;font-size:12px}
+select,input[type=text],input[type=email]{border:1px solid #dce3d6;padding:10px;border-radius:6px;background:white;color:var(--ink);max-width:100%}
+select{font-size:12px}
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px;background:white}
+table{width:100%;border-collapse:collapse;text-align:left;white-space:nowrap}
+th{font-size:10px;color:#8a9681;letter-spacing:.7px;text-transform:uppercase;font-weight:500;background:#fafbf7;padding:13px 20px;border-bottom:1px solid var(--line)}
+td{padding:15px 20px;border-bottom:1px solid #eef1e9;font-size:12px}
+tr:last-child td{border:0}
+td small{display:block;font-size:10px;color:#939c8a}
+tbody tr[data-detail]{cursor:pointer}
+tbody tr[data-detail]:hover{background:#f8faf4}
+.unit-title{display:flex;align-items:center;gap:10px}
+.unit-icon{background:#f0f4e9;border:1px solid #e7ecdf;padding:7px;display:flex;border-radius:7px;color:#7e936d}
+.unit-icon svg{width:16px;height:16px}
+.empty{padding:45px;text-align:center;color:var(--muted)}
+
+/* ======================================================================
+ * SECTION 6 -- PAGE: Wohnung (detail) -- tabs, split layout, list rows, action grid, health bars, notice
+ * ====================================================================== */
+.tabs{display:flex;gap:23px;border-bottom:1px solid var(--line);margin-bottom:23px}
+.tabs button{border:0;border-bottom:2px solid transparent;background:transparent;padding:12px 0;color:var(--muted);font-size:12px}
+.tabs button.active{border-color:#47734c;color:#365d3b;font-weight:600}
+.split{display:grid;grid-template-columns:1.35fr 1fr;gap:20px}
+.list-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 0;border-bottom:1px solid var(--line)}
+.list-row:last-child{border-bottom:0}
+.list-row small{display:block;color:var(--muted);font-size:11px;margin-top:3px}
+.action-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}
+.action-grid .button{white-space:normal;justify-content:start;text-align:left}
+.health-bars{display:flex;gap:4px;height:42px;margin:21px 0 8px}
+.health-bars i{flex:1;border-radius:3px;background:#b5cba4}
+.health-bars i.missing{background:#e2b6a6}
+.detail-top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:24px}
+.back{margin-bottom:22px}
+.notice{display:flex;gap:12px;padding:17px;border:1px solid #edddd3;border-radius:8px;background:#fff7f1;margin:0 0 20px;font-size:12px}
+.notice svg{color:#b98059}
+.notice p{color:#93816e;font-size:11px;margin-top:3px}
+
+/* ======================================================================
+ * SECTION 7 -- PAGE: Einrichtung (installation steps)
+ * ====================================================================== */
+.steps{counter-reset:steps}
+.step{display:flex;gap:13px;padding:20px 0;border-bottom:1px solid var(--line)}
+.step:before{counter-increment:steps;content:counter(steps);display:grid;place-items:center;border-radius:50%;background:#eaf0e3;color:#607c4e;width:27px;height:27px;flex-shrink:0;font-size:11px}
+.step p{font-size:12px;color:var(--muted);margin-top:4px}
+.step .button{margin-top:13px}
+
+/* ======================================================================
+ * SECTION 8 -- PAGE: Konto
+ * ====================================================================== */
+.account-card{max-width:700px}
+.privacy{margin-top:20px;font-size:11px;color:var(--muted);display:flex;gap:8px;align-items:center}
+.privacy svg{width:15px}
+.mobile-menu{display:none}
+
+/* ======================================================================
+ * SECTION 9 -- DIALOGS, TOAST, SKIP LINK, MOBILE MENU SHADE
+ * ====================================================================== */
+dialog{border:1px solid #dce3d3;border-radius:14px;padding:28px;width:460px;max-width:calc(100vw - 30px);color:var(--ink);box-shadow:0 25px 120px #18361e30}
+dialog::backdrop{background:#1b302e55;backdrop-filter:blur(3px)}
+.dialog-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:13px}
+.dialog-content p{font-size:13px;color:var(--muted)}
+.dialog-content label{display:block;font-size:12px;margin-top:16px}
+.dialog-content input,.dialog-content select{display:block;width:100%;margin-top:6px}
+.dialog-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:24px}
+.toast{position:fixed;bottom:25px;left:calc(50% + 100px);transform:translateX(-50%);background:#294733;color:white;padding:13px 20px;border-radius:9px;font-size:12px;box-shadow:0 5px 25px #20332022;z-index:100;max-width:90vw}
+.skip{position:fixed;top:-80px;left:20px;z-index:100;background:white;padding:10px}
+.skip:focus{top:10px}
+body.menu-open .sidebar{transform:translateX(0)}
+.menu-shade{display:none}
+
+/* ======================================================================
+ * SECTION 10 -- PAGE: Updates (rollout block)
+ * ====================================================================== */
+.rollout-number{font-size:48px;letter-spacing:-2px}
+.rollout-number small{font-size:16px;letter-spacing:0;color:var(--muted)}
+.rollout-block{display:flex;justify-content:space-between;align-items:center;gap:20px}
+.rollout-block .update-progress{width:250px;max-width:100%}
+
+/* ======================================================================
+ * SECTION 11 -- PAGE: Aufgaben (task list)
+ * ====================================================================== */
+.task-list .issue{width:100%;margin-bottom:12px}
+.task-list .issue-top{float:right}
+.task-list .issue-bottom{margin-top:12px}
+
+/* ======================================================================
+ * SHARED: switch (Konto options)
+ * ====================================================================== */
+.switch{width:34px;height:20px;background:#73946a;border:0;border-radius:20px;padding:3px;display:inline-flex;justify-content:flex-end}
+.switch:after{content:'';width:14px;height:14px;border-radius:50%;background:white}
+.switch[aria-checked=false]{background:#ced4c9;justify-content:flex-start}
+
+/* ======================================================================
+ * SECTION 12 -- RESPONSIVE (same order and breakpoints as the draft; 1550 / 1150 / 900 / 650 / reduced motion)
+ * ====================================================================== */
+@media(min-width:1550px){.main{padding-top:43px}
+.building-picture{height:205px}
+.house{transform:scale(1.15);transform-origin:bottom}
+.metrics{padding:27px 0}
+.issue{padding:21px}
+.bottom-grid{margin-top:30px}
+}
+@media(max-width:1150px){:root{--side:200px}
+.main{padding:28px 25px}
+.topbar{padding:0 25px}
+.sidebar{padding:27px 12px}
+.building-heading,.building-footer{padding:15px 12px}
+.building-picture{margin:0 10px}
+.house{width:135px}
+.house.two{width:143px}
+.house.three{width:129px}
+.tree{left:10px}
+.tree.right{right:10px}
+.metric{padding:0 18px}
+.issues{gap:10px}
+.issue{padding:14px}
+.issue h3{font-size:12px}
+.buildings{gap:12px}
+.brand{padding:0 8px}
+}
+@media(max-width:900px){.issues{grid-template-columns:1fr}
+.issue{display:grid;grid-template-columns:1fr 1fr;column-gap:15px}
+.issue-top{grid-column:1/-1;margin-bottom:5px}
+.issue-symbol{display:none}
+.issue-top time{margin-left:auto}
+.issue h3{font-size:13px}
+.issue p{grid-column:1}
+.issue-bottom{grid-column:2;grid-row:2/4;margin:0;padding:0;border:0}
+.buildings{grid-template-columns:1fr}
+.building{display:grid;grid-template-columns:1fr 1fr}
+.building-picture{grid-row:1/3;grid-column:2;height:157px;margin:10px}
+.building-heading{padding:20px 17px}
+.building-footer{padding:10px 17px 20px}
+.bottom-grid,.split{grid-template-columns:1fr}
+.metrics{padding:17px 0}
+.metric{padding:0 12px}
+.metric-number{font-size:27px}
+.metric-foot{font-size:9px}
+.metric-label svg{display:none}
+.metric-label{font-size:10px}
+}
+@media(max-width:650px){:root{--side:0px}
+.sidebar{width:240px;transform:translateX(-100%);visibility:hidden}
+.menu-open .sidebar{visibility:visible}
+.shell{margin:0}
+.topbar{height:60px;padding:0 18px}
+.mobile-menu{display:grid}
+.top-actions{gap:8px}
+.breadcrumb{margin-right:auto;margin-left:9px}
+.breadcrumb>span{display:none}
+.main{padding:26px 18px}
+.page-heading{align-items:flex-start;flex-wrap:wrap;gap:12px}
+h1{font-size:29px}
+.page-heading .button{font-size:11px}
+.page-heading .subtitle{font-size:12px}
+.metrics{grid-template-columns:repeat(2,1fr);gap:20px 0}
+.metric{padding:0 19px}
+.metric:nth-child(2){border:0}
+.metric-number{font-size:31px}
+.metric-label{font-size:11px}
+.metric-foot{font-size:10px}
+.issue{grid-template-columns:1fr}
+.issue-top{grid-row:1}
+.issue-bottom{grid-column:1;grid-row:auto;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.issues{gap:10px}
+.issue-symbol{display:grid}
+.issue-top{margin-bottom:10px}
+.issue h3{font-size:14px}
+.issue p{font-size:12px}
+.issue-bottom{font-size:11px}
+.section-head h2{font-size:17px}
+.building-heading h3{font-size:12px}
+.building-status{align-items:flex-start;gap:8px;flex-direction:column}
+.building-heading svg{display:none}
+.building-picture{height:174px;margin-left:0}
+.building-footer{padding-top:0}
+.footer{gap:20px}
+.footer span:last-child{display:none}
+.toast{left:50%;width:max-content}
+.rollout-block{flex-wrap:wrap}
+.action-grid{grid-template-columns:1fr}
+.detail-top{align-items:flex-start}
+.detail-top h1{font-size:26px}
+.tabs{gap:21px}
+.menu-open .menu-shade{display:block;position:fixed;inset:0;background:#1a302d60;z-index:19}
+.toolbar select{flex:1;width:45%}
+.search{min-width:100%}
+.account-card .list-row{flex-wrap:wrap}
+.panel{padding:18px}
+.activity-row time{font-size:9px}
+.activity-row{font-size:10px}
+.building-picture .house{width:125px}
+.building-picture .house.two{width:135px}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}
+}
+
+/* ======================================================================
+ * SECTION 13 -- ADDITIONS FOR THE SERVER-RENDERED PORT
+ * Everything below replaces something the draft did with inline styles,
+ * JavaScript state or demo data. Kept after the responsive block; where it
+ * must beat a media rule it does so by specificity, not by !important.
+ * ====================================================================== */
+
+/* -- progressive enhancement switches (class `js` is set by shell.js) -- */
+html:not(.js) .js-only{display:none}
+.js .no-js-only{display:none}
+
+/* -- utilities (draft inline styles turned into classes) -- */
+.crumb-sep{padding:0 13px;color:#bcc3b6}
+.service-note .service-stand{padding-left:12px;display:block;margin-top:4px}
+.account{color:inherit}
+.account-gear{margin-left:auto;display:flex;color:#7d897d}
+.account-gear svg{width:17px;height:17px}
+.account-text{min-width:0}
+.account-text span,.account-text small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.map-hint{margin-top:10px}
+.results-count{margin-top:14px}
+.mt-16{margin-top:16px}
+.mt-20{margin-top:20px}
+.mt-23{margin-top:23px}
+.mb-8{margin-bottom:8px}
+.mb-10{margin-bottom:10px}
+.mb-12{margin-bottom:12px}
+.panel-aside{align-self:start}
+.panel-wide{grid-column:1/-1}
+.row-actions{display:flex;gap:20px;align-items:center}
+.row-actions-tight{display:flex;gap:15px;align-items:center}
+.max-760{max-width:760px}
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+.inline-form{display:inline}
+.text-button{font:inherit;font-size:12px;cursor:pointer}
+a.text-button{color:#47745a}
+
+/* -- sidebar: logout form inside the account block, mobile close link -- */
+.account-wrap{border-top:1px solid #dbe1d5;padding-top:13px}
+.account-wrap .account{border-top:0;padding-top:0}
+.logout-form{margin:10px 0 0}
+.logout-button{display:flex;align-items:center;gap:8px;width:100%;border:0;background:transparent;color:#67756b;font-size:12px;padding:8px 10px;border-radius:7px;text-align:left}
+.logout-button:hover{background:#e3e9df}
+.logout-button svg{width:16px;height:16px}
+.sidebar-close{display:none}
+.mobile-menu{color:inherit}
+.topbar .bell-dot{position:relative}
+.topbar .bell-dot:after{content:'';position:absolute;top:6px;right:7px;width:7px;height:7px;border-radius:50%;background:var(--red);border:1.5px solid #fafbf8}
+
+/* -- Uebersicht: cards are links, windows are links, view toggle is links -- */
+.issue{display:block;color:inherit}
+.issue-symbol.neutral{background:#eef2ea;color:#6d7868}
+a.window{text-decoration:none}
+.house{height:auto;min-height:129px}
+.house.two{min-height:117px}
+.house.three{min-height:100px}
+.house-floor.cols-1{grid-template-columns:1fr}
+.house-floor.cols-3{grid-template-columns:repeat(3,1fr);gap:8px}
+.house-floor.cols-4{grid-template-columns:repeat(4,1fr);gap:6px}
+.house.dense .house-floor{margin-bottom:6px;gap:8px}
+.house.dense .window{height:16px}
+.house.dense .window .window-dot{width:4px;height:4px;top:3px}
+.building-picture.tall{height:auto;min-height:169px;padding-top:14px}
+.building-heading h3 a:hover{text-decoration:underline}
+.building-heading>div{min-width:0}
+.segmented a{border:0;background:transparent;padding:5px 10px;border-radius:4px;font-size:10px;color:#819078;display:flex;align-items:center;gap:5px}
+.segmented a.active{background:white;color:#435d38;box-shadow:0 1px 3px #1a2a1710}
+.metric-label{gap:8px}
+.metric-foot a{text-decoration:underline}
+.attention-empty{border:1px solid var(--line);border-radius:9px;background:white;padding:17px 18px;font-size:13px;color:var(--muted)}
+progress.update-progress{appearance:none;-webkit-appearance:none;border:0;display:block;width:100%;background:#d5dfca}
+progress.update-progress::-webkit-progress-bar{background:#d5dfca}
+progress.update-progress::-webkit-progress-value{background:#7f9e68;border-radius:5px}
+progress.update-progress::-moz-progress-bar{background:#7f9e68;border-radius:5px}
+.activity-empty{font-size:12px;color:var(--muted);padding:13px 0 0}
+.activity-row>span{min-width:0}
+.activity-icon.warn{color:var(--amber);border-color:#eadfc6}
+.activity-icon.error{color:var(--red);border-color:#efd5cf}
+.footer a{text-decoration:underline}
+
+/* -- Wohnungen: server-side filter form -- */
+.toolbar .button{min-height:38px}
+.table-wrap{position:relative}
+.table-wrap td a.row-link{display:flex;align-items:center;color:inherit}
+.chevron-cell{width:1%;color:#98a591}
+.chevron-cell a{display:flex;justify-content:flex-end}
+.table-wrap tbody tr:hover{background:#f8faf4}
+.table-wrap td.status-cell{white-space:nowrap}
+.unit-title small{display:block}
+.unit-title>span:last-child{min-width:0}
+
+/* -- mobile menu without JavaScript: the sidebar is the :target of the
+ *    hamburger link; shell.js upgrades the same links to a class toggle -- */
+@media(max-width:650px){
+.sidebar:target{transform:translateX(0);visibility:visible}
+.sidebar:target+.menu-shade{display:block;position:fixed;inset:0;background:#1a302d60;z-index:19}
+.sidebar-close{display:grid;position:absolute;right:10px;top:12px}
+.sidebar{overflow-y:auto}
+.building-picture.tall{height:auto}
+}
+@media(prefers-reduced-motion:no-preference){
+.sidebar{transition:transform .2s ease,visibility .2s}
+}
+
+/* -- cards drawn as links; "when" label of an issue card; single-panel bottom row -- */
+.issue-when{font-size:10px;color:#899085}
+.issue-top .issue-when{margin-left:auto}
+.issue p+p{margin-top:2px}
+.bottom-grid.single{grid-template-columns:1fr}
+.task-list .attention-empty{margin-bottom:12px}
+.task-list .issue-top{gap:10px}
+@media(max-width:900px){.building>*{min-width:0}}

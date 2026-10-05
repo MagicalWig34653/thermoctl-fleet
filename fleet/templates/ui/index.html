@@ -1,80 +1,139 @@
 {% extends "base.html" %}
-{% import "_unit_macros.html" as units %}
+{% import "_icons.html" as icons %}
+{% import "_cards.html" as cards %}
 
-{% block title %}Übersicht – thermoctl-fleet{% endblock %}
+{% block title %}Übersicht – thermoctl fleet{% endblock %}
+{% block main_class %}{% endblock %}
 
 {% block content %}
-{# "Übersicht" (UI-redesign stage 2, information-architecture area 1) --
-   already German-rendered and derived by
-   fleet/ui_overview.py::build_overview. This template only iterates and
-   prints; it makes no triage, ordering, or wording decisions of its own.
-   One sentence, then the action inbox, then the unchanged building/
-   site-map visual (healthy apartments appear only there, per the brief).
-#}
-<h1>Übersicht</h1>
-<p class="overview-headline">{{ overview.headline }}</p>
+{# "Übersicht" -- the owner's design draft, server-rendered. All derivation
+   and German wording lives in fleet/ui_overview.py + fleet/ui_portfolio.py
+   (`overview`); this template only iterates and prints. #}
+{% set m = overview.metrics %}
+<div class="page-heading">
+    <div>
+        <div class="eyebrow">Mein Portfolio</div>
+        <h1>Alles im Blick.</h1>
+        <p class="subtitle">
+            {% if overview.apartment_count %}
+            {{ overview.property_count }} {{ "Liegenschaft" if overview.property_count == 1 else "Liegenschaften" }}, {{ overview.apartment_count }} {{ "Wohnung" if overview.apartment_count == 1 else "Wohnungen" }}. Ein zentraler Überblick.
+            {% else %}
+            Noch keine Wohnung eingerichtet. Ein zentraler Überblick, sobald die erste verbunden ist.
+            {% endif %}
+        </p>
+    </div>
+    <a class="button primary" href="/ui/inventory">{{ icons.icon("plus") }}Wohnung einrichten</a>
+</div>
 
-<section class="inbox" aria-labelledby="inbox-heading">
-    <h2 id="inbox-heading">Was zu tun ist</h2>
+<section class="metrics" aria-label="Portfolio in Zahlen">
+    <div class="metric">
+        <div class="metric-label">Wohnungen {{ icons.icon("home") }}</div>
+        <div class="metric-number">{{ m.apartment_count }}</div>
+        <div class="metric-foot">{{ m.property_text }}</div>
+    </div>
+    <div class="metric">
+        <div class="metric-label">Erreichbar {{ icons.icon("wifi") }}</div>
+        <div class="metric-number">{{ m.reachable_count }} <small>/ {{ m.apartment_count }}</small></div>
+        <div class="metric-foot {{ 'ok' if m.reachable_ok else 'warn' }}">{{ m.reachable_foot }}</div>
+    </div>
+    <div class="metric">
+        <div class="metric-label">Handlungsbedarf {{ icons.icon("alert") }}</div>
+        <div class="metric-number">{{ m.attention_count }}</div>
+        <div class="metric-foot {{ 'ok' if m.attention_ok else 'warn' }}">{{ m.attention_foot }}</div>
+    </div>
+    <div class="metric">
+        <div class="metric-label">Letzte Sicherungen {{ icons.icon("shield") }}</div>
+        <div class="metric-number">{{ m.backup_count }} <small>/ {{ m.apartment_count }}</small></div>
+        <div class="metric-foot {{ 'ok' if m.backup_ok else 'warn' }}">{{ m.backup_foot }}</div>
+    </div>
+</section>
+
+<section class="attention" aria-labelledby="attention-heading">
+    <div class="section-head">
+        <div class="section-title"><h2 id="attention-heading">Hier braucht es Sie</h2><span class="counter">{{ overview.inbox | length }}</span></div>
+        <a class="text-button" href="/ui/tasks">Alle Aufgaben {{ icons.icon("arrow") }}</a>
+    </div>
     {% if overview.inbox %}
-    <ul class="inbox-list">
-        {% for item in overview.inbox %}
-        <li class="inbox-item inbox-item--{{ item.kind }}">
-            <div class="inbox-item__body">
-                <span class="inbox-item__title">{{ item.title }}</span>
-                <span class="inbox-item__subtitle">{{ item.subtitle }}</span>
-                {% if item.since_text %}<span class="inbox-item__meta">{{ item.since_text }}</span>{% endif %}
-                {% if item.stale_hint %}<span class="inbox-item__meta">{{ item.stale_hint }}</span>{% endif %}
-            </div>
-            <a class="command-button inbox-item__action" href="{{ item.action_href }}">{{ item.action_label }}</a>
-        </li>
+    <div class="issues">
+        {% for item in overview.inbox[:3] %}
+        {{ cards.issue_card(item) }}
         {% endfor %}
-    </ul>
+    </div>
     {% else %}
-    {# "Empty inbox = calm confirmation" (brief) – no icon, no colour,
-       just the plain German sentence the headline above already gave. #}
-    <p class="inbox-empty">Nichts zu tun – alle {{ overview.apartment_count }} Wohnungen sind in Ordnung.</p>
+    {# "Empty inbox = calm confirmation" -- the plain sentence, no alarm colour. #}
+    <p class="attention-empty">{{ cards.calm_text(overview.apartment_count) }}</p>
     {% endif %}
 </section>
 
-<section class="site-map" aria-labelledby="site-map-heading">
-    <h2 id="site-map-heading">Alle Wohnungen</h2>
-    {% if overview.property_groups %}
-    {% for group in overview.property_groups %}
-    <section class="property-group" aria-labelledby="property-heading-{{ loop.index }}">
-        <h3 id="property-heading-{{ loop.index }}">
-            {% if group.property_name %}
-            {{ group.property_name }}{% if group.property_address %} ({{ group.property_address }}){% endif %}
-            {% else %}
-            Ohne Gebäudezuordnung
-            {% endif %}
-        </h3>
-        {% if group.has_floor_data %}
-        <div class="building" role="list" aria-label="Stockwerke">
-            {% for floor in group.floors %}
-            <div class="building__floor" role="listitem">
-                <span class="building__floor-label">{{ floor.floor_label }}</span>
-                <div class="building__units">
-                    {% for tile in floor.tiles %}
-                    {{ units.apartment_block(tile) }}
+<section aria-labelledby="buildings-heading">
+    <div class="section-head">
+        <div class="section-title"><h2 id="buildings-heading">Ihre Liegenschaften</h2><span class="counter">{{ overview.property_count }}</span></div>
+        <div class="segmented" role="group" aria-label="Darstellung">
+            <a class="{% if not list_view %}active{% endif %}" href="/ui/" {% if not list_view %}aria-current="true"{% endif %}>{{ icons.icon("grid") }}Gebäude</a>
+            <a class="{% if list_view %}active{% endif %}" href="/ui/?ansicht=liste" {% if list_view %}aria-current="true"{% endif %}>{{ icons.icon("list") }}Liste</a>
+        </div>
+    </div>
+    {% if list_view %}
+    {{ cards.apartment_table(list_view.rows, "Noch keine Wohnungen eingerichtet.") }}
+    {% elif overview.buildings %}
+    <div class="buildings">
+        {% for b in overview.buildings %}
+        <article class="building">
+            <div class="building-heading">
+                <div><h3><a href="{{ b.href }}">{{ b.name }}</a></h3>{% if b.subtitle %}<p>{{ b.subtitle }}</p>{% endif %}</div>
+                {{ icons.icon("building") }}
+            </div>
+            <div class="building-picture{% if b.tall %} tall{% endif %}">
+                <span class="tree"></span><span class="tree right"></span>
+                <div class="house{% if b.variant %} {{ b.variant }}{% endif %}{% if b.dense %} dense{% endif %}" role="group" aria-label="{{ b.name }}">
+                    {% for row in b.rows %}
+                    <div class="house-floor cols-{{ row | length }}">
+                        {% for w in row %}
+                        <a class="window{% if w.state %} {{ w.state }}{% endif %}" href="{{ w.href }}" aria-label="{{ w.label }}" title="{{ w.label }}"><span class="window-dot"></span></a>
+                        {% endfor %}
+                    </div>
                     {% endfor %}
                 </div>
             </div>
-            {% endfor %}
-        </div>
-        {% else %}
-        <ul class="unit-list">
-            {% for floor in group.floors %}
-            {% for tile in floor.tiles %}
-            <li>{{ units.apartment_block(tile) }}</li>
-            {% endfor %}
-            {% endfor %}
-        </ul>
-        {% endif %}
-    </section>
-    {% endfor %}
+            <div class="building-footer">
+                <div class="building-status">
+                    <span class="muted">{{ b.count_text }}</span>
+                    <span class="badge{% if b.badge_class %} {{ b.badge_class }}{% endif %}">{{ b.badge_text }}</span>
+                </div>
+                <div class="status-bar" aria-hidden="true">{% for state in b.segments %}<span class="{{ state }}"></span>{% endfor %}</div>
+            </div>
+        </article>
+        {% endfor %}
+    </div>
+    <p class="tiny muted map-hint">Jedes Fenster ist eine Wohnung. Anklicken öffnet die Details.</p>
     {% else %}
-    <p>Keine Wohnungen registriert.</p>
+    <div class="panel"><p class="empty">Noch keine Wohnungen eingerichtet. <a class="text-button" href="/ui/inventory">Wohnung einrichten {{ icons.icon("arrow") }}</a></p></div>
     {% endif %}
 </section>
+
+<div class="bottom-grid{% if not overview.rollout %} single{% endif %}">
+    <section class="panel" aria-labelledby="activity-heading">
+        <div class="section-head"><h3 id="activity-heading">Zuletzt passiert</h3><span class="tiny muted">Neueste zuerst</span></div>
+        {% for entry in overview.activity %}
+        <div class="activity-row">
+            <span class="activity-icon{% if entry.tone %} {{ entry.tone }}{% endif %}">{{ icons.icon(entry.icon) }}</span>
+            <span>{{ entry.title }}<small>{{ entry.subtitle }}</small></span>
+            <time>{{ entry.time_text }}</time>
+        </div>
+        {% else %}
+        <p class="activity-empty">Noch keine Ereignisse.</p>
+        {% endfor %}
+    </section>
+    {% if overview.rollout %}
+    {% set r = overview.rollout %}
+    <section class="panel update-panel" aria-labelledby="rollout-heading">
+        <div class="eyebrow">Softwareverteilung</div>
+        <h3 id="rollout-heading">{{ r.title }}</h3>
+        <p>{{ r.text }}</p>
+        <progress class="update-progress" max="{{ r.total }}" value="{{ r.converged }}" aria-label="Fortschritt der Softwareverteilung"></progress>
+        <div class="progress-meta"><span>{{ r.converged }} von {{ r.total }} Wohnungen</span><span>{{ r.percent }} %</span></div>
+        <a class="text-button mt-16" href="{{ r.href }}">Rollout ansehen {{ icons.icon("arrow") }}</a>
+    </section>
+    {% endif %}
+</div>
 {% endblock %}

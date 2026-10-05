@@ -522,18 +522,15 @@ def test_unauthenticated_tasks_view_redirects_to_login(client: TestClient) -> No
     assert "Aufgaben" not in response.text
 
 
-def test_authenticated_tasks_view_redirects_to_overview(
+def test_authenticated_tasks_view_renders_the_aufgaben_page(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:
-    """UI-redesign stage 2: "Aufgaben" no longer has its own page -- its
-    three groups moved into the "Übersicht" action inbox
-    (`fleet.ui_overview.build_overview`, exercised by its own
-    `tests/test_ui_overview.py`). This old URL must keep working (CLAUDE.md
-    hard constraint), as a 303 to its new home, not a second render of the
-    same content."""
+    """"Aufgaben" is a page of its own again (UI rebuild, phase 1): the
+    action inbox of `fleet.ui_overview.build_overview` in the draft's task
+    style (exercised in detail by `tests/test_ui_rebuild.py`)."""
 
     _login(client, password, totp_secret)
     response = client.get("/ui/tasks", follow_redirects=False)
 
-    assert response.status_code == 303
-    assert response.headers["location"] == "/ui/"
+    assert response.status_code == 200
+    assert "<h1>Das steht an.</h1>" in response.text

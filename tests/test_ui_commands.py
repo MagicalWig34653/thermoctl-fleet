@@ -719,7 +719,9 @@ def test_apartment_page_no_inline_style_or_script(
     response = client.get(f"/ui/apartments/{APARTMENT}")
 
     assert " style=" not in response.text
-    assert "<script" not in response.text
+    # No inline script: every script tag is an external, same-origin file.
+    for tag in re.findall(r"<script\b[^>]*>", response.text):
+        assert 'src="/ui/static/' in tag
 
 
 def test_max_fetch_logs_lines_matches_the_protocol_bound() -> None:

@@ -63,6 +63,17 @@ FAULT_KIND_LABELS: dict[FaultKind, str] = {
 }
 
 
+def status_tone(status: str) -> str:
+    """The draft's visual tone of a tile status: `""` (fine), `"warn"`
+    (amber -- only an outdated version) or `"error"` (red -- every other
+    kind of trouble). Shared by the Übersicht's building windows and the
+    Wohnungen list's status pills."""
+
+    if status == "ok":
+        return ""
+    return "warn" if status == "outdated" else "error"
+
+
 @dataclass(frozen=True)
 class FaultDisplay:
     kind_label: str
@@ -424,4 +435,5 @@ __all__ = [
     "PropertyGroup",
     "build_house_overview",
     "group_tiles_by_property",
+    "status_tone",
 ]

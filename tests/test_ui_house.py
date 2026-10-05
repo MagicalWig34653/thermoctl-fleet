@@ -754,4 +754,4 @@ def test_house_view_with_no_apartments_shows_the_empty_state(
     response = client.get("/ui/")
 
     assert response.status_code == 200
-    assert "Keine Wohnungen registriert." in response.text
+    assert "Noch keine Wohnungen eingerichtet." in response.text

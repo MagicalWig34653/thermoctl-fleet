@@ -3,112 +3,116 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}thermoctl-fleet{% endblock %}</title>
+    <title>{% block title %}thermoctl fleet{% endblock %}</title>
     {#
-    An external, same-origin stylesheet, not an inline style block
-    (cross-review round 2: `default-src 'self'` without `'unsafe-inline'`
-    blocks inline CSS too, not only inline scripts -- see
-    fleet/static/ui/fleet-ui.css's own header comment). No page loads a
-    script unless it explicitly opts in via {% block scripts %} below;
-    every other page stays exactly as script-free as P3.0's original
-    "no JS needed" requirement, and the CSP sent by fleet/ui_routes.py's
-    security-headers middleware (`script-src 'self'`, same-origin only, no
-    CDN at runtime) would refuse anything not served from /ui/static
-    regardless.
+    Same-origin stylesheets and scripts only: the CSP sent by fleet/
+    ui_routes.py's security-headers middleware (`default-src 'self'`, no
+    'unsafe-inline') refuses inline CSS (blocks and attributes), inline
+    scripts and event-handler attributes. `legacy.css` carries the rules of the pages
+    that are not rebuilt yet, `fleet-ui.css` is the design system ported
+    from the owner's draft and wins every tie. `shell.js` is tiny, loaded
+    synchronously on purpose (it only adds the `js` class so the page never
+    flashes its no-JavaScript layout) and works as pure enhancement: the
+    mobile menu is a `:target` link without it.
     #}
+    <link rel="icon" type="image/svg+xml" href="/ui/static/favicon.svg">
+    <link rel="stylesheet" href="/ui/static/legacy.css">
     <link rel="stylesheet" href="/ui/static/fleet-ui.css">
+    <script src="/ui/static/shell.js"></script>
 </head>
 <body>
-<a class="skip-link" href="#main">Zum Inhalt springen</a>
+{% import "_icons.html" as icons %}
+<a class="skip" href="#main">Zum Inhalt springen</a>
 {#
-UI-redesign stage 2 (docs/ui-redesign-ia.md): four areas, one navigation
-structure, rendered twice -- `.app-sidenav` (a left sidebar, >= 760px) and
-`.app-bottom-nav` (a bottom tab bar, < 760px) -- a CSS-only breakpoint
-switch (`display: none` on whichever is not active for the current
-viewport), not two different link sets: both lists point at the exact
-same four hrefs in the exact same order, so there is exactly one piece of
-navigation information, shown in the layout that fits the viewport. Both
-are real `<nav>` elements with real links -- works without JavaScript, and
-a `display: none` element is correctly removed from the accessibility
-tree, so a screen-reader user is never offered the same four links twice.
-`{% block content %}` is written exactly once below (Jinja forbids the
-same block name twice in one template) -- the `ui_session` check instead
-wraps the *surrounding* chrome (sidebar/topbar/bottom nav), so the login
-page (no session yet) renders the identical `<main id="main">` with none
-of that chrome around it.
-#}
-{#
-`active_area` is derived here from the request path itself, not passed in
-by every single route's own context -- with ~30 routes under `/ui`
-(forms, confirms, downloads, ...) requiring each one to remember to set
-the same value would be exactly the kind of easy-to-forget duplication
-this file's own "one navigation structure" note above argues against.
-`/ui/apartments/...` (the apartment-detail page) is deliberately grouped
-under "Wohnungen" too, not left unhighlighted -- it is that area's own
-detail view, the same way a file's detail page stays under its folder's
-nav entry in any list/detail UI.
+Shell of the owner's design draft: sidebar + topbar around one `<main>`.
+`{% block content %}` is written exactly once (Jinja forbids the same block
+name twice) -- the `ui_session` checks wrap only the surrounding chrome, so a
+page rendered without a session gets the bare `<main>`.
 
-Computed only when `ui_session` is set (the only case any of this is
-actually rendered) -- `request.url` requires a `path` key in the ASGI
-scope, which every real request always has, but a handful of this
-package's own unit tests call a route function directly against a bare,
-hand-built scope that deliberately omits it (e.g.
-`tests/test_ui_throttle.py`'s `_make_request`, used only to exercise
-`resolve_client_ip`). Those tests only ever reach the *unauthenticated*
-login-failure template, so guarding this behind `ui_session` keeps them
-working without this file ever needing to know they exist.
+`active_area` is derived from the request path (not passed by every route):
+with ~30 routes under /ui, requiring each to remember it would be exactly the
+easy-to-forget duplication this file avoids. Computed only when `ui_session`
+is set -- `request.url` needs a `path` in the ASGI scope, which a few unit
+tests that call a route function against a hand-built scope omit.
+
+`nav_counts()` comes from `fleet.ui_nav.nav_context` (a context processor):
+the "Aufgaben"/"Updates" badges and the "Letzter Stand" line are computed by
+one helper from real data, never hard-coded.
 #}
 {% if ui_session %}
 {% set _path = request.url.path %}
 {% set active_area =
     "uebersicht" if _path == "/ui/" else
     "wohnungen" if _path.startswith("/ui/apartments") else
+    "aufgaben" if _path.startswith("/ui/tasks") else
     "einrichtung" if _path.startswith("/ui/inventory") else
     "updates" if _path.startswith("/ui/rollouts") else
+    "konto" if _path.startswith("/ui/account") else
     none %}
-{% endif %}
-<div class="app-shell">
-    {% if ui_session %}
-    <nav class="app-sidenav" aria-label="Hauptnavigation">
-        <span class="app-sidenav__brand">thermoctl-fleet</span>
-        <a href="/ui/" {% if active_area == "uebersicht" %}aria-current="page"{% endif %}>Übersicht</a>
-        <a href="/ui/apartments" {% if active_area == "wohnungen" %}aria-current="page"{% endif %}>Wohnungen</a>
-        <a href="/ui/inventory" {% if active_area == "einrichtung" %}aria-current="page"{% endif %}>Einrichtung</a>
-        <a href="/ui/rollouts" {% if active_area == "updates" %}aria-current="page"{% endif %}>Updates</a>
-        <div class="app-sidenav__user">
-            <a href="/ui/account/webauthn">Konto</a>
-            <form method="post" action="/ui/logout">
+{% set crumb_labels = {
+    "uebersicht": "Übersicht", "wohnungen": "Wohnungen", "aufgaben": "Aufgaben",
+    "einrichtung": "Einrichtung", "updates": "Updates", "konto": "Konto"} %}
+{% set nav = nav_counts() %}
+{% set initials = (ui_session.user.username[:2] | upper) %}
+<aside class="sidebar" id="sidebar" aria-label="Seitenleiste">
+    <a class="icon-button sidebar-close" href="#main" data-action="menu-close" aria-label="Menü schließen">{{ icons.icon("close") }}</a>
+    <a class="brand" href="/ui/" aria-label="thermoctl fleet, Übersicht">
+        <span class="brandmark">{{ icons.icon("brand") }}</span>
+        <span class="brandword">thermoctl<small>FLEET</small></span>
+    </a>
+    <div class="workspace">
+        {{ icons.icon("building") }}
+        <span>Meine Liegenschaften<small>Portfolio{% if nav %} · {{ nav.properties }} Gebäude{% endif %}</small></span>
+    </div>
+    <div class="eyebrow nav-caption">Verwaltung</div>
+    <nav id="nav" aria-label="Hauptnavigation">
+        {% for area, href, icon_name, label in [
+            ("uebersicht", "/ui/", "grid", "Übersicht"),
+            ("wohnungen", "/ui/apartments", "home", "Wohnungen"),
+            ("aufgaben", "/ui/tasks", "tasks", "Aufgaben"),
+            ("einrichtung", "/ui/inventory", "box", "Einrichtung"),
+            ("updates", "/ui/rollouts", "update", "Updates")] %}
+        {% set badge = (nav.tasks if area == "aufgaben" else nav.updates if area == "updates" else 0) if nav else 0 %}
+        <a class="nav-link{% if active_area == area %} active{% endif %}" href="{{ href }}" {% if active_area == area %}aria-current="page"{% endif %}>
+            {{ icons.icon(icon_name) }}{{ label }}
+            {% if badge %}<span class="count">{{ badge }}<span class="visually-hidden"> offen</span></span>{% endif %}
+        </a>
+        {% endfor %}
+    </nav>
+    <div class="sidebar-bottom">
+        <div class="service-note"><span class="dot"></span>Fleet-Dienst erreichbar<br><span class="service-stand">Letzter Stand{% if nav %} · {{ nav.stand }}{% endif %}</span></div>
+        <div class="account-wrap">
+            <a class="account" href="/ui/account/webauthn" {% if active_area == "konto" %}aria-current="page"{% endif %}>
+                <span class="avatar" aria-hidden="true">{{ initials }}</span>
+                <span class="account-text"><span>{{ ui_session.user.username }}</span><small>Konto &amp; Passkeys</small></span>
+                <span class="account-gear">{{ icons.icon("settings") }}</span>
+            </a>
+            <form class="logout-form" method="post" action="/ui/logout">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <button type="submit">Abmelden</button>
+                <button class="logout-button" type="submit">{{ icons.icon("logout") }}Abmelden</button>
             </form>
         </div>
-    </nav>
-    {% endif %}
-    <div class="app-column">
-        {% if ui_session %}
-        <header class="app-topbar">
-            <span class="app-topbar__brand">thermoctl-fleet</span>
-            <div class="app-topbar__user">
-                <a href="/ui/account/webauthn">Konto</a>
-                <form method="post" action="/ui/logout">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <button type="submit">Abmelden</button>
-                </form>
-            </div>
-        </header>
-        {% endif %}
-        <main id="main" class="app-main">
-        {% block content %}{% endblock %}
-        </main>
     </div>
-</div>
+</aside>
+<a class="menu-shade" href="#main" data-action="menu-close" aria-label="Menü schließen" tabindex="-1"></a>
+<div class="shell">
+    <header class="topbar">
+        <a class="icon-button mobile-menu" href="#sidebar" data-action="menu" aria-label="Menü öffnen" aria-controls="sidebar">{{ icons.icon("menu") }}</a>
+        <div class="breadcrumb"><span>Arbeitsbereich <span class="crumb-sep">/</span></span><b>{% block crumb %}{{ crumb_labels.get(active_area, "") }}{% endblock %}</b></div>
+        <div class="top-actions">
+            <a class="icon-button{% if nav and nav.tasks %} bell-dot{% endif %}" href="/ui/tasks" aria-label="Offene Aufgaben{% if nav and nav.tasks %} ({{ nav.tasks }}){% endif %}">{{ icons.icon("bell") }}</a>
+            <a href="/ui/account/webauthn" class="avatar" aria-label="Konto öffnen">{{ initials }}</a>
+        </div>
+    </header>
+{% endif %}
+    <main id="main" class="main{% block main_class %} legacy{% endblock %}">
+    {% block content %}{% endblock %}
+    {% if ui_session %}
+    <div class="footer"><span>thermoctl fleet &nbsp;·&nbsp; Mit Ruhe verwalten.</span>{% if nav %}<span>Stand · {{ nav.stand }}</span>{% endif %}</div>
+    {% endif %}
+    </main>
 {% if ui_session %}
-<nav class="app-bottom-nav" aria-label="Hauptnavigation (mobil)">
-    <a href="/ui/" {% if active_area == "uebersicht" %}aria-current="page"{% endif %}>Übersicht</a>
-    <a href="/ui/apartments" {% if active_area == "wohnungen" %}aria-current="page"{% endif %}>Wohnungen</a>
-    <a href="/ui/inventory" {% if active_area == "einrichtung" %}aria-current="page"{% endif %}>Einrichtung</a>
-    <a href="/ui/rollouts" {% if active_area == "updates" %}aria-current="page"{% endif %}>Updates</a>
-</nav>
+</div>
 {% endif %}
 {% block scripts %}{% endblock %}
 </body>

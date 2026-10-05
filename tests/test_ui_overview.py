@@ -376,8 +376,8 @@ def test_overview_empty_inbox_is_a_calm_confirmation(
     response = client.get("/ui/")
 
     assert response.status_code == 200
-    assert "Alles in Ordnung." in response.text
-    assert "Nichts zu tun" in response.text
+    assert "Nichts zu tun – die Wohnung ist in Ordnung." in response.text
+    assert "Alles im Blick." in response.text
 
 
 def test_overview_escapes_an_apartment_id_with_html_special_characters(
@@ -432,15 +432,17 @@ def test_overview_carries_the_security_headers(
     assert response.headers["Cache-Control"] == "no-store"
 
 
-def test_tasks_url_still_works_via_redirect(
+def test_tasks_url_renders_the_same_inbox_as_its_own_page(
     client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
 ) -> None:
     """CLAUDE.md hard constraint: every existing route keeps working --
-    `/ui/tasks` 303-redirects to its new home instead of still rendering a
-    separate page."""
+    `/ui/tasks` answers 200 and lists the very inbox item the Übersicht
+    shows (same `build_overview` data, so the two can never disagree)."""
 
+    storage.set_apartment_token(APARTMENT_A, secrets.token_urlsafe(32))
     _login(client, password, totp_secret)
     response = client.get("/ui/tasks", follow_redirects=False)
 
-    assert response.status_code == 303
-    assert response.headers["location"] == "/ui/"
+    assert response.status_code == 200
+    assert APARTMENT_A in response.text
+    assert APARTMENT_A in client.get("/ui/").text

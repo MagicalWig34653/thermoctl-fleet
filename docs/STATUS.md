@@ -2,6 +2,34 @@
 
 Last updated: 2026-10-05.
 
+
+## UI rebuild from the owner's design draft, phase 1 (2026-10-05)
+
+The owner rejected the previous UI twice; it is being rebuilt to match the
+draft (`fleet-entwurf/`) exactly. Phase 1 (foundation) is done:
+
+- Design system `fleet/static/ui/fleet-ui.css` ported from the draft (light
+  theme only, Archivo fonts and the dark theme removed), draft icon set as
+  Jinja macro (`_icons.html`), brand mark + SVG favicon, draft shell in
+  `base.html` (sidebar, topbar, mobile overlay menu that works as a plain
+  `:target` link without JS). Badge counts and "Letzter Stand" come from one
+  helper (`fleet/ui_nav.py`, context processor), tested.
+- Login + 2FA: split-screen page, ONE form posted once to `POST /ui/login`
+  with the unchanged fields; the two steps are client-side (`auth.js`), no
+  server round trip or password check on step 1; without JS all fields show.
+  Auth flow, CSRF, passkey button (`webauthn.js`) and the passwordless
+  variant are unchanged.
+- Übersicht, Wohnungen, Aufgaben (`/ui/tasks` is a page again, no longer a
+  redirect) rebuilt from real data (`fleet/ui_portfolio.py`, four new
+  read-only `Storage` queries). Gebäude/Liste toggle via `?ansicht=liste`.
+- Not yet rebuilt (phase 2): apartment detail, Einrichtung, Updates, Konto,
+  confirm pages. They run on the new shell with `legacy.css`.
+- Open: `ruff format --check .` was already failing on 30+ files before this
+  change (CI only runs `ruff check`); new files are format-clean, old files
+  were deliberately not reformatted. `tools/docs_screenshots.py` still
+  captures the old (dark/light) IA screenshots; the new ones in
+  `docs/ui-redesign/` were produced with an ad-hoc Playwright script.
+
 ## Marketing website updated to the rebuilt fleet UI (2026-10-05)
 
 The GitHub Pages site (`site/`) still described the pre-redesign UI (`docs/
