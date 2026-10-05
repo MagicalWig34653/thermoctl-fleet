@@ -30,6 +30,7 @@ one place a landlord sees a bare date (device acquisition date,
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
@@ -89,6 +90,13 @@ def format_technical_reason(raw: str) -> str:
     never mistaken for polished German UI copy. The caller decides whether
     `raw` reaches this function at all -- a human-entered "Grund" (desired
     state, rollout start/resume/cancel) never does."""
+
+    apartment_reason = re.fullmatch(r"Wohnung '([^']+)': (.+)", raw)
+    if apartment_reason is not None:
+        apartment_id, reason = apartment_reason.groups()
+        translated_reason = _KNOWN_REASON_TRANSLATIONS.get(reason)
+        if translated_reason is not None:
+            return f"Wohnung {apartment_id}: {translated_reason}"
 
     translated = _KNOWN_REASON_TRANSLATIONS.get(raw)
     if translated is not None:

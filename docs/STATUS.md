@@ -2,6 +2,20 @@
 
 Last updated: 2026-10-05.
 
+## UI redesign: final owner-approved polish (2026-10-05)
+
+Required "*" and "(optional)" now sit next to the label (screen readers get
+"Pflichtfeld"); inventory lines read "Bewohnt, EG, Ost, 5 Heizkreise"
+(proper singular/plural); "Einrichtung" is split into three server-side
+sub-areas (`?bereich=`: Objekte & Wohnungen, Basisstationen, Neue
+Basisstation vorbereiten) with forms in cards, redirects land in the right
+sub-area; the rollout inbox reason "Wohnung '<id>': agent rejected" renders
+as "Wohnung <id>: Vom Agenten abgelehnt.". Main-session read-back: every
+changed template keeps an identical multiset of form `action`/`method`/
+`name` attributes and hidden inputs (scripted before/after comparison);
+ruff/mypy clean; full pytest tests="2331" failures="0" errors="0"
+skipped="3"; docs/ui-redesign/ screenshots regenerated and reviewed.
+
 ## Fleet UI redesign, stage 2 polish pass (2026-10-05)
 
 The owner approved stage 2's structure (below) and asked for a polish

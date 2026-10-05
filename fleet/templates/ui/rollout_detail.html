@@ -25,7 +25,7 @@
 {% if detail.can_resume %}
 <form method="post" action="/ui/rollouts/{{ detail.rollout_id | urlpath }}/resume">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="resume_reason">Grund für Fortsetzen
+    <label for="resume_reason"><span class="field-label-text">Grund für Fortsetzen<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="resume_reason" name="reason" required>
     </label>
     <button type="submit">Fortsetzen</button>
@@ -34,7 +34,7 @@
 {% if detail.can_cancel %}
 <form method="post" action="/ui/rollouts/{{ detail.rollout_id | urlpath }}/cancel">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label for="cancel_reason">Grund für Abbruch
+    <label for="cancel_reason"><span class="field-label-text">Grund für Abbruch<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="cancel_reason" name="reason" required>
     </label>
     <button type="submit" class="button--danger">Abbrechen</button>

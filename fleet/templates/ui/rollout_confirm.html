@@ -36,7 +36,7 @@
     <input type="hidden" name="apartment_ids" value="{{ apartment_id }}">
     {% endfor %}
     <input type="hidden" name="test_apartment_id" value="{{ test_apartment_id }}">
-    <label for="reason">Grund
+    <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="reason" name="reason" required>
     </label>
     <button type="submit">Rollout starten</button>

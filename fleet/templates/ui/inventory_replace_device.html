@@ -21,14 +21,14 @@
 <form method="post" action="/ui/inventory/apartments/{{ view.apartment_id }}/replace-device">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="expected_assignment_id" value="{{ view.current_assignment_id }}">
-    <label for="target_state">Zielzustand des ausgebauten Geräts
+    <label for="target_state"><span class="field-label-text">Zielzustand des ausgebauten Geräts<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <select id="target_state" name="target_state" required>
             {% for state, state_label in view.target_states %}
             <option value="{{ state }}">{{ state_label }}</option>
             {% endfor %}
         </select>
     </label>
-    <label for="reason">Grund
+    <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="reason" name="reason" required>
     </label>
     <button type="submit" class="button--danger">Bestätigen: Gerät ausbauen</button>

@@ -280,33 +280,24 @@ input[name="verification_code"] {
     max-width: 34rem;
 }
 
-/* Required/optional marking (brief: "clear required/optional marking").
- * HTML's own `required` attribute already drives `:required`/`:optional`
- * -- styled here instead of adding a parallel "(Pflichtfeld)"/"(optional)"
- * text to every single label (several already spell "(Pflichtfeld)" out
- * where the form has exactly one field and the word carries real
- * meaning, e.g. rollout_confirm.html's "Grund" -- those stay, this is the
- * general case). */
-/* Scoped to the actual "fields" (text/password/date inputs and selects)
- * -- a label wrapping a checkbox/radio (the "Wohnungen"-selection rows on
- * "Neuer Rollout") is a list selection, not a form field with its own
- * required/optional state, and must not get a "(optional)" marker. */
-label:has(input[type=text]:required)::after,
-label:has(input[type=password]:required)::after,
-label:has(input[type=date]:required)::after,
-label:has(select:required)::after {
-    content: " *";
+/* Keep field status beside its label, before the control. */
+.field-required {
     color: var(--signal);
 }
 
-label:has(input[type=text]:optional)::after,
-label:has(input[type=password]:optional)::after,
-label:has(input[type=date]:optional)::after,
-label:has(select:optional)::after {
-    content: " (optional)";
+.field-optional {
     font-size: 0.8rem;
     font-weight: 400;
     opacity: 0.65;
+}
+
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
 }
 
 fieldset {
@@ -573,6 +564,47 @@ ul.task-list {
     margin-top: 0;
 }
 
+.inventory-subnav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    border-bottom: 1px solid var(--line);
+    margin: 1.5rem 0 2rem;
+}
+
+.inventory-subnav a {
+    display: inline-block;
+    padding: 0.7rem 0.9rem;
+    min-height: 44px;
+}
+
+.inventory-subnav a[aria-current="page"] {
+    border-bottom: 3px solid var(--flame);
+    font-weight: 700;
+}
+
+.inventory-form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+    gap: 1rem;
+    margin-top: 1.5rem;
+}
+
+.inventory-form-card {
+    border: 1px solid var(--line);
+    border-radius: 0.25rem;
+    padding: 1rem;
+    margin: 1.5rem 0;
+}
+
+.inventory-form-grid .inventory-form-card {
+    margin: 0;
+}
+
+.inventory-form-card h2 {
+    margin-top: 0;
+}
+
 ul.inventory-apartments,
 ul.inventory-devices {
     list-style: none;
@@ -587,6 +619,11 @@ ul.inventory-devices li {
     border: 1px solid #8888;
     border-radius: 0.25rem;
     padding: 0.5rem 0.75rem;
+}
+
+.inventory-devices h3 {
+    font-size: 1rem;
+    margin-bottom: 0.5rem;
 }
 
 /* Stage-1 command buttons with confirmation (P5.1b) -- one button per

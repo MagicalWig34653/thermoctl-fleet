@@ -352,7 +352,7 @@ def test_inventory_view_shows_a_prepare_link_for_an_eligible_device(
     _register_device(storage)
     _login(client, password, totp_secret)
 
-    response = client.get("/ui/inventory")
+    response = client.get("/ui/inventory?bereich=basisstationen")
 
     assert response.status_code == 200
     assert "/ui/inventory/devices/sn-1/prepare" in response.text
@@ -411,7 +411,7 @@ def test_confirm_submit_success_redirects_and_assigns(
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/ui/inventory"
+    assert response.headers["location"] == "/ui/inventory?bereich=objekte"
     device = storage.get_device("sn-1")
     assert device is not None
     assert device.state == "in_service"

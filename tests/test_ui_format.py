@@ -43,6 +43,18 @@ def test_format_technical_reason_known_literal_is_translated() -> None:
     assert format_technical_reason("agent rejected") == "Vom Agenten abgelehnt."
 
 
+def test_format_technical_reason_known_apartment_reason_is_translated() -> None:
+    assert (
+        format_technical_reason("Wohnung 'musterstr1-we3': agent rejected")
+        == "Wohnung musterstr1-we3: Vom Agenten abgelehnt."
+    )
+
+
+def test_format_technical_reason_unknown_apartment_reason_stays_marked() -> None:
+    raw = "Wohnung 'musterstr1-we3': unexpected agent error"
+    assert format_technical_reason(raw) == f"Technischer Hinweis (Agent): {raw}"
+
+
 def test_format_technical_reason_known_success_literal_is_translated() -> None:
     assert (
         format_technical_reason("already at the desired revision.")

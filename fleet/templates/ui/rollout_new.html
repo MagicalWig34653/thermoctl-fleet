@@ -26,7 +26,7 @@
 <form method="post" action="/ui/rollouts/new">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
-    <label for="service">Dienst
+    <label for="service"><span class="field-label-text">Dienst<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <select id="service" name="service" required>
             {% for name, label in service_options %}
             <option value="{{ name }}" {% if name == service %}selected{% endif %}>{{ label }}</option>
@@ -34,19 +34,19 @@
         </select>
     </label>
 
-    <label for="version">Version
+    <label for="version"><span class="field-label-text">Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="version" name="version" value="{{ version }}" maxlength="{{ max_version_length }}" required>
     </label>
 
-    <label for="digest">Digest (sha256:...)
+    <label for="digest"><span class="field-label-text">Digest (sha256:...)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="digest" name="digest" value="{{ digest }}" pattern="sha256:[0-9a-f]{64}" required>
     </label>
 
-    <label for="stagger_hours">Wartezeit nach Pilot (Stunden)
+    <label for="stagger_hours"><span class="field-label-text">Wartezeit nach Pilot (Stunden)<span class="field-optional"> (optional)</span></span>
         <input type="text" id="stagger_hours" name="stagger_hours" value="{{ stagger_hours }}">
     </label>
 
-    <label for="timeout_hours">Zeitüberschreitung je Wohnung (Stunden)
+    <label for="timeout_hours"><span class="field-label-text">Zeitüberschreitung je Wohnung (Stunden)<span class="field-optional"> (optional)</span></span>
         <input type="text" id="timeout_hours" name="timeout_hours" value="{{ timeout_hours }}">
     </label>
 

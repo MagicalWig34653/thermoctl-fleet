@@ -29,10 +29,10 @@
 <h2>Neuen Passkey registrieren</h2>
 <p id="webauthn-register-error" class="error" role="alert"></p>
 <form id="webauthn-register-reauth-form">
-    <label for="reauth_totp_code">Aktueller Bestätigungscode (zur Bestätigung)
+    <label for="reauth_totp_code"><span class="field-label-text">Aktueller Bestätigungscode (zur Bestätigung)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="reauth_totp_code" inputmode="numeric" autocomplete="one-time-code" required>
     </label>
-    <label for="passkey_label">Bezeichnung
+    <label for="passkey_label"><span class="field-label-text">Bezeichnung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="passkey_label" value="Passkey" required>
     </label>
     <input type="hidden" id="csrf_token" value="{{ csrf_token }}">

@@ -11,17 +11,17 @@
 <h1>Wohnungen</h1>
 
 <form method="get" action="/ui/apartments" class="apartments-filter">
-    <label for="apartments-q">Suche
+    <label for="apartments-q"><span class="field-label-text">Suche<span class="field-optional"> (optional)</span></span>
         <input type="text" id="apartments-q" name="q" value="{{ view.query }}" placeholder="Wohnung oder Liegenschaft">
     </label>
-    <label for="apartments-property">Liegenschaft
+    <label for="apartments-property"><span class="field-label-text">Liegenschaft<span class="field-optional"> (optional)</span></span>
         <select id="apartments-property" name="property">
             {% for option in view.property_options %}
             <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
             {% endfor %}
         </select>
     </label>
-    <label for="apartments-state">Zustand
+    <label for="apartments-state"><span class="field-label-text">Zustand<span class="field-optional"> (optional)</span></span>
         <select id="apartments-state" name="state">
             {% for option in view.state_options %}
             <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>

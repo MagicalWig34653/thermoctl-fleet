@@ -23,6 +23,7 @@ from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from fleet.ui_overview import build_overview
 from protocol import Heartbeat
+from protocol.desired_state import DesiredState
 from protocol.version import PROTOCOL_VERSION
 from tests.conftest import store_encrypted_totp_secret
 
@@ -203,8 +204,8 @@ def test_two_distinct_apartments_with_trouble_count_separately(storage: Storage)
     assert overview.headline == "2 Wohnungen brauchen Sie jetzt."
 
 
-def _desired_state() -> object:
-    from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
+def _desired_state() -> DesiredState:
+    from protocol.desired_state import Services, ServiceState, UpdateWindow
 
     digest = "sha256:" + "a" * 64
     return DesiredState(
@@ -262,6 +263,9 @@ def test_rollout_waiting_for_decision_produces_an_inbox_item(storage: Storage) -
     assert len(rollout_items) == 1
     assert rollout_items[0].action_label == "Ansehen und entscheiden"
     assert rollout_items[0].action_href == f"/ui/rollouts/{rollout.id}"
+    assert rollout_items[0].stale_hint == (
+        f"Wohnung {APARTMENT_A}: Vom Agenten abgelehnt."
+    )
 
 
 def test_apartment_href_is_url_encoded_in_inbox_items(storage: Storage) -> None:

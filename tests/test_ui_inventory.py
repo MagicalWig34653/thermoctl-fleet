@@ -385,6 +385,51 @@ def test_inventory_view_renders_after_login(
     assert response.headers["Referrer-Policy"] == "no-referrer"
 
 
+def test_inventory_sections_and_apartment_line_render_without_script(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    property_ = storage.create_property("House 7", "Street 7")
+    for apartment_id, count in (("house7-a01", 1), ("house7-a05", 5)):
+        storage.create_apartment(
+            apartment_id, property_id=property_.id, label=apartment_id,
+            floor="EG", orientation="Ost", state="occupied",
+            heating_circuits=count, pilot_mode=False,
+        )
+    _login(client, password, totp_secret)
+
+    objects = client.get("/ui/inventory")
+    assert 'aria-label="Einrichtung: Bereiche"' in objects.text
+    assert 'href="/ui/inventory?bereich=objekte" aria-current="page"' in objects.text
+    assert "Bewohnt, EG, Ost, 1 Heizkreis" in objects.text
+    assert "Bewohnt, EG, Ost, 5 Heizkreise" in objects.text
+    assert 'action="/ui/inventory/properties"' in objects.text
+    assert 'action="/ui/inventory/apartments"' in objects.text
+    assert 'action="/ui/inventory/devices"' not in objects.text
+    assert 'Name<span class="field-required"' in objects.text
+    assert (
+        'Pflichtfeld</span></span>\n            <input type="text" id="property_name"'
+        in objects.text
+    )
+    assert (
+        'Notizen (keine Mieterdaten!)<span class="field-optional"> (optional)</span>'
+        in objects.text
+    )
+
+    devices = client.get("/ui/inventory?bereich=basisstationen")
+    assert 'href="/ui/inventory?bereich=basisstationen" aria-current="page"' in devices.text
+    assert 'action="/ui/inventory/devices"' in devices.text
+    assert "Geräteregistrierungen bestätigen" in devices.text
+    assert 'action="/ui/inventory/properties"' not in devices.text
+
+    steps = client.get("/ui/inventory?bereich=vorbereiten")
+    assert "Neue Basisstation vorbereiten" in steps.text
+    assert "?bereich=basisstationen#device-register-form" in steps.text
+    assert 'action="/ui/inventory/devices"' not in steps.text
+
+    unknown = client.get("/ui/inventory?bereich=unknown")
+    assert 'href="/ui/inventory?bereich=objekte" aria-current="page"' in unknown.text
+
+
 def _login_and_get_csrf(
     client: TestClient, password: str, totp_secret: str, path: str = "/ui/inventory"
 ) -> str:
@@ -418,6 +463,7 @@ def test_create_property_validation_error_rerenders_with_a_message(
 
     assert response.status_code == 400
     assert "leer" in response.text
+    assert 'action="/ui/inventory/properties"' in response.text
     assert storage.list_properties() == []
 
 
@@ -438,7 +484,7 @@ def test_create_property_success_redirects_and_persists(
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/ui/inventory"
+    assert response.headers["location"] == "/ui/inventory?bereich=objekte"
     properties = storage.list_properties()
     assert len(properties) == 1
     assert properties[0].name == "House 7"
@@ -557,6 +603,7 @@ def test_register_device_rejects_an_over_length_model(
     )
 
     assert response.status_code == 400
+    assert 'action="/ui/inventory/devices"' in response.text
     assert storage.get_device("sn-1") is None
 
 
@@ -780,6 +827,7 @@ def test_create_apartment_success_defaults_state_occupied_and_pilot_mode_false(
     )
 
     assert response.status_code == 303
+    assert response.headers["location"] == "/ui/inventory?bereich=objekte"
     apartment = storage.get_apartment("house7-a03")
     assert apartment is not None
     assert apartment.state == "occupied"
@@ -826,6 +874,7 @@ def test_register_device_ends_registered_regardless_of_no_state_field(
     )
 
     assert response.status_code == 303
+    assert response.headers["location"] == "/ui/inventory?bereich=basisstationen"
     device = storage.get_device("sn-12345")
     assert device is not None
     assert device.state == "registered"
@@ -1076,6 +1125,7 @@ def test_apartment_edit_submit_success_writes_entity_and_audit_entry(
     )
 
     assert response.status_code == 303
+    assert response.headers["location"] == "/ui/inventory?bereich=objekte"
     apartment = storage.get_apartment("house7-a03")
     assert apartment is not None
     assert apartment.label == "Neu"
@@ -1214,11 +1264,15 @@ def test_inventory_filter_in_storage_and_faulty(
 
     _login(client, password, totp_secret)
 
-    in_storage_response = client.get("/ui/inventory?filter=in_storage")
+    in_storage_response = client.get("/ui/inventory?bereich=basisstationen&filter=in_storage")
     assert "sn-storage" in in_storage_response.text
     assert "sn-faulty" not in in_storage_response.text
 
-    faulty_response = client.get("/ui/inventory?filter=faulty")
+    legacy_filter_response = client.get("/ui/inventory?filter=in_storage")
+    assert "sn-storage" in legacy_filter_response.text
+    assert "sn-faulty" not in legacy_filter_response.text
+
+    faulty_response = client.get("/ui/inventory?bereich=basisstationen&filter=faulty")
     assert "sn-faulty" in faulty_response.text
     assert "sn-storage" not in faulty_response.text
 
@@ -1259,7 +1313,7 @@ def test_xss_escaping_of_device_model_field(
     )
 
     _login(client, password, totp_secret)
-    response = client.get("/ui/inventory")
+    response = client.get("/ui/inventory?bereich=basisstationen")
 
     assert marker not in response.text
     assert "&lt;script&gt;" in response.text
@@ -1503,7 +1557,7 @@ def test_replace_device_submit_success_closes_assignment_and_revokes_token(
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/ui/inventory"
+    assert response.headers["location"] == "/ui/inventory?bereich=objekte"
     assert storage.get_current_assignment("house7-a03") is None
     device = storage.get_device("sn-1")
     assert device is not None
@@ -1901,7 +1955,7 @@ def test_device_state_submit_success_redirects_and_persists(
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/ui/inventory"
+    assert response.headers["location"] == "/ui/inventory?bereich=basisstationen"
     device = storage.get_device("sn-1")
     assert device is not None
     assert device.state == "in_storage"

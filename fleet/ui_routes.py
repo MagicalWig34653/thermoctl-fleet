@@ -719,8 +719,19 @@ def _inventory_response(
     device_filter: str | None,
     error: str | None,
     status_code: int = 200,
+    bereich: str | None = None,
 ) -> HTMLResponse:
     view = build_inventory_view(storage, device_filter)
+    if bereich not in {"objekte", "basisstationen", "vorbereiten"}:
+        requested = request.query_params.get("bereich")
+        if requested in {"objekte", "basisstationen", "vorbereiten"}:
+            bereich = requested
+        elif device_filter is not None:
+            bereich = "basisstationen"
+        elif request.url.path.startswith("/ui/inventory/devices"):
+            bereich = "basisstationen"
+        else:
+            bereich = "objekte"
     response = templates.TemplateResponse(
         request,
         "inventory.html",
@@ -729,6 +740,7 @@ def _inventory_response(
             "csrf_token": authenticated.session.csrf_token,
             "view": view,
             "error": error,
+            "bereich": bereich,
         },
         status_code=status_code,
     )
@@ -740,6 +752,7 @@ def _inventory_response(
 def inventory(
     request: Request,
     filter: str | None = None,
+    bereich: str | None = None,
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
@@ -750,7 +763,9 @@ def inventory(
     value is silently treated as "no filter", see
     `fleet.ui_inventory.build_inventory_view`)."""
 
-    return _inventory_response(request, storage, authenticated, device_filter=filter, error=None)
+    return _inventory_response(
+        request, storage, authenticated, device_filter=filter, error=None, bereich=bereich
+    )
 
 
 @router.post("/inventory/properties")
@@ -791,7 +806,7 @@ def create_property_submit(
         )
 
     storage.create_property(name.strip(), address.strip(), notes.strip() or None)
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 @router.post("/inventory/apartments")
@@ -882,7 +897,7 @@ def create_apartment_submit(
             request, storage, authenticated, device_filter=None, error=str(exc), status_code=400
         )
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 @router.post("/inventory/devices")
@@ -954,7 +969,7 @@ def register_device_submit(
             request, storage, authenticated, device_filter=None, error=str(exc), status_code=400
         )
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=basisstationen", status_code=303)
 
 
 @router.get("/inventory/apartments/{apartment_id}/edit", response_class=HTMLResponse)
@@ -1076,7 +1091,7 @@ def apartment_edit_submit(
         ui_username=authenticated.user.username,
         reason=reason.strip(),
     )
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 # -----------------------------------------------------------------------------
@@ -1311,7 +1326,7 @@ def device_confirm_submit(
             request, storage, authenticated, error=str(exc), status_code=400
         )
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 # -----------------------------------------------------------------------------
@@ -1455,7 +1470,7 @@ def replace_device_submit(
     except ValueError as exc:
         return _error(str(exc))
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=objekte", status_code=303)
 
 
 @router.post("/inventory/devices/{device_id}/state")
@@ -1519,7 +1534,7 @@ def device_state_submit(
             status_code=400,
         )
 
-    return RedirectResponse(url="/ui/inventory", status_code=303)
+    return RedirectResponse(url="/ui/inventory?bereich=basisstationen", status_code=303)
 
 
 # -----------------------------------------------------------------------------

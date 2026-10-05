@@ -105,8 +105,7 @@
                 <input type="hidden" name="fault_kind" value="{{ fault.fault_kind }}">
                 <input type="hidden" name="zone" value="{{ fault.zone }}">
                 <input type="hidden" name="since" value="{{ fault.since.isoformat() }}">
-                <label>
-                    Hinweis
+                <label><span class="field-label-text">Hinweis<span class="field-optional"> (optional)</span></span>
                     <input type="text" name="note" maxlength="500" value="{{ fault.acknowledged_note or '' }}">
                 </label>
                 <button type="submit">{{ "Erneut quittieren" if fault.acknowledged_by else "Quittieren" }}</button>
@@ -285,13 +284,13 @@
            fleet/static/ui/restore_form.js just before submit, never by
            the landlord directly. #}
         <input type="hidden" name="key_block_b64" id="restore-key-block" value="">
-        <label for="restore-backup-id">Sicherung</label>
+        <label for="restore-backup-id"><span class="field-label-text">Sicherung<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span></label>
         <select name="backup_id" id="restore-backup-id" required>
             {% for backup in detail.restore_operational_backups %}
             <option value="{{ backup.backup_id }}">{{ backup.created_text }} ({{ backup.size_text }})</option>
             {% endfor %}
         </select>
-        <label for="restore-key-plaintext">Schlüssel des Vermieters</label>
+        <label for="restore-key-plaintext"><span class="field-label-text">Schlüssel des Vermieters<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span></label>
         {# No `name` attribute (owner decision): this field is never part
            of the form submission, with or without JavaScript. #}
         <input type="password" id="restore-key-plaintext" autocomplete="off">
