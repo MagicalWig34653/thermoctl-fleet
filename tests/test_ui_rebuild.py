@@ -289,6 +289,8 @@ def test_shell_has_sidebar_nav_badges_account_and_logout(
     # Brand mark + favicon (the draft's icon, not the old app icon).
     assert 'class="brandmark"' in html
     assert '<link rel="icon" type="image/svg+xml" href="/ui/static/favicon.svg">' in html
+    # Home-screen icon: the Icon Composer app icon, rendered for iOS.
+    assert '<link rel="apple-touch-icon" href="/ui/static/apple-touch-icon.png">' in html
 
 
 def test_mobile_menu_works_as_a_plain_link_without_javascript(
@@ -348,6 +350,7 @@ def test_static_assets_of_the_rebuild_are_served_same_origin(client: TestClient)
         ("rollout-confirm.js", "javascript"),
         ("auth.js", "javascript"),
         ("favicon.svg", "image/svg+xml"),
+        ("apple-touch-icon.png", "image/png"),
     ):
         response = client.get(f"/ui/static/{name}")
         assert response.status_code == 200, name
