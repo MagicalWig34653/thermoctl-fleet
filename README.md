@@ -31,7 +31,7 @@
 ## What is it?
 
 `thermoctl-fleet` is a small cloud service for landlords who run several
-[`thermoctl`](../thermoctl) installations. Every apartment sends a heartbeat
+`thermoctl` installations. Every apartment sends a heartbeat
 with health data; the service collects faults, **raises an alarm when a
 heartbeat is missing**, and can send a short, closed list of maintenance
 commands to the apartment.
