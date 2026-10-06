@@ -3,6 +3,37 @@
 Last updated: 2026-10-06.
 
 
+## GitHub Pages website rebuilt from the owner's website draft (2026-10-06)
+
+`site/` was replaced by the owner's draft (`fleet-entwurf-website/`): landing
+page `site/index.html`, documentation `site/docs.html` (+ `assets/js/docs.js`,
+chapters rendered client-side per hash route, as in the draft), styles in
+`assets/css/styles.css` (draft CSS plus a small block for code, tables and the
+flow stories), `assets/js/site.js`, and the static click demo under
+`site/demo/` (labelled "Interaktive Demo", fictitious data, demo code
+123456, no real credentials). No external fonts/CDNs; all links relative.
+
+- Content is the real project documentation, filled into the draft's chapter
+  structure; one chapter was added ("Fleet-Dienst betreiben": Docker, env
+  vars, TLS pinning, `fleet.admin`, passkeys incl. passwordless networks,
+  `tools.dev_fleet`). The old interactive architecture diagram is replaced by
+  the draft-style flow diagram plus ten step-by-step "Abläufe" and the
+  component table in the chapter "So funktioniert Fleet". Removed: old
+  `style.css`, `architektur.html`, `architecture*.js`, `docs/*.html`, old
+  images.
+- Corrections made while moving content: five Stufe-1 commands (the old
+  security page said four), the first-boot WLAN import exists (the old table
+  said it did not), `factory_reset`/`open_access` are Stufe 2 and not on the
+  command channel, container updates are "derzeit abgeschaltet".
+- Screenshots: real UI from `python -m tools.docs_screenshots`
+  (`docs/ui-redesign/*-1440.png`), top-cropped to the draft's 1360x960
+  aspect and stored as WebP in `site/assets/img/` (no generated
+  `docs/ui-redesign/*.webp` committed). Favicon is `fleet/static/ui/
+  favicon.svg`; `apple-touch-icon.png` is its 180 px render. `branding/` was
+  not touched.
+- The site is not covered by pytest (no test referenced `site/`); checked
+  with Playwright at 1440/768/390/320 px, no horizontal scroll.
+
 ## UI rebuild phase 2a: apartment detail + confirmation pages (2026-10-06)
 
 - `apartment.html` rebuilt to the draft's detail view (back link, heading

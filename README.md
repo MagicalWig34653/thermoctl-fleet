@@ -126,15 +126,22 @@ Use `--reset` to recreate it and `--no-reload` to disable source watching.
 
 ## Documentation website
 
-A German-language documentation site for landlords/operators -- explains the
-project from scratch, the security model, and day-to-day operation -- lives
-under [`site/`](site/) (plain HTML/CSS, no build step) and is published via
-GitHub Pages at **<https://magicalwig34653.github.io/thermoctl-fleet/>**
+A German-language website and documentation for landlords/operators --
+landing page, an eight-chapter illustrated documentation (running the fleet
+service, adding the first apartment, daily operation, maintenance, the
+architecture, the security model, FAQ), and a static click demo with
+fictitious data -- lives under [`site/`](site/) (plain HTML/CSS/JS, no build
+step, no external fonts or CDNs) and is published via GitHub Pages at
+**<https://magicalwig34653.github.io/thermoctl-fleet/>**
 (deployed by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) on
-every push to `main` that touches `site/**`). Its screenshots are captured
-against a throwaway, locally seeded demo fleet by
+every push to `main` that touches `site/**`). Its screenshots are the real UI
+captured against a throwaway, locally seeded demo fleet by
 [`tools/docs_screenshots.py`](tools/docs_screenshots.py) -- reproducible, no
-real apartment or tenant data.
+real apartment or tenant data -- and cropped to `site/assets/img/`.
+
+The site's favicon is the fleet UI's own mark,
+[`fleet/static/ui/favicon.svg`](fleet/static/ui/favicon.svg) (a copy lives in
+`site/assets/icon/`, next to its PNG `apple-touch-icon`).
 
 The app icon lives at [`branding/thermoctl-fleet.icon`](branding/thermoctl-fleet.icon)
 (an Xcode Icon Composer bundle: the fleet UI's brand mark -- two mint glass
