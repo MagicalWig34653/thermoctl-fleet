@@ -1,163 +1,323 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="branding/renders/thermoctl-fleet-icon-Dark-1024.png">
+  <img src="branding/renders/thermoctl-fleet-icon-Default-1024.png" alt="thermoctl-fleet app icon" width="120" height="120">
+</picture>
+
 # thermoctl-fleet
 
-<img src="site/assets/icon/apple-touch-icon.png" alt="" width="96" height="96" align="right">
+**The landlord's overview across all apartments: health, faults, and an alarm when a heartbeat goes missing.**
 
-A small cloud service for landlords with several [`thermoctl`](../thermoctl)
-installations: it receives a heartbeat with health data from every
-apartment, collects faults, alarms on **absence** of a heartbeat, and can
-send a short, closed list of maintenance commands to an apartment. It is
-**not a second controller** -- setpoints, schedules, and arming stay in the
-apartment -- and **not a data collector**: room temperatures, setpoints, and
-tenant data are not transmitted. The full reasoning for this scope is in
-[`docs/specification.md`](docs/specification.md).
+[![CI](https://github.com/MagicalWig34653/thermoctl-fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/MagicalWig34653/thermoctl-fleet/actions/workflows/ci.yml)
+[![Website](https://img.shields.io/badge/website-GitHub%20Pages-2f6b4f)](https://magicalwig34653.github.io/thermoctl-fleet/)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-3776ab)](pyproject.toml)
 
-## Relationship to thermoctl
+[Website](https://magicalwig34653.github.io/thermoctl-fleet/) ·
+[Dokumentation](https://magicalwig34653.github.io/thermoctl-fleet/docs.html) ·
+[Interaktive Demo](https://magicalwig34653.github.io/thermoctl-fleet/demo/)
+
+<br>
+
+<img src="docs/ui-redesign/uebersicht-1440.png" alt="The fleet overview: all apartments of a building at a glance (demo data)" width="900">
+
+</div>
+
+> The website and the documentation are in German; this README is in English.
+> The screenshots show the real UI against a locally seeded demo fleet, with
+> fictitious data.
+
+## What is it?
+
+`thermoctl-fleet` is a small cloud service for landlords who run several
+[`thermoctl`](../thermoctl) installations. Every apartment sends a heartbeat
+with health data; the service collects faults, **raises an alarm when a
+heartbeat is missing**, and can send a short, closed list of maintenance
+commands to the apartment.
 
 `thermoctl` stays a standalone, self-hostable single-apartment product and
-works fully without this service. `thermoctl-fleet` does not talk to
-`thermoctl` directly: a separate, very small program runs on each
-apartment's base station, the **agent** (`agent/`), which queries thermoctl
-exclusively through its existing, read-only REST interface and is the only
-thing that talks to the cloud. This separation is deliberate, not
-incidental: the agent is the security boundary -- it decides locally which
-commands it executes at all, regardless of whether the cloud has been
-compromised.
+works fully without this service. The two never talk directly: a very small
+**agent** on each apartment's base station queries thermoctl only through its
+existing read-only REST interface and is the only component that talks to the
+cloud.
 
-## One repository, two images
+### What it is not
 
-`thermoctl-fleet` ships **two** independent Docker images from **one**
-repository: `fleet/` (the cloud service) and `agent/` (the agent). They run
-on different hardware, at different operators, with different lifecycles --
-and still live in one repository, because they are tightly coupled via a
-shared protocol: the heartbeat schema, the closed command list, and the
-desired-state format for an apartment's four containers. These contracts
-live as Pydantic models in [`protocol/`](protocol/) and are imported by both
-sides.
+- **Not a second controller.** Setpoints, schedules, frost protection, and
+  arming stay in the apartment. The cloud cannot change them: the command does
+  not exist.
+- **Not a data collector.** Room temperatures, setpoints, schedules, absence
+  periods, tenant names, and contact details are never transmitted.
+- **Not a replacement for the apartment view.** The tenant never sees the
+  cloud.
 
-Separate repositories would inevitably duplicate these contracts -- once in
-`fleet`, once in `agent`, with no tool enforcing that they match -- and
-would make contract tests impossible: [`tests/`](tests/) checks, among other
-things, that an example heartbeat from the specification is accepted by
-exactly the same model that the cloud side also accepts. That requires both
-sides to import the same module, not two copies of it.
+The full reasoning is in [`docs/specification.md`](docs/specification.md),
+which is the authoritative source for this project.
 
-Two further parts in the same repository, for the same reason, but without
-their own Docker image:
+## Features
 
-- **[`watchdog/`](watchdog/)** -- written in Go, not in Python: it is the
-  one thing on the device that has to work when everything else is broken,
-  and a statically linked binary does not know the classes of failure
-  (a broken interpreter, a half-applied system update) that can disable a
-  Python process. It shares a line-based state file with the agent (not
-  JSON, so it stays readable in every language with built-in tools) --
-  `watchdog/check_contract.sh` checks this contract across languages:
-  Python writes, the built Go binary reads.
-- **[`image/`](image/)** -- the recipe for the base station's prepared
-  system images (Raspberry Pi OS or Debian, both 64-bit). No custom
-  operating system, just a package list, units, and configuration on top of
-  plain Debian.
+- **Heartbeat monitoring.** One health report per apartment every 120 seconds;
+  alarms on the *absence* of a heartbeat, not only on reported faults.
+- **Fault collection.** Open faults, battery and signal values across all
+  apartments in one overview, with acknowledgement.
+- **Closed command list.** Five stage-1 maintenance commands (`report_now`,
+  `fetch_logs`, `backup_now`, `agent_restart`, `diagnostic_bundle`), each with
+  an id, an expiry, and a local log entry in the apartment.
+- **Outbound-only connection.** HTTPS upstream, Server-Sent Events downstream;
+  no port forwarding in the tenant's router, no MQTT over the internet.
+- **Device registration.** One-time registration code, certificate
+  fingerprint pinning, and a verification code confirmed in the UI.
+- **Encrypted backups.** Operational data is encrypted on the device before
+  upload; the cloud stores only an opaque block.
+- **Careful sign-in.** Password plus TOTP, optional passkeys (WebAuthn),
+  lockout and per-IP throttling; accounts are created only on the server's
+  command line.
+- **Prepared base-station images** and a flash tool (terminal UI and CLI) for
+  Raspberry Pi and amd64 mini PCs.
 
-## Layout
+## How it works
 
+```mermaid
+flowchart LR
+    subgraph apt["Apartment (base station)"]
+        T["thermoctl<br/>(controller)"]
+        A["agent"]
+        W["watchdog (Go)"]
+        T -- "read-only REST" --> A
+        W -. "swaps agent container" .-> A
+    end
+    F["fleet service<br/>(cloud)"]
+    A -- "HTTPS POST: heartbeat, events, results" --> F
+    F -- "SSE: GET /v1/commands" --> A
+    L["Landlord (browser)"] --> F
 ```
-fleet/       Cloud service (FastAPI): heartbeat and event receipt, SSE command output
-agent/       Agent on the base station: sending heartbeats, executing commands,
-             desired-state reconciliation, backup
-protocol/    Shared Pydantic models -- the actual contract between both sides
-watchdog/    Go module: swaps the agent container, no Docker image
-image/       Recipe for the prepared system images (Raspberry Pi OS, Debian)
-tools/       Build/CI tooling, among other things the check of the image/ configuration
-docs/        Specification (adopted unchanged) and STATUS.md
-```
 
-**Status:** this is a scaffold, not a finished application. Every missing
-piece in `fleet/`, `agent/`, and `watchdog/` carries a reference to the
-relevant section of the specification (`NotImplementedError` in Python, an
-error value referencing the section in Go). The current status and open
-points are in [`docs/STATUS.md`](docs/STATUS.md).
+The **agent is the security boundary**, not the cloud: it decides locally
+whether a command is executed at all (id already seen, expiry exceeded,
+precondition met). The **watchdog** only swaps between two already present,
+already verified container images and has no network access.
 
-## Running locally
+The repository holds both Docker images, the watchdog, and the system image
+recipe because all of them are tightly coupled through one contract: the
+Pydantic models in [`protocol/`](protocol/) are imported by both the cloud and
+the agent, which makes contract tests possible.
+
+<details>
+<summary><b>Screenshots</b></summary>
+<br>
+
+| Apartment detail | Sign-in with 2FA | Overview on a phone |
+|---|---|---|
+| <img src="docs/ui-redesign/wohnung-ueberblick-1440.png" alt="Apartment detail view" width="420"> | <img src="docs/ui-redesign/login-2fa-1440.png" alt="Sign-in, second step" width="420"> | <img src="docs/ui-redesign/uebersicht-390.png" alt="Overview, mobile layout" width="180"> |
+
+</details>
+
+## Quick start
+
+Requires Python 3.13 or newer.
+
+### Run the fleet UI locally
 
 ```bash
 python3.13 -m venv .venv && .venv/bin/pip install -e ".[dev,fleet,agent,flash,docs]"
-.venv/bin/python -m pytest
+.venv/bin/python -m tools.dev_fleet
 ```
 
-`python -m pytest` instead of `.venv/bin/pytest`: the console script under
-`.venv/bin` does not work reliably with an editable install on macOS --
-the same cause thermoctl's README names for its own console command (the
-file that makes the package discoverable there is marked hidden and skipped
-at startup). `python -m pytest` instead takes the project directory into
-the module path in the regular way.
+The launcher creates a private, gitignored `.dev/` database with a demo login
+and TOTP key, prints the login, and serves the UI on `localhost:8000`. Use
+`--reset` (with `--yes` to skip the prompt) to recreate the state, `--port` to
+change the port, and `--no-reload` to disable source watching.
 
-Run the cloud service against itself (without a database, without
-authentication -- see `docs/STATUS.md`):
+Alternatively, run the bare service (no database, no authentication; see
+[`docs/STATUS.md`](docs/STATUS.md)):
 
 ```bash
 .venv/bin/uvicorn fleet.app:app --reload
 ```
 
-An example interplay of both images via Docker Compose is in
-[`docker/compose.example.yml`](docker/compose.example.yml).
+### Docker
 
-Check the watchdog (own toolchain, see
-[`watchdog/README.md`](watchdog/README.md)):
+Two independent images come from one repository:
 
 ```bash
-cd watchdog && go vet ./... && go test ./...
+docker build -f docker/Dockerfile.fleet -t thermoctl-fleet .
+docker build -f docker/Dockerfile.agent -t thermoctl-agent .
+docker run -d --name fleet --env-file .env -p 127.0.0.1:8100:8000 thermoctl-fleet
 ```
 
-## Entwickeln mit PyCharm
+[`docker/compose.example.yml`](docker/compose.example.yml) illustrates how the
+two fit together. It is not a rollout recipe: the agent runs on each
+apartment's base station, not next to the fleet service. Keep your own values
+in a local `.env` that is never committed.
+
+<details>
+<summary><b>Operating the fleet service: accounts and configuration</b></summary>
+<br>
+
+Accounts are created only on the server, never through the web UI. The
+password is prompted interactively; `FLEET_DATABASE_URL` and `FLEET_TOTP_KEY`
+must be set.
+
+```bash
+python -m fleet.admin create-user alice
+```
+
+Required for operation:
+
+| Variable | Purpose |
+|---|---|
+| `FLEET_DATABASE_URL` | SQLAlchemy connection string of the database |
+| `FLEET_TOTP_KEY` | Key under which accounts' TOTP secrets are stored encrypted |
+| `FLEET_WEBAUTHN_RP_ID`, `FLEET_WEBAUTHN_ORIGIN`, `FLEET_WEBAUTHN_RP_NAME` | Passkey (WebAuthn) relying party |
+| `FLEET_PUBLIC_URL` | Public address, written into the generated `agent-registration.json` |
+| `FLEET_CERT_FINGERPRINT` | SHA-256 fingerprint of the server certificate (`sha256:<64 hex>`) that agents pin |
+
+Many further optional variables (alarm interval, retention periods, session
+and lockout behaviour, registration throttling, SMTP/webhook alerts,
+`FLEET_UI_PASSWORDLESS_NETWORKS`, ...) are described, derived from the source,
+in the
+[documentation chapter on running the service](https://magicalwig34653.github.io/thermoctl-fleet/docs.html#server).
+TLS cannot be switched off; usually a reverse proxy terminates it.
+
+</details>
+
+### Flash a base station
+
+Terminal UI (German interface; guides through image, disk, settings,
+confirmation, writing, read-back, and boot files):
+
+```bash
+python -m tools.flash_tui
+```
+
+Or the CLI. Show the eligible disks, do a dry run, then verify what was
+written:
+
+```bash
+python -m tools.flash_image list-disks
+python -m tools.flash_image flash \
+  --image thermoctl-base-station.img.xz --disk /dev/disk4 \
+  --fleet-address https://fleet.example.invalid \
+  --certificate-fingerprint sha256:<64 hex characters> \
+  --registration-code <registration code from the fleet UI> \
+  --dry-run
+python -m tools.flash_image verify --disk /dev/disk4 --image thermoctl-base-station.img.xz
+```
+
+Drop `--dry-run` to write for real. Optional: `--backup-recipient` (a public
+age recipient, repeatable), `--wifi-ssid` and `--wifi-password`,
+`--boot-mount-point`. The tool offers only external, physical disks and
+**erases the target**; disks over 256 GB additionally need `--allow-large-disk`.
+`--yes` skips the typed confirmation only together with
+`--i-know-this-erases-the-disk`.
+
+### Test enrollment without hardware (Mac)
+
+An Apple Silicon Mac, [Lima](https://lima-vm.io), and QEMU are enough to run
+the whole registration flow against a locally started fleet service. The VM
+uses a locally built agent image, so the real watchdog digest swap is **not**
+exercised.
+
+```bash
+brew install lima qemu
+tools/mac-test-vm create
+tools/mac-test-vm start
+tools/mac-test-vm enroll     # confirm the device in the UI, then:
+tools/mac-test-vm finish
+tools/mac-test-vm logs       # also: status, ssh, stop, delete --yes
+```
+
+## Security principles
+
+These six points are not up for renegotiation; see [`CLAUDE.md`](CLAUDE.md)
+and the specification.
+
+1. **The command list is closed.** A new `CommandType` extends what a
+   compromised fleet server could do to an apartment; stage 2 needs the
+   owner's explicit approval.
+2. **Image sources are hard-coded in the agent.** The cloud names version and
+   digest, never the source; no digest, no start.
+3. **No private keys in the cloud.** WireGuard and device keys are generated on
+   the base station; the cloud sees public keys only.
+4. **No tenant data in plain text in the cloud.** Operational backups are
+   encrypted on the device; the cloud never holds the key.
+5. **The agent is the security boundary.** Command checks live in `agent/` and
+   are enforced there, whatever the cloud says.
+6. **The watchdog knows no network and no registry,** and its `go.mod` stays
+   free of dependencies.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| [`fleet/`](fleet/) | Cloud service (FastAPI): heartbeats and events, SSE command output, web UI |
+| [`agent/`](agent/) | Agent on the base station: heartbeats, command execution, desired-state reconciliation, backup |
+| [`protocol/`](protocol/) | Shared Pydantic models, the contract between both sides |
+| [`watchdog/`](watchdog/) | Go module without dependencies; swaps the agent container; no Docker image |
+| [`image/`](image/) | Recipe for the prepared base-station images (Raspberry Pi OS, Debian 13) |
+| [`tools/`](tools/) | Dev server, flash tool, screenshots, image check, Mac test VM |
+| [`docker/`](docker/) | `Dockerfile.fleet`, `Dockerfile.agent`, example compose file |
+| [`site/`](site/) | GitHub Pages website, documentation, and click demo (plain HTML/CSS/JS) |
+| [`branding/`](branding/) | App icon (Icon Composer bundle) and renders |
+| [`docs/`](docs/) | [Specification](docs/specification.md) and [`STATUS.md`](docs/STATUS.md) |
+| [`tests/`](tests/) | Test suite, including contract tests across both sides |
+
+## Development
+
+```bash
+.venv/bin/python -m pytest
+.venv/bin/ruff check .
+.venv/bin/mypy protocol fleet agent tools
+(cd watchdog && go vet ./... && go test ./...)
+```
+
+Use `python -m pytest` rather than the `.venv/bin/pytest` console script: with
+an editable install on macOS the script does not reliably find the package.
+
+CI ([`ci.yml`](.github/workflows/ci.yml)) runs ruff, mypy, and pytest on
+Python 3.13 and 3.14 and builds both Docker images; the watchdog, image, and
+Pages workflows are separate.
+
+<details>
+<summary><b>PyCharm run configurations</b></summary>
+<br>
 
 Open the repository with the project interpreter and use the shared `.run/`
-configurations (grouped in PyCharm):
+configurations (grouped in PyCharm; names are German):
 
-- **Fleet:** `Fleet – Dev-Server (Demo-Daten)`, `Fleet – Dev-Server zurücksetzen`.
-  The launcher creates a private, gitignored `.dev/` database, demo login,
-  and TOTP key, then prints the login and serves the UI on localhost:8000.
-- **Tests:** `Tests – alle`, `Tests – schnell (ohne Coverage)`.
-- **Prüfungen:** `Ruff`, `Mypy`, `Image-Konfiguration prüfen`, `Watchdog – Go-Tests`.
-- **Werkzeuge:** `Flash-Tool (Terminal-Oberfläche)`, `Flash-Tool – Laufwerke anzeigen`,
-  `Website-Screenshots erzeugen`, `Website lokal ansehen`.
-- **Mac-Test-VM:** `Status`, `Erstellen`, `Starten`, `Registrieren`, `Logs`, `Stoppen`.
+- **Fleet:** dev server with demo data, reset the dev server.
+- **Tests:** all (with coverage), fast (without coverage).
+- **Checks:** Ruff, Mypy, image configuration check, watchdog Go tests.
+- **Tools:** flash tool (terminal UI), flash tool disk listing, website
+  screenshots, serve the website locally.
+- **Mac test VM:** status, create, start, enroll, logs, stop.
 
-The same local fleet starts outside PyCharm with `python -m tools.dev_fleet`.
-Use `--reset` to recreate it and `--no-reload` to disable source watching.
+</details>
 
-## Documentation website
+## Project status
 
-A German-language website and documentation for landlords/operators --
-landing page, an eight-chapter illustrated documentation (running the fleet
-service, adding the first apartment, daily operation, maintenance, the
-architecture, the security model, FAQ), and a static click demo with
-fictitious data -- lives under [`site/`](site/) (plain HTML/CSS/JS, no build
-step, no external fonts or CDNs) and is published via GitHub Pages at
-**<https://magicalwig34653.github.io/thermoctl-fleet/>**
-(deployed by [`.github/workflows/pages.yml`](.github/workflows/pages.yml) on
-every push to `main` that touches `site/**`). Its screenshots are the real UI
-captured against a throwaway, locally seeded demo fleet by
-[`tools/docs_screenshots.py`](tools/docs_screenshots.py) -- reproducible, no
-real apartment or tenant data -- and cropped to `site/assets/img/`.
+This is a scaffold under active development, not a finished product. The
+current state and every open point are tracked in
+[`docs/STATUS.md`](docs/STATUS.md). Known open points:
 
-The site's favicon is the fleet UI's own mark,
-[`fleet/static/ui/favicon.svg`](fleet/static/ui/favicon.svg) (a copy lives in
-`site/assets/icon/`, next to its PNG `apple-touch-icon`).
+- The flash tool has **not been tested on real hardware**; the Windows backend
+  in particular is untested, and the Linux path still needs a hardware test
+  with expendable media.
+- The amd64 image still needs an end-to-end boot test.
+- Container update execution is **disabled** for now.
+- Stage-2 commands (for example `service_restart`, `apply_update`,
+  `factory_reset`, `open_access`) are not available on the command channel and
+  need the owner's approval after a heating season of operational experience.
 
-The app icon lives at [`branding/thermoctl-fleet.icon`](branding/thermoctl-fleet.icon)
-(an Xcode Icon Composer bundle: the fleet UI's brand mark -- two mint glass
-buildings on forest green, one window lit in lime for the apartment that
-needs attention). The web UI and the site use the same mark as a flat SVG
-favicon (`fleet/static/ui/favicon.svg`).
-Rendered with Icon Composer's own `ictool` (`Default`/`Dark`/`ClearLight`
-renditions, `branding/renders/`):
+## Contributing
 
-<p>
-  <img src="branding/renders/thermoctl-fleet-icon-Default-1024.png" alt="App icon, Default rendition" width="128" height="128">
-  <img src="branding/renders/thermoctl-fleet-icon-Dark-1024.png" alt="App icon, Dark rendition" width="128" height="128">
-  <img src="branding/renders/thermoctl-fleet-icon-ClearLight-1024.png" alt="App icon, ClearLight rendition" width="128" height="128">
-</p>
+Please read [`CLAUDE.md`](CLAUDE.md) first, in particular the scope limits and
+the six security principles. Changes touching them need explicit approval from
+the project owner. Every endpoint and function gets a real test; `ruff`, `mypy`,
+and `pytest` must pass. Never commit secrets, apartment ids, or addresses.
 
 ## License
 
-`thermoctl-fleet`, like `thermoctl`, is licensed under the
-[GNU Affero General Public License, Version 3](LICENSE) (AGPL-3.0-only).
+Licensed under the [GNU Affero General Public License, version 3](LICENSE)
+(AGPL-3.0-only), like `thermoctl`.

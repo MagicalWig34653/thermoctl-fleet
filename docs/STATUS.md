@@ -3,6 +3,17 @@
 Last updated: 2026-10-06.
 
 
+## README rewritten (2026-10-06)
+
+`README.md` is now a consistently English, GitHub-style README: centered
+header (app icon with dark rendition, badges, links to website, documentation
+and demo), hero screenshot from `docs/ui-redesign/`, what it is / is not,
+features, mermaid architecture diagram, quick start (dev server, Docker,
+flash tool, Mac test VM), the six security principles, layout, development,
+honest open points, contributing, license. Every command and flag was checked
+against `tools/` and the docs chapters. No code changed; no test references
+the README.
+
 ## GitHub Pages website rebuilt from the owner's website draft (2026-10-06)
 
 `site/` was replaced by the owner's draft (`fleet-entwurf-website/`): landing
