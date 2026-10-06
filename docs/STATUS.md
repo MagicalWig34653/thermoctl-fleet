@@ -12281,3 +12281,12 @@ braucht). Drei Ebenen (`BuildingLow`, `BuildingTall`, `LitWindow`), Fenster
 als Aussparungen. Renderings `Default`/`Dark`/`ClearLight` neu mit `ictool`
 erzeugt (`branding/renders/`). Das frühere Thermometer-Icon liegt in der
 Git-Historie.
+
+## 2026-10-06: App-Icon auf Website und als Homescreen-Icon
+
+Die Website zeigt im Kopf (Landingpage, Doku) das mit Icon Composer
+gerenderte App-Icon (`site/assets/icon/app-icon-96.png`, 512er-Version
+daneben). `apple-touch-icon.png` ist auf Website und in der Fleet-Oberfläche
+(`/ui/static/apple-touch-icon.png`, in `base.html`/`login.html` verlinkt)
+der iOS-Export desselben Icons. Das Favicon im Browser-Tab bleibt das flache
+SVG-Zeichen, weil es in 16 px schärfer ist.
