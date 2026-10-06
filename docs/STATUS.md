@@ -12240,3 +12240,13 @@ Die Kern- und Backend-Module erreichen mit gemockten Geräten 100 % Zeilenabdeck
 Die Textual-Pilot-Tests sind vorhanden, konnten in dieser Sandbox aber nicht
 laufen: der Paketindex war für `pip install 'textual>=8.2.8,<9'` per DNS nicht
 erreichbar. Die TUI-Abdeckung ist deshalb hier noch nicht belegt.
+
+## 2026-10-06: App-Icon im Stil des neuen UI-Entwurfs
+
+Das Icon-Composer-Bundle `branding/thermoctl-fleet.icon` zeigt jetzt das
+Markenzeichen aus dem UI-Entwurf: zwei mintfarbene Glas-Gebäude auf
+Waldgrün, ein Fenster leuchtet limettengrün (die Wohnung, die Aufmerksamkeit
+braucht). Drei Ebenen (`BuildingLow`, `BuildingTall`, `LitWindow`), Fenster
+als Aussparungen. Renderings `Default`/`Dark`/`ClearLight` neu mit `ictool`
+erzeugt (`branding/renders/`). Das frühere Thermometer-Icon liegt in der
+Git-Historie.
