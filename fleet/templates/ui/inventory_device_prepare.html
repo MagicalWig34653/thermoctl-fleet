@@ -1,13 +1,18 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
 {% block title %}Gerät vorbereiten – thermoctl-fleet{% endblock %}
 
+{% block main_class %}{% endblock %}
+{% block crumb %}Einrichtung{% endblock %}
+
 {% block content %}
+<div class="page-heading"><div><div class="eyebrow">Neue Installation</div><h1>Basisstation vorbereiten</h1><p class="subtitle">Einmaligen Registrierungscode für die Inbetriebnahme erzeugen.</p></div></div>
 {# "Vorbereiten" (P4.2, section 20.2 step 2) -- generates a one-time
    registration code for one device. Already derived by
    fleet/ui_routes.py::device_prepare_form/device_prepare_submit; this
    template only iterates and prints. #}
-<h1>Gerät vorbereiten: {{ device.id }}</h1>
+<h2 class="subpage-title">Gerät vorbereiten: {{ device.id }}</h2>
 
 {% if error %}
 <p class="error" role="alert">{{ error }}</p>
@@ -15,7 +20,7 @@
 
 <p>Modell: {{ device.model }}, Zustand: {{ device.state }}</p>
 
-<form method="post" action="/ui/inventory/devices/{{ device.id | urlpath }}/prepare">
+<form class="ui-form panel" method="post" action="/ui/inventory/devices/{{ device.id | urlpath }}/prepare">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     {% if device.state == "in_storage" %}
     <label>
@@ -23,8 +28,8 @@
         Gerät wurde zurückgesetzt (Werkseinstellungen)
     </label>
     {% endif %}
-    <button type="submit">Registrierungscode erzeugen</button>
+    <button class="button primary" type="submit">Registrierungscode erzeugen</button>
 </form>
 
-<p><a href="/ui/inventory">Zurück zum Inventar</a></p>
+<p class="back"><a class="text-button" href="/ui/inventory">Zurück zum Inventar</a></p>
 {% endblock %}

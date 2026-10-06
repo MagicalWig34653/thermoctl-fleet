@@ -720,12 +720,22 @@ class PerDeviceDisplay:
     signal_quality: int | None
 
 
+# Human labels of the event severities (`protocol/events.py`); an unknown
+# value is shown as sent, never dropped.
+SEVERITY_LABELS: dict[str, str] = {
+    "stoerung": "Störung",
+    "warnung": "Warnung",
+    "info": "Hinweis",
+}
+
+
 @dataclass(frozen=True)
 class PastFaultDisplay:
     kind_label: str
     key: str
     severity: str
     received_text: str
+    severity_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -843,6 +853,9 @@ class ApartmentDetail:
     desired_state_history: list[DesiredStateDisplay]
     desired_state_outcome: DesiredStateOutcomeDisplay | None
     desired_state_active: bool
+    # Age of the newest stored heartbeat ("vor 3 Min."), `None` before the
+    # first one -- real data, shown as the draft's "Letzter Kontakt" row.
+    last_contact_text: str | None = None
 
 
 def _close_run(run_rows: list[HeartbeatHistoryEntry], now: datetime) -> tuple[TimelineEntry, float]:
@@ -1156,6 +1169,7 @@ def build_apartment_detail(
             key=event.schluessel,
             severity=event.schwere,
             received_text=f"vor {_relative_duration(now, event.received_at)}",
+            severity_label=SEVERITY_LABELS.get(event.schwere, event.schwere),
         )
         for event in storage.list_events_for_apartment(apartment_id, since)
     ]
@@ -1270,6 +1284,7 @@ def build_apartment_detail(
         desired_state_history=desired_state_history_displays,
         desired_state_outcome=desired_state_outcome_display,
         desired_state_active=False,
+        last_contact_text=f"vor {_relative_duration(now, latest.received_at)}",
     )
 
 

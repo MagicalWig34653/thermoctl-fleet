@@ -10,7 +10,7 @@ authenticated request to it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from fleet.storage import RolloutApartmentRecord, Storage
@@ -72,10 +72,36 @@ class RolloutListEntry:
     created_by: str
     total_apartments: int
     converged_apartments: int
+    apartments: list[RolloutListApartment] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RolloutListApartment:
+    apartment_id: str
+    label: str
+    status: str
+    progress_label: str
+    result_label: str
+
+
+def _list_apartment_display(
+    record: RolloutApartmentRecord, labels: dict[str, str]
+) -> RolloutListApartment:
+    result = "Erfolgreich" if record.status == "converged" else (
+        "Fehler" if record.status in ("failed", "timed_out") else "–"
+    )
+    return RolloutListApartment(
+        apartment_id=record.apartment_id,
+        label=labels.get(record.apartment_id, record.apartment_id),
+        status=record.status,
+        progress_label=_APARTMENT_STATUS_LABELS.get(record.status, record.status).capitalize(),
+        result_label=result,
+    )
 
 
 def build_rollout_list(storage: Storage) -> list[RolloutListEntry]:
     entries = []
+    labels = {apartment.id: apartment.label for apartment in storage.list_apartments()}
     for rollout in storage.list_rollouts():
         apartments = storage.rollout_apartments(rollout.id)
         entries.append(
@@ -90,6 +116,7 @@ def build_rollout_list(storage: Storage) -> list[RolloutListEntry]:
                 created_by=rollout.created_by,
                 total_apartments=len(apartments),
                 converged_apartments=sum(1 for a in apartments if a.status == "converged"),
+                apartments=[_list_apartment_display(a, labels) for a in apartments],
             )
         )
     return entries
@@ -174,6 +201,7 @@ __all__ = [
     "RolloutApartmentDisplay",
     "RolloutDetail",
     "RolloutListEntry",
+    "RolloutListApartment",
     "build_rollout_detail",
     "build_rollout_list",
 ]

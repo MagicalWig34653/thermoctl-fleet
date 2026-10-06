@@ -1,16 +1,21 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
 {% block title %}Gerät ausbauen/tauschen – thermoctl-fleet{% endblock %}
 
+{% block main_class %}{% endblock %}
+{% block crumb %}Einrichtung{% endblock %}
+
 {% block content %}
+<div class="page-heading"><div><div class="eyebrow">Verwaltung</div><h1>Basisstation austauschen.</h1><p class="subtitle">Ausbau bestätigen und ein Ersatzgerät vorbereiten.</p></div></div>
 {# "Gerät ausbauen / tauschen" (P4.3, section 20.2 device-swap steps 1-2) --
    closes the apartment's open assignment, sets the removed device's state,
    and revokes the apartment's agent token, all in one transaction
    (Storage.remove_device). A replacement device (if any) is only ever
    *linked* here to P4.2's "Vorbereiten" flow, never assigned directly --
    "no release without a confirmed verification code" (section 20.3). #}
-<p><a href="/ui/inventory">&larr; Zurück zum Inventar</a></p>
-<h1>Gerät ausbauen/tauschen: {{ view.apartment_id }}{% if view.apartment_label != view.apartment_id %} ({{ view.apartment_label }}){% endif %}</h1>
+<p class="back"><a class="text-button" href="/ui/inventory">&larr; Zurück zum Inventar</a></p>
+<h2 class="subpage-title">Gerät ausbauen/tauschen: {{ view.apartment_id }}{% if view.apartment_label != view.apartment_id %} ({{ view.apartment_label }}){% endif %}</h2>
 
 <p>Aktuelles Gerät: {{ view.current_device_id }} ({{ view.current_device_model }})</p>
 
@@ -18,7 +23,7 @@
 <p class="error" role="alert">{{ error }}</p>
 {% endif %}
 
-<form method="post" action="/ui/inventory/apartments/{{ view.apartment_id }}/replace-device">
+<form class="ui-form panel" method="post" action="/ui/inventory/apartments/{{ view.apartment_id }}/replace-device">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="expected_assignment_id" value="{{ view.current_assignment_id }}">
     <label for="target_state"><span class="field-label-text">Zielzustand des ausgebauten Geräts<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
@@ -31,10 +36,10 @@
     <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="reason" name="reason" required>
     </label>
-    <button type="submit" class="button--danger">Bestätigen: Gerät ausbauen</button>
+    <button class="button button--danger" type="submit">Bestätigen: Gerät ausbauen</button>
 </form>
 
-<section>
+<section class="panel inventory-replacement">
     <h2>Ersatzgerät vom Lager (optional)</h2>
     <p>Nur ein Verweis auf die Vorbereitung – die Zuweisung selbst erfolgt
         erst nach bestätigtem Verifizierungscode.</p>

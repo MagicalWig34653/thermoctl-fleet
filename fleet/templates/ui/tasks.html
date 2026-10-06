@@ -1,73 +1,44 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
+{% import "_cards.html" as cards %}
 
-{% block title %}Aufgaben – thermoctl-fleet{% endblock %}
+{% block title %}Aufgaben – thermoctl fleet{% endblock %}
+{% block main_class %}{% endblock %}
 
 {% block content %}
-{# "Aufgaben" (P3.4/P3.4a, section 9's third view) -- three task groups,
-   already filtered, sorted, and rendered into German text by
-   fleet/ui_tasks.py::build_task_overview. This template only iterates and
-   prints; it makes no filtering, sorting, or wording decisions of its own.
-   A row for a silent apartment (P3.4a, decision 2026-09-26) carries
-   task.stale (a CSS-only marker, .task-list__stale) plus a second line of
-   literal German hint text (task.stale_hint, e.g. "... Wohnung meldet sich
-   nicht") -- the hint is always text, never colour alone, so it still
-   reads correctly for someone who cannot see the CSS marker. #}
-<h1>Aufgaben</h1>
+{# "Aufgaben" -- the draft's task page: every inbox item as a card, plus the
+   "Gut zu wissen" side panel. The data is the same `OverviewData` the
+   Übersicht uses (fleet/ui_overview.py), so the numbers can never disagree
+   with the sidebar badge. Wording of each item (stale hints included) is
+   decided there, this template only prints. #}
+{% set counts = overview.kind_counts %}
+{% set connectivity = counts.get("alarm", 0) + counts.get("fault", 0) + counts.get("never_reported", 0) %}
+{% set batteries = counts.get("battery", 0) %}
+<div class="page-heading">
+    <div>
+        <div class="eyebrow">Betrieb</div>
+        <h1>Das steht an.</h1>
+        <p class="subtitle">
+            {% if overview.inbox %}{{ overview.inbox | length }} {{ "offene Aufgabe" if overview.inbox | length == 1 else "offene Aufgaben" }} in Ihrem Portfolio.{% else %}{{ cards.calm_text(overview.apartment_count) }}{% endif %}
+        </p>
+    </div>
+</div>
 
-<section class="task-group" aria-labelledby="task-group-battery">
-    <h2 id="task-group-battery">Batterierunde</h2>
-    {% if overview.battery_rounds %}
-    <ul class="task-list">
-        {% for task in overview.battery_rounds %}
-        <li{% if task.stale %} class="task-list__stale"{% endif %}>
-            <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
-            {{ task.battery_percent }}&nbsp;% (Stand {{ task.last_contact_text }})
-            {% if task.stale %}
-            <br><span class="task-list__stale-hint">{{ task.stale_hint }}</span>
-            {% endif %}
-        </li>
+<div class="split">
+    <section class="task-list" aria-label="Offene Aufgaben">
+        {% for item in overview.inbox %}
+        {{ cards.issue_card(item) }}
+        {% else %}
+        <p class="attention-empty">Nichts fällig.</p>
         {% endfor %}
-    </ul>
-    {% else %}
-    <p class="task-group__empty">Nichts fällig.</p>
-    {% endif %}
-</section>
-
-<section class="task-group" aria-labelledby="task-group-updates">
-    <h2 id="task-group-updates">Updates</h2>
-    {% if overview.updates %}
-    <ul class="task-list">
-        {% for task in overview.updates %}
-        <li{% if task.stale %} class="task-list__stale"{% endif %}>
-            <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
-            veraltete Protokollversion (Agent {{ task.agent_version }}, thermoctl {{ task.thermoctl_version }})
-            {% if task.stale %}
-            <br><span class="task-list__stale-hint">{{ task.stale_hint }}</span>
-            {% endif %}
-        </li>
-        {% endfor %}
-    </ul>
-    {% else %}
-    <p class="task-group__empty">Nichts fällig.</p>
-    {% endif %}
-</section>
-
-<section class="task-group" aria-labelledby="task-group-faults">
-    <h2 id="task-group-faults">Unbestätigte Störungen</h2>
-    {% if overview.unconfirmed_faults %}
-    <ul class="task-list">
-        {% for task in overview.unconfirmed_faults %}
-        <li{% if task.stale %} class="task-list__stale"{% endif %}>
-            <a href="{{ task.apartment_href }}">{{ task.apartment_id }}</a>:
-            {{ task.kind_label }} ({{ task.zone }}), {{ task.since_text }}
-            {% if task.stale %}
-            <br><span class="task-list__stale-hint">{{ task.stale_hint }}</span>
-            {% endif %}
-        </li>
-        {% endfor %}
-    </ul>
-    {% else %}
-    <p class="task-group__empty">Nichts fällig.</p>
-    {% endif %}
-</section>
+    </section>
+    <aside class="panel panel-aside" aria-labelledby="know-heading">
+        <div class="eyebrow mb-10">Gut zu wissen</div>
+        <h2 id="know-heading">Priorität hat Erreichbarkeit.</h2>
+        <p class="subtitle">Prüfen Sie zuerst die Basisstation ohne Kontakt. Eine ausbleibende Meldung sagt noch nichts über den lokalen Heizbetrieb aus.</p>
+        <div class="list-row"><span>Verbindung &amp; Störungen</span><span class="badge{% if connectivity %} error{% else %} gray{% endif %}">{{ connectivity }} offen</span></div>
+        <div class="list-row"><span>Batterien</span><span class="badge{% if batteries %} warn{% else %} gray{% endif %}">{% if batteries %}{{ batteries }} einplanen{% else %}nichts offen{% endif %}</span></div>
+        <div class="list-row"><span>Softwareverteilung</span><a class="text-button" href="{{ overview.rollout.href if overview.rollout else '/ui/rollouts' }}">{% if overview.rollout %}{{ "Wartet" if overview.rollout.waiting else "Läuft" }}{% else %}Keine laufende{% endif %} {{ icons.icon("arrow") }}</a></div>
+    </aside>
+</div>
 {% endblock %}

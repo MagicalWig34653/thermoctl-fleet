@@ -1,100 +1,79 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
 {% block title %}Einrichtung – thermoctl-fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Einrichtung{% endblock %}
 
 {% block content %}
 {# Inventory view model supplies the objects and devices for these three
    server-rendered sections. Forms and their submitted fields are unchanged. #}
-<h1>Einrichtung</h1>
+<div class="page-heading"><div><div class="eyebrow">Verwaltung</div><h1>Gut eingerichtet.</h1><p class="subtitle">Liegenschaften organisieren und Basisstationen in Betrieb nehmen.</p></div></div>
 
 {% if error %}
 <p class="error" role="alert">{{ error }}</p>
 {% endif %}
 
-<nav class="inventory-subnav" aria-label="Einrichtung: Bereiche">
+<nav class="inventory-subnav tabs" aria-label="Einrichtung: Bereiche">
     <a href="/ui/inventory?bereich=objekte" {% if bereich == "objekte" %}aria-current="page"{% endif %}>Objekte &amp; Wohnungen</a>
     <a href="/ui/inventory?bereich=basisstationen" {% if bereich == "basisstationen" %}aria-current="page"{% endif %}>Basisstationen</a>
-    <a href="/ui/inventory?bereich=vorbereiten" {% if bereich == "vorbereiten" %}aria-current="page"{% endif %}>Neue Basisstation vorbereiten</a>
+    <a href="/ui/inventory?bereich=vorbereiten" {% if bereich == "vorbereiten" %}aria-current="page"{% endif %}>Neue Installation</a>
 </nav>
 
 {% if bereich == "objekte" %}
-<section aria-labelledby="inventory-objects-heading">
-    <h2 id="inventory-objects-heading">Liegenschaften und Wohnungen</h2>
+<div class="inventory-overview split"><section class="panel" aria-labelledby="inventory-objects-heading">
+    <h2 id="inventory-objects-heading">Liegenschaften &amp; Wohnungen</h2>
     {% if view.property_groups %}
     {% for group in view.property_groups %}
-    <article class="inventory-property">
-        <h3>{{ group.name }}</h3>
-        <p>{{ group.address }}</p>
+    <details class="inventory-property">
+        <summary class="list-row"><span><strong>{{ group.name }}</strong><small>{{ group.address }} · {{ group.apartments | length }} Wohnungen</small></span><span class="text-button">Ansehen {{ icons.icon("arrow") }}</span></summary>
         {% if group.notes %}<p class="apartment-detail__note">{{ group.notes }}</p>{% endif %}
         {% if group.apartments %}
         <ul class="inventory-apartments">
             {% for apartment in group.apartments %}
-            <li>
-                <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
-                – {{ apartment.state_label }}{% if apartment.floor %}, {{ apartment.floor }}{% endif %}{% if apartment.orientation %}, {{ apartment.orientation }}{% endif %}, {{ apartment.heating_circuits }} Heizkreis{% if apartment.heating_circuits != 1 %}e{% endif %}
-                {% if apartment.pilot_mode %}<span class="apartment-tile__tag">Pilotbetrieb</span>{% endif %}
-                <br>
-                Gerät:
-                {% if apartment.current_device_id %}
-                {{ apartment.current_device_id }} ({{ apartment.current_device_model }})
-                {% else %}
-                keines zugewiesen
-                {% endif %}
-                &nbsp;<a href="{{ apartment.edit_href }}">Bearbeiten</a>
-                {% if apartment.replace_device_href %}
-                &nbsp;<a href="{{ apartment.replace_device_href }}">Gerät ausbauen/tauschen</a>
-                {% endif %}
-            </li>
+            <li class="inventory-apartment-row"><span class="inventory-apartment-info">
+                <a href="{{ apartment.href }}"><strong>{{ apartment.label or apartment.id }}</strong></a>
+                <small>{% if apartment.state_label != 'Bewohnt' %}{{ apartment.state_label }} · {% endif %}{% if apartment.floor %}{{ apartment.floor }} · {% endif %}{% if apartment.orientation %}{{ apartment.orientation }} · {% endif %}{{ apartment.heating_circuits }} Heizkreis{% if apartment.heating_circuits != 1 %}e{% endif %} · Basisstation: {{ apartment.current_device_id or 'keine' }}</small>
+                <code>{{ apartment.id }}</code>{% if apartment.pilot_mode %} <span class="apartment-tile__tag">Pilotbetrieb</span>{% endif %}
+            </span><span class="inventory-apartment-actions"><a href="{{ apartment.edit_href }}">Bearbeiten</a>{% if apartment.replace_device_href %}<a href="{{ apartment.replace_device_href }}">Gerät ausbauen/tauschen</a>{% endif %}</span></li>
             {% endfor %}
         </ul>
         {% else %}
         <p>Keine Wohnungen in dieser Liegenschaft.</p>
         {% endif %}
-    </article>
+    </details>
     {% endfor %}
     {% else %}
     <p>Keine Liegenschaften angelegt.</p>
     {% endif %}
 
     {% if view.unassigned_apartments %}
-    <article class="inventory-property">
-        <h3>Ohne Liegenschaft</h3>
+    <details class="inventory-property">
+        <summary class="list-row"><strong>Ohne Liegenschaft</strong><span class="text-button">Ansehen {{ icons.icon("arrow") }}</span></summary>
         <ul class="inventory-apartments">
             {% for apartment in view.unassigned_apartments %}
-            <li>
-                <a href="{{ apartment.href }}">{{ apartment.id }}{% if apartment.label and apartment.label != apartment.id %} ({{ apartment.label }}){% endif %}</a>
-                – {{ apartment.state_label }}
-                &nbsp;<a href="{{ apartment.edit_href }}">Bearbeiten</a>
-                {% if apartment.replace_device_href %}
-                &nbsp;<a href="{{ apartment.replace_device_href }}">Gerät ausbauen/tauschen</a>
-                {% endif %}
-            </li>
+            <li class="inventory-apartment-row"><span class="inventory-apartment-info"><a href="{{ apartment.href }}"><strong>{{ apartment.label or apartment.id }}</strong></a><small>{% if apartment.state_label != 'Bewohnt' %}{{ apartment.state_label }} · {% endif %}{{ apartment.heating_circuits }} Heizkreis{% if apartment.heating_circuits != 1 %}e{% endif %} · Basisstation: {{ apartment.current_device_id or 'keine' }}</small><code>{{ apartment.id }}</code></span><span class="inventory-apartment-actions"><a href="{{ apartment.edit_href }}">Bearbeiten</a>{% if apartment.replace_device_href %}<a href="{{ apartment.replace_device_href }}">Gerät ausbauen/tauschen</a>{% endif %}</span></li>
             {% endfor %}
         </ul>
-    </article>
+    </details>
     {% endif %}
-</section>
-
-<div class="inventory-form-grid">
-<article class="inventory-form-card">
-    <h2>Liegenschaft anlegen</h2>
-    <form method="post" action="/ui/inventory/properties">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <label for="property_name"><span class="field-label-text">Name<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-            <input type="text" id="property_name" name="name" required>
-        </label>
-        <label for="property_address"><span class="field-label-text">Adresse<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-            <input type="text" id="property_address" name="address" required>
-        </label>
-        <label for="property_notes"><span class="field-label-text">Notizen (keine Mieterdaten!)<span class="field-optional"> (optional)</span></span>
-            <input type="text" id="property_notes" name="notes">
-        </label>
-        <button type="submit">Anlegen</button>
-    </form>
-</article>
-<article class="inventory-form-card">
+    <div class="inventory-create-row">
+    <details class="inventory-create"><summary class="button">{{ icons.icon("plus") }} Liegenschaft anlegen</summary>
+        <div class="inventory-form-card">
+            <h2>Liegenschaft anlegen</h2>
+            <form class="ui-form" method="post" action="/ui/inventory/properties">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <label for="property_name"><span class="field-label-text">Name<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span><input type="text" id="property_name" name="name" required></label>
+                <label for="property_address"><span class="field-label-text">Adresse<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span><input type="text" id="property_address" name="address" required></label>
+                <label for="property_notes"><span class="field-label-text">Notizen (keine Mieterdaten!)<span class="field-optional"> (optional)</span></span><input type="text" id="property_notes" name="notes"></label>
+                <button class="button primary" type="submit">Anlegen</button>
+            </form>
+        </div>
+    </details>
+<details class="inventory-create inventory-create--apartment"><summary class="button">{{ icons.icon("plus") }} Wohnung anlegen</summary>
+<div class="inventory-form-card">
     <h2>Wohnung anlegen</h2>
-    <form method="post" action="/ui/inventory/apartments">
+    <form class="ui-form" method="post" action="/ui/inventory/apartments">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label for="apartment_id"><span class="field-label-text">Wohnungs-ID (dauerhaft, z. B. house7-a03)<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="apartment_id" name="id" pattern="[a-z0-9-]+" required>
@@ -118,30 +97,32 @@
         <label for="apartment_heating_circuits"><span class="field-label-text">Anzahl Heizkreise<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="apartment_heating_circuits" name="heating_circuits" inputmode="numeric" required>
         </label>
-        <button type="submit">Anlegen</button>
+        <button class="button primary" type="submit">Anlegen</button>
     </form>
-</article>
 </div>
+</details>
+    </div>
+</section><aside class="panel panel-aside"><div class="eyebrow mb-12">Neue Installation</div><h2>Eine Wohnung anschließen.</h2><p class="subtitle">Wohnung zuordnen, Basisstation vorbereiten und die erste Verbindung bestätigen.</p><a class="button primary mt-23" href="/ui/inventory?bereich=vorbereiten">Einrichtung starten {{ icons.icon("arrow") }}</a></aside></div>
+
 {% elif bereich == "basisstationen" %}
-<section aria-labelledby="inventory-devices-heading">
-    <h2 id="inventory-devices-heading">Geräte nicht im Einsatz</h2>
-    <nav aria-label="Filter">
+<section class="panel inventory-device-panel" aria-labelledby="inventory-devices-heading">
+    <div class="section-head"><h2 id="inventory-devices-heading">Basisstationen im Lager</h2><a class="button primary" href="#device-register-form">Gerät registrieren {{ icons.icon("plus") }}</a></div>
+    <nav class="inventory-filters" aria-label="Filter">
         <a href="/ui/inventory?bereich=basisstationen">Alle</a>
         <a href="/ui/inventory?bereich=basisstationen&amp;filter=in_storage">Im Lager</a>
         <a href="/ui/inventory?bereich=basisstationen&amp;filter=faulty">Defekt</a>
     </nav>
-    <p><a href="/ui/inventory/devices/confirm">Geräteregistrierungen bestätigen</a></p>
+    <p><a class="text-button" href="/ui/inventory/devices/confirm">Geräteregistrierungen bestätigen {{ icons.icon("arrow") }}</a></p>
     {% if view.devices_not_in_service %}
     <ul class="inventory-devices">
         {% for device in view.devices_not_in_service %}
-        <li>{{ device.id }} ({{ device.model }}) – {{ device.state_label }}, seit {{ device.acquisition_date }},
-            Image {{ device.image_version }}, Watchdog {{ device.watchdog_version }}
+        <li class="inventory-device-row"><div class="list-row"><span><strong>{{ device.id }}</strong><small>{{ device.model }} · seit {{ device.acquisition_date }} · Image {{ device.image_version }} · Watchdog {{ device.watchdog_version }}</small></span><span class="badge {{ 'error' if device.state_label == 'Defekt' else 'gray' }}">{{ device.state_label }}</span>
             {% if device.prepare_href %}
-            &nbsp;<a href="{{ device.prepare_href }}">Vorbereiten</a>
+            <a class="text-button" href="{{ device.prepare_href }}">Vorbereiten {{ icons.icon("arrow") }}</a>
             {% endif %}
-            {% if device.allowed_target_states %}
+            </div>{% if device.allowed_target_states %}
             <h3>Gerätezustand ändern</h3>
-            <form method="post" action="{{ device.state_action_href }}">
+            <form class="ui-form" method="post" action="{{ device.state_action_href }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <label><span class="field-label-text">Neuer Zustand<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
                     <select name="target_state" required>
@@ -153,7 +134,7 @@
                 <label><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
                     <input type="text" name="reason" required>
                 </label>
-                <button type="submit">Zustand ändern</button>
+                <button class="button primary" type="submit">Zustand ändern</button>
             </form>
             {% endif %}
         </li>
@@ -163,9 +144,9 @@
     <p>Keine Geräte in dieser Ansicht.</p>
     {% endif %}
 </section>
-<article class="inventory-form-card" id="device-register-form">
+<article class="inventory-form-card panel" id="device-register-form">
     <h2>Gerät registrieren</h2>
-    <form method="post" action="/ui/inventory/devices">
+    <form class="ui-form" method="post" action="/ui/inventory/devices">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label for="device_id"><span class="field-label-text">Seriennummer / Hardware-ID<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="device_id" name="id" required>
@@ -182,12 +163,12 @@
         <label for="device_watchdog_version"><span class="field-label-text">Watchdog-Version<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
             <input type="text" id="device_watchdog_version" name="watchdog_version" required>
         </label>
-        <button type="submit">Registrieren</button>
+        <button class="button primary" type="submit">Registrieren</button>
     </form>
 </article>
 {% else %}
-<section class="setup-flow" aria-labelledby="setup-flow-heading">
-    <h2 id="setup-flow-heading">Neue Basisstation vorbereiten</h2>
+<section class="setup-flow panel max-760" aria-labelledby="setup-flow-heading">
+    <h2 id="setup-flow-heading">Schritt für Schritt zur neuen Basisstation</h2>
     {# A guided step flow – numbered steps are justified here (brief:
        "numbered markers ... are a sequence"), unlike anywhere else in
        this application, because preparing a device genuinely *is* one:
@@ -197,25 +178,11 @@
        (fleet/ui_routes.py's P4.2/P4.2b/P4.3 routes) – nothing new is
        built here, only the order these forms already have to happen in
        is made explicit. #}
-    <ol class="setup-flow__steps">
-        <li>
-            <strong>Gerät registrieren</strong> – Seriennummer, Modell und
-            Versionen eintragen (<a href="/ui/inventory?bereich=basisstationen#device-register-form">Gerät registrieren</a>).
-        </li>
-        <li>
-            <strong>Vorbereiten</strong> – beim registrierten Gerät unter
-            "Geräte nicht im Einsatz" auf "Vorbereiten" klicken; der
-            einmalige Registrierungscode wird dort genau einmal angezeigt.
-        </li>
-        <li>
-            <strong>Ausliefern</strong> – Basisstation mit diesem Code vor
-            Ort in Betrieb nehmen; sie meldet sich danach selbst.
-        </li>
-        <li>
-            <strong>Bestätigen</strong> – unter
-            <a href="/ui/inventory/devices/confirm">"Geräteregistrierungen bestätigen"</a>
-            den Bestätigungscode prüfen und der Wohnung zuordnen.
-        </li>
+    <ol class="setup-flow__steps steps">
+        <li class="step"><div><h3>Wohnung auswählen</h3><p>Liegenschaft und Wohnung zuordnen oder eine neue Wohnung anlegen.</p><a class="button" href="/ui/inventory?bereich=objekte">Wohnung zuordnen</a></div></li>
+        <li class="step"><div><h3>Basisstation vorbereiten</h3><p>Gerät registrieren, aus dem Lager auswählen und den einmaligen Registrierungscode erzeugen.</p><a class="button" href="/ui/inventory?bereich=basisstationen#device-register-form">Gerät registrieren</a></div></li>
+        <li class="step"><div><h3>Vor Ort verbinden</h3><p>Basisstation mit Strom und Internet verbinden. Die Anmeldung erscheint anschließend zur Bestätigung.</p></div></li>
+        <li class="step"><div><h3>Registrierung bestätigen</h3><p>Gerätedaten und Bestätigungscode prüfen und die Zuordnung freigeben.</p><a class="button" href="/ui/inventory/devices/confirm">Registrierungen prüfen</a></div></li>
     </ol>
 </section>
 {% endif %}

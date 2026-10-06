@@ -401,9 +401,8 @@ def test_acknowledged_fault_no_longer_appears_on_tasks_view(
     _login(client, password, totp_secret)
     csrf_token = _csrf_from_apartment_page(client, APARTMENT)
 
-    # UI-redesign stage 2: "Aufgaben" no longer has its own page -- its
-    # groups (including unconfirmed faults) are now part of the
-    # "Übersicht" action inbox (`/ui/tasks` 303-redirects there).
+    # "Aufgaben" (`/ui/tasks`) lists the same action-inbox items the
+    # Übersicht shows the first three of, unconfirmed faults included.
     before = client.get("/ui/tasks")
     assert APARTMENT in before.text
 
@@ -418,5 +417,5 @@ def test_acknowledged_fault_no_longer_appears_on_tasks_view(
     )
 
     after = client.get("/ui/tasks")
-    assert "Alles in Ordnung." in after.text
-    assert APARTMENT not in after.text.split('<section class="site-map"')[0]
+    assert "Nichts fällig." in after.text
+    assert APARTMENT not in after.text

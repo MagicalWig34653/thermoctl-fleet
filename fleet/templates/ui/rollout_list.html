@@ -1,47 +1,35 @@
 {% extends "base.html" %}
+{% import "_icons.html" as icons %}
 
 {% block title %}Updates – thermoctl-fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Updates{% endblock %}
 
 {% block content %}
-<h1>Updates</h1>
-
-<p class="error" role="alert">
-    Update-Ausführung ist derzeit abgeschaltet (fail-closed Vorprüfung des Agenten, Pilotbetrieb
-    des jeweiligen Geräts erforderlich) – ein Rollout stoppt daher bei der Testwohnung, bis
-    thermoctl eine Gesundheits-/Außentemperatur-API liefert.
-</p>
-
-<p><a href="/ui/rollouts/new">Neuer Rollout</a></p>
-
+<div class="page-heading"><div><div class="eyebrow">Software</div><h1>Updates mit Überblick.</h1><p class="subtitle">Software kontrolliert und schrittweise verteilen.</p></div><a class="button primary" href="/ui/rollouts/new">{{ icons.icon("plus") }} Neuer Rollout</a></div>
+<div class="notice notice--amber" role="status">{{ icons.icon("shield") }}<div><strong>Update-Ausführung derzeit abgeschaltet.</strong><p>Die geräteseitige Vorprüfung stoppt einen Rollout bei der Testwohnung, bis die benötigte Gesundheits- und Außentemperatur-API verfügbar ist. Pilotbetrieb des Geräts ist erforderlich.</p></div></div>
 {% if entries %}
-<table>
-    <thead>
-        <tr>
-            <th>Dienst</th>
-            <th>Version</th>
-            <th>Status</th>
-            <th>Wohnungen</th>
-            <th>Erstellt</th>
-            <th>Von</th>
-        </tr>
-    </thead>
-    <tbody>
-        {% for entry in entries %}
-        <tr>
-            <td><a href="/ui/rollouts/{{ entry.rollout_id | urlpath }}">{{ entry.service_label }}</a></td>
-            <td>{{ entry.version }}</td>
-            <td>
-                {{ entry.state_label }}
-                {% if entry.stopped_reason %}<br><small>{{ entry.stopped_reason }}</small>{% endif %}
-            </td>
-            <td>{{ entry.converged_apartments }} / {{ entry.total_apartments }}</td>
-            <td>{{ entry.created_text }}</td>
-            <td>{{ entry.created_by }}</td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
+{% for entry in entries %}
+<article class="panel rollout-card">
+    <div class="section-head"><span class="badge {{ 'warn' if entry.state == 'stopped' else 'gray' if entry.state == 'cancelled' else '' }}">{% if entry.state == 'running' %}● Rollout läuft{% else %}{{ entry.state_label | capitalize }}{% endif %}</span><span class="tiny muted">Erstellt {{ entry.created_text }}</span></div>
+    <div class="rollout-block"><div><h2><a href="/ui/rollouts/{{ entry.rollout_id | urlpath }}">{{ entry.service_label }} {{ entry.version }}</a></h2><p class="subtitle">{{ entry.total_apartments }} Wohnungen · erstellt von {{ entry.created_by }}</p></div><div class="rollout-metric"><div class="rollout-number">{{ entry.converged_apartments }}<small> / {{ entry.total_apartments }} aktualisiert</small></div><progress class="update-progress" value="{{ entry.converged_apartments }}" max="{{ entry.total_apartments if entry.total_apartments else 1 }}">{{ entry.converged_apartments }} von {{ entry.total_apartments }}</progress></div></div>
+    <div class="list-row"><span class="muted">{% if entry.stopped_reason %}{{ entry.stopped_reason }}{% else %}{{ entry.converged_apartments }} erfolgreich · {{ entry.total_apartments - entry.converged_apartments }} ausstehend{% endif %}</span><a class="text-button" href="/ui/rollouts/{{ entry.rollout_id | urlpath }}">Rollout ansehen {{ icons.icon("arrow") }}</a></div>
+</article>
+{% if entry.state in ('running', 'stopped') and entry.apartments %}
+<section class="rollout-list-apartments" aria-label="Wohnungen im Rollout {{ entry.service_label }} {{ entry.version }}">
+<h2 class="rollout-table-title">Wohnungen im Rollout</h2><div class="table-wrap"><table>
+    <thead><tr><th>Wohnung</th><th>Version</th><th>Fortschritt</th><th>Ergebnis</th></tr></thead>
+    <tbody>{% for apartment in entry.apartments %}<tr>
+        <td><a href="/ui/apartments/{{ apartment.apartment_id | urlpath }}"><strong>{{ apartment.label }}</strong></a><small>{{ apartment.apartment_id }}</small></td>
+        <td class="muted-cell" data-label="Version">{{ entry.version }}</td>
+        <td class="status-cell" data-label="Fortschritt">{{ apartment.progress_label }}</td>
+        <td data-label="Ergebnis"><span class="badge {{ 'error' if apartment.status in ('failed', 'timed_out') else 'gray' if apartment.result_label == '–' else '' }}">{{ apartment.result_label }}</span></td>
+    </tr>{% endfor %}</tbody>
+</table></div><p class="privacy">{{ icons.icon("shield") }} Bei einem Fehler wird die Verteilung angehalten, bevor weitere Wohnungen folgen.</p>
+</section>
+{% endif %}
+{% endfor %}
 {% else %}
-<p>Noch keine Rollouts angelegt.</p>
+<section class="panel"><h2>Noch keine Rollouts angelegt.</h2><p class="subtitle">Wählen Sie einen Dienst und die Wohnungen für die Softwareverteilung aus.</p></section>
 {% endif %}
 {% endblock %}

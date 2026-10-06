@@ -63,6 +63,33 @@ FAULT_KIND_LABELS: dict[FaultKind, str] = {
 }
 
 
+def place_name(tile: ApartmentTile) -> str:
+    """The human name of an apartment for cards and feeds: `"Property ·
+    Label"` when both exist (the draft's "Lindenstraße 12 · Wohnung 03"),
+    else the label, else the technical id as the last resort."""
+
+    return place_text(tile.property_name, tile.label, tile.apartment_id)
+
+
+def place_text(property_name: str | None, label: str | None, apartment_id: str) -> str:
+    """`place_name` for callers that have the three parts but no tile (the
+    apartment page): `"Property · Label"`, else the label, else the id."""
+
+    name = label or apartment_id
+    return f"{property_name} · {name}" if property_name and label else name
+
+
+def status_tone(status: str) -> str:
+    """The draft's visual tone of a tile status: `""` (fine), `"warn"`
+    (amber -- only an outdated version) or `"error"` (red -- every other
+    kind of trouble). Shared by the Übersicht's building windows and the
+    Wohnungen list's status pills."""
+
+    if status == "ok":
+        return ""
+    return "warn" if status == "outdated" else "error"
+
+
 @dataclass(frozen=True)
 class FaultDisplay:
     kind_label: str
@@ -424,4 +451,6 @@ __all__ = [
     "PropertyGroup",
     "build_house_overview",
     "group_tiles_by_property",
+    "place_name",
+    "status_tone",
 ]

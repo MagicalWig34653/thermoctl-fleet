@@ -1,48 +1,150 @@
-{% extends "base.html" %}
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Anmelden · thermoctl fleet</title>
+    {#
+    Login and second factor in ONE form, posted once to POST /ui/login with
+    exactly the fields the server already reads (username, password,
+    totp_code, pre_csrf, webauthn_assertion, webauthn_challenge_id) -- the
+    server-side auth flow (fleet/ui_auth.py, CSRF, passkeys, the passwordless
+    variant) is untouched. The draft's two screens ("1 Anmelden", "2
+    Bestätigen") are two panes of that form: auth.js flips `data-step` on
+    #auth-flow client-side and never inspects the password (no oracle: the
+    server alone decides, after step 2, with one generic failure message).
+    Without JavaScript every field is visible and one "Anmelden" button
+    submits the form.
 
-{% block title %}Anmeldung – thermoctl-fleet{% endblock %}
+    CSP: external stylesheet/script only, no inline style or handler.
+    #}
+    <link rel="icon" type="image/svg+xml" href="/ui/static/favicon.svg">
+    <link rel="stylesheet" href="/ui/static/auth.css">
+    <script src="/ui/static/auth.js"></script>
+</head>
+<body>
+{% import "_icons.html" as icons %}
+<a class="skip" href="#main">Zum Inhalt springen</a>
+<div class="auth-shell">
+    <aside class="story">
+        <a class="brand" href="/ui/" aria-label="thermoctl fleet">
+            <span class="brand-mark">{{ icons.icon("brand") }}</span>
+            <span class="brand-name">thermoctl<small>FLEET</small></span>
+        </a>
+        <div class="story-copy">
+            <div class="eyebrow">Für alles, was zu Ihren Häusern gehört.</div>
+            <h2>Ihre Liegenschaften.<br>Ein gutes Gefühl.<br><em>Ein klarer Überblick.</em></h2>
+            <p>Damit Sie wissen, wo alles läuft.<br>Und wo es gerade Ihre Aufmerksamkeit braucht.</p>
+        </div>
+        {% include "_auth_illustration.html" %}
+        <div class="story-bottom">
+            {{ icons.icon("shield") }}
+            <span><strong>Einblicke, die Privatsphäre respektieren.</strong>Temperaturen und Mieterdaten bleiben in der Wohnung.</span>
+        </div>
+    </aside>
+    <section class="auth-side">
+        <header class="auth-top">
+            <div class="mobile-brand">
+                <a class="brand" href="/ui/" aria-label="thermoctl fleet">
+                    <span class="brand-mark">{{ icons.icon("brand") }}</span>
+                    <span class="brand-name">thermoctl<small>FLEET</small></span>
+                </a>
+            </div>
+        </header>
+        <main id="main" class="auth-content">
+            <div class="auth-flow" id="auth-flow" data-step="1">
+                <div class="steps js-only" aria-label="Anmeldung" id="auth-steps">
+                    <span class="step active" id="step-1" aria-current="step"><span class="step-number">1</span>Anmelden</span>
+                    <span class="step-line"></span>
+                    <span class="step" id="step-2"><span class="step-number">2</span>Bestätigen</span>
+                </div>
 
-{% block content %}
-<h1>Anmeldung</h1>
-{% if error %}
-<p class="error" role="alert">{{ error }}</p>
-{% endif %}
-<form method="post" action="/ui/login" id="login-form">
-    <input type="hidden" name="pre_csrf" value="{{ pre_csrf }}">
-    <input type="hidden" name="webauthn_assertion" id="webauthn-assertion" value="">
-    <input type="hidden" name="webauthn_challenge_id" id="webauthn-challenge-id" value="">
-    <label for="username"><span class="field-label-text">Benutzername<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-        <input type="text" id="username" name="username" autocomplete="username" required autofocus>
-    </label>
-    {% if passwordless_available %}
-    {# Owner decision 2026-10-03: from a network listed in
-       FLEET_UI_PASSWORDLESS_NETWORKS a passkey alone suffices -- the
-       password field stays for the TOTP path, but is no longer required. #}
-    <p class="hint" id="passwordless-hint">Du bist in einem bekannten Netz: Mit Passkey brauchst du kein Passwort und keinen Bestätigungscode – Benutzername eingeben und „Mit Passkey anmelden“ wählen.</p>
-    <label for="password"><span class="field-label-text">Passwort (nur ohne Passkey nötig)<span class="field-optional"> (optional)</span></span>
-        <input type="password" id="password" name="password" autocomplete="current-password">
-    </label>
-    {% else %}
-    <label for="password"><span class="field-label-text">Passwort<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
-        <input type="password" id="password" name="password" autocomplete="current-password" required>
-    </label>
-    {% endif %}
-    <label for="totp_code"><span class="field-label-text">Bestätigungscode (Authenticator-App)<span class="field-optional"> (optional)</span></span>
-        <input type="text" id="totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code">
-    </label>
-    <button type="submit">Anmelden</button>
-    {% if webauthn_enabled %}
-    {# P6.2: a passkey is an alternative to the TOTP code above, not an
-       extra field -- `webauthn.js` fills the two hidden fields above and
-       submits this same form, leaving `totp_code` empty. #}
-    <button type="button" id="webauthn-login-button">Mit Passkey anmelden</button>
-    <p id="webauthn-error" class="error" role="alert"></p>
-    {% endif %}
-</form>
-{% endblock %}
+                <span class="factor-icon js-only" data-step-only="2">{{ icons.icon("phone") }}</span>
+                <h1 data-step-only="1">Willkommen zurück.</h1>
+                <h1 class="js-only" data-step-only="2">Noch ein sicherer Schritt.</h1>
+                <p class="intro" data-step-only="1">Melden Sie sich an, um Ihre Liegenschaften<br>im Blick zu behalten.</p>
+                <p class="intro js-only" data-step-only="2">Öffnen Sie Ihre Authenticator-App und geben Sie<br>den sechsstelligen Bestätigungscode ein.</p>
 
-{% block scripts %}
+                <form method="post" action="/ui/login" id="login-form" class="auth-form">
+                    <input type="hidden" name="pre_csrf" value="{{ pre_csrf }}">
+                    <input type="hidden" name="webauthn_assertion" id="webauthn-assertion" value="">
+                    <input type="hidden" name="webauthn_challenge_id" id="webauthn-challenge-id" value="">
+
+                    {% if error %}
+                    <p class="error" role="alert" data-step-only="1">{{ error }}</p>
+                    {% endif %}
+
+                    <div class="step-pane" data-pane="1">
+                        <label class="field" for="username">
+                            <span class="field-label">Benutzername</span>
+                            <div class="input-wrap">
+                                {{ icons.icon("user") }}
+                                <input id="username" name="username" type="text" autocomplete="username" required autofocus spellcheck="false" autocapitalize="none">
+                            </div>
+                        </label>
+                        {% if passwordless_available %}
+                        {# Owner decision 2026-10-03: from a network listed in
+                           FLEET_UI_PASSWORDLESS_NETWORKS a passkey alone suffices --
+                           the password stays available for the code path, but is
+                           no longer required. #}
+                        <p class="field-note" id="passwordless-hint">Sie sind in einem bekannten Netz: Mit Passkey brauchen Sie weder Passwort noch Bestätigungscode. Benutzername eingeben und „Mit Passkey anmelden“ wählen.</p>
+                        {% endif %}
+                        <label class="field" for="password">
+                            <span class="field-label">Passwort{% if passwordless_available %} <span class="field-optional">(nur ohne Passkey nötig)</span>{% endif %}</span>
+                            <div class="input-wrap">
+                                {{ icons.icon("lock") }}
+                                <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Ihr Passwort" {% if not passwordless_available %}required{% endif %}>
+                                <button class="reveal js-only" type="button" id="reveal" aria-label="Passwort anzeigen" aria-pressed="false">{{ icons.icon("eye") }}</button>
+                            </div>
+                        </label>
+                    </div>
+
+                    <div class="step-pane" data-pane="2">
+                        <label class="code-label" for="totp_code">Bestätigungscode <span class="code-input-optional">(Authenticator-App{% if passwordless_available %}, mit Passkey nicht nötig{% endif %})</span></label>
+                        <div class="code-area" id="code-area">
+                            <input id="totp_code" name="totp_code" type="text" inputmode="numeric" autocomplete="one-time-code" aria-describedby="code-help" aria-label="Sechsstelliger Bestätigungscode" spellcheck="false">
+                            <div class="code-boxes" aria-hidden="true">
+                                <span class="code-box"></span><span class="code-box"></span><span class="code-box"></span><span class="code-box"></span><span class="code-box"></span><span class="code-box"></span>
+                            </div>
+                        </div>
+                        <p class="code-help" id="code-help" role="status" aria-live="polite">Nach der sechsten Ziffer wird der Code automatisch geprüft. Einfügen ist auch möglich.</p>
+                    </div>
+
+                    <button class="button primary has-arrow no-js-only" type="submit" id="login-submit-plain">
+                        <span>Anmelden</span>{{ icons.icon("arrow") }}
+                    </button>
+                    <button class="button primary has-arrow js-only" type="button" id="step-next" data-step-only="1">
+                        <span>Weiter zur Bestätigung</span>{{ icons.icon("arrow") }}
+                    </button>
+                    <button class="button primary has-arrow js-only" type="submit" id="login-submit" data-step-only="2">
+                        <span>Bestätigen &amp; anmelden</span>{{ icons.icon("arrow") }}
+                    </button>
+
+                    {% if webauthn_enabled %}
+                    {# P6.2: a passkey is an alternative to the password + code, not an
+                       extra field -- `webauthn.js` fills the two hidden fields above
+                       and submits this same form, leaving `totp_code` empty. One
+                       button for both steps (webauthn.js addresses it by id). #}
+                    <div class="separator"><span data-step-only="1">oder ohne Passwort</span><span class="js-only" data-step-only="2">oder anders bestätigen</span></div>
+                    <button class="button" type="button" id="webauthn-login-button">
+                        {{ icons.icon("key") }}<span data-step-only="1">Mit Passkey anmelden</span><span class="js-only" data-step-only="2">Mit Passkey bestätigen</span>
+                    </button>
+                    <p class="passkey-hint"><span data-step-only="1">Touch ID, Face ID oder Sicherheitsschlüssel</span><span class="js-only" data-step-only="2">Mit einem bereits eingerichteten Passkey fortfahren.</span></p>
+                    <p id="webauthn-error" class="error" role="alert"></p>
+                    {% endif %}
+
+                    <button class="back-link js-only" type="button" id="step-back" data-step-only="2">{{ icons.icon("back") }}Zurück zur Anmeldung</button>
+                </form>
+            </div>
+        </main>
+        <footer class="auth-footer">
+            <span>thermoctl fleet · Mit Ruhe verwalten.</span>
+            <span class="footer-lock">{{ icons.icon("lock") }}Geschützter Zugang</span>
+        </footer>
+    </section>
+</div>
 {% if webauthn_enabled %}
 <script src="/ui/static/webauthn.js"></script>
 {% endif %}
-{% endblock %}
+</body>
+</html>

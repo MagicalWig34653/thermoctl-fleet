@@ -1,0 +1,12 @@
+{#
+Shared pieces of the confirmation pages (command, desired state, tenant
+change): the apartment reference line and the required-field marker. Kept as
+macros so the pages cannot drift apart in wording or markup.
+#}
+{% macro apartment_ref(apartment_id, apartment_label) -%}
+<strong>{{ apartment_label or apartment_id }}</strong>{% if apartment_label and apartment_label != apartment_id %} <span class="id-text">({{ apartment_id }})</span>{% endif %}
+{%- endmacro %}
+
+{% macro required() -%}
+<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span>
+{%- endmacro %}

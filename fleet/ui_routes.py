@@ -72,7 +72,7 @@ from fleet.ui_auth import (
     webauthn_begin_throttle_threshold,
 )
 from fleet.ui_format import format_local_datetime
-from fleet.ui_house import build_house_overview
+from fleet.ui_house import build_house_overview, place_text, status_tone
 from fleet.ui_inventory import (
     APARTMENT_ID_PATTERN,
     APARTMENT_STATE_LABELS,
@@ -91,6 +91,7 @@ from fleet.ui_inventory import (
     build_inventory_view,
     build_replace_device_view,
 )
+from fleet.ui_nav import nav_context, remember_overview
 from fleet.ui_overview import build_overview
 from fleet.ui_rollout import (
     ROLLOUT_SERVICE_LABELS,
@@ -108,7 +109,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ui")
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates" / "ui"
-templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+# `nav_context` (fleet.ui_nav) provides the lazy `nav_counts()` the base
+# template's sidebar badges read -- on every page, without each route passing it.
+templates = Jinja2Templates(directory=str(_TEMPLATES_DIR), context_processors=[nav_context])
 # P3.2 review of P3.1's tile link: `urllib.parse.quote(value, safe="")`
 # as a Jinja filter, not Jinja's own built-in `urlencode` (which leaves "/"
 # unescaped -- fine for a query string, wrong for a path *segment* that may
@@ -599,22 +602,63 @@ def webauthn_delete_credential(
 @router.get("/", response_class=HTMLResponse)
 def index(
     request: Request,
+    ansicht: str = "",
     authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
-    """"Übersicht" (UI-redesign stage 2, information-architecture area 1)
-    -- the new start page, replacing the separate "Das Haus" (P3.1) and
-    "Aufgaben" (P3.4) views (see `fleet.ui_overview`'s own docstring for
-    the full reasoning). One sentence ("Alles in Ordnung" / "N Wohnungen
-    brauchen Sie jetzt"), the action inbox, then the unchanged
-    building/site-map visual. All derivation/German rendering happens in
-    `fleet.ui_overview.build_overview`; this route only wires the
-    authenticated request to it and renders the template."""
+    """"Übersicht" (UI rebuild, phase 1: the owner's design draft) -- the
+    start page: four portfolio metrics, the "Hier braucht es Sie" cards, one
+    building card per property (a window per apartment), the "Zuletzt
+    passiert" feed and, only while one is in flight, the rollout card. All
+    derivation/German rendering happens in `fleet.ui_overview.build_overview`
+    (and `fleet.ui_portfolio`); this route only wires the authenticated
+    request to it and renders the template.
 
-    overview = build_overview(storage, datetime.now(UTC))
+    `?ansicht=liste` switches the building cards to the flat apartment table
+    (the draft's "Gebäude | Liste" toggle, as plain links -- no JavaScript);
+    any other value is the building view."""
+
+    now = datetime.now(UTC)
+    overview = build_overview(storage, now)
+    remember_overview(request, overview, now)
+    list_view = (
+        build_apartments_list_view(overview.tiles, query="", property_filter="", state_filter="")
+        if ansicht == "liste"
+        else None
+    )
     response = templates.TemplateResponse(
         request,
         "index.html",
+        {
+            "ui_session": authenticated,
+            "csrf_token": authenticated.session.csrf_token,
+            "overview": overview,
+            "list_view": list_view,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/tasks", response_class=HTMLResponse)
+def tasks_page(
+    request: Request,
+    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+) -> HTMLResponse:
+    """"Aufgaben" -- the full action inbox (the same items "Hier braucht es
+    Sie" on the Übersicht shows the first three of), in the draft's task-list
+    style. Still behind `require_ui_user` like every `/ui` page. The data
+    comes from the same `fleet.ui_overview.build_overview` as the Übersicht,
+    so the sidebar badge, the Übersicht card counter and this page can never
+    disagree."""
+
+    now = datetime.now(UTC)
+    overview = build_overview(storage, now)
+    remember_overview(request, overview, now)
+    response = templates.TemplateResponse(
+        request,
+        "tasks.html",
         {
             "ui_session": authenticated,
             "csrf_token": authenticated.session.csrf_token,
@@ -623,29 +667,6 @@ def index(
     )
     response.headers["Cache-Control"] = "no-store"
     return response
-
-
-@router.get("/tasks")
-def tasks_redirect(
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
-) -> RedirectResponse:
-    """"Aufgaben" (P3.4) no longer has its own page -- its three groups
-    (battery rounds, updates, unconfirmed faults) are now part of the
-    "Übersicht" action inbox (`index` above, `fleet.ui_overview
-    .build_overview`). This old URL keeps working, per the owner's own
-    hard constraint ("every existing route keeps working -- old URLs
-    either still render or 303-redirect to their new home"), by
-    redirecting to the page that absorbed it rather than rendering a
-    second, now-orphaned copy of the same data.
-
-    **Still behind `require_ui_user`, same as before this change** -- an
-    unauthenticated request must keep getting redirected to `/ui/login`
-    (not to `/ui/`, which would itself then redirect to login a second
-    time), exactly the same observable behaviour `/ui/tasks` already had.
-    """
-
-    del authenticated  # only its side effect (the redirect-to-login raise) matters here
-    return RedirectResponse(url="/ui/", status_code=303)
 
 
 @router.get("/apartments", response_class=HTMLResponse)
@@ -2130,6 +2151,9 @@ def _rollout_new_response(
     status_code: int = 200,
 ) -> HTMLResponse:
     apartments = []
+    property_names: dict[int | None, str] = {
+        property_.id: property_.name for property_ in storage.list_properties()
+    }
     for apartment in storage.list_apartments():
         if apartment.state == "retired":
             continue
@@ -2137,6 +2161,7 @@ def _rollout_new_response(
             {
                 "apartment_id": apartment.id,
                 "label": apartment.label,
+                "property_name": property_names.get(apartment.property_id, "Ohne Liegenschaft"),
                 "pilot_mode": apartment.pilot_mode,
                 "has_desired_state": storage.get_desired_state(apartment.id) is not None,
             }
@@ -2937,6 +2962,25 @@ def apartment_detail(
     # history/referrer could carry.
     bundle_cleanup_failed = request.query_params.get("bundle_cleanup_failed") is not None
     active_tab = _normalize_apartment_tab(ansicht)
+    # Human heading of the page (rebuilt UI): "Liegenschaft · Wohnung", floor
+    # as eyebrow. Presentation only -- the technical id stays secondary text.
+    place = apartment_id
+    floor: str | None = None
+    tone = ""
+    if detail is not None:
+        record = storage.get_apartment(apartment_id)
+        property_record = (
+            storage.get_property(record.property_id)
+            if record is not None and record.property_id is not None
+            else None
+        )
+        place = place_text(
+            property_record.name if property_record is not None else None,
+            detail.label,
+            apartment_id,
+        )
+        floor = record.floor if record is not None else None
+        tone = status_tone(detail.status)
     response = templates.TemplateResponse(
         request,
         "apartment.html",
@@ -2947,6 +2991,9 @@ def apartment_detail(
             "detail": detail,
             "bundle_cleanup_failed": bundle_cleanup_failed,
             "active_tab": active_tab,
+            "place": place,
+            "floor": floor,
+            "tone": tone,
         },
         status_code=200 if detail is not None else 404,
     )

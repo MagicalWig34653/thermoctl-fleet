@@ -1,5 +1,5 @@
 """Seeds a throwaway fleet database with realistic demo data and captures
-screenshots of the real UI for the documentation website (`site/`).
+screenshots of the rebuilt UI (`docs/ui-redesign/`).
 
 Reproducible, local-only tooling: a fresh SQLite file in a temporary
 directory, migrated with the project's own Alembic chain (`fleet.storage
@@ -7,14 +7,15 @@ directory, migrated with the project's own Alembic chain (`fleet.storage
 (Playwright/Chromium) driving the real login flow (password + TOTP, computed
 with `pyotp` from the secret `python -m fleet.admin create-user` would also
 print). No secrets, no real apartment data -- every apartment id, address and
-reading below is fictional ("Musterstraße ...").
+reading below is fictional (Lindenstraße 12, Gartenweg 8, Parkallee 3 in Musterstadt).
 
 Run from the repository root, with Playwright's Chromium already installed
 in the active environment (`playwright install chromium`):
 
     python tools/docs_screenshots.py
 
-Writes PNGs into `site/assets/img/`. `tests/test_docs_screenshots.py` covers
+Writes PNGs into `docs/ui-redesign/` (light theme, 1440 and 390 px).
+`tests/test_docs_screenshots.py` covers
 the parts that are worth covering for real: `seed()` against a real,
 migrated temporary SQLite database (read back through the actual
 `fleet.storage`/UI view-builder API -- this is the part that breaks when
@@ -45,10 +46,16 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-IMG_DIR = REPO_ROOT / "site" / "assets" / "img"
+IMG_DIR = REPO_ROOT / "docs" / "ui-redesign"
+
+
+@dataclass(frozen=True)
+class DemoProperty:
+    name: str
+    address: str
 
 
 @dataclass(frozen=True)
@@ -59,62 +66,53 @@ class DemoApartment:
     orientation: str
     heating_circuits: int
     state: str
+    property_index: int = 0
 
 
-# Fictional throughout -- no real apartment, tenant, or address.
-#
-# UI-redesign stage 2 (docs/ui-redesign-ia.md): extended from the original
-# three (one per floor) so the "Übersicht" site map has a floor with more
-# than one apartment side by side (2. OG: WE3 + WE6), and so the action
-# inbox shows several *different* kinds of row at once (fault, absence
-# alarm, never-reported, battery-low, outdated version) rather than only
-# the fault/alarm pair the original three apartments produced.
-APARTMENTS = [
-    DemoApartment(
-        id="musterstr1-we3",
-        label="Musterstraße 1, WE 3",
-        floor="2. OG",
-        orientation="Süd",
-        heating_circuits=4,
-        state="occupied",
-    ),
-    DemoApartment(
-        id="musterstr1-we6",
-        label="Musterstraße 1, WE 6",
-        floor="2. OG",
-        orientation="Nord",
-        heating_circuits=2,
-        state="occupied",
-    ),
-    DemoApartment(
-        id="musterstr1-we5",
-        label="Musterstraße 1, WE 5",
-        floor="3. OG",
-        orientation="West",
-        heating_circuits=3,
-        state="occupied",
-    ),
-    DemoApartment(
-        id="beispielweg9-we1",
-        label="Beispielweg 9, WE 1",
-        floor="EG",
-        orientation="Ost",
-        heating_circuits=5,
-        state="occupied",
-    ),
-    DemoApartment(
-        id="beispielweg9-we2",
-        label="Beispielweg 9, WE 2",
-        floor="EG",
-        orientation="West",
-        heating_circuits=3,
-        state="occupied",
-    ),
+# Fictional throughout -- no real apartment, tenant, or address. The shape
+# follows the owner's design draft: three properties with 6 / 6 / 4
+# apartments, almost all of them reachable.
+PROPERTIES = [
+    DemoProperty("Lindenstraße 12", "Lindenstraße 12, 12345 Musterstadt"),
+    DemoProperty("Gartenweg 8", "Gartenweg 8, 12345 Musterstadt"),
+    DemoProperty("Parkallee 3", "Parkallee 3, 12345 Musterstadt"),
 ]
+
+_FLOORS = ["EG", "EG", "1. OG", "1. OG", "2. OG", "2. OG"]
+_ORIENTATIONS = ["Ost", "West", "Süd", "Nord", "Ost", "West"]
+
+
+def _build_apartments() -> list[DemoApartment]:
+    slugs = ["lindenstr12", "gartenweg8", "parkallee3"]
+    counts = [6, 6, 4]
+    entries = []
+    for property_index, (slug, count) in enumerate(zip(slugs, counts, strict=True)):
+        for number in range(1, count + 1):
+            entries.append(
+                DemoApartment(
+                    id=f"{slug}-w{number:02d}",
+                    label=f"Wohnung {number:02d}",
+                    floor=_FLOORS[number - 1],
+                    orientation=_ORIENTATIONS[number - 1],
+                    heating_circuits=2 + number % 3,
+                    state="occupied",
+                    property_index=property_index,
+                )
+            )
+    return entries
+
+
+APARTMENTS = _build_apartments()
 
 # Indices into `APARTMENTS` used by name below, so a reorder of the list
 # above cannot silently point `seed()` at the wrong apartment.
-_WE3, _WE6, _WE5, _BW1, _BW2 = range(5)
+_OK = 0  # Lindenstraße 12, Wohnung 01 -- healthy
+_ALARM = 2  # Lindenstraße 12, Wohnung 03 -- not reporting (open alarm)
+_FAULT = 5  # Lindenstraße 12, Wohnung 06 -- open sensor fault
+_BATTERY = 7  # Gartenweg 8, Wohnung 02 -- weak battery
+_ROLLOUT = range(6, 12)  # Gartenweg 8 -- the running rollout's apartments
+_RECOVERED = 14  # Parkallee 3, Wohnung 03 -- was unreachable, came back
+_FRESH_BACKUP = 15  # Parkallee 3, Wohnung 04 -- backup a few minutes ago
 
 
 def _free_port() -> int:
@@ -140,10 +138,14 @@ def _wait_for_server(url: str, timeout_s: float = 20.0) -> None:
 
 
 def seed(database_url: str) -> None:
-    """Builds the demo fleet: a property, three apartments, heartbeats (one
-    with an open fault), an alarm, a backup, and a rollout."""
+    """Builds the demo fleet in the shape of the design draft: three
+    properties (6 / 6 / 4 apartments), fresh heartbeats for all but one
+    apartment, one sensor fault, one weak battery, a recent backup for
+    every apartment, a recovered outage for the activity feed and one
+    running rollout at partial progress."""
 
     from fleet.storage import create_storage, upgrade
+    from protocol.events import Event
     from protocol.heartbeat import (
         ControlState,
         DeviceState,
@@ -158,17 +160,15 @@ def seed(database_url: str) -> None:
     upgrade(database_url)
     storage = create_storage(database_url)
 
-    prop = storage.create_property(
-        name="Musterstraße 1 & Beispielweg 9",
-        address="Musterstraße 1 / Beispielweg 9, 12345 Musterstadt",
-        notes="Demo-Bestand für die Dokumentations-Screenshots.",
-    )
+    property_ids = [
+        storage.create_property(name=prop.name, address=prop.address).id for prop in PROPERTIES
+    ]
 
     now = datetime.now(UTC)
     for entry in APARTMENTS:
         storage.create_apartment(
             entry.id,
-            property_id=prop.id,
+            property_id=property_ids[entry.property_index],
             label=entry.label,
             floor=entry.floor,
             orientation=entry.orientation,
@@ -178,15 +178,12 @@ def seed(database_url: str) -> None:
         )
 
     def heartbeat(
-        open_faults: list[OpenFault],
-        weakest_battery: int,
-        worst_signal: int,
-        protocol_version: int = PROTOCOL_VERSION,
+        open_faults: list[OpenFault], weakest_battery: int, worst_signal: int
     ) -> Heartbeat:
         return Heartbeat(
             apartment="placeholder",
-            protocol_version=protocol_version,
-            sent_at=now - timedelta(minutes=1),
+            protocol_version=PROTOCOL_VERSION,
+            sent_at=now - timedelta(seconds=30),
             agent="0.3.0",
             thermoctl=ThermoctlState(version="0.9.5", reachable=True, mode="armed"),
             control=ControlState(
@@ -207,69 +204,73 @@ def seed(database_url: str) -> None:
             open_faults=open_faults,
         )
 
-    # WE3: healthy, recent heartbeat -- the plain "in Ordnung" case, and
-    # one of two apartments sharing "2. OG" (the site map's floor with
-    # more than one unit side by side).
-    storage.save_heartbeat(
-        APARTMENTS[_WE3].id,
-        heartbeat([], weakest_battery=78, worst_signal=61),
-        received_at=now,
-    )
+    for index, entry in enumerate(APARTMENTS):
+        if index == _ALARM:
+            continue  # handled below: old heartbeat plus an open alarm
+        faults: list[OpenFault] = []
+        battery = 55 + (index * 7) % 40
+        if index == _FAULT:
+            faults = [
+                OpenFault(kind=FaultKind.SENSOR_FAULT, since=now - timedelta(hours=2), zone="Bad")
+            ]
+        if index == _BATTERY:
+            battery = 12
+        storage.save_heartbeat(
+            entry.id,
+            heartbeat(faults, weakest_battery=battery, worst_signal=45 + (index * 5) % 40),
+            received_at=now - timedelta(seconds=20 + index),
+        )
 
-    # WE6: weak battery (under the 20% threshold) -- shares "2. OG" with
-    # WE3, and is this fleet's one "Batterie schwach" inbox item.
+    # The one apartment that stopped reporting: last heartbeat old enough
+    # for the "not reporting" alarm.
     storage.save_heartbeat(
-        APARTMENTS[_WE6].id,
-        heartbeat([], weakest_battery=15, worst_signal=52),
-        received_at=now,
-    )
-
-    # WE5: one open fault (sensor fault in the bathroom).
-    storage.save_heartbeat(
-        APARTMENTS[_WE5].id,
-        heartbeat(
-            [OpenFault(kind=FaultKind.SENSOR_FAULT, since=now - timedelta(hours=5), zone="Bad")],
-            weakest_battery=22,
-            worst_signal=38,
-        ),
-        received_at=now,
-    )
-
-    # Beispielweg 9, WE1: last heartbeat old enough to trigger the "not
-    # reporting" alarm -- shares "EG" with WE2 below.
-    storage.save_heartbeat(
-        APARTMENTS[_BW1].id,
-        heartbeat([], weakest_battery=55, worst_signal=70, protocol_version=PROTOCOL_VERSION - 1),
-        received_at=now - timedelta(minutes=20),
+        APARTMENTS[_ALARM].id,
+        heartbeat([], weakest_battery=66, worst_signal=60),
+        received_at=now - timedelta(minutes=24),
     )
     storage.raise_alarm(
-        APARTMENTS[_BW1].id,
+        APARTMENTS[_ALARM].id,
         kind="not_reporting",
         urgency="high",
-        raised_at=now - timedelta(minutes=14),
+        raised_at=now - timedelta(minutes=18),
     )
 
-    # Beispielweg 9, WE2: never reported at all (no heartbeat saved) --
-    # this fleet's "noch nie gemeldet" case, and the second apartment on
-    # "EG".
-
-    # A backup for WE3.
-    storage.create_backup_record(
-        APARTMENTS[_WE3].id,
-        "operational_data",  # type: ignore[arg-type]
-        size_bytes=4_194_304,
-        content_hash="sha256:" + "ab" * 32,
-        storage_path="demo/not-a-real-path.age",
-        now=now,
+    # An outage that already ended -- a "Basisstation wieder erreichbar"
+    # line in the activity feed.
+    recovered = storage.raise_alarm(
+        APARTMENTS[_RECOVERED].id,
+        kind="not_reporting",
+        urgency="high",
+        raised_at=now - timedelta(hours=3),
     )
+    if recovered is not None:
+        storage.clear_alarm(recovered.id, now - timedelta(minutes=40))
+
+    # A fault report arriving for the apartment with the open fault.
+    storage.save_event(
+        APARTMENTS[_FAULT].id,
+        Event(schluessel="zigbee2mqtt:bridge", schwere="stoerung", titel="t", text="x"),
+        now - timedelta(hours=2),
+    )
+
+    # A backup for every apartment, all younger than 24 hours; one only a
+    # few minutes old.
+    for index, entry in enumerate(APARTMENTS):
+        age = timedelta(minutes=6) if index == _FRESH_BACKUP else timedelta(hours=1 + index)
+        storage.create_backup_record(
+            entry.id,
+            "operational_data",  # type: ignore[arg-type]
+            size_bytes=4_194_304,
+            content_hash="sha256:" + "ab" * 32,
+            storage_path="demo/not-a-real-path.age",
+            now=now - age,
+        )
 
     from datetime import time as dt_time
 
     from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 
-    window = UpdateWindow(
-        from_=dt_time(2, 0), until=dt_time(5, 0), not_below_outdoor_temp_c=-10.0
-    )
+    window = UpdateWindow(from_=dt_time(2, 0), until=dt_time(5, 0), not_below_outdoor_temp_c=-10.0)
     services = Services(
         thermoctl=ServiceState(
             image="ghcr.io/example/thermoctl", version="0.9.5", digest="sha256:" + "11" * 32
@@ -284,33 +285,43 @@ def seed(database_url: str) -> None:
             image="ghcr.io/example/thermoctl-agent", version="0.3.0", digest="sha256:" + "44" * 32
         ),
     )
-    for entry in (APARTMENTS[_WE3], APARTMENTS[_WE6]):
+    rollout_apartments = [APARTMENTS[index] for index in _ROLLOUT]
+    for entry in rollout_apartments:
         storage.create_desired_state_revision(
             entry.id,
             DesiredState(revision=0, services=services, window=window),
             ui_username="demo",
             reason="Demo-Ausgangszustand für die Dokumentations-Screenshots.",
-            now=now,
+            now=now - timedelta(days=1),
         )
 
-    # A rollout across WE3 (pilot) and WE6 -- stopped after WE3 fails, so
-    # the "Übersicht" action inbox also shows a "Rollout wartet auf
-    # Entscheidung" row (UI-redesign stage 2's `fleet.ui_overview`).
+    # A running rollout at partial progress: four of six apartments done,
+    # the fifth in progress, the last still queued.
     rollout = storage.create_rollout(
         service="thermoctl",
         version="0.9.6",
         digest="sha256:" + "cd" * 32,
-        apartment_ids=[APARTMENTS[_WE3].id, APARTMENTS[_WE6].id],
+        apartment_ids=[entry.id for entry in rollout_apartments],
         stagger_hours=2.0,
-        timeout_hours=1.0,
+        timeout_hours=6.0,
         ui_username="demo",
         reason="Demo-Rollout für die Dokumentations-Screenshots.",
-        now=now,
+        now=now - timedelta(hours=6),
     )
-    storage.start_rollout_apartment(rollout.id, APARTMENTS[_WE3].id, revision=1, now=now)
-    storage.mark_rollout_apartment_failed(
-        rollout.id, APARTMENTS[_WE3].id, reason="agent rejected", now=now
-    )
+    for position, entry in enumerate(rollout_apartments[:5]):
+        storage.start_rollout_apartment(
+            rollout.id,
+            entry.id,
+            revision=1,
+            now=now - timedelta(minutes=5)
+            if position == 4
+            else now - timedelta(hours=4 - position),
+        )
+        if position < 4:
+            storage.mark_rollout_apartment_converged(
+                rollout.id, entry.id, now=now - timedelta(hours=3 - position * 0.5)
+            )
+    storage.set_rollout_pilot_converged(rollout.id, now - timedelta(hours=4))
 
 
 def create_ui_user(database_url: str, totp_key: str, username: str, password: str) -> str:
@@ -414,38 +425,44 @@ def _webp_path_for(png_path: Path) -> Path:
     return png_path.with_suffix(".webp")
 
 
-# Pages captured for `site/` at desktop width, by `(path, filename stem)`
-# -- the rebuilt information architecture's four areas plus the three
-# apartment tabs (docs/ui-redesign-ia.md). Named after the new structure
-# throughout; no page keeps an old name ("dashboard", "tasks", "apartment",
-# "inventory", "rollouts") since the areas themselves were renamed, not
-# just restyled.
-_SITE_PAGES: tuple[tuple[str, str], ...] = (
+# Pages of the rebuilt UI captured for docs/ui-redesign/ (light theme only,
+# at both widths): `(path, filename stem)`. Pages that still run on the
+# legacy stylesheet (Einrichtung, Updates, Konto) are left out until their
+# rebuild lands.
+_REBUILT_PAGES: tuple[tuple[str, str], ...] = (
     ("/ui/", "uebersicht"),
+    ("/ui/?ansicht=liste", "uebersicht-liste"),
     ("/ui/apartments", "wohnungen"),
-    (f"/ui/apartments/{APARTMENTS[_WE5].id}?ansicht=ueberblick", "wohnung-ueberblick"),
-    (f"/ui/apartments/{APARTMENTS[_WE5].id}?ansicht=wartung", "wohnung-wartung"),
-    (f"/ui/apartments/{APARTMENTS[_WE5].id}?ansicht=technik", "wohnung-technik"),
+    ("/ui/tasks", "aufgaben"),
     ("/ui/inventory", "einrichtung"),
     ("/ui/rollouts", "updates"),
+    ("/ui/rollouts/new", "updates-neu"),
+    ("/ui/account/webauthn", "konto"),
+    # Apartment detail: the one with an open sensor fault (Überblick,
+    # Wartung with its backup) and one inside the running rollout (Technik,
+    # which carries a desired state), plus one confirmation page.
+    ("/ui/apartments/lindenstr12-w06?ansicht=ueberblick", "wohnung-ueberblick"),
+    ("/ui/apartments/lindenstr12-w06?ansicht=wartung", "wohnung-wartung"),
+    ("/ui/apartments/gartenweg8-w01?ansicht=technik", "wohnung-technik"),
+    ("/ui/apartments/lindenstr12-w06/commands/report_now/confirm", "befehl-bestaetigen"),
 )
 
-# A couple of representative mobile shots, bottom tab bar included -- not
-# every page (the brief asks for "1-2 mobile shots", not a full mobile
-# set): the one page every visit starts on, and the apartment page with
-# its tab nav, which is the one other place the responsive layout changes
-# shape materially (sidebar -> bottom bar, two columns -> one).
-_SITE_MOBILE_PAGES: tuple[tuple[str, str], ...] = (
-    ("/ui/", "uebersicht-mobil"),
-    (f"/ui/apartments/{APARTMENTS[_WE5].id}?ansicht=ueberblick", "wohnung-ueberblick-mobil"),
-)
+_VIEWPORTS: tuple[int, ...] = (1440, 390)
 
-_SITE_MOBILE_WIDTH = 390
+
+def _shoot_full_page(page: Any, path: Path, width: int) -> None:  # pragma: no cover
+    """Full-page screenshot: resize the viewport to the page's scrolled
+    height first, then capture without Playwright's scroll-and-stitch (which
+    would repaint a fixed element once per stitched slice)."""
+
+    page.set_viewport_size({"width": width, "height": 900})
+    height = page.evaluate("document.documentElement.scrollHeight")
+    page.set_viewport_size({"width": width, "height": max(int(height), 900)})
+    page.screenshot(path=str(path))
 
 
 # Drives a real browser (Playwright/Chromium) against a real, already
-# running fleet server -- a unit test would only re-mock Playwright, not
-# exercise anything for real; see the module docstring.
+# running fleet server -- a unit test would only re-mock Playwright.
 def capture(  # pragma: no cover
     base_url: str, username: str, password: str, totp_secret: str
 ) -> None:
@@ -453,210 +470,42 @@ def capture(  # pragma: no cover
     from playwright.sync_api import sync_playwright
 
     IMG_DIR.mkdir(parents=True, exist_ok=True)
-
     totp = pyotp.TOTP(totp_secret)
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
-
-        schemes: tuple[Literal["light", "dark"], ...] = ("light", "dark")
-        for index, scheme in enumerate(schemes):
+        for index, width in enumerate(_VIEWPORTS):
             if index > 0:
                 _wait_for_fresh_totp_window()
-
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                color_scheme=scheme,
-            )
+            context = browser.new_context(viewport={"width": width, "height": 900})
             page = context.new_page()
 
-            # Login page, unauthenticated.
             page.goto(f"{base_url}/ui/login", wait_until="networkidle")
-            page.screenshot(path=str(IMG_DIR / f"login-{scheme}.png"))
+            _shoot_full_page(page, IMG_DIR / f"login-{width}.png", width)
 
+            # Step 1 -> step 2 of the one login form (client-side switch).
             page.fill("#username", username)
             page.fill("#password", password)
-            page.fill("#totp_code", totp.now())
-            page.click(
-                "#login-form button[type=submit], "
-                "#login-form button:not(#webauthn-login-button)"
-            )
-            page.wait_for_load_state("networkidle")
+            page.click("#step-next")
+            page.keyboard.type("123")
+            _shoot_full_page(page, IMG_DIR / f"login-2fa-{width}.png", width)
 
-            for path, stem in _SITE_PAGES:
+            page.fill("#totp_code", "")
+            page.keyboard.type(totp.now())  # auto-submits after six digits
+            page.wait_for_url("**/ui/", timeout=10_000)
+
+            for path, stem in _REBUILT_PAGES:
                 page.goto(f"{base_url}{path}", wait_until="networkidle")
-                page.screenshot(path=str(IMG_DIR / f"{stem}-{scheme}.png"), full_page=True)
+                _shoot_full_page(page, IMG_DIR / f"{stem}-{width}.png", width)
+
+            if width <= 650:
+                page.goto(f"{base_url}/ui/", wait_until="networkidle")
+                page.set_viewport_size({"width": width, "height": 844})
+                page.click(".mobile-menu")
+                page.wait_for_timeout(400)
+                page.screenshot(path=str(IMG_DIR / f"menu-{width}.png"))
 
             context.close()
-
-            # Mobile shots -- own context/login (a fresh TOTP step is
-            # needed either way between captures), own narrow viewport, the
-            # same `_shoot_full_page` device `capture_ui_redesign_ia` uses
-            # below to avoid `full_page=True` double-painting the fixed
-            # bottom tab bar (see that function's own docstring).
-            _wait_for_fresh_totp_window()
-            mobile_context = browser.new_context(
-                viewport={"width": _SITE_MOBILE_WIDTH, "height": 900},
-                color_scheme=scheme,
-            )
-            mobile_page = mobile_context.new_page()
-            mobile_page.goto(f"{base_url}/ui/login", wait_until="networkidle")
-            mobile_page.fill("#username", username)
-            mobile_page.fill("#password", password)
-            mobile_page.fill("#totp_code", totp.now())
-            mobile_page.click(
-                "#login-form button[type=submit], "
-                "#login-form button:not(#webauthn-login-button)"
-            )
-            mobile_page.wait_for_load_state("networkidle")
-
-            for path, stem in _SITE_MOBILE_PAGES:
-                mobile_page.goto(f"{base_url}{path}", wait_until="networkidle")
-                _shoot_full_page(
-                    mobile_page, IMG_DIR / f"{stem}-{scheme}.png", _SITE_MOBILE_WIDTH
-                )
-
-            mobile_context.close()
-
-        browser.close()
-
-
-# "Wohnung" tabs captured for docs/ui-redesign/ below, by their own
-# `?ansicht=` value and the German-sentence-case filename stem the brief's
-# IA uses for them.
-_APARTMENT_TABS: tuple[tuple[str, str], ...] = (
-    ("ueberblick", "wohnung-ueberblick"),
-    ("wartung", "wohnung-wartung"),
-    ("technik", "wohnung-technik"),
-)
-
-# `(path, filename stem)` for every other page of the rebuilt IA
-# (docs/ui-redesign-ia.md) -- captured at both viewport widths, both
-# colour schemes, by `capture_ui_redesign_ia` below.
-_IA_PAGES: tuple[tuple[str, str], ...] = (
-    ("/ui/", "uebersicht"),
-    ("/ui/apartments", "wohnungen"),
-    ("/ui/inventory", "einrichtung"),
-    ("/ui/rollouts", "updates"),
-    # Forms pass (UI-redesign stage 2 polish, "die Formulare richtig
-    # formatieren"): the owner explicitly asked for at least one
-    # screenshot of each major form -- "Konto" (passkey management) and
-    # "Neuer Rollout" each live on their own page, unlike the acknowledge-
-    # fault/restore/commands forms, which are already inline on a page
-    # captured above (wohnung-ueberblick/-wartung).
-    ("/ui/account/webauthn", "konto"),
-    ("/ui/rollouts/new", "rollout-neu"),
-)
-
-_IA_VIEWPORTS: tuple[tuple[int, str], ...] = ((1440, "1440"), (390, "390"))
-
-
-# Drives a real browser (Playwright/Chromium) against a real, already
-# running fleet server, capturing every page of the rebuilt information
-# architecture (docs/ui-redesign-ia.md) at both widths the brief names
-# (1440px desktop, 390px mobile) and both colour schemes, into
-# `docs/ui-redesign/` -- separate from `capture()` above (which feeds
-# `site/`'s own, differently-named screenshots) because the two serve
-# different documents with a different page set and naming convention.
-# Not unit-tested, same reasoning as `capture` -- needs a real browser.
-def _shoot_full_page(page: Any, path: Path, width: int) -> None:  # pragma: no cover
-    """A full-page screenshot that resizes the viewport to the page's own
-    full scrolled height first, then captures without Playwright's own
-    `full_page=True` scroll-and-stitch.
-
-    **Round-1 screenshot critique (docs/ui-redesign-ia.md self-review):**
-    `full_page=True` against a page with a `position: fixed` element (this
-    application's own mobile bottom tab bar, `.app-bottom-nav`, below the
-    760px breakpoint) re-paints that fixed element at every scrolled
-    "page" Playwright stitches together, so it appeared duplicated,
-    floating mid-content, in every captured mobile screenshot -- a
-    screenshot-tooling artifact, not a bug in the actual rendered page (a
-    real browser only ever paints a `position: fixed` element once, pinned
-    to the live viewport). Resizing the viewport to the full content
-    height first means there is nothing left to scroll, so there is
-    nothing left to stitch.
-    """
-
-    # Reset to the base viewport height *before* measuring -- this
-    # application's `.app-shell` is `min-height: 100vh` (round-3 screenshot
-    # critique caught the bug a first version of this function had: measuring
-    # `scrollHeight` while the viewport was still sized from a *previous*
-    # page's resize let each page's `100vh` compound into the next,
-    # ballooning every subsequent screenshot with growing empty space).
-    page.set_viewport_size({"width": width, "height": 900})
-    height = page.evaluate("document.documentElement.scrollHeight")
-    page.set_viewport_size({"width": width, "height": max(int(height), 900)})
-    page.screenshot(path=str(path))
-
-
-def capture_ui_redesign_ia(  # pragma: no cover
-    base_url: str, username: str, password: str, totp_secret: str
-) -> None:
-    import pyotp
-    from playwright.sync_api import sync_playwright
-
-    out_dir = REPO_ROOT / "docs" / "ui-redesign"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    totp = pyotp.TOTP(totp_secret)
-    schemes: tuple[Literal["light", "dark"], ...] = ("light", "dark")
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
-        step = 0
-        for width, width_label in _IA_VIEWPORTS:
-            for scheme in schemes:
-                if step > 0:
-                    _wait_for_fresh_totp_window()
-                step += 1
-
-                context = browser.new_context(
-                    viewport={"width": width, "height": 900}, color_scheme=scheme
-                )
-                page = context.new_page()
-
-                page.goto(f"{base_url}/ui/login", wait_until="networkidle")
-                page.screenshot(path=str(out_dir / f"login-{width_label}-{scheme}.png"))
-                page.fill("#username", username)
-                page.fill("#password", password)
-                page.fill("#totp_code", totp.now())
-                page.click(
-                    "#login-form button[type=submit], "
-                    "#login-form button:not(#webauthn-login-button)"
-                )
-                page.wait_for_load_state("networkidle")
-
-                for path, stem in _IA_PAGES:
-                    page.goto(f"{base_url}{path}", wait_until="networkidle")
-                    _shoot_full_page(
-                        page, out_dir / f"{stem}-{width_label}-{scheme}.png", width
-                    )
-
-                for ansicht, stem in _APARTMENT_TABS:
-                    page.goto(
-                        f"{base_url}/ui/apartments/{APARTMENTS[_WE5].id}?ansicht={ansicht}",
-                        wait_until="networkidle",
-                    )
-                    _shoot_full_page(
-                        page, out_dir / f"{stem}-{width_label}-{scheme}.png", width
-                    )
-
-                # One more major form: the stopped demo rollout's own
-                # detail page (seed()'s thermoctl rollout across WE3/WE6,
-                # stopped after WE3 fails) carries the "Fortsetzen"/
-                # "Abbrechen" forms -- reached by following the "Updates"
-                # list's own link rather than hard-coding the rollout id
-                # (it is a generated uuid, not something this script
-                # controls).
-                page.goto(f"{base_url}/ui/rollouts", wait_until="networkidle")
-                page.click("table a[href^='/ui/rollouts/']")
-                page.wait_for_load_state("networkidle")
-                _shoot_full_page(
-                    page, out_dir / f"rollout-entscheiden-{width_label}-{scheme}.png", width
-                )
-
-                context.close()
-
         browser.close()
 
 
@@ -684,9 +533,17 @@ def optimize_images() -> None:
 # arguments, and that the server subprocess is always torn down (even when
 # `capture` raises, and killed if a clean `wait()` times out) -- no pragma
 # needed, nothing here is actually untestable.
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
     import base64
     import secrets as _secrets
+
+    argparse.ArgumentParser(
+        description=(
+            "Seed a throwaway demo fleet, start it, and capture the rebuilt UI "
+            f"(light, 1440 and 390 px) into {IMG_DIR}."
+        )
+    ).parse_args([] if argv is None else argv)
 
     totp_key = base64.b64encode(_secrets.token_bytes(32)).decode("ascii")
     os.environ["FLEET_TOTP_KEY"] = totp_key
@@ -717,4 +574,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover -- just an entry point
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,171 @@
+/* Login / 2FA pages -- ported from the owner's design draft (auth.css).
+ * Same colour language as fleet-ui.css, but its own stylesheet: the split-screen
+ * layout reuses class names (.button, .brand, .steps, .step) that mean
+ * something else inside the app shell, so the two files are never loaded on the
+ * same page. CSP: no inline styles; the step switch is `data-step` on
+ * #auth-flow, flipped by auth.js. Without JavaScript every field is visible in
+ * one form (see the "no-JS" section at the end). */
+:root{--ink:#263f35;--muted:#798476;--green:#34563e;--border:#dfe5d9;--bg:#fafbf7;--red:#ad5145}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+button,input{font:inherit}
+button,a{-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+a{color:inherit;text-decoration:none}
+button{cursor:pointer;color:inherit}
+button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #a1b894;outline-offset:4px}
+svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+h1,h2,p{margin:0}
+button:disabled{opacity:.5;cursor:default}
+.auth-shell{min-height:100svh;display:grid;grid-template-columns:minmax(430px,1fr) minmax(500px,1fr)}
+.story{background:#eaf0e2;position:relative;overflow:hidden;display:flex;flex-direction:column;padding:43px 55px 31px}
+.brand{display:inline-flex;align-items:center;gap:11px;width:max-content}
+.brand-mark{width:37px;height:40px;background:#2d4e3d;border-radius:10px;display:grid;place-items:center;color:#dfebd6}
+.brand-mark svg{width:25px;height:25px}
+.brand-name{font-size:20px;font-weight:650;letter-spacing:-.8px;line-height:1.1}
+.brand-name small{display:block;font-size:10px;letter-spacing:2.3px;font-weight:400;margin-top:4px;color:#7f8e73}
+.story-copy{position:relative;z-index:1;max-width:425px;margin:clamp(70px,12vh,135px) auto 0;width:100%}
+.eyebrow{font-size:10px;font-weight:600;letter-spacing:1.8px;color:#829471;text-transform:uppercase}
+.story h2{font-size:clamp(36px,3.1vw,49px);line-height:1.15;letter-spacing:-1.9px;font-weight:530;margin-top:18px}
+.story h2 em{font-style:normal;color:#72905d}
+.story-copy>p{font-size:13px;line-height:1.8;color:#7c8b70;margin-top:22px;max-width:320px}
+.illustration{display:block;width:100%;height:auto;max-height:305px;flex-shrink:0;stroke-width:1;position:relative;margin:15px auto 8px;max-width:510px}
+.story-bottom{margin-top:auto;border-top:1px solid #d7e0cb;padding-top:21px;display:flex;gap:11px;align-items:center;font-size:11px;color:#7c8e6b}
+.story-bottom svg{width:17px;flex-shrink:0}
+.story-bottom strong{display:block;font-weight:500;color:#567044;margin-bottom:2px}
+.auth-side{display:flex;flex-direction:column;padding:39px 45px 26px;min-width:0;background:#fafbf7}
+.auth-top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.auth-content{width:100%;max-width:355px;margin:auto; padding:55px 0}
+.steps{display:flex;align-items:center;gap:10px;margin-bottom:33px;font-size:10px;color:#99a18f}
+.step{display:flex;align-items:center;gap:7px;white-space:nowrap}
+.step-number{width:22px;height:22px;border:1px solid #dbe2d2;border-radius:50%;display:grid;place-items:center;font-size:10px;background:#f7f9f2}
+.step.active{color:#48633c}
+.step.active .step-number{background:#e6eedd;border-color:#d6e1ca;font-weight:650}
+.step.done{color:#7b926b}
+.step-line{width:31px;height:1px;background:#dbe3d3}
+.auth-content h1{font-size:32px;font-weight:550;letter-spacing:-1.15px;line-height:1.25}
+.intro{font-size:12px;line-height:1.8;color:#87917d;margin-top:12px;margin-bottom:27px}
+.field{display:block;margin-bottom:19px}
+.field-label{display:block;font-size:11px;font-weight:550;color:#586c4c;margin-bottom:8px}
+.input-wrap{position:relative}
+.input-wrap>svg{position:absolute;left:13px;top:14px;width:17px;height:17px;color:#99a38e;pointer-events:none}
+.input-wrap input{background:#fff;border:1px solid #dce3d3;border-radius:7px;width:100%;height:46px;padding:0 42px;color:var(--ink);font-size:12px;transition:border-color .15s}
+.input-wrap input:focus{outline:0;border-color:#8ca77a;box-shadow:0 0 0 3px #7c9c6212}
+.input-wrap input::placeholder{color:#a7b09e}
+.reveal{position:absolute;right:5px;top:5px;background:transparent;border:0;height:36px;width:34px;display:grid;place-items:center;color:#8b997f;border-radius:4px}
+.reveal:hover{background:#f1f5ea}
+.reveal svg{width:17px;height:17px}
+.button{width:100%;min-height:45px;display:flex;align-items:center;justify-content:center;gap:9px;background:white;border:1px solid #dce3d4;border-radius:7px;font-size:12px;font-weight:550;transition:background .15s}
+.button:hover{background:#f1f5e9}
+.button svg{width:17px;height:17px}
+.button.primary{background:#34563e;color:#fff;border-color:#34563e}
+.button.primary:hover{background:#294730}
+.button.primary .arrow{margin-left:auto;width:15px}
+.button.primary.has-arrow{justify-content:space-between;padding:0 15px}
+.separator{display:flex;align-items:center;gap:13px;margin:23px 0;font-size:10px;color:#a1aa96}
+.separator:before,.separator:after{content:'';height:1px;background:#e1e6db;flex:1}
+.passkey-hint{text-align:center;font-size:10px;color:#919d85;margin-top:9px}
+.auth-footer{display:flex;justify-content:space-between;gap:10px;font-size:10px;color:#a0a996}
+.footer-lock{display:flex;align-items:center;gap:5px}
+.footer-lock svg{width:11px;height:11px}
+.back-link{display:inline-flex;align-items:center;gap:6px;color:#839378;font-size:11px;margin-bottom:21px}
+.back-link svg{width:13px;height:13px}
+.back-link:hover{color:#36523b}
+.factor-icon{display:grid;place-items:center;width:47px;height:49px;background:#edf2e7;border:1px solid #e0e8d5;border-radius:12px;margin-bottom:20px;color:#708963}
+.factor-icon svg{width:24px;height:24px}
+.code-label{font-size:11px;font-weight:550;color:#647a55;display:block;margin-bottom:10px}
+.code-area{position:relative;border-radius:8px}
+.code-area input{position:absolute;inset:0;width:100%;height:100%;opacity:.015;z-index:2;cursor:text;font-size:24px;border:0;background:transparent;color:transparent;caret-color:transparent}
+.code-boxes{display:grid;grid-template-columns:repeat(6,1fr);gap:9px;pointer-events:none}
+.code-box{height:58px;background:#fff;border:1px solid #dbe3d2;border-radius:8px;display:grid;place-items:center;font-size:25px;color:#36573e;font-variant-numeric:tabular-nums;box-shadow:0 2px 3px #293c1710}
+.code-box:nth-child(3){margin-right:3px}
+.code-box:nth-child(4){margin-left:3px}
+.code-box:empty:before{content:'';height:5px;width:5px;border-radius:50%;background:#dce4d3}
+.code-box.filled{background:#f1f6eb;border-color:#c5d7b7}
+.code-area:focus-within{outline:2px solid #a5be92;outline-offset:4px}
+.code-area:focus-within .code-box.current{border-color:#7a9b64;box-shadow:0 0 0 1px #7a9b64}
+.code-area:focus-within .code-box.current:empty:before{width:1px;height:23px;background:#7e9a6e;border-radius:0}
+.code-area.invalid .code-box{border-color:#cf9d93;background:#fdf6f2}
+.code-help{font-size:10px;line-height:1.7;color:#98a18c;margin:13px 0 23px}
+.error{color:var(--red);font-size:11px;line-height:1.6;margin:0 0 15px;min-height:0}
+.error:empty{display:none}
+.mobile-brand{display:none}
+.skip{position:fixed;top:-70px;background:white;padding:10px;z-index:20}
+.skip:focus{top:10px}
+@media(min-width:1550px){.story{padding-left:75px;padding-right:75px}
+.auth-content{max-width:380px}
+.story-copy{max-width:480px}
+.illustration{max-width:570px}
+}
+@media(max-height:800px) and (min-width:861px){.story-copy{margin-top:60px}
+.story h2{font-size:39px}
+.illustration{max-height:255px}
+.auth-content{padding:30px 0}
+.steps{margin-bottom:25px}
+}
+@media(max-width:1100px){.story{padding-left:35px;padding-right:35px}
+.auth-side{padding-left:32px;padding-right:32px}
+.auth-shell{grid-template-columns:minmax(320px,.9fr) minmax(410px,1fr)}
+.story h2{font-size:36px}
+.story-copy{margin-top:100px}
+}
+@media(max-width:860px){.auth-shell{display:block}
+.story{display:none}
+.auth-side{min-height:100svh;padding:24px 26px}
+.mobile-brand{display:inline-flex}
+.auth-content{padding:55px 0;max-width:380px}
+.auth-footer{padding-top:10px}
+.brand-name{font-size:18px}
+.brand-mark{width:32px;height:35px}
+.brand-mark svg{width:23px;height:23px}
+.steps{margin-bottom:30px}
+}
+@media(max-width:380px){.auth-side{padding:21px 19px}
+.code-boxes{gap:6px}
+.code-box{height:54px}
+.auth-footer{font-size:9px}
+.auth-content h1{font-size:29px}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}
+}
+/* Subtle feedback for the separate verification step. */
+.code-box{transition:background-color .2s,border-color .2s,box-shadow .2s}
+.code-area.checking .code-box{animation:code-check .8s ease-in-out infinite;animation-delay:calc(var(--digit,0) * 55ms)}
+.code-box:nth-child(2){--digit:1}
+.code-box:nth-child(3){--digit:2}
+.code-box:nth-child(4){--digit:3}
+.code-box:nth-child(5){--digit:4}
+.code-box:nth-child(6){--digit:5}
+.code-area.verified .code-box{background:#e4efda;border-color:#8dab75;color:#3c6636;animation:code-confirm .4s ease-out both;animation-delay:calc(var(--digit,0) * 35ms)}
+.code-area.checking:focus-within,.code-area.verified:focus-within{outline-color:#c0d1b2}
+.code-area.checking .code-box.current,.code-area.verified .code-box.current{box-shadow:none}
+#verify-form[aria-busy=true] .button{opacity:1;cursor:wait}
+.code-help{min-height:34px}
+@keyframes code-check{0%,100%{background:#f1f6eb}
+50%{background:#e2ecd8;border-color:#b1c69d}
+}
+@keyframes code-confirm{0%{transform:translateY(0)}
+50%{transform:translateY(-3px)}
+100%{transform:translateY(0)}
+}
+@media(prefers-reduced-motion:reduce){.code-box{animation:none!important;transition:none!important}
+}
+
+/* -- no-JS / JS switches (class `js` is set by auth.js) --
+ * Without JS every field is visible in one form and one plain submit button
+ * works; `.js-only` things (step indicator, step-2 copy, back link, the two
+ * step buttons) stay hidden. With JS, #auth-flow[data-step] decides which
+ * pane and which step-only copy is shown. */
+html:not(.js) .js-only{display:none}
+.js .no-js-only{display:none}
+.js .auth-flow[data-step="1"] [data-step-only="2"],
+.js .auth-flow[data-step="1"] [data-pane="2"],
+.js .auth-flow[data-step="2"] [data-step-only="1"],
+.js .auth-flow[data-step="2"] [data-pane="1"]{display:none}
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+
+/* -- details the draft drew with inline styles or demo copy -- */
+button.back-link{border:0;background:transparent;padding:0;font:inherit;font-size:11px;margin-top:22px;margin-bottom:0}
+.field-optional,.code-input-optional{font-weight:400;color:#99a18f}
+.field-note{font-size:11px;line-height:1.7;color:#87917d;margin:-4px 0 19px}
+.separator span,.passkey-hint span{display:inline}
+.auth-content .error{margin-top:12px}

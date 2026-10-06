@@ -391,7 +391,7 @@ def test_inventory_sections_and_apartment_line_render_without_script(
     property_ = storage.create_property("House 7", "Street 7")
     for apartment_id, count in (("house7-a01", 1), ("house7-a05", 5)):
         storage.create_apartment(
-            apartment_id, property_id=property_.id, label=apartment_id,
+            apartment_id, property_id=property_.id, label=f"Wohnung {count:02d}",
             floor="EG", orientation="Ost", state="occupied",
             heating_circuits=count, pilot_mode=False,
         )
@@ -400,16 +400,18 @@ def test_inventory_sections_and_apartment_line_render_without_script(
     objects = client.get("/ui/inventory")
     assert 'aria-label="Einrichtung: Bereiche"' in objects.text
     assert 'href="/ui/inventory?bereich=objekte" aria-current="page"' in objects.text
-    assert "Bewohnt, EG, Ost, 1 Heizkreis" in objects.text
-    assert "Bewohnt, EG, Ost, 5 Heizkreise" in objects.text
+    assert "Street 7 · 2 Wohnungen" in objects.text
+    assert '<details class="inventory-property">' in objects.text
+    assert "EG · Ost · 1 Heizkreis · Basisstation: keine" in objects.text
+    assert "EG · Ost · 5 Heizkreise · Basisstation: keine" in objects.text
+    assert "<strong>Wohnung 01</strong>" in objects.text
+    assert "<code>house7-a01</code>" in objects.text
+    assert '<summary class="button">' in objects.text
     assert 'action="/ui/inventory/properties"' in objects.text
     assert 'action="/ui/inventory/apartments"' in objects.text
     assert 'action="/ui/inventory/devices"' not in objects.text
     assert 'Name<span class="field-required"' in objects.text
-    assert (
-        'Pflichtfeld</span></span>\n            <input type="text" id="property_name"'
-        in objects.text
-    )
+    assert 'id="property_name" name="name" required' in objects.text
     assert (
         'Notizen (keine Mieterdaten!)<span class="field-optional"> (optional)</span>'
         in objects.text
@@ -422,7 +424,7 @@ def test_inventory_sections_and_apartment_line_render_without_script(
     assert 'action="/ui/inventory/properties"' not in devices.text
 
     steps = client.get("/ui/inventory?bereich=vorbereiten")
-    assert "Neue Basisstation vorbereiten" in steps.text
+    assert "Schritt für Schritt zur neuen Basisstation" in steps.text
     assert "?bereich=basisstationen#device-register-form" in steps.text
     assert 'action="/ui/inventory/devices"' not in steps.text
 

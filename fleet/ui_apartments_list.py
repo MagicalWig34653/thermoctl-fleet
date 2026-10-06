@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import quote
 
-from fleet.ui_house import ApartmentTile
+from fleet.ui_house import ApartmentTile, status_tone
 
 _STATE_FILTER_LABELS: dict[str, str] = {
     "alarm": "Meldet sich nicht",
@@ -61,6 +61,9 @@ class ApartmentRow:
     status_label: str
     property_name: str | None
     last_contact_text: str
+    # Draft table: floor under the apartment name, pill tone of the status.
+    floor: str | None = None
+    tone: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,8 @@ def _row(tile: ApartmentTile) -> ApartmentRow:
         status_label=tile.status_label,
         property_name=tile.property_name,
         last_contact_text=tile.last_contact_text,
+        floor=tile.floor,
+        tone=status_tone(tile.status),
     )
 
 

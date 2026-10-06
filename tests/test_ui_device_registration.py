@@ -259,7 +259,7 @@ def test_prepare_submit_shows_the_code_once_and_never_stores_it_in_plain_text(
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
 
-    match = re.search(r"<pre>([^<]+)</pre>", response.text)
+    match = re.search(r"<pre[^>]*>([^<]+)</pre>", response.text)
     assert match is not None
     raw_code = match.group(1).strip()
     assert raw_code

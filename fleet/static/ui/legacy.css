@@ -1,0 +1,330 @@
+/* LEGACY page styles -- classes of the pages phase 2 of the UI rebuild has
+ * not redesigned yet (Einrichtung, Updates, Konto).
+ * Loaded BEFORE fleet-ui.css; element rules are scoped to `.legacy`
+ * (the <main> of every page that does not override block `main_class`).
+ * Phase 2 deletes rules from this file page by page and removes it at the end.
+ * Colours come from the draft tokens (fleet-ui.css) via the aliases below. */
+
+:root {
+    --surface: #ffffff;
+    --flame: #2f513e;
+    --teal: #31755d;
+    --signal: #b74c40;
+    --focus-ring: #76b49b;
+}
+
+.legacy .hint {
+    border: 1px solid currentColor;
+    padding: 0.75rem 1rem;
+    border-radius: 0.25rem;
+    opacity: 0.85;
+}
+
+.legacy .error {
+    border: 1px solid var(--signal);
+    padding: 0.75rem 1rem;
+    border-radius: 0.25rem;
+    color: var(--signal);
+}
+
+/* A handful of error placeholders (`#webauthn-error`, `#webauthn-
+ * register-error`) exist in the DOM up front for `webauthn.js` to fill
+ * in client-side and start out empty -- an empty red-bordered box reads
+ * as a layout bug, not "no error", so it is hidden until it actually has
+ * text (forms pass, "inline validation messages ... shown next to the
+ * field": absence of a message means no box at all, not an empty one). */
+.legacy .error:empty {
+    display: none;
+}
+
+.legacy label {
+    display: block;
+    margin-top: 0.75rem;
+    font-weight: 500;
+}
+
+.legacy input[type=text],
+.legacy input[type=password],
+.legacy input[type=date],
+.legacy select,
+.legacy textarea {
+    display: block;
+    width: 100%;
+    max-width: 20rem; /* "medium" default -- see the per-field overrides below */
+    padding: 0.45rem 0.55rem;
+    margin-top: 0.35rem;
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    box-sizing: border-box;
+}
+
+/* Forms pass (UI-redesign stage 2 polish, "die Formulare richtig
+ * formatieren"): consistent widths *per input*, keyed by the field's own
+ * `name` attribute. Field names are fixed (CLAUDE.md: every form's field
+ * names stay byte-identical) so one rule here covers every template that
+ * happens to share a name, with no template edits needed. Three tiers --
+ * short (a code/number/date/short id), medium (the 20rem default above,
+ * for a name/label/single-line text), long (a digest or other content
+ * that benefits from the page's own ~34rem measure, docs/ui-redesign-
+ * plan.md's "Type" section). `input[name^="..."]` matches the per-service
+ * `version_{{ name }}`/`digest_{{ name }}` fields on "Sollzustand
+ * bearbeiten" too, not only the bare `version`/`digest` fields elsewhere. */
+.legacy input[name="totp_code"],
+.legacy input[name="floor"],
+.legacy input[name="orientation"],
+.legacy input[name="lines"],
+.legacy input[name="stagger_hours"],
+.legacy input[name="timeout_hours"],
+.legacy input[name="window_from"],
+.legacy input[name="window_until"],
+.legacy input[name="window_temp"],
+.legacy input[name="watchdog_version"],
+.legacy input[name="acquisition_date"],
+.legacy input[name^="version"] {
+    max-width: 9rem;
+}
+
+.legacy input[name="digest"],
+.legacy input[name^="digest_"],
+.legacy input[name="q"],
+.legacy input[name="reason"],
+.legacy input[name="note"],
+.legacy input[name="notes"],
+.legacy input[name="address"],
+.legacy input[name="verification_code"] {
+    max-width: 34rem;
+}
+
+/* Helper text under a field (brief: "helper text under fields") -- a
+ * plain, quiet line directly below the input it belongs to. Existing
+ * inline parenthetical hints ("(JJJJ-MM-TT)", "(sha256:...)") stay in the
+ * label text itself where the hint *is* the expected format of the very
+ * next input (so it reads right before typing); `.field-hint` is for the
+ * handful of forms that spell the same thing out as its own line. */
+.field-hint {
+    display: block;
+    margin-top: 0.3rem;
+    font-size: 0.85rem;
+    opacity: 0.75;
+    max-width: 34rem;
+}
+
+/* Keep field status beside its label, before the control. */
+.field-required {
+    color: var(--signal);
+}
+
+.field-optional {
+    font-size: 0.8rem;
+    font-weight: 400;
+    opacity: 0.65;
+}
+
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+}
+
+.legacy fieldset {
+    border: 1px solid var(--line);
+    border-radius: 0.4rem;
+    padding: 0.75rem 1rem 1rem;
+    margin: 1.25rem 0 0;
+}
+
+.legacy fieldset > fieldset {
+    margin-top: 1rem;
+}
+
+.legacy legend {
+    font-weight: 600;
+    padding: 0 0.3rem;
+}
+
+/* Button variants (brief: "primary/secondary/danger button styles").
+ * `<button>` (a form's own submit action -- always the one primary thing
+ * a form does) gets a filled flame look by default. `a.command-button`
+ * keeps its existing outlined look unchanged (`ul.command-buttons` holds
+ * several side by side -- filling all of them equally loud would fight
+ * this file's own "quiet is the default, trouble has to compete for
+ * attention" rule, docs/ui-redesign-plan.md's principle 1); `.button--
+ * secondary`/`.button--danger` are modifiers either element can opt into.
+ * `.button--danger` reuses the same `--signal` colour the status system
+ * already uses for "alarm" -- never the only signal, the label itself
+ * already says "...durchführen"/"ausbauen"/"entfernen" (never colour
+ * alone, this file's existing rule). */
+.legacy button {
+    display: inline-block;
+    padding: 0.5rem 1.1rem;
+    margin-top: 1rem;
+    border: 1px solid var(--flame);
+    border-radius: 0.35rem;
+    background: var(--flame);
+    color: var(--surface);
+    font: inherit;
+    font-weight: 500;
+    text-align: center;
+    cursor: pointer;
+}
+
+.legacy button:hover {
+    filter: brightness(0.92);
+}
+
+.button--secondary,
+button.button--secondary {
+    background: transparent;
+    border-color: var(--line);
+    color: var(--ink);
+}
+
+.button--danger,
+button.button--danger {
+    background: var(--signal);
+    border-color: var(--signal);
+    color: var(--surface);
+}
+
+.apartment-tile__tag {
+    display: inline-block;
+    border: 1px solid currentColor;
+    border-radius: 0.25rem;
+    padding: 0 0.35rem;
+    font-size: 0.85em;
+}
+
+/* "Eine Wohnung" (P3.2) -- the heartbeat-history timeline
+ * (.timeline / .timeline__entry) and its sections. Same "never colour
+ * alone" rule as P3.1's tiles: a gap entry is distinguished by its own
+ * "Lücke" label and border accent together, not by colour by itself.
+ */
+main.legacy section + section {
+    margin-top: 1.5rem;
+}
+
+main.legacy section h2 {
+    font-size: 1.05rem;
+    margin-bottom: 0.5rem;
+}
+
+.apartment-detail__note {
+    font-size: 0.9em;
+    opacity: 0.8;
+}
+
+/* "Aufgaben" (P3.4) -- three task groups, each a plain list, "Nichts
+ * fällig." for an empty one (same "quiet surface" idea as P3.1's tiles,
+ * here without any colour coding -- a task list is already ordered by
+ * what needs doing, it does not also need a red/green split).
+ */
+.task-group {
+    margin: 2rem 0 0;
+}
+
+.task-group:first-of-type {
+    margin-top: 1rem;
+}
+
+.task-group h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1.1rem;
+}
+
+.task-group__empty {
+    opacity: 0.7;
+}
+
+ul.task-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+}
+
+.task-list li {
+    border: 1px solid #8888;
+    border-radius: 0.25rem;
+    padding: 0.5rem 0.75rem;
+}
+
+/* A stale row (P3.4a, decision 2026-09-26): the apartment's underlying
+ * heartbeat/fault value is real but read while it was last reachable, the
+ * apartment now has an open "not reporting" alarm. The dashed border is a
+ * secondary cue only -- `.task-list__stale-hint`'s literal German text
+ * ("... Wohnung meldet sich nicht") is what actually carries the meaning,
+ * per this package's own accessibility requirement (text, not colour
+ * alone).
+ */
+.task-list li.task-list__stale {
+    border-style: dashed;
+}
+
+.task-list__stale-hint {
+    display: inline-block;
+    margin-top: 0.25rem;
+    font-size: 0.9em;
+    opacity: 0.8;
+}
+
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+}
+
+    border: 1px solid #8888;
+    border-radius: 0.25rem;
+    padding: 0.5rem 0.75rem;
+}
+
+}
+
+/* P6.2: the "remove this passkey" form sits inline next to its label in
+   the credential list, not stacked as its own block -- kept here rather
+   than an inline style= attribute (CSP has no 'unsafe-inline' for styles
+   either, see this file's own header comment). */
+.inline-form {
+    display: inline;
+}
+
+.site-map .property-group:first-of-type {
+    margin-top: 0.5rem;
+}
+
+/* "Technik" digest + copy affordance. */
+code.digest {
+    font-size: 0.85rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    * {
+        transition: none !important;
+        animation: none !important;
+    }
+}
+
+/* Links on legacy pages: the draft resets `a` to inherit/no underline, legacy
+ * content links need to stay recognisable as links. */
+.legacy a {
+    color: var(--flame);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.legacy a.text-button,
+.legacy a.button {
+    text-decoration: none;
+}
+
+.legacy h2 {
+    margin-top: 0;
+}

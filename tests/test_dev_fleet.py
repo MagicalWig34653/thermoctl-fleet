@@ -37,7 +37,7 @@ def test_first_start_creates_private_state_and_real_account(
     password = login.split("Password: ", 1)[1].splitlines()[0]
     uri = login.split("TOTP provisioning URI: ", 1)[1].strip()
     storage = create_storage(f"sqlite:///{state / 'fleet-dev.db'}")
-    assert len(storage.list_properties()) == 1
+    assert len(storage.list_properties()) == len(docs_screenshots.PROPERTIES)
     assert len(storage.list_apartments()) == len(docs_screenshots.APARTMENTS)
     user = storage.get_ui_user_by_username(username)
     assert user is not None
@@ -95,8 +95,6 @@ def test_private_writer_refuses_to_overwrite(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         dev_fleet._write_private(path, "second")
     assert path.read_text() == "first"
-
-
 
 
 @pytest.mark.parametrize("port", ["0", "70000"])

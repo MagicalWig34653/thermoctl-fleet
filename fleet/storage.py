@@ -2485,6 +2485,85 @@ class Storage:
                 )
             return grouped
 
+    def latest_backup_at_by_apartment(self) -> dict[str, datetime]:
+        """`apartment_id -> created_at (aware UTC) of that apartment's newest
+        backup`, for every apartment that has at least one -- one grouped
+        query. Read-only; feeds the Übersicht's "Letzte Sicherungen" metric
+        (how many apartments have a recent backup)."""
+
+        with self.session() as session:
+            rows = session.execute(
+                select(BackupRecord.apartment_id, func.max(BackupRecord.created_at)).group_by(
+                    BackupRecord.apartment_id
+                )
+            ).all()
+            return {
+                apartment_id: created_at.replace(tzinfo=UTC) for apartment_id, created_at in rows
+            }
+
+    def list_recent_backups(self, limit: int) -> list[tuple[str, BackupSummary]]:
+        """The `limit` newest backups across all apartments as
+        `(apartment_id, summary)`, newest first -- read-only, bounded; feeds
+        the Übersicht's "Zuletzt passiert" feed."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(BackupRecord)
+                    .order_by(BackupRecord.created_at.desc(), BackupRecord.id.desc())
+                    .limit(limit)
+                ).all()
+            )
+            return [
+                (
+                    row.apartment_id,
+                    BackupSummary(
+                        backup_id=row.backup_id,
+                        kind=row.kind,
+                        created_at=row.created_at.replace(tzinfo=UTC),
+                        size_bytes=row.size_bytes,
+                        content_hash=row.content_hash,
+                    ),
+                )
+                for row in rows
+            ]
+
+    def list_recent_alarm_changes(self, limit: int) -> list[AlarmRecord]:
+        """The `limit` alarm rows with the newest state change (cleared, else
+        raised), newest first, across all apartments -- read-only, bounded;
+        feeds the Übersicht's "Zuletzt passiert" feed."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(AlarmRecord)
+                    .order_by(
+                        func.coalesce(AlarmRecord.cleared_at, AlarmRecord.raised_at).desc(),
+                        AlarmRecord.id.desc(),
+                    )
+                    .limit(limit)
+                ).all()
+            )
+            session.expunge_all()
+            return rows
+
+    def list_recent_fault_events(self, limit: int) -> list[EventRecord]:
+        """The `limit` newest fault events (rows with a derived `fault_kind`)
+        across all apartments, newest first -- read-only, bounded; feeds the
+        Übersicht's "Zuletzt passiert" feed."""
+
+        with self.session() as session:
+            rows = list(
+                session.scalars(
+                    select(EventRecord)
+                    .where(EventRecord.fault_kind.is_not(None))
+                    .order_by(EventRecord.received_at.desc(), EventRecord.id.desc())
+                    .limit(limit)
+                ).all()
+            )
+            session.expunge_all()
+            return rows
+
     def delete_backups(self, backup_ids: list[str]) -> list[str]:
         """Deletes the metadata rows for `backup_ids` (retention's own
         "everything not kept is deleted") and returns each deleted row's

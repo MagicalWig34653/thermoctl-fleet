@@ -1,6 +1,65 @@
 # Status
 
-Last updated: 2026-10-05.
+Last updated: 2026-10-06.
+
+
+## UI rebuild phase 2a: apartment detail + confirmation pages (2026-10-06)
+
+- `apartment.html` rebuilt to the draft's detail view (back link, heading
+  with floor eyebrow and status badge, tabs as plain `?ansicht=` links,
+  Überblick / Wartung / Technik with the draft's panels, notice, health
+  bars, list rows, action grid). Every previous section is kept (Alarme,
+  Wiederherstellen, Verlauf, Diagnosepakete); no route, form action, field
+  name, hidden input or CSRF handling changed. Commands stay plain links to
+  their confirmation page; the tenant change stays a link to its
+  confirmation page (destructive styling). `pilot_mode`/`open_access`
+  semantics untouched -- the agent enforces them, the page only states them.
+- Heading is `place_text` (Liegenschaft . Wohnung, new helper next to
+  `place_name`), floor as eyebrow, the technical id only as secondary text;
+  the route passes `place`/`floor`/`tone` as template context.
+- Confirmation pages (`command_confirm`, `desired_state_edit`,
+  `desired_state_confirm`, `tenant_change_confirm`) are the draft's dialog
+  look as a page (`.confirm-card`, CSS section 9), shared macros in
+  `_confirm.html`. These pages show the apartment label with the id as
+  secondary text (no property name there: their routes do not load it).
+- CSS lives in sections 6 and 9 of `fleet-ui.css`; the apartment/confirm
+  rules were removed from `legacy.css` (kept: what Einrichtung/Updates/Konto
+  still use).
+- Screenshots: `tools/docs_screenshots.py` now also captures
+  `wohnung-ueberblick/-wartung/-technik` and `befehl-bestaetigen` at 1440
+  and 390 into `docs/ui-redesign/`; the stale dark/light `wohnung-*` PNGs
+  are deleted.
+- Tests: tab/section wording asserts adapted to the new markup (no
+  security assertion weakened), new tests for `place_text`, the rebuilt
+  heading, CSP and confirmation-page cards.
+
+## UI rebuild from the owner's design draft, phase 1 (2026-10-05)
+
+The owner rejected the previous UI twice; it is being rebuilt to match the
+draft (`fleet-entwurf/`) exactly. Phase 1 (foundation) is done:
+
+- Design system `fleet/static/ui/fleet-ui.css` ported from the draft (light
+  theme only, Archivo fonts and the dark theme removed), draft icon set as
+  Jinja macro (`_icons.html`), brand mark + SVG favicon, draft shell in
+  `base.html` (sidebar, topbar, mobile overlay menu that works as a plain
+  `:target` link without JS). Badge counts and "Letzter Stand" come from one
+  helper (`fleet/ui_nav.py`, context processor), tested.
+- Login + 2FA: split-screen page, ONE form posted once to `POST /ui/login`
+  with the unchanged fields; the two steps are client-side (`auth.js`), no
+  server round trip or password check on step 1; without JS all fields show.
+  Auth flow, CSRF, passkey button (`webauthn.js`) and the passwordless
+  variant are unchanged.
+- Übersicht, Wohnungen, Aufgaben (`/ui/tasks` is a page again, no longer a
+  redirect) rebuilt from real data (`fleet/ui_portfolio.py`, four new
+  read-only `Storage` queries). Gebäude/Liste toggle via `?ansicht=liste`.
+- Not yet rebuilt (phase 2): Einrichtung, Updates, Konto. They run on the
+  new shell with `legacy.css`. (Apartment detail and its confirm pages: see
+  "Phase 2a" below.)
+- Open: `ruff format --check .` was already failing on 30+ files before this
+  change (CI only runs `ruff check`); new files are format-clean, old files
+  were deliberately not reformatted. `tools/docs_screenshots.py` still
+  captures the old (dark/light) IA screenshots; the new ones in
+  `docs/ui-redesign/` were produced with an ad-hoc Playwright script.
 
 ## Marketing website updated to the rebuilt fleet UI (2026-10-05)
 

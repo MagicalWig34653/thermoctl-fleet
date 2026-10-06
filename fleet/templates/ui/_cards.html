@@ -1,0 +1,58 @@
+{#
+Shared Jinja macros of the rebuilt pages (design draft components):
+the "needs you" issue card and the apartment table. Each macro that draws an
+icon imports the icon set itself -- an imported template cannot see the
+caller's imports.
+#}
+{% import "_icons.html" as icons %}
+
+{# One "Hier braucht es Sie" / Aufgaben card for an `InboxItem`
+   (fleet.ui_overview). The whole card is one link to the place the action
+   lives -- no state-changing form is cloned here (see ui_overview's note). #}
+{% macro issue_card(item) -%}
+<a class="issue" href="{{ item.action_href }}">
+    <div class="issue-top">
+        <span class="issue-symbol{% if item.warn %} warn{% endif %}">{{ icons.icon(item.icon) }}</span>
+        {% if item.since_text %}<span class="issue-when">{{ item.since_text }}</span>{% endif %}
+    </div>
+    <h3>{{ item.title }}</h3>
+    <p>{{ item.subtitle }}</p>
+    {% if item.stale_hint %}<p>{{ item.stale_hint }}</p>{% endif %}
+    <div class="issue-bottom"><span>{{ item.action_label }}</span>{{ icons.icon("arrow") }}</div>
+</a>
+{%- endmacro %}
+
+{# The draft's apartment table, for `ApartmentRow`s
+   (fleet.ui_apartments_list). `empty_text` is shown for no rows. #}
+{% macro apartment_table(rows, empty_text) -%}
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr><th scope="col">Wohnung</th><th scope="col">Liegenschaft</th><th scope="col">Status</th><th scope="col">Letzte Meldung</th><th scope="col"><span class="visually-hidden">Details</span></th></tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td>
+                    <a class="unit-title row-link" href="{{ row.href }}" title="{{ row.apartment_id }}">
+                        <span class="unit-icon">{{ icons.icon("home") }}</span>
+                        <span>{{ row.label or row.apartment_id }}{% if row.floor %}<small>{{ row.floor }}</small>{% endif %}</span>
+                    </a>
+                </td>
+                <td class="muted-cell">{{ row.property_name or "Ohne Liegenschaft" }}</td>
+                <td class="status-cell"><span class="badge{% if row.tone %} {{ row.tone }}{% endif %}">{{ "!" if row.tone == "error" else "◔" if row.tone == "warn" else "✓" }} {{ row.status_label }}</span></td>
+                <td class="muted">{{ row.last_contact_text }}</td>
+                <td class="chevron-cell"><a href="{{ row.href }}" tabindex="-1" aria-hidden="true">{{ icons.icon("chevron") }}</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">{{ empty_text }}</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{%- endmacro %}
+
+{# The calm "nothing to do" sentence of the Übersicht and Aufgaben. #}
+{% macro calm_text(apartment_count) -%}
+{% if apartment_count == 0 %}Nichts zu tun – es ist noch keine Wohnung eingerichtet.{% elif apartment_count == 1 %}Nichts zu tun – die Wohnung ist in Ordnung.{% else %}Nichts zu tun – alle {{ apartment_count }} Wohnungen sind in Ordnung.{% endif %}
+{%- endmacro %}
