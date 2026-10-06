@@ -137,9 +137,10 @@ against a throwaway, locally seeded demo fleet by
 real apartment or tenant data.
 
 The app icon lives at [`branding/thermoctl-fleet.icon`](branding/thermoctl-fleet.icon)
-(an Xcode Icon Composer bundle: a thermometer whose scale is the fleet --
-four glass segments, warm at the bottom and cool at the top, rising from a
-warm bulb) and is also used as the site's favicon.
+(an Xcode Icon Composer bundle: the fleet UI's brand mark -- two mint glass
+buildings on forest green, one window lit in lime for the apartment that
+needs attention). The web UI and the site use the same mark as a flat SVG
+favicon (`fleet/static/ui/favicon.svg`).
 Rendered with Icon Composer's own `ictool` (`Default`/`Dark`/`ClearLight`
 renditions, `branding/renders/`):
 
