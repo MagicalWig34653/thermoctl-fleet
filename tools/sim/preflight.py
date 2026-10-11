@@ -264,10 +264,7 @@ def _run(argv: Sequence[str]) -> tuple[int, str]:  # pragma: no cover - runs a p
 def _heartbeats(directory: Path) -> Mapping[str, datetime | None]:  # pragma: no cover - needs DB
     from tools.sim.env.up_fleet import last_heartbeats
 
-    db_file = directory / "fleet-data" / "fleet.db"
-    if not db_file.exists():
-        raise RuntimeError(f"no fleet database at {db_file}")
-    return last_heartbeats(f"sqlite:///{db_file}")
+    return last_heartbeats()  # read through a helper container; never from the host
 
 
 def real_probes() -> Probes:  # pragma: no cover - wiring

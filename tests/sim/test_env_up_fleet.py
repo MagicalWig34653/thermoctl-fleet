@@ -5,17 +5,51 @@ import httpx
 import pytest
 
 from tools.sim.clock import clock_path
-from tools.sim.env import up_fleet
+from tools.sim.env import db_access, up_fleet
 from tools.sim.env.config import ROOT
 
 
+class FakeDb:
+    """Stands in for FleetDb: records calls, 'pulls' a local sqlite file path."""
+
+    def __init__(self, tmp_path, rows=None, exists=True):
+        self.calls = []
+        self.tmp_path = tmp_path
+        self.rows = rows or []
+        self._exists = exists
+
+    def ensure_volume(self):
+        self.calls.append("ensure_volume")
+
+    def remove_volume(self):
+        self.calls.append("remove_volume")
+
+    def exists(self):
+        return self._exists
+
+    def query(self, sql, params=()):
+        self.calls.append(("query", sql))
+        return self.rows
+
+    def local_copy(self, scratch):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def cm():
+            self.calls.append(("pull", scratch))
+            yield f"sqlite:///{scratch}/fleet.db"
+            self.calls.append("push")
+
+        return cm()
+
+
 def test_prepare_state_creates_private_key_clock_and_dirs(tmp_path):
-    url, key = up_fleet.prepare_state(tmp_path)
-    assert url == f"sqlite:///{tmp_path / 'fleet-data' / 'fleet.db'}"
+    key = up_fleet.prepare_state(tmp_path)
+    assert not (tmp_path / "fleet-data").exists()  # the database is NOT in the state dir
     assert stat.S_IMODE((tmp_path / "totp.key").stat().st_mode) == 0o600
     assert clock_path(tmp_path).read_text().strip() == "2026-01-05 08:00:00"
     assert (tmp_path / "faults").is_dir() and (tmp_path / "backups").is_dir()
-    assert up_fleet.prepare_state(tmp_path) == (url, key)  # idempotent, key kept
+    assert up_fleet.prepare_state(tmp_path) == key  # idempotent, key kept
 
 
 def test_prepare_state_keeps_an_existing_clock(tmp_path):
@@ -29,7 +63,10 @@ def test_up_builds_base_then_composes_then_waits(tmp_path, monkeypatch):
     calls, waited = [], []
     monkeypatch.setattr(up_fleet, "seed_if_needed", lambda *a: False)
     up_fleet.up(
-        tmp_path, lambda cmd, env: calls.append((cmd, dict(env))), wait=lambda: waited.append(1)
+        tmp_path,
+        lambda cmd, env: calls.append((cmd, dict(env))),
+        wait=lambda: waited.append(1),
+        db=FakeDb(tmp_path),
     )
     assert (
         calls[0][0][:2] == ["docker", "build"] and "thermoctl-sim-fleet-base:local" in calls[0][0]
@@ -64,7 +101,7 @@ def test_up_seeds_when_users_file_missing(tmp_path, monkeypatch):
 
 def test_down_only_addresses_the_sim_project(tmp_path):
     calls = []
-    up_fleet.down(tmp_path, lambda cmd, env: calls.append(cmd))
+    up_fleet.down(tmp_path, lambda cmd, env: calls.append(cmd), db=FakeDb(tmp_path))
     assert calls == [
         [
             "docker",
@@ -80,10 +117,71 @@ def test_down_only_addresses_the_sim_project(tmp_path):
     assert not any(a in ("-v", "--volumes", "--rmi") for a in calls[0])
 
 
+def test_down_removes_the_volume_and_the_state_bound_to_it_but_keeps_the_rest(tmp_path):
+    for d in ("registrations", "agent-tokens", "db-scratch", "faults"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "x").write_text("1")
+    for f in ("users.json", "totp.key", "keep.log"):
+        (tmp_path / f).write_text("1")
+    db = FakeDb(tmp_path)
+    up_fleet.down(tmp_path, lambda cmd, env: None, db=db)
+    assert db.calls == ["remove_volume"]
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == ["faults", "keep.log"]
+
+
+def test_needs_db_work_only_when_something_is_missing(tmp_path):
+    assert up_fleet.needs_db_work(tmp_path, agents=False) is True
+    (tmp_path / "registrations").mkdir()
+    (tmp_path / "registrations" / "_index.json").write_text("{}")
+    (tmp_path / "users.json").write_text("{}")
+    assert up_fleet.needs_db_work(tmp_path, agents=False) is False
+    assert up_fleet.needs_db_work(tmp_path, agents=True) is True  # no tokens yet
+    tokens = tmp_path / "agent-tokens"
+    tokens.mkdir()
+    for apartment in up_fleet.CONTAINER_APARTMENTS:
+        (tokens / f"{apartment}.token").write_text("t")
+    assert up_fleet.needs_db_work(tmp_path, agents=True) is False
+    (tokens / "sim-a05.token").write_text("")  # empty file counts as missing
+    assert up_fleet.needs_db_work(tmp_path, agents=True) is True
+
+
+def test_up_seeds_on_a_local_copy_between_volume_creation_and_compose_up(tmp_path, monkeypatch):
+    order = []
+    db = FakeDb(tmp_path)
+    monkeypatch.setattr(
+        up_fleet, "seed_if_needed", lambda d, url, key: order.append(("seed", url)) or True
+    )
+    monkeypatch.setattr(
+        "tools.sim.env.enroll.enroll_container_apartments",
+        lambda d, url, now: order.append(("enrol", url)) or {},
+    )
+    up_fleet.up(
+        tmp_path,
+        lambda cmd, env: order.append(cmd[1]),
+        wait=lambda: None,
+        agents=True,
+        db=db,
+    )
+    scratch_url = f"sqlite:///{tmp_path / 'db-scratch'}/fleet.db"
+    assert order == ["build", ("seed", scratch_url), ("enrol", scratch_url), "compose"]
+    assert db.calls == ["ensure_volume", ("pull", tmp_path / "db-scratch"), "push"]
+    assert str(tmp_path / "fleet-data") not in scratch_url
+
+
+def test_up_does_not_touch_the_database_when_everything_is_in_place(tmp_path):
+    (tmp_path / "registrations").mkdir()
+    (tmp_path / "registrations" / "_index.json").write_text("{}")
+    (tmp_path / "users.json").write_text("{}")
+    db = FakeDb(tmp_path)
+    up_fleet.up(tmp_path, lambda cmd, env: None, wait=lambda: None, db=db)
+    assert db.calls == ["ensure_volume"]  # no pull/push next to a possibly running fleet
+
+
 def test_main_down_and_error_paths(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SIM_STATE_DIR", str(tmp_path))
     seen = []
-    monkeypatch.setattr(up_fleet, "down", lambda d, run: seen.append(d))
+    monkeypatch.setattr(up_fleet, "down", lambda d, run, **kw: seen.append(d))
     assert up_fleet.main(["--down"]) == 0 and seen == [tmp_path]
 
     def boom(d, run, **kw):
@@ -117,7 +215,10 @@ def test_compose_file_only_uses_sim_names_and_loopback():
     assert fleet["container_name"].startswith("thermoctl-sim")
     assert fleet["image"].startswith("thermoctl-sim")
     assert all(p.startswith("127.0.0.1:8200:") for p in fleet["ports"])
-    assert "volumes" not in doc  # no named volumes that down could confuse with the user's
+    # the only volume is the external sim-prefixed one that up_fleet creates and --down removes
+    assert doc["volumes"] == {"fleet-data": {"external": True, "name": "thermoctl-sim-fleet-data"}}
+    assert fleet["volumes"][0] == "fleet-data:/data"  # a named volume, not a host bind mount
+    assert not any("fleet-data" in v and "SIM_STATE_DIR" in v for v in fleet["volumes"])
     assert (
         "FAKETIME_NO_CACHE" not in fleet["environment"]
     )  # livelocks the fleet (finding in smoke run)
@@ -168,8 +269,14 @@ def test_up_with_agents_enrols_first_then_starts_every_service(tmp_path, monkeyp
         "tools.sim.env.enroll.enroll_container_apartments",
         lambda d, url, now: order.append(("enrol", d, now.year)) or {},
     )
-    up_fleet.up(tmp_path, lambda cmd, env: order.append(cmd[-3:]), wait=lambda: None, agents=True)
-    assert order[0] == ("enrol", tmp_path, 2026)
+    up_fleet.up(
+        tmp_path,
+        lambda cmd, env: order.append(cmd[-3:]),
+        wait=lambda: None,
+        agents=True,
+        db=FakeDb(tmp_path),
+    )
+    assert order[1] == ("enrol", tmp_path, 2026)  # after the image build, before compose up
     assert order[-1] == ["up", "-d", "--build"]
 
 
@@ -180,7 +287,7 @@ def test_up_without_agents_never_enrols(tmp_path, monkeypatch):
         raise AssertionError("must not enrol")
 
     monkeypatch.setattr("tools.sim.env.enroll.enroll_container_apartments", boom)
-    up_fleet.up(tmp_path, lambda cmd, env: None, wait=lambda: None)
+    up_fleet.up(tmp_path, lambda cmd, env: None, wait=lambda: None, db=FakeDb(tmp_path))
 
 
 def test_format_heartbeat_report():
@@ -197,36 +304,34 @@ def test_format_heartbeat_report():
     ]
 
 
-def test_check_reads_heartbeats_from_the_fleet_db(tmp_path, monkeypatch):
-    from datetime import UTC, datetime
+def test_check_reads_heartbeats_through_the_db_access_layer(tmp_path, monkeypatch):
+    from datetime import datetime
 
-    from fastapi.testclient import TestClient
-
-    from fleet.app import app
-    from fleet.storage import create_storage, get_storage
-    from tools.sim.env.enroll import enroll_container_apartments
-    from tools.sim.env.fleet_setup import seed_fleet
-    from tools.sim.sim_agent import SimAgent, healthy_sections
-
-    with pytest.raises(RuntimeError, match="no fleet database"):
-        up_fleet.check(tmp_path)
-    url, _ = up_fleet.prepare_state(tmp_path)
-    seed_fleet(tmp_path, url)
-    tokens = enroll_container_apartments(tmp_path, url, datetime(2026, 1, 5, 8, tzinfo=UTC))
-    storage = create_storage(url)
-    app.dependency_overrides[get_storage] = lambda: storage
-    try:
-        with TestClient(app) as client:
-            token = tokens["sim-a03"].read_text().strip()
-            assert SimAgent("sim-a03", client, token, healthy_sections).tick()  # type: ignore[arg-type]
-    finally:
-        app.dependency_overrides.pop(get_storage, None)
-    lines = up_fleet.check(tmp_path).splitlines()
+    rows = [("sim-a03", "2026-01-05 07:59:30.123456")]
+    db = FakeDb(tmp_path, rows=rows)
+    lines = up_fleet.check(tmp_path, db).splitlines()
     assert lines[0].startswith("virtual now: 2026-01-05 08:00:00")
     assert any(line.startswith("sim-a03: ") and "never" not in line for line in lines)
     assert "sim-a04: never" in lines
+    assert any(c[0] == "query" and "heartbeats" in c[1] for c in db.calls)
+    assert up_fleet.last_heartbeats(db)["sim-a03"] == datetime(2026, 1, 5, 7, 59, 30, 123456)
+    with pytest.raises(RuntimeError, match="no fleet database"):
+        up_fleet.check(tmp_path, FakeDb(tmp_path, exists=False))
     monkeypatch.setenv("SIM_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(db_access, "real_db", lambda: FakeDb(tmp_path))
     assert up_fleet.main(["--check"]) == 0
+
+
+def test_main_reports_db_access_errors(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SIM_STATE_DIR", str(tmp_path))
+
+    class Broken(FakeDb):
+        def exists(self):
+            raise db_access.DbAccessError("docker is down")
+
+    monkeypatch.setattr(db_access, "real_db", lambda: Broken(tmp_path))
+    assert up_fleet.main(["--check"]) == 1
+    assert "docker is down" in capsys.readouterr().err
 
 
 def test_main_logins_refreshes_and_reports_failure(tmp_path, monkeypatch):

@@ -37,7 +37,7 @@ services:
       dockerfile: tools/sim/env/Dockerfile.fleet-sim
       args:
         BASE_IMAGE: thermoctl-sim-fleet-base:local
-    # Run as the host user so the host can seed the same SQLite file.
+    # Same uid/gid as the host user; the named volume is chowned to it by up_fleet.
     user: "${SIM_UID:?set by up_fleet}:${SIM_GID:?set by up_fleet}"
     ports:
       - "127.0.0.1:8200:8000"
@@ -63,7 +63,10 @@ services:
       # is enough, the runner settles after each clock step.
       FAKETIME_CACHE_DURATION: "1"
     volumes:
-      - "${SIM_STATE_DIR:?set by up_fleet}/fleet-data:/data"
+      # Named volume (native FS in the Colima VM), NOT a host bind mount: SQLite corrupts when
+      # the macOS host and the container share the file over virtiofs. Created and handed to
+      # SIM_UID by `up_fleet` (db_access), removed only by the sim `--down`.
+      - "fleet-data:/data"
       - "${SIM_STATE_DIR}/backups:/backups"
       - "${SIM_STATE_DIR}/diagnostic-bundles:/bundles"
       # The directory, not the file: SimClock replaces the file by rename, which a
@@ -305,3 +308,8 @@ services:
 networks:
   sim-net:
     name: thermoctl-sim-net
+
+volumes:
+  fleet-data:
+    external: true   # created by up_fleet (needs chown first), removed by up_fleet --down
+    name: thermoctl-sim-fleet-data

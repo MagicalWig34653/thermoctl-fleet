@@ -2,9 +2,11 @@
 
 The fleet runs in Docker (image = repo fleet image + libfaketime) so it shares
 the agents' virtual clock; the Mac host could not LD_PRELOAD the Linux library.
-The SQLite file lives in `<state>/fleet-data` (bind mount), so the host seeds it
-with the real Storage API before the container starts. Only resources whose
-names start with `thermoctl-sim` are ever created or removed.
+The SQLite file lives in the Docker named volume `thermoctl-sim-fleet-data` (native
+filesystem inside the Colima VM), never on a host bind mount: SQLite does not survive
+two kernels sharing one file over virtiofs (see `db_access`). The host seeds a local copy
+with the real Storage API before the container starts and pushes it into the volume.
+Only resources whose names start with `thermoctl-sim` are ever created or removed.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import argparse
 import base64
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -23,11 +26,16 @@ from pathlib import Path
 import httpx
 
 from tools.sim.clock import SIM_START, clock_path
-from tools.sim.env.config import APARTMENT_IDS, FLEET_URL, PREFIX, ROOT, state_dir, virtual_now
+from tools.sim.env import db_access
+from tools.sim.env.config import FLEET_URL, PREFIX, ROOT, state_dir, virtual_now
+from tools.sim.env.enroll import CONTAINER_APARTMENTS, TOKEN_DIRNAME
 
 COMPOSE_FILE = Path(__file__).with_name("compose.sim.yml")
 BASE_IMAGE = f"{PREFIX}-fleet-base:local"
 RunCmd = Callable[[list[str], Mapping[str, str]], object]
+SCRATCH_DIRNAME = "db-scratch"  # local working copy while seeding; emptied afterwards
+# State files that only make sense together with the database; `down` removes them with it.
+DB_BOUND_STATE = ("registrations", TOKEN_DIRNAME, "users.json", "totp.key")
 
 
 def _write_private(path: Path, content: str) -> None:
@@ -36,10 +44,10 @@ def _write_private(path: Path, content: str) -> None:
         out.write(content)
 
 
-def prepare_state(directory: Path) -> tuple[str, str]:
-    """Create dirs, TOTP key and clock if missing; return (database_url, totp_key)."""
+def prepare_state(directory: Path) -> str:
+    """Create dirs, TOTP key and clock if missing; return the TOTP key."""
     directory.mkdir(parents=True, exist_ok=True)
-    for name in ("fleet-data", "backups", "diagnostic-bundles", "faults"):
+    for name in ("backups", "diagnostic-bundles", "faults"):
         (directory / name).mkdir(exist_ok=True)
     key_path = directory / "totp.key"
     if not key_path.exists():
@@ -49,8 +57,7 @@ def prepare_state(directory: Path) -> tuple[str, str]:
     clock.parent.mkdir(exist_ok=True)
     if not clock.exists():
         clock.write_text(SIM_START.strftime("%Y-%m-%d %H:%M:%S") + "\n", encoding="ascii")
-    url = f"sqlite:///{directory / 'fleet-data' / 'fleet.db'}"
-    return url, key_path.read_text(encoding="ascii").strip()
+    return key_path.read_text(encoding="ascii").strip()
 
 
 def compose_env(
@@ -104,41 +111,69 @@ def wait_healthy(
         sleep(1.0)
 
 
+def needs_db_work(directory: Path, *, agents: bool) -> bool:
+    """True if seeding, UI users or (with `agents`) a token file is still missing."""
+    if not (directory / "registrations" / "_index.json").exists():
+        return True
+    if not (directory / "users.json").exists():
+        return True
+    if agents:
+        for apartment in CONTAINER_APARTMENTS:
+            token = directory / TOKEN_DIRNAME / f"{apartment}.token"
+            if not token.exists() or token.stat().st_size == 0:
+                return True
+    return False
+
+
 def up(
     directory: Path,
     run_cmd: RunCmd,
     *,
     wait: Callable[[], None] = wait_healthy,
     agents: bool = False,
+    db: db_access.FleetDb | None = None,
 ) -> None:
-    """Build and start the fleet; with `agents` also enrol and start sim-a03..sim-a12."""
-    database_url, totp_key = prepare_state(directory)
-    seed_if_needed(directory, database_url, totp_key)
-    if agents:
-        from tools.sim.env.enroll import enroll_container_apartments
+    """Build and start the fleet; with `agents` also enrol and start sim-a03..sim-a12.
 
-        enroll_container_apartments(directory, database_url, virtual_now(directory))
+    The database is only written here, on a local copy, while the fleet is not running.
+    """
+    totp_key = prepare_state(directory)
     env = compose_env(directory, totp_key)
     run_cmd(["docker", "build", "-f", "docker/Dockerfile.fleet", "-t", BASE_IMAGE, str(ROOT)], env)
+    fleet_db = db or db_access.real_db()
+    fleet_db.ensure_volume()
+    if needs_db_work(directory, agents=agents):
+        with fleet_db.local_copy(directory / SCRATCH_DIRNAME) as database_url:
+            seed_if_needed(directory, database_url, totp_key)
+            if agents:
+                from tools.sim.env.enroll import enroll_container_apartments
+
+                enroll_container_apartments(directory, database_url, virtual_now(directory))
     run_cmd(_compose("up", "-d", "--build", *(() if agents else ("fleet",))), env)
     wait()
 
 
-def down(directory: Path, run_cmd: RunCmd) -> None:
-    """Stop and remove the sim containers and network; state files are kept."""
+def down(directory: Path, run_cmd: RunCmd, *, db: db_access.FleetDb | None = None) -> None:
+    """Stop and remove the sim containers and network, then the database volume.
+
+    The database is deleted on purpose: `down` means a fresh run. The secrets and
+    registration files that belong to it go too (they would not match a new database);
+    the clock, logs and everything else in the state dir are kept.
+    """
     run_cmd(_compose("down", "--remove-orphans"), compose_env(directory, "unused"))
+    (db or db_access.real_db()).remove_volume()
+    for name in DB_BOUND_STATE:
+        target = directory / name
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink(missing_ok=True)
+    shutil.rmtree(directory / SCRATCH_DIRNAME, ignore_errors=True)
 
 
-def last_heartbeats(database_url: str) -> dict[str, datetime | None]:
+def last_heartbeats(db: db_access.FleetDb | None = None) -> dict[str, datetime | None]:
     """Receipt time of each apartment's latest heartbeat (read-only), None if never seen."""
-    from fleet.storage import create_storage
-
-    storage = create_storage(database_url)
-    out: dict[str, datetime | None] = {}
-    for apartment in APARTMENT_IDS:
-        latest = storage.get_latest_heartbeat(apartment)
-        out[apartment] = None if latest is None else latest.received_at
-    return out
+    return db_access.last_heartbeat_times(db or db_access.real_db())
 
 
 def format_heartbeat_report(rows: Mapping[str, datetime | None], now: datetime) -> str:
@@ -154,13 +189,12 @@ def format_heartbeat_report(rows: Mapping[str, datetime | None], now: datetime) 
     return "\n".join(lines)
 
 
-def check(directory: Path) -> str:
-    """Report for the running stack, read from the fleet database."""
-    db_file = directory / "fleet-data" / "fleet.db"
-    if not db_file.exists():
-        raise RuntimeError(f"no fleet database at {db_file}; run up_fleet first")
-    database_url = f"sqlite:///{db_file}"
-    return format_heartbeat_report(last_heartbeats(database_url), virtual_now(directory))
+def check(directory: Path, db: db_access.FleetDb | None = None) -> str:
+    """Report for the running stack, read from the fleet database (through a container)."""
+    fleet_db = db or db_access.real_db()
+    if not fleet_db.exists():
+        raise RuntimeError("no fleet database in the volume; run up_fleet first")
+    return format_heartbeat_report(last_heartbeats(fleet_db), virtual_now(directory))
 
 
 def _run(cmd: list[str], env: Mapping[str, str]) -> object:  # pragma: no cover - needs Docker
@@ -188,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             up(directory, _run, agents=args.agents)
             print(f"fleet up at {FLEET_URL}; credentials in {directory / 'users.json'}")
-    except (subprocess.CalledProcessError, RuntimeError) as exc:
+    except (subprocess.CalledProcessError, RuntimeError, db_access.DbAccessError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0

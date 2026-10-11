@@ -98,8 +98,37 @@ python -m tools.sim.env.vms --down          # deletes ONLY thermoctl-sim-a01/a02
 python -m tools.sim.env.up_fleet --down     # removes thermoctl-sim containers and network
 ```
 
-Seeded data, the clock and all outputs stay in `sim-state/`; delete that
-directory (or point `SIM_STATE_DIR` elsewhere) for a clean start.
+`up_fleet --down` (and so `stack --down`) **deletes the fleet database**: it removes the
+Docker volume `thermoctl-sim-fleet-data` and the state files that only fit that database
+(`registrations/`, `agent-tokens/`, `users.json`, `totp.key`). Data loss is intended: the
+next `--up` is a fresh run. The clock and all other outputs stay in `sim-state/`; delete
+that directory (or point `SIM_STATE_DIR` elsewhere) for a completely clean start.
+
+### Where the fleet database lives, and how to look at it
+
+The SQLite file is `/data/fleet.db` in the **named volume `thermoctl-sim-fleet-data`**
+(native filesystem inside the Colima VM), not in `sim-state/`. Never bind-mount it to the
+Mac or open it from the host: SQLite's locking does not work across virtiofs, and a host
+reader/writer next to the container writer corrupts the file ("database disk image is
+malformed", first seen as HTTP 500 on every heartbeat). All access goes through
+`tools/sim/env/db_access.py` (short-lived helper containers on the same volume):
+
+```sh
+# read-only peek (works while the stack runs); or use up_fleet --check
+docker run --rm --network none -v thermoctl-sim-fleet-data:/data --entrypoint python \
+  thermoctl-sim-fleet-base:local -c "import sqlite3;c=sqlite3.connect('file:/data/fleet.db?mode=ro',uri=True);print(c.execute('select apartment_id,count(*) from heartbeats group by 1').fetchall())"
+# consistent copy for offline analysis (sqlite backup API), then inspect the copy on the Mac
+python - <<'PY'
+from pathlib import Path
+from tools.sim.env.db_access import real_db
+real_db().snapshot_to(Path("/tmp/fleet-snapshot.db"))
+PY
+```
+
+Seeding and enrolling write only before the fleet starts, on a local copy that is pushed
+into the volume integrity-checked; `up_fleet` refuses to write while `thermoctl-sim-fleet`
+runs. Everything else that reads the DB (`--check`, `preflight`, the pentest) uses
+read-only queries through the helper container.
 
 ## 6. Tenant instances (the tenant personas' own UI)
 
