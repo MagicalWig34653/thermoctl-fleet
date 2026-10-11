@@ -127,3 +127,57 @@ def test_run_passes_env_and_prints_outstanding(dirs, capsys, monkeypatch):
     rows = (dirs / "s" / "failures.jsonl").read_text().splitlines()
     n = len({json.loads(r)["step"] for r in rows})
     assert n > 0 and f"{n} failed persona steps outstanding" in out
+
+
+def test_parse_personas_validates_and_dedups():
+    assert cli.parse_personas(None) is None
+    assert cli.parse_personas("landlord, caretaker,landlord") == ["landlord", "caretaker"]
+    with pytest.raises(ValueError, match="unknown persona.*nobody"):
+        cli.parse_personas("landlord,nobody")
+    with pytest.raises(ValueError, match="empty"):
+        cli.parse_personas(" , ")
+
+
+def test_run_rejects_unknown_persona_with_exit_1(dirs, capsys):
+    assert cli.main(["run", "--weeks", "1", "--personas", "nobody"]) == 1
+    assert "unknown persona" in capsys.readouterr().err
+
+
+def _fake_env(monkeypatch, events):
+    monkeypatch.setattr("tools.sim.runner.time.sleep", lambda s: None)
+
+    class Env:
+        @staticmethod
+        def apartments():
+            return ["a01"]
+
+        @staticmethod
+        def urls():
+            return {"fleet": "http://127.0.0.1:1"}
+
+        @staticmethod
+        def apply_event(event):
+            events.append(event)
+            raise NotImplementedError("nope")
+
+    monkeypatch.setattr(cli.importlib, "import_module", lambda name: Env)
+    monkeypatch.setattr(cli, "ensure_persona_cwd", lambda d: d)
+    from tools.sim.haiku import PersonaResult
+
+    monkeypatch.setattr(cli, "run_persona", lambda p, cwd, env: PersonaResult(True, "DONE", False))
+
+
+def test_run_with_filter_then_other_filter_is_refused(dirs, capsys, monkeypatch):
+    _fake_env(monkeypatch, [])
+    assert cli.main(["run", "--weeks", "1", "--personas", "landlord"]) == 0
+    capsys.readouterr()
+    assert cli.main(["run", "--weeks", "1", "--personas", "caretaker"]) == 1
+    assert "started with personas landlord" in capsys.readouterr().err
+
+
+def test_run_prints_skipped_event_count(dirs, capsys, monkeypatch):
+    events = []
+    _fake_env(monkeypatch, events)
+    assert cli.main(["run", "--weeks", "30", "--personas", "landlord"]) == 0
+    assert events
+    assert f"{len(events)} events skipped" in capsys.readouterr().out

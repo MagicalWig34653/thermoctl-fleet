@@ -136,3 +136,133 @@ def test_tool_notes_describe_working_dir_jar_and_options():
     assert "--cookie-jar" in TOOL_NOTES and "file name" in TOOL_NOTES
     for opt in ("--json", "--form", "--url", "--out", "--width", "--dark", "--role"):
         assert opt in TOOL_NOTES
+
+
+def _skip_kinds(events):
+    from tools.sim.scenario import Event
+
+    def apply(event: Event) -> None:
+        events.append(event)
+        raise NotImplementedError(f"no handler for {event.kind}")
+
+    return apply
+
+
+def test_not_implemented_event_is_logged_and_marked_applied(tmp_path):
+    from tools.sim.runner import skipped_event_count
+
+    seen = []
+    kwargs = make(tmp_path, lambda p: GOOD, [])
+    kwargs["apply_event"] = _skip_kinds(seen)
+    run(**kwargs)
+    state = SimState.load(tmp_path / "s" / "state.json")
+    assert state.week == 3 and seen
+    assert set(state.applied_events) == {e.id for e in seen}
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "s" / "skipped-events.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == len(seen) == skipped_event_count(tmp_path / "s")
+    assert set(rows[0]) == {"event", "kind", "apartment", "week", "message"}
+    assert "no handler" in rows[0]["message"]
+
+
+def test_skipped_events_are_not_logged_twice_on_resume(tmp_path):
+    from tools.sim.runner import skipped_event_count
+
+    seen = []
+    kwargs = make(tmp_path, lambda p: GOOD, [])
+    kwargs["apply_event"] = _skip_kinds(seen)
+    run(**kwargs)
+    first = skipped_event_count(tmp_path / "s")
+    run(**kwargs)
+    assert skipped_event_count(tmp_path / "s") == first == len(seen)
+
+
+def test_other_event_errors_abort_with_state_saved(tmp_path):
+    calls = []
+
+    def boom(event):
+        calls.append(event)
+        if len(calls) == 2:
+            raise RuntimeError("docker died")
+
+    kwargs = make(tmp_path, lambda p: GOOD, [], weeks=20)
+    kwargs["apply_event"] = boom
+    with pytest.raises(RuntimeError, match="docker died"):
+        run(**kwargs)
+    state = SimState.load(tmp_path / "s" / "state.json")
+    assert calls[0].id in state.applied_events
+    assert calls[1].id not in state.applied_events
+
+
+def test_persona_filter_limits_steps(tmp_path):
+    prompts = []
+
+    def fn(prompt):
+        prompts.append(prompt)
+        return GOOD
+
+    kwargs = make(tmp_path, fn, [])
+    run(**kwargs, personas=["landlord"])
+    state = SimState.load(tmp_path / "s" / "state.json")
+    assert state.personas == ["landlord"]
+    assert state.done_steps == [f"w{w:03d}:landlord" for w in range(3)]
+    assert len(prompts) == 3
+
+
+def test_unknown_persona_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="unknown personas: nobody"):
+        run(**make(tmp_path, lambda p: GOOD, []), personas=["nobody"])
+
+
+def test_resume_with_different_filter_is_refused(tmp_path):
+    kwargs = make(tmp_path, lambda p: GOOD, [], weeks=1)
+    run(**kwargs, personas=["landlord"])
+    with pytest.raises(ValueError, match="started with personas landlord"):
+        run(**kwargs, personas=["landlord", "caretaker"])
+    with pytest.raises(ValueError, match="started with personas landlord"):
+        run(**kwargs)  # default = all
+
+
+def test_resume_with_same_filter_in_other_order_is_fine(tmp_path):
+    kwargs = make(tmp_path, lambda p: GOOD, [], weeks=1)
+    run(**kwargs, personas=["landlord", "caretaker"])
+    run(**kwargs, personas=["caretaker", "landlord"])
+
+
+def test_resume_with_different_seed_is_refused(tmp_path):
+    kwargs = make(tmp_path, lambda p: GOOD, [], weeks=1)
+    run(**kwargs, seed=3)
+    with pytest.raises(ValueError, match="seed 3"):
+        run(**kwargs, seed=4)
+
+
+def test_old_state_without_parameters_counts_as_all_personas_seed_1(tmp_path):
+    state_dir = tmp_path / "s"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text('{"week": 1, "done_steps": [], "applied_events": []}')
+    kwargs = make(tmp_path, lambda p: GOOD, [], weeks=2)
+    with pytest.raises(ValueError, match="started with personas"):
+        run(**kwargs, personas=["landlord"])
+    run(**kwargs)
+
+
+def test_pause_then_resume_with_filter_keeps_working(tmp_path):
+    n = []
+
+    def flaky(prompt):
+        n.append(1)
+        return PersonaResult(False, "", True) if len(n) == 2 else GOOD
+
+    kwargs = make(tmp_path, flaky, [])
+    with pytest.raises(LimitPause):
+        run(**kwargs, personas=["landlord"])
+    run(**kwargs, personas=["landlord"])
+    assert SimState.load(tmp_path / "s" / "state.json").week == 3
+
+
+def test_refresh_logins_called_once_per_week(tmp_path):
+    calls = []
+    run(**make(tmp_path, lambda p: GOOD, []), refresh_logins=lambda: calls.append(1))
+    assert len(calls) == 3

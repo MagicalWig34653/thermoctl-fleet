@@ -54,3 +54,18 @@ def test_mark_event_is_idempotent():
     state.mark_event("e1")
     state.mark_event("e1")
     assert state.applied_events == ["e1"]
+
+
+def test_run_parameters_roundtrip_and_default_to_none(tmp_path):
+    path = tmp_path / "state.json"
+    assert SimState().personas is None and SimState().seed is None
+    SimState(personas=["landlord"], seed=7).save(path)
+    loaded = SimState.load(path)
+    assert loaded.personas == ["landlord"] and loaded.seed == 7
+
+
+def test_has_progress():
+    assert not SimState().has_progress()
+    assert SimState(week=1).has_progress()
+    assert SimState(done_steps=["w000:landlord"]).has_progress()
+    assert SimState(applied_events=["e"]).has_progress()

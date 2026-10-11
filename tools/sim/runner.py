@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 from pathlib import Path
 
@@ -37,6 +37,47 @@ _STEP_ID = re.compile(r"w\d+:[A-Za-z0-9_-]+")
 
 class LimitPause(Exception):
     """Usage limit hit; state is saved, rerun to resume."""
+
+
+def _record_skipped_event(state_dir: Path, event: Event, message: str) -> None:
+    row = {
+        "event": event.id,
+        "kind": str(event.kind),
+        "apartment": event.apartment,
+        "week": event.week,
+        "message": message[:_FAILURE_TEXT_MAX],
+    }
+    with (state_dir / "skipped-events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+
+def skipped_event_count(state_dir: Path) -> int:
+    path = state_dir / "skipped-events.jsonl"
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
+def _check_resume_parameters(
+    state: SimState, personas: list[str], seed: int, all_ids: list[str]
+) -> None:
+    """Refuse a resume whose persona filter or seed differs from the one that started the run."""
+    # Older state files recorded neither: they were runs with all personas and seed 1.
+    recorded_personas = state.personas if state.personas is not None else all_ids
+    recorded_seed = state.seed if state.seed is not None else 1
+    if state.has_progress():
+        if sorted(recorded_personas) != sorted(personas):
+            raise ValueError(
+                f"state was started with personas {','.join(recorded_personas)} but this run "
+                f"asks for {','.join(personas)}; use the same --personas or a fresh state dir"
+            )
+        if recorded_seed != seed:
+            raise ValueError(
+                f"state was started with seed {recorded_seed} but this run asks for seed "
+                f"{seed}; use the same --seed or a fresh state dir"
+            )
+    state.personas = list(personas)
+    state.seed = seed
 
 
 def _record_failure(state_dir: Path, step_id: str, week: int, text: str) -> None:
@@ -78,16 +119,31 @@ def run(
     seed: int = 1,
     tool_notes: str = "",
     settle_s: float = 0.0,
+    personas: Sequence[str] | None = None,
+    refresh_logins: Callable[[], None] | None = None,
 ) -> None:
     """Run (or resume) the simulation up to `weeks`.
 
     A week always ends with exactly seven daily clock steps, so the clock at the
     start of week N is SIM_START + N weeks; resume restores that. Events are
     keyed by id and persona steps by `wNNN:<persona>`, so nothing repeats.
+
+    `personas` restricts the run to those ids (default all); it and `seed` are stored
+    in the state and a resume with different values raises ValueError. An event whose
+    handler raises NotImplementedError is logged to `skipped-events.jsonl` and counted
+    as applied; any other exception aborts the run (state saved). `refresh_logins`,
+    if given, is called once at the start of every simulated week.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
     state = SimState.load(state_path)
+    all_ids = [p.id for p in PERSONAS]
+    selected = list(personas) if personas is not None else all_ids
+    unknown = sorted(set(selected) - set(all_ids))
+    if unknown:
+        raise ValueError(f"unknown personas: {', '.join(unknown)}")
+    _check_resume_parameters(state, selected, seed, all_ids)
+    state.save(state_path)
     clock = SimClock(clock_path(state_dir))
     clock.now = SIM_START + timedelta(weeks=state.week)
     clock.write()
@@ -99,7 +155,7 @@ def run(
     for step_id in _failed_steps(state_dir):
         persona_id = step_id.split(":", 1)[1]
         week_of = int(step_id.split(":", 1)[0][1:])
-        if state.is_done(step_id) or persona_id not in by_id:
+        if state.is_done(step_id) or persona_id not in by_id or persona_id not in selected:
             continue
         retry_date = (SIM_START + timedelta(weeks=week_of)).date().isoformat()
         prompt = build_prompt(by_id[persona_id], week_of, retry_date, urls, tool_notes)
@@ -115,11 +171,21 @@ def run(
 
     for week in range(state.week, weeks):
         state.week = week
+        if refresh_logins is not None:
+            refresh_logins()
         for event in due_events(schedule, week, state.applied_events):
-            apply_event(event)
+            try:
+                apply_event(event)
+            except NotImplementedError as exc:
+                _record_skipped_event(state_dir, event, str(exc))
+            except BaseException:
+                state.save(state_path)
+                raise
             state.mark_event(event.id)
             state.save(state_path)
         for persona in due_personas(week):
+            if persona.id not in selected:
+                continue
             step_id = f"w{week:03d}:{persona.id}"
             if state.is_done(step_id):
                 continue

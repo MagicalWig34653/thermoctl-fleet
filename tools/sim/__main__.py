@@ -11,7 +11,14 @@ from pathlib import Path
 
 from tools.sim.findings import build_index
 from tools.sim.haiku import ensure_persona_cwd, run_persona
-from tools.sim.runner import TOOL_NOTES, LimitPause, outstanding_failures, run
+from tools.sim.personas import PERSONAS
+from tools.sim.runner import (
+    TOOL_NOTES,
+    LimitPause,
+    outstanding_failures,
+    run,
+    skipped_event_count,
+)
 from tools.sim.state import SimState
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,7 +43,28 @@ def persona_env(root: Path, python_executable: str, base_env: Mapping[str, str])
     return env
 
 
+def parse_personas(raw: str | None) -> list[str] | None:
+    """Comma list of persona ids, validated; None (flag absent) means all."""
+    if raw is None:
+        return None
+    known = [p.id for p in PERSONAS]
+    ids = [part.strip() for part in raw.split(",") if part.strip()]
+    if not ids:
+        raise ValueError(f"--personas is empty; choose from: {', '.join(known)}")
+    unknown = [i for i in ids if i not in known]
+    if unknown:
+        raise ValueError(
+            f"unknown persona(s): {', '.join(unknown)}; choose from: {', '.join(known)}"
+        )
+    return list(dict.fromkeys(ids))
+
+
 def _print_outstanding() -> None:
+    skipped = skipped_event_count(STATE_DIR)
+    if skipped:
+        print(
+            f"{skipped} events skipped (not implemented), see {STATE_DIR / 'skipped-events.jsonl'}"
+        )
     try:
         count = len(outstanding_failures(STATE_DIR))
     except ValueError:  # pragma: no cover - state was just written by the run
@@ -49,9 +77,18 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     run_p = sub.add_parser("run")
     run_p.add_argument("--weeks", type=int, default=156)
+    run_p.add_argument("--seed", type=int, default=1)
+    run_p.add_argument("--personas", default=None, help="comma list of persona ids (default all)")
     sub.add_parser("status")
     sub.add_parser("report")
     args = parser.parse_args(argv)
+    selected: list[str] | None = None
+    if args.cmd == "run":
+        try:
+            selected = parse_personas(args.personas)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
     if args.cmd == "status":
         try:
@@ -86,7 +123,12 @@ def main(argv: list[str] | None = None) -> int:
             persona_fn=lambda prompt: run_persona(prompt, cwd=persona_cwd, env=child_env),
             tool_notes=TOOL_NOTES,
             settle_s=3.0,
+            seed=args.seed,
+            personas=selected,
         )
+    except ValueError as exc:  # resume with different parameters, corrupt state
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     except LimitPause as pause:
         print(f"paused at {pause}; rerun `python -m tools.sim run` to resume")
         _print_outstanding()

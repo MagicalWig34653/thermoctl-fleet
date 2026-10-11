@@ -13,6 +13,9 @@ class SimState:
     week: int = 0
     done_steps: list[str] = field(default_factory=list)
     applied_events: list[str] = field(default_factory=list)
+    # Run parameters that must not change on resume; None = not recorded (older state).
+    personas: list[str] | None = None
+    seed: int | None = None
 
     @classmethod
     def load(cls, path: Path) -> SimState:
@@ -32,6 +35,9 @@ class SimState:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
         os.replace(tmp, path)
+
+    def has_progress(self) -> bool:
+        return self.week > 0 or bool(self.done_steps) or bool(self.applied_events)
 
     def mark_step(self, step_id: str) -> None:
         if step_id not in self.done_steps:
