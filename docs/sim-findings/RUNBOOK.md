@@ -73,3 +73,11 @@ directory (or point `SIM_STATE_DIR` elsewhere) for a clean start.
 | Login cookies per role (secret, mode 0600) | `sim-state/storage-states/<role>.json` |
 | Persona scratch dir (screenshots) | `sim-state/persona-cwd/` |
 | Virtual clock | `sim-state/clock/clock` |
+
+## Lessons from the first live run
+
+- Every run starts from a fresh state: `python -m tools.sim.env.up_fleet --down`, delete
+  `sim-state/`, then `--agents` and `--logins`. Deleting only `state.json` leaves later
+  heartbeats in the fleet database and the personas see events "from the future".
+- Persona browsers cannot submit forms yet (open problem in `01-smoke-run.md`).
+- Personas read link targets from the `links:` list that `browse text` appends.

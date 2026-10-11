@@ -34,7 +34,7 @@ expected to stay "never"). Personas: Haiku 5.5, low effort.
 6. `41cf2f1` clock file overwritten in place (a rename-based swap made libfaketime fall back to real time for a moment, so containers recorded real-time heartbeats, 2026-10-11, mixed with virtual ones).
 7. `ca5c011` container events (pause/kill/wifi) for VM apartments sim-a01/a02 are skipped, not fatal.
 8. `765acc6` `docker unpause` after a power loss (container already restarted) is not an error.
-9. (this commit series) `browse text` lists link targets (`links:` section) and the tool notes say so; without it the personas reported "cannot find the page" as a blocker (more than half of the first run's findings were this artefact; week 0 was rerun after the fix).
+9. `231973d` `browse text` lists link targets (`links:` section) and the tool notes say so; without it the personas reported "cannot find the page" as a blocker (more than half of the first run's findings were this artefact; week 0 was rerun after the fix).
 
 ## Product findings
 
