@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+import signal
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
+from types import FrameType
 
 from tools.sim.clock import SIM_START, SimClock, clock_path
 from tools.sim.findings import append_findings, build_index, parse_findings
-from tools.sim.haiku import PersonaResult
+from tools.sim.haiku import REGISTRY, ChildRegistry, PersonaResult
 from tools.sim.personas import PERSONAS, build_prompt, due_personas
 from tools.sim.scenario import Event, build_schedule, due_events
 from tools.sim.state import SimState
@@ -45,6 +48,42 @@ _STEP_ID = re.compile(r"w\d+:[A-Za-z0-9_-]+")
 
 class LimitPause(Exception):
     """Usage limit hit; state is saved, rerun to resume."""
+
+
+class Terminated(BaseException):  # noqa: N818 - a signal, not an error
+    """SIGTERM/SIGINT arrived; children are killed, `exit_code` is 128 + signal.
+
+    Derives from BaseException so the run's own `except Exception` paths never
+    swallow it; `run` saves state on the way out.
+    """
+
+    def __init__(self, exit_code: int) -> None:
+        super().__init__(exit_code)
+        self.exit_code = exit_code
+
+
+def handle_termination(signum: int, registry: ChildRegistry = REGISTRY) -> None:
+    """Kill every running persona group, then unwind with the conventional exit code."""
+    registry.kill_all()
+    raise Terminated(128 + int(signum))
+
+
+@contextmanager
+def termination_handlers(
+    registry: ChildRegistry = REGISTRY,
+    install: Callable[..., object] = signal.signal,
+) -> Iterator[None]:
+    """SIGTERM/SIGINT forward to `handle_termination`; previous handlers are restored."""
+
+    def _handler(signum: int, frame: FrameType | None) -> None:
+        handle_termination(signum, registry)
+
+    previous = {sig: install(sig, _handler) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            install(sig, handler)
 
 
 def _record_skipped_event(state_dir: Path, event: Event, message: str) -> None:
@@ -166,62 +205,66 @@ def run(
     clock.write()
     schedule = build_schedule(seed, weeks, apartments)
 
-    # Failed steps of earlier runs belong to weeks that already ended; retry
-    # them first, with the prompt dated to their own week.
-    by_id = {p.id: p for p in PERSONAS}
-    for step_id in _failed_steps(state_dir):
-        persona_id = step_id.split(":", 1)[1]
-        week_of = int(step_id.split(":", 1)[0][1:])
-        if state.is_done(step_id) or persona_id not in by_id or persona_id not in selected:
-            continue
-        retry_date = (SIM_START + timedelta(weeks=week_of)).date().isoformat()
-        prompt = build_prompt(by_id[persona_id], week_of, retry_date, urls, tool_notes)
-        result = persona_fn(prompt)
-        if result.limit_hit:
-            raise LimitPause(step_id)
-        if not result.ok:
-            _record_failure(state_dir, step_id, week_of, result.text)
-            continue
-        append_findings(findings_dir, parse_findings(result.text, week_of, persona_id))
-        state.mark_step(step_id)
-        state.save(state_path)
-
-    for week in range(state.week, weeks):
-        state.week = week
-        if refresh_logins is not None and week > 0:  # week 0: fresh from up_fleet --logins
-            refresh_logins()
-        for event in due_events(schedule, week, state.applied_events):
-            try:
-                apply_event(event)
-            except NotImplementedError as exc:
-                _record_skipped_event(state_dir, event, str(exc))
-            except BaseException:
-                state.save(state_path)
-                raise
-            state.mark_event(event.id)
-            state.save(state_path)
-        for persona in due_personas(week):
-            if persona.id not in selected:
+    try:
+        # Failed steps of earlier runs belong to weeks that already ended; retry
+        # them first, with the prompt dated to their own week.
+        by_id = {p.id: p for p in PERSONAS}
+        for step_id in _failed_steps(state_dir):
+            persona_id = step_id.split(":", 1)[1]
+            week_of = int(step_id.split(":", 1)[0][1:])
+            if state.is_done(step_id) or persona_id not in by_id or persona_id not in selected:
                 continue
-            step_id = f"w{week:03d}:{persona.id}"
-            if state.is_done(step_id):
-                continue
-            prompt = build_prompt(persona, week, clock.now.date().isoformat(), urls, tool_notes)
+            retry_date = (SIM_START + timedelta(weeks=week_of)).date().isoformat()
+            prompt = build_prompt(by_id[persona_id], week_of, retry_date, urls, tool_notes)
             result = persona_fn(prompt)
             if result.limit_hit:
-                state.save(state_path)
                 raise LimitPause(step_id)
             if not result.ok:
-                _record_failure(state_dir, step_id, week, result.text)
-                continue  # not marked done: retried on the next run
-            append_findings(findings_dir, parse_findings(result.text, week, persona.id))
+                _record_failure(state_dir, step_id, week_of, result.text)
+                continue
+            append_findings(findings_dir, parse_findings(result.text, week_of, persona_id))
             state.mark_step(step_id)
             state.save(state_path)
-        for _ in range(7):  # day steps so periodic jobs (alarm checks) see time pass
-            clock.advance(timedelta(days=1))
-            time.sleep(settle_s)
-        state.week = week + 1
+
+        for week in range(state.week, weeks):
+            state.week = week
+            if refresh_logins is not None and week > 0:  # week 0: fresh from up_fleet --logins
+                refresh_logins()
+            for event in due_events(schedule, week, state.applied_events):
+                try:
+                    apply_event(event)
+                except NotImplementedError as exc:
+                    _record_skipped_event(state_dir, event, str(exc))
+                except BaseException:
+                    state.save(state_path)
+                    raise
+                state.mark_event(event.id)
+                state.save(state_path)
+            for persona in due_personas(week):
+                if persona.id not in selected:
+                    continue
+                step_id = f"w{week:03d}:{persona.id}"
+                if state.is_done(step_id):
+                    continue
+                prompt = build_prompt(persona, week, clock.now.date().isoformat(), urls, tool_notes)
+                result = persona_fn(prompt)
+                if result.limit_hit:
+                    state.save(state_path)
+                    raise LimitPause(step_id)
+                if not result.ok:
+                    _record_failure(state_dir, step_id, week, result.text)
+                    continue  # not marked done: retried on the next run
+                append_findings(findings_dir, parse_findings(result.text, week, persona.id))
+                state.mark_step(step_id)
+                state.save(state_path)
+            for _ in range(7):  # day steps so periodic jobs (alarm checks) see time pass
+                clock.advance(timedelta(days=1))
+                time.sleep(settle_s)
+            state.week = week + 1
+            state.save(state_path)
+    except Terminated:
         state.save(state_path)
+        raise
     state.week = weeks
     state.save(state_path)
     build_index(findings_dir)

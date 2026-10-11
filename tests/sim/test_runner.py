@@ -272,3 +272,86 @@ def test_tool_notes_describe_act_with_a_real_form_example():
     assert "browse act" in TOOL_NOTES
     assert "--steps" in TOOL_NOTES and "#reason" in TOOL_NOTES
     assert "/commands/<command>/confirm" in TOOL_NOTES
+
+
+# --- termination handling --------------------------------------------------------
+
+
+def test_handle_termination_kills_children_and_raises_with_exit_code():
+    import signal as sig
+
+    from tools.sim.haiku import ChildRegistry
+    from tools.sim.runner import Terminated, handle_termination
+
+    killed: list[int] = []
+    reg = ChildRegistry(killpg=lambda pgid, s: killed.append(pgid))
+    reg.register(77)
+    with pytest.raises(Terminated) as info:
+        handle_termination(sig.SIGTERM, reg)
+    assert info.value.exit_code == 143 and killed == [77]
+    with pytest.raises(Terminated) as info:
+        handle_termination(sig.SIGINT, reg)
+    assert info.value.exit_code == 130
+
+
+def test_termination_handlers_install_and_restore():
+    import signal as sig
+
+    from tools.sim.haiku import ChildRegistry
+    from tools.sim.runner import Terminated, termination_handlers
+
+    table: dict[int, object] = {sig.SIGTERM: "old-term", sig.SIGINT: "old-int"}
+
+    def fake_signal(num, handler):
+        previous = table[num]
+        table[num] = handler
+        return previous
+
+    killed: list[int] = []
+    reg = ChildRegistry(killpg=lambda pgid, s: killed.append(pgid))
+    reg.register(9)
+    with termination_handlers(reg, install=fake_signal):
+        handler = table[sig.SIGTERM]
+        assert callable(handler) and callable(table[sig.SIGINT])
+        with pytest.raises(Terminated):
+            handler(sig.SIGTERM, None)
+    assert table == {sig.SIGTERM: "old-term", sig.SIGINT: "old-int"}
+    assert killed == [9]
+
+
+def test_termination_handlers_restore_even_on_error():
+    import signal as sig
+
+    from tools.sim.haiku import ChildRegistry
+    from tools.sim.runner import termination_handlers
+
+    table: dict[int, object] = {sig.SIGTERM: "t", sig.SIGINT: "i"}
+
+    def fake_signal(num, handler):
+        previous = table[num]
+        table[num] = handler
+        return previous
+
+    with pytest.raises(RuntimeError):
+        with termination_handlers(ChildRegistry(), install=fake_signal):
+            raise RuntimeError
+    assert table == {sig.SIGTERM: "t", sig.SIGINT: "i"}
+
+
+def test_terminated_during_persona_saves_state_and_propagates(tmp_path):
+    from tools.sim.runner import Terminated
+
+    calls = []
+
+    def persona(prompt):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise Terminated(143)
+        return GOOD
+
+    with pytest.raises(Terminated):
+        run(**make(tmp_path, persona, []))
+    state = SimState.load(tmp_path / "s" / "state.json")
+    assert len(state.done_steps) == 1  # first persona finished, second was interrupted
+    assert not (tmp_path / "f" / "INDEX.md").exists()  # no half-finished report
+    assert not (tmp_path / "s" / "failures.jsonl").exists()  # an interruption is no failure

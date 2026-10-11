@@ -254,3 +254,31 @@ def test_run_wires_login_refresh_only_when_stack_is_up(dirs, monkeypatch):
     (dirs / "s" / "users.json").write_text("{}")
     cli.main(["run", "--weeks", "1", "--personas", "landlord"])
     assert seen[-1] is not None
+
+
+def test_run_terminated_returns_signal_exit_code_without_traceback(dirs, capsys, monkeypatch):
+    from tools.sim.runner import Terminated
+
+    class Env:
+        @staticmethod
+        def apartments():
+            return ["a01"]
+
+        @staticmethod
+        def urls():
+            return {"fleet": "http://127.0.0.1:1"}
+
+        @staticmethod
+        def apply_event(event):
+            pass
+
+    monkeypatch.setattr(cli.importlib, "import_module", lambda name: Env)
+    monkeypatch.setattr(cli, "ensure_persona_cwd", lambda d: d)
+
+    def fake(prompt, cwd, env):
+        raise Terminated(143)
+
+    monkeypatch.setattr(cli, "run_persona", fake)
+    assert cli.main(["run", "--weeks", "1"]) == 143
+    out = capsys.readouterr()
+    assert "Traceback" not in out.err and "terminated" in out.out

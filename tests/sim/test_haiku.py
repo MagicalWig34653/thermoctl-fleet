@@ -3,6 +3,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tools.sim.haiku import (
     DEFAULT_ALLOWED_TOOLS,
     DEFAULT_DISALLOWED_TOOLS,
@@ -136,3 +138,77 @@ def test_env_is_passed_to_popen_and_defaults_to_os_environ(tmp_path: Path, monke
     p = fake(stdout="ok")
     run_persona("hi", cwd=tmp_path, popen=p, env={"PYTHONPATH": "/x"})
     assert p.kw["env"] == {"PYTHONPATH": "/x"}  # type: ignore[attr-defined]
+
+
+# --- child registry --------------------------------------------------------------
+
+
+def test_registry_kills_every_registered_group_once_and_forgets_them():
+    from tools.sim.haiku import ChildRegistry
+
+    calls: list[tuple[int, int]] = []
+    reg = ChildRegistry(killpg=lambda pgid, sig: calls.append((pgid, sig)))
+    reg.register(10)
+    reg.register(11)
+    reg.register(10)  # idempotent
+    reg.kill_all()
+    assert sorted(calls) == [(10, signal.SIGKILL), (11, signal.SIGKILL)]
+    assert reg.pgids() == []
+    reg.kill_all()
+    assert len(calls) == 2
+
+
+def test_registry_unregister_and_dead_groups():
+    from tools.sim.haiku import ChildRegistry
+
+    def gone(pgid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    reg = ChildRegistry(killpg=gone)
+    reg.register(5)
+    reg.register(6)
+    reg.unregister(5)
+    reg.unregister(99)  # unknown: no error
+    assert reg.pgids() == [6]
+    reg.kill_all()  # a vanished group must not raise
+    assert reg.pgids() == []
+
+
+def test_run_persona_registers_while_running_and_unregisters_after(tmp_path: Path):
+    from tools.sim.haiku import ChildRegistry
+
+    reg = ChildRegistry(killpg=lambda p, s: None)
+    seen: list[list[int]] = []
+    p = fake(stdout="DONE")
+
+    def spying_popen(cmd: list[str], **kw: Any) -> FakeProc:
+        proc = p(cmd, **kw)
+        original = proc.communicate
+
+        def communicate(input: str | None = None, timeout: float | None = None) -> Any:
+            seen.append(reg.pgids())
+            return original(input=input, timeout=timeout)
+
+        proc.communicate = communicate  # type: ignore[method-assign]
+        return proc
+
+    run_persona("hi", cwd=tmp_path, popen=spying_popen, registry=reg)
+    assert seen == [[4242]]
+    assert reg.pgids() == []
+
+
+def test_run_persona_unregisters_when_interrupted(tmp_path: Path):
+    from tools.sim.haiku import ChildRegistry
+
+    class Boom(BaseException):
+        pass
+
+    reg = ChildRegistry(killpg=lambda p, s: None)
+
+    class Proc(FakeProc):
+        def communicate(self, input: str | None = None, timeout: float | None = None) -> Any:
+            raise Boom
+
+    with pytest.raises(Boom):
+        run_persona("hi", cwd=tmp_path, popen=lambda c, **k: Proc("", "", 0), registry=reg)
+    assert reg.pgids() == []

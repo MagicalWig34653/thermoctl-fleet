@@ -17,10 +17,12 @@ from tools.sim.runner import (
     TOOL_NOTES,
     LimitPause,
     LoginsUnavailable,
+    Terminated,
     outstanding_failures,
     record_failure,
     run,
     skipped_event_count,
+    termination_handlers,
 )
 from tools.sim.state import SimState
 
@@ -142,22 +144,26 @@ def main(argv: list[str] | None = None) -> int:
     child_env.update(getattr(env, "persona_env_extras", dict)())
     refresh = getattr(env, "refresh_logins", None)
     try:
-        run(
-            weeks=args.weeks,
-            state_dir=state_dir(),
-            findings_dir=FINDINGS_DIR,
-            apartments=env.apartments(),
-            urls=env.urls(),
-            apply_event=env.apply_event,
-            persona_fn=lambda prompt: run_persona(prompt, cwd=persona_cwd, env=child_env),
-            tool_notes=TOOL_NOTES,
-            settle_s=3.0,
-            seed=args.seed,
-            personas=selected,
-            refresh_logins=_safe_refresh(refresh, state_dir())
-            if refresh and _stack_is_up()
-            else None,
-        )
+        with termination_handlers():
+            run(
+                weeks=args.weeks,
+                state_dir=state_dir(),
+                findings_dir=FINDINGS_DIR,
+                apartments=env.apartments(),
+                urls=env.urls(),
+                apply_event=env.apply_event,
+                persona_fn=lambda prompt: run_persona(prompt, cwd=persona_cwd, env=child_env),
+                tool_notes=TOOL_NOTES,
+                settle_s=3.0,
+                seed=args.seed,
+                personas=selected,
+                refresh_logins=_safe_refresh(refresh, state_dir())
+                if refresh and _stack_is_up()
+                else None,
+            )
+    except Terminated as stop:
+        print(f"terminated (exit {stop.exit_code}); state saved, rerun to resume")
+        return stop.exit_code
     except LoginsUnavailable as exc:
         print(f"error: {exc}; run `python -m tools.sim.env.logins --refresh`", file=sys.stderr)
         return 1

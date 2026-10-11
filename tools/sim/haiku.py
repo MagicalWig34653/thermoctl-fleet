@@ -37,6 +37,39 @@ DEFAULT_DISALLOWED_TOOLS: tuple[str, ...] = (
 )
 
 
+class ChildRegistry:
+    """Process groups of running persona sessions, so a termination signal can reach them.
+
+    Personas run in their own session (`start_new_session=True`); a SIGTERM to the
+    runner does not reach them by itself and would leave an orphaned `claude -p`.
+    """
+
+    def __init__(self, killpg: Callable[[int, int], None] = os.killpg) -> None:
+        self._killpg = killpg
+        self._pgids: set[int] = set()
+
+    def register(self, pgid: int) -> None:
+        self._pgids.add(pgid)
+
+    def unregister(self, pgid: int) -> None:
+        self._pgids.discard(pgid)
+
+    def pgids(self) -> list[int]:
+        return sorted(self._pgids)
+
+    def kill_all(self) -> None:
+        """SIGKILL every registered group (a group that is already gone is fine)."""
+        groups, self._pgids = self._pgids, set()
+        for pgid in sorted(groups):
+            try:
+                self._killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+REGISTRY = ChildRegistry()
+
+
 def ensure_persona_cwd(state_dir: Path) -> Path:
     """Scratch working directory without repo files; the runner passes this as `cwd`."""
     d = state_dir / "persona-cwd"
@@ -78,12 +111,13 @@ def run_persona(
     disallowed_tools: Sequence[str] = DEFAULT_DISALLOWED_TOOLS,
     popen: Callable[..., Any] = subprocess.Popen,
     killpg: Callable[[int, int], None] = os.killpg,
+    registry: ChildRegistry = REGISTRY,
 ) -> PersonaResult:
     """Run `claude -p` once; the prompt goes via stdin so `ps` does not show it.
 
     A usage limit only counts on a non-zero exit. On timeout the whole process
     group is killed and partial stdout is kept. `env` defaults to the current
-    environment.
+    environment. While the session runs its process group is in `registry`.
     """
     cmd = [
         "claude",
@@ -110,20 +144,24 @@ def run_persona(
         text=True,
         start_new_session=True,
     )
+    registry.register(proc.pid)
     try:
-        stdout, stderr = proc.communicate(input=prompt, timeout=timeout_s)
-    except subprocess.TimeoutExpired as exc:
-        partial = _text(exc.stdout)
         try:
-            killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:  # pragma: no cover - already gone
-            pass
-        try:
-            out, _ = proc.communicate(timeout=10)
-            partial = _text(out) or partial
-        except subprocess.TimeoutExpired:  # pragma: no cover - pipe held open
-            pass
-        return PersonaResult(ok=False, text=partial, limit_hit=False)
-    if proc.returncode != 0 and _is_limit(stdout, stderr):
-        return PersonaResult(ok=False, text=stdout, limit_hit=True)
-    return PersonaResult(ok=proc.returncode == 0, text=stdout, limit_hit=False)
+            stdout, stderr = proc.communicate(input=prompt, timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            partial = _text(exc.stdout)
+            try:
+                killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:  # pragma: no cover - already gone
+                pass
+            try:
+                out, _ = proc.communicate(timeout=10)
+                partial = _text(out) or partial
+            except subprocess.TimeoutExpired:  # pragma: no cover - pipe held open
+                pass
+            return PersonaResult(ok=False, text=partial, limit_hit=False)
+        if proc.returncode != 0 and _is_limit(stdout, stderr):
+            return PersonaResult(ok=False, text=stdout, limit_hit=True)
+        return PersonaResult(ok=proc.returncode == 0, text=stdout, limit_hit=False)
+    finally:
+        registry.unregister(proc.pid)
