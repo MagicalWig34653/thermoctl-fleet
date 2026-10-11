@@ -24,11 +24,23 @@ class SimClock:
     now: datetime = SIM_START
 
     def write(self) -> None:
-        """Atomically publish the current simulated time (readers, cache duration 1 s)."""
+        """Publish the current simulated time (readers: libfaketime, cache duration 1 s).
+
+        The file is overwritten IN PLACE (fixed width, one write): replacing it by a
+        rename makes libfaketime in the containers fall back to real time for a moment.
+        """
+        data = (self.now.strftime("%Y-%m-%d %H:%M:%S") + "\n").encode("ascii")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(self.now.strftime("%Y-%m-%d %H:%M:%S") + "\n", encoding="ascii")
-        os.replace(tmp, self.path)
+        if not self.path.exists():
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, self.path)  # first creation: nobody reads it yet
+            return
+        fd = os.open(self.path, os.O_WRONLY)
+        try:
+            os.pwrite(fd, data, 0)
+        finally:
+            os.close(fd)
 
     def advance(self, delta: timedelta) -> datetime:
         if delta <= timedelta(0):
