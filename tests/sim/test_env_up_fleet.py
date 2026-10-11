@@ -118,7 +118,9 @@ def test_compose_file_only_uses_sim_names_and_loopback():
     assert fleet["image"].startswith("thermoctl-sim")
     assert all(p.startswith("127.0.0.1:8200:") for p in fleet["ports"])
     assert "volumes" not in doc  # no named volumes that down could confuse with the user's
-    assert "FAKETIME_NO_CACHE" not in fleet["environment"]  # livelocks the fleet (finding in smoke run)
+    assert (
+        "FAKETIME_NO_CACHE" not in fleet["environment"]
+    )  # livelocks the fleet (finding in smoke run)
     assert fleet["environment"]["FAKETIME_CACHE_DURATION"] == "1"
     assert (ROOT / "tools/sim/env/Dockerfile.fleet-sim").is_file()
 
@@ -236,3 +238,19 @@ def test_main_logins_refreshes_and_reports_failure(tmp_path, monkeypatch):
     assert up_fleet.main(["--logins"]) == 0 and seen == [tmp_path]
     monkeypatch.setattr(logins, "refresh", lambda d: {"a": True, "b": False})
     assert up_fleet.main(["--logins"]) == 1
+
+
+def test_report_treats_naive_database_times_as_utc(monkeypatch):
+    from datetime import UTC, datetime
+
+    monkeypatch.setenv("TZ", "Europe/Berlin")
+    import time
+
+    time.tzset()
+    try:
+        now = datetime(2026, 1, 5, 8, 10, tzinfo=UTC)
+        text = up_fleet.format_heartbeat_report({"sim-a03": datetime(2026, 1, 5, 8, 9, 30)}, now)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+    assert text.splitlines()[1] == "sim-a03: 2026-01-05 08:09:30 (30s ago)"

@@ -148,8 +148,9 @@ def format_heartbeat_report(rows: Mapping[str, datetime | None], now: datetime) 
         if seen is None:
             lines.append(f"{apartment}: never")
             continue
-        age = int((now - seen.astimezone(UTC)).total_seconds())
-        lines.append(f"{apartment}: {seen.astimezone(UTC):%Y-%m-%d %H:%M:%S} ({age}s ago)")
+        seen_utc = seen.replace(tzinfo=UTC) if seen.tzinfo is None else seen.astimezone(UTC)
+        age = int((now - seen_utc).total_seconds())
+        lines.append(f"{apartment}: {seen_utc:%Y-%m-%d %H:%M:%S} ({age}s ago)")
     return "\n".join(lines)
 
 
