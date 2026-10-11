@@ -188,6 +188,13 @@ on the next tick.
   the registration file `<state>/vm/<apt>/agent-registration.json`; the CA is installed in the VM.
 - Virtual clock: the two containers use libfaketime from the VM (`/sim-clock/clock`, a read-only
   Lima mount of `<state>/clock`). The VM itself runs on real time (see `02-vm-run.md`).
+- **The watchdog was NOT exercised at all.** On an image built by the recipe the real
+  `thermoctl-watchdog.service` cannot start (its service user is never created, finding 40) and
+  the state file the recipe pre-sets is rejected by the watchdog (finding 41). The binary builds
+  and installs, but no swap, rollback or restart rule ran in any VM, in the full run either.
+- Only VMs the sim created are adopted or deleted: `<state>/vms-created.json` lists them
+  (names, creation time, 0600). `--up` refuses an existing `thermoctl-sim-a0N` that is not in
+  the marker; `--down` deletes marker-listed VMs only.
 - Limits: nothing but the fleet protocol is exercised; no thermoctl, Z2M, WireGuard, hardware
   watchdog, digest swap. The VM events apply one at a time and block (power loss about 12 s).
   Findings 40-42 describe what the real image does badly; the harness does not paper over them.
