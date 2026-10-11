@@ -52,12 +52,23 @@ def test_run_pause_returns_75(dirs, capsys, monkeypatch):
         def apply_event(event):
             pass
 
+        @staticmethod
+        def persona_env_extras():
+            return {"SIM_STORAGE_STATE_DIR": "/x/storage"}
+
     monkeypatch.setattr(cli.importlib, "import_module", lambda name: Env)
     monkeypatch.setattr(cli, "ensure_persona_cwd", lambda d: d)
     from tools.sim.haiku import PersonaResult
 
-    monkeypatch.setattr(cli, "run_persona", lambda p, cwd, env: PersonaResult(False, "", True))
+    seen = {}
+
+    def fake_persona(p, cwd, env):
+        seen.update(env)
+        return PersonaResult(False, "", True)
+
+    monkeypatch.setattr(cli, "run_persona", fake_persona)
     assert cli.main(["run", "--weeks", "1"]) == 75
+    assert seen["SIM_STORAGE_STATE_DIR"] == "/x/storage"
     assert "rerun" in capsys.readouterr().out
 
 

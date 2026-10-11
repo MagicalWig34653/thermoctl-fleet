@@ -74,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ENV_MISSING
     persona_cwd = ensure_persona_cwd(STATE_DIR)
     child_env = persona_env(ROOT, sys.executable, os.environ)
+    child_env.update(getattr(env, "persona_env_extras", dict)())
     try:
         run(
             weeks=args.weeks,
