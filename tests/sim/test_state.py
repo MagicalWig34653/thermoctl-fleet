@@ -1,3 +1,5 @@
+import pytest
+
 from tools.sim.state import SimState
 
 
@@ -24,3 +26,31 @@ def test_roundtrip_and_idempotent_marks(tmp_path):
 def test_save_leaves_no_temp_file(tmp_path):
     SimState().save(tmp_path / "state.json")
     assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+
+
+def test_load_ignores_unknown_keys(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text('{"week": 4, "done_steps": ["x"], "future_field": 1}', encoding="utf-8")
+    state = SimState.load(path)
+    assert state.week == 4 and state.done_steps == ["x"]
+
+
+@pytest.mark.parametrize("payload", ["{not json", "[1, 2]", '"text"'])
+def test_load_rejects_corrupt_state_naming_the_file(tmp_path, payload):
+    path = tmp_path / "state.json"
+    path.write_text(payload, encoding="utf-8")
+    with pytest.raises(ValueError, match="state.json"):
+        SimState.load(path)
+
+
+def test_save_creates_parent_directory(tmp_path):
+    path = tmp_path / "deep" / "er" / "state.json"
+    SimState(week=2).save(path)
+    assert SimState.load(path).week == 2
+
+
+def test_mark_event_is_idempotent():
+    state = SimState()
+    state.mark_event("e1")
+    state.mark_event("e1")
+    assert state.applied_events == ["e1"]
