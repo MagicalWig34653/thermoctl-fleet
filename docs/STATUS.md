@@ -3,6 +3,10 @@
 Last updated: 2026-10-11.
 
 
+## Usage simulation: Formulare und Signale (Task 10b, 2026-10-11)
+
+`browse act` (fill/click/select/check/wait_text, max. 20 Schritte, Passwortwerte maskiert) lässt Personas Formulare absenden; SIGTERM/SIGINT beenden die Persona-Prozessgruppe, speichern den Zustand und enden mit 143/130. Noch nicht live gelaufen.
+
 ## Usage simulation: Smoke-Run-Vorbereitung (Task 10a, 2026-10-11)
 
 Drift begrenzt (+-86400 s), `run --personas/--seed` (Filter im Checkpoint, Resume mit anderem Filter abgelehnt), nicht implementierte Events landen in `skipped-events.jsonl`, Persona-Logins (`up_fleet --logins`, `env.logins --refresh`, wöchentlich im Lauf), Ablauf in `docs/sim-findings/RUNBOOK.md`. Noch nicht live gelaufen.
