@@ -59,6 +59,16 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
     ap.add_argument("--cookie-jar", type=Path)
     args = ap.parse_args(argv)
 
+    if args.cookie_jar is not None:
+        # Confine the jar to the persona scratch dir (= cwd): no writes elsewhere.
+        try:
+            resolved = args.cookie_jar.resolve()
+            resolved.relative_to(Path.cwd().resolve())
+        except (OSError, ValueError):
+            print("refused: --cookie-jar must be inside the working directory", file=sys.stderr)
+            return 2
+        args.cookie_jar = resolved
+
     try:
         check_url(args.url, allowed_hosts())
     except ValueError as exc:
@@ -83,7 +93,10 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
     http = client or httpx.Client(follow_redirects=False, trust_env=False, timeout=30.0)
     try:
         resp = http.request(args.method, args.url, headers=headers, **kwargs)  # type: ignore[arg-type]
-    except httpx.HTTPError as exc:
+    except httpx.InvalidURL as exc:
+        print(f"error: invalid URL: {exc}", file=sys.stderr)
+        return 2
+    except (httpx.HTTPError, httpx.StreamError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:

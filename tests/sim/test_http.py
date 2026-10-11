@@ -104,7 +104,8 @@ def test_refused_url_exits_2_without_request(capsys: pytest.CaptureFixture[str])
     assert "refused" in capsys.readouterr().err
 
 
-def test_cookie_jar_roundtrip(tmp_path, capsys: pytest.CaptureFixture[str]):  # type: ignore[no-untyped-def]
+def test_cookie_jar_roundtrip(tmp_path, monkeypatch, capsys):  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
     jar = tmp_path / "jar.json"
     state = {"n": 0}
 
@@ -119,3 +120,58 @@ def test_cookie_jar_roundtrip(tmp_path, capsys: pytest.CaptureFixture[str]):  # 
     assert json.loads(jar.read_text()) == {"sid": "abc"}
     simhttp.main(["GET", "http://127.0.0.1:1/", "--cookie-jar", str(jar)], client=_client(handler))
     assert state["n"] == 2
+
+
+def test_cookie_jar_outside_cwd_refused(tmp_path, monkeypatch, capsys):  # type: ignore[no-untyped-def]
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+
+    def handler(req: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("must not be called")
+
+    for bad in (tmp_path / "jar.json", work / ".." / "jar.json", "/etc/jar.json"):
+        rc = simhttp.main(
+            ["GET", "http://127.0.0.1:1/", "--cookie-jar", str(bad)], client=_client(handler)
+        )
+        assert rc == 2
+    assert "cookie-jar" in capsys.readouterr().err
+    assert not (tmp_path / "jar.json").exists()
+
+
+def test_cookie_jar_symlink_escape_refused(tmp_path, monkeypatch, capsys):  # type: ignore[no-untyped-def]
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "link.json").symlink_to(tmp_path / "outside.json")
+    monkeypatch.chdir(work)
+    rc = simhttp.main(
+        ["GET", "http://127.0.0.1:1/", "--cookie-jar", "link.json"],
+        client=_client(lambda r: httpx.Response(200)),
+    )
+    assert rc == 2
+
+
+def test_invalid_url_is_clean_error(capsys: pytest.CaptureFixture[str]):
+    rc = simhttp.main(
+        ["GET", "http://127.0.0.1:abc/x"], client=_client(lambda r: httpx.Response(200))
+    )
+    err = capsys.readouterr().err
+    assert rc == 2 and err.startswith("error:") and "Traceback" not in err
+    assert len(err.strip().splitlines()) == 1
+
+
+def test_request_error_is_clean_error(capsys: pytest.CaptureFixture[str]):
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    rc = simhttp.main(["GET", "http://127.0.0.1:1/"], client=_client(handler))
+    err = capsys.readouterr().err
+    assert rc == 1 and err.startswith("error:") and "Traceback" not in err
+
+
+def test_unexpected_httpx_error_is_clean(capsys: pytest.CaptureFixture[str]):
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.UnsupportedProtocol("nope")
+
+    rc = simhttp.main(["GET", "http://127.0.0.1:1/"], client=_client(handler))
+    assert rc == 1 and "Traceback" not in capsys.readouterr().err
