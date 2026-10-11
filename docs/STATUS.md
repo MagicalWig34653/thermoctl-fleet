@@ -12352,3 +12352,7 @@ einen defekten Checkpoint einzeilig, der Lauf nennt offene Fehlschritte.
 `tools/sim/browse.py` (Playwright-Browserwerkzeug für Personas: `shot`/`text`,
 nur lokale Hosts, Ausgabe nur im Arbeitsverzeichnis, fremde Unteranfragen
 abgebrochen) mit Tests in `tests/sim/`. Nur Werkzeug, kein Produktcode.
+
+`docs/sim-findings/10-agent-heartbeat-gap.md`: erster Befund der Simulation
+(Blocker: der Agent sendet keinen Heartbeat, die Ausbleiben-Warnung träfe
+jede Wohnung).
