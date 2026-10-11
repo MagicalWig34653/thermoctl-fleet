@@ -22,6 +22,8 @@ only, no fixes. Harness in `tools/sim/` (scenario schedule with
 non-overlapping outages, tolerant findings parser) in progress. Persona
 sessions are confined: local-only HTTP wrapper `tools.sim.http` instead of
 curl, file tools denied, prompt on stdin, scratch cwd, stderr-only limit detection.
+Resumable runner and CLI (`python -m tools.sim run|status|report`; exit 75 on
+usage limit, failed persona steps go to `sim-state/failures.jsonl` and are retried).
 
 
 ## README rewritten (2026-10-06)

@@ -77,3 +77,8 @@ def test_index_dedupes_near_duplicate_titles(tmp_path: Path) -> None:
     index = build_index(tmp_path).read_text()
     assert index.count("utton") == 1
     assert "week 3" in index
+
+
+def test_build_index_creates_missing_directory(tmp_path):
+    path = build_index(tmp_path / "nope" / "f")
+    assert "No findings yet" in path.read_text(encoding="utf-8")

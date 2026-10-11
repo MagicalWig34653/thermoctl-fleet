@@ -129,6 +129,7 @@ def build_index(out_dir: Path) -> Path:
                     + (f" -- `{r['evidence']}`" if r["evidence"] else "")
                 )
             lines.append("")
+    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "INDEX.md"
     path.write_text("\n".join(lines), encoding="utf-8")
     return path

@@ -1,0 +1,129 @@
+"""Week loop: events -> personas -> clock, checkpointed after every step."""
+
+from __future__ import annotations
+
+import json
+import time
+from collections.abc import Callable
+from datetime import timedelta
+from pathlib import Path
+
+from tools.sim.clock import SIM_START, SimClock
+from tools.sim.findings import append_findings, build_index, parse_findings
+from tools.sim.haiku import PersonaResult
+from tools.sim.personas import PERSONAS, build_prompt, due_personas
+from tools.sim.scenario import Event, build_schedule, due_events
+from tools.sim.state import SimState
+
+# Exactly the tools a persona session has (see haiku.DEFAULT_ALLOWED_TOOLS).
+TOOL_NOTES = (
+    "You can only use two commands. "
+    "`python -m tools.sim.http GET <url>` or `python -m tools.sim.http POST <url> <json>` "
+    "talks to the local systems listed above. "
+    "`python -m tools.sim.browse shot <url> <name>` takes a screenshot of a page and "
+    "`python -m tools.sim.browse text <url>` prints the visible text of a page, as a "
+    "person in a browser would see it."
+)
+
+_FAILURE_TEXT_MAX = 500
+
+
+class LimitPause(Exception):
+    """Usage limit hit; state is saved, rerun to resume."""
+
+
+def _record_failure(state_dir: Path, step_id: str, week: int, text: str) -> None:
+    row = {"step": step_id, "week": week, "text": text[:_FAILURE_TEXT_MAX]}
+    with (state_dir / "failures.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+
+def _failed_steps(state_dir: Path) -> list[str]:
+    path = state_dir / "failures.jsonl"
+    if not path.exists():
+        return []
+    steps: dict[str, None] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            steps[json.loads(line)["step"]] = None
+        except (ValueError, KeyError, TypeError):
+            continue  # a torn last line must not block the run
+    return list(steps)
+
+
+def run(
+    *,
+    weeks: int,
+    state_dir: Path,
+    findings_dir: Path,
+    apartments: list[str],
+    urls: dict[str, str],
+    apply_event: Callable[[Event], None],
+    persona_fn: Callable[[str], PersonaResult],
+    seed: int = 1,
+    tool_notes: str = "",
+    settle_s: float = 0.0,
+) -> None:
+    """Run (or resume) the simulation up to `weeks`.
+
+    A week always ends with exactly seven daily clock steps, so the clock at the
+    start of week N is SIM_START + N weeks; resume restores that. Events are
+    keyed by id and persona steps by `wNNN:<persona>`, so nothing repeats.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "state.json"
+    state = SimState.load(state_path)
+    clock = SimClock(state_dir / "clock")
+    clock.now = SIM_START + timedelta(weeks=state.week)
+    clock.write()
+    schedule = build_schedule(seed, weeks, apartments)
+
+    # Failed steps of earlier runs belong to weeks that already ended; retry
+    # them first, with the prompt dated to their own week.
+    by_id = {p.id: p for p in PERSONAS}
+    for step_id in _failed_steps(state_dir):
+        persona_id = step_id.split(":", 1)[1]
+        week_of = int(step_id.split(":", 1)[0][1:])
+        if state.is_done(step_id) or persona_id not in by_id:
+            continue
+        retry_date = (SIM_START + timedelta(weeks=week_of)).date().isoformat()
+        prompt = build_prompt(by_id[persona_id], week_of, retry_date, urls, tool_notes)
+        result = persona_fn(prompt)
+        if result.limit_hit:
+            raise LimitPause(step_id)
+        if not result.ok:
+            _record_failure(state_dir, step_id, week_of, result.text)
+            continue
+        append_findings(findings_dir, parse_findings(result.text, week_of, persona_id))
+        state.mark_step(step_id)
+        state.save(state_path)
+
+    for week in range(state.week, weeks):
+        state.week = week
+        for event in due_events(schedule, week, state.applied_events):
+            apply_event(event)
+            state.mark_event(event.id)
+            state.save(state_path)
+        for persona in due_personas(week):
+            step_id = f"w{week:03d}:{persona.id}"
+            if state.is_done(step_id):
+                continue
+            prompt = build_prompt(persona, week, clock.now.date().isoformat(), urls, tool_notes)
+            result = persona_fn(prompt)
+            if result.limit_hit:
+                state.save(state_path)
+                raise LimitPause(step_id)
+            if not result.ok:
+                _record_failure(state_dir, step_id, week, result.text)
+                continue  # not marked done: retried on the next run
+            append_findings(findings_dir, parse_findings(result.text, week, persona.id))
+            state.mark_step(step_id)
+            state.save(state_path)
+        for _ in range(7):  # day steps so periodic jobs (alarm checks) see time pass
+            clock.advance(timedelta(days=1))
+            time.sleep(settle_s)
+        state.week = week + 1
+        state.save(state_path)
+    state.week = weeks
+    state.save(state_path)
+    build_index(findings_dir)
