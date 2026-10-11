@@ -195,3 +195,24 @@ def test_container_events_for_vm_apartments_are_skipped_not_fatal(kind):
     with pytest.raises(NotImplementedError, match="no container"):
         apply_event_with(_ev(kind, apt="sim-a01"), calls.append)
     assert calls == []
+
+
+def test_unpause_after_power_loss_is_not_an_error():
+    import subprocess
+
+    def fail(cmd):
+        raise subprocess.CalledProcessError(1, cmd, stderr="Error: Container x is not paused")
+
+    apply_event_with(_ev(EventKind.HEARTBEAT_RESTORE), fail)  # state reached: no raise
+
+
+def test_other_docker_failures_still_raise():
+    import subprocess
+
+    def fail(cmd):
+        raise subprocess.CalledProcessError(1, cmd, stderr="Error: no such container")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        apply_event_with(_ev(EventKind.HEARTBEAT_RESTORE), fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        apply_event_with(_ev(EventKind.POWER_LOSS), fail)

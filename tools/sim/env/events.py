@@ -42,9 +42,21 @@ def _container_of(event: Event) -> str:
     return name
 
 
+_ALREADY_THERE = ("is not paused", "is not running", "is already paused")
+
+
 def _docker(*verb: str) -> Handler:
     def handler(event: Event, run_cmd: RunCmd) -> None:
-        run_cmd(["docker", *verb, _container_of(event)])
+        try:
+            run_cmd(["docker", *verb, _container_of(event)])
+        except subprocess.CalledProcessError as exc:
+            # A power loss (kill + start) between a pause and its unpause already ended
+            # the pause; the state asked for is reached, which is not an error.
+            if verb[0] in ("pause", "unpause") and any(
+                text in str(exc.stderr) for text in _ALREADY_THERE
+            ):
+                return
+            raise
 
     return handler
 
