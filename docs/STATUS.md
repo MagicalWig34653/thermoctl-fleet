@@ -12386,3 +12386,5 @@ Simulation, erster Livelauf (Task 10, `docs/sim-findings/01-smoke-run.md`): Stac
 virtuelle Uhr, Ausbleiben-Alarm und Persona-Pipeline laufen; 9 Harness-Fehler
 behoben, 4 Produktbefunde (11 bis 14). Offen: Formulare absenden, frischer
 State pro Lauf.
+
+Pentest (Task 12, simulation): `python -m tools.sim.pentest` runs 43 scripted checks against the loopback sim fleet; 5 findings (20 to 24, one major: a NaN heartbeat breaks the UI), results in `docs/sim-findings/pentest/results.md`.
