@@ -12339,3 +12339,8 @@ Bereich) mit Tests in `tests/sim/`. Nur Werkzeug, kein Produktcode.
 und `tools/sim/haiku.py` (headless `claude -p`, enge `--allowedTools`,
 Usage-Limit-Erkennung nur bei Exit-Code != 0) mit Tests in `tests/sim/`.
 Nur Werkzeug, kein Produktcode.
+
+`tools/sim/sim_agent.py` (Heartbeat-Treiber je Wohnung, Fehler per Datei
+`<state>/faults/<apartment>.json`, baut das echte `protocol.heartbeat`-Modell)
+mit Tests in `tests/sim/`; `tools/sim/http.py` sperrt `--cookie-jar` auf das
+Arbeitsverzeichnis. Nur Werkzeug, kein Produktcode.
