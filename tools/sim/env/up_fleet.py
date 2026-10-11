@@ -1,4 +1,4 @@
-"""Start or stop the sim fleet: `python -m tools.sim.env.up_fleet [--down]`.
+"""Start or stop the sim fleet: `python -m tools.sim.env.up_fleet [--agents|--down|--check]`.
 
 The fleet runs in Docker (image = repo fleet image + libfaketime) so it shares
 the agents' virtual clock; the Mac host could not LD_PRELOAD the Linux library.
@@ -17,12 +17,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
 from tools.sim.clock import SIM_START, clock_path
-from tools.sim.env.config import FLEET_URL, PREFIX, ROOT, state_dir
+from tools.sim.env.config import APARTMENT_IDS, FLEET_URL, PREFIX, ROOT, state_dir, virtual_now
 
 COMPOSE_FILE = Path(__file__).with_name("compose.sim.yml")
 BASE_IMAGE = f"{PREFIX}-fleet-base:local"
@@ -103,18 +104,62 @@ def wait_healthy(
         sleep(1.0)
 
 
-def up(directory: Path, run_cmd: RunCmd, *, wait: Callable[[], None] = wait_healthy) -> None:
+def up(
+    directory: Path,
+    run_cmd: RunCmd,
+    *,
+    wait: Callable[[], None] = wait_healthy,
+    agents: bool = False,
+) -> None:
+    """Build and start the fleet; with `agents` also enrol and start sim-a03..sim-a12."""
     database_url, totp_key = prepare_state(directory)
     seed_if_needed(directory, database_url, totp_key)
+    if agents:
+        from tools.sim.env.enroll import enroll_container_apartments
+
+        enroll_container_apartments(directory, database_url, virtual_now(directory))
     env = compose_env(directory, totp_key)
     run_cmd(["docker", "build", "-f", "docker/Dockerfile.fleet", "-t", BASE_IMAGE, str(ROOT)], env)
-    run_cmd(_compose("up", "-d", "--build"), env)
+    run_cmd(_compose("up", "-d", "--build", *(() if agents else ("fleet",))), env)
     wait()
 
 
 def down(directory: Path, run_cmd: RunCmd) -> None:
     """Stop and remove the sim containers and network; state files are kept."""
     run_cmd(_compose("down", "--remove-orphans"), compose_env(directory, "unused"))
+
+
+def last_heartbeats(database_url: str) -> dict[str, datetime | None]:
+    """Receipt time of each apartment's latest heartbeat (read-only), None if never seen."""
+    from fleet.storage import create_storage
+
+    storage = create_storage(database_url)
+    out: dict[str, datetime | None] = {}
+    for apartment in APARTMENT_IDS:
+        latest = storage.get_latest_heartbeat(apartment)
+        out[apartment] = None if latest is None else latest.received_at
+    return out
+
+
+def format_heartbeat_report(rows: Mapping[str, datetime | None], now: datetime) -> str:
+    """One line per apartment: last heartbeat time and its age against `now`."""
+    lines = [f"virtual now: {now:%Y-%m-%d %H:%M:%S}"]
+    for apartment, seen in rows.items():
+        if seen is None:
+            lines.append(f"{apartment}: never")
+            continue
+        age = int((now - seen.astimezone(UTC)).total_seconds())
+        lines.append(f"{apartment}: {seen.astimezone(UTC):%Y-%m-%d %H:%M:%S} ({age}s ago)")
+    return "\n".join(lines)
+
+
+def check(directory: Path) -> str:
+    """Report for the running stack, read from the fleet database."""
+    db_file = directory / "fleet-data" / "fleet.db"
+    if not db_file.exists():
+        raise RuntimeError(f"no fleet database at {db_file}; run up_fleet first")
+    database_url = f"sqlite:///{db_file}"
+    return format_heartbeat_report(last_heartbeats(database_url), virtual_now(directory))
 
 
 def _run(cmd: list[str], env: Mapping[str, str]) -> object:  # pragma: no cover - needs Docker
@@ -124,13 +169,17 @@ def _run(cmd: list[str], env: Mapping[str, str]) -> object:  # pragma: no cover 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tools.sim.env.up_fleet", description=__doc__)
     parser.add_argument("--down", action="store_true", help="remove thermoctl-sim containers")
+    parser.add_argument("--agents", action="store_true", help="also enrol and start the agents")
+    parser.add_argument("--check", action="store_true", help="print last heartbeat per apartment")
     args = parser.parse_args(argv)
     directory = state_dir()
     try:
         if args.down:
             down(directory, _run)
+        elif args.check:
+            print(check(directory))
         else:
-            up(directory, _run)
+            up(directory, _run, agents=args.agents)
             print(f"fleet up at {FLEET_URL}; credentials in {directory / 'users.json'}")
     except (subprocess.CalledProcessError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)

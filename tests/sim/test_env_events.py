@@ -10,7 +10,7 @@ from tools.sim.clock import clock_path
 from tools.sim.env import HANDLERS, UNIMPLEMENTED_KINDS, apply_event_with
 from tools.sim.env.events import FAULT_SHAPES, container_name
 from tools.sim.scenario import Event, EventKind
-from tools.sim.sim_agent import build_heartbeat, healthy_sections, make_health
+from tools.sim.sim_agent import build_heartbeat, drifted_now, healthy_sections, make_health
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +34,6 @@ def test_unimplemented_set_is_exactly_the_later_subtasks():
             EventKind.BACKUP,
             EventKind.TOKEN_EXPIRY,
             EventKind.TENANT_CHANGE,
-            EventKind.CLOCK_DRIFT,
         }
     )
 
@@ -137,3 +136,30 @@ def test_apply_event_uses_subprocess(monkeypatch):
 
 def test_persona_env_extras_points_at_storage_state(state):
     assert env.persona_env_extras() == {"SIM_STORAGE_STATE_DIR": str(state / "storage-state")}
+
+
+def test_clock_drift_writes_a_bounded_signed_offset_the_agent_applies(state):
+    cmds = []
+    apply_event_with(_ev(EventKind.CLOCK_DRIFT), cmds.append)
+    assert cmds == []
+    path = state / "faults" / "sim-a03.drift"
+    assert path.stat().st_mode & 0o777 == 0o600
+    drift = float(path.read_text())
+    assert 120 <= abs(drift) <= 3600
+    assert make_health(state, "sim-a03")()["system"]["clock_drift_s"] == drift
+    shift = (drifted_now(state, "sim-a03")() - datetime.now(UTC)).total_seconds()
+    assert abs(shift - drift) < 5
+
+
+def test_clock_drift_is_deterministic_per_event_and_replaced_by_a_new_one(state):
+    apply_event_with(_ev(EventKind.CLOCK_DRIFT, n="1"), list.append)
+    first = (state / "faults" / "sim-a03.drift").read_text()
+    apply_event_with(_ev(EventKind.CLOCK_DRIFT, n="1"), list.append)
+    assert (state / "faults" / "sim-a03.drift").read_text() == first
+    apply_event_with(_ev(EventKind.CLOCK_DRIFT, n="2"), list.append)
+    assert (state / "faults" / "sim-a03.drift").read_text() != first
+
+
+def test_clock_drift_validates_the_apartment_id(state):
+    with pytest.raises(ValueError):
+        apply_event_with(_ev(EventKind.CLOCK_DRIFT, apt="fleet"), list.append)

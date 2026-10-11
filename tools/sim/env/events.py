@@ -13,6 +13,7 @@ import re
 import subprocess
 import zlib
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from tools.sim.env.config import NETWORK, PREFIX, state_dir, virtual_now
@@ -96,12 +97,34 @@ def _fault(event: Event, run_cmd: RunCmd) -> None:
     shape = FAULT_SHAPES[zlib.crc32(event.id.encode()) % len(FAULT_SHAPES)]
     faults = directory / "faults"
     faults.mkdir(parents=True, exist_ok=True)
-    target = faults / f"{event.apartment}.json"
+    _write_state_file(
+        faults / f"{event.apartment}.json", json.dumps(shape(virtual_now(directory).isoformat()))
+    )
+
+
+def _write_state_file(target: Path, content: str) -> None:
+    """Atomically replace `target` with a 0600 file (the sim agent only ever reads it)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as out:
-        json.dump(shape(virtual_now(directory).isoformat()), out)
+        out.write(content)
     os.replace(tmp, target)
+
+
+def _clock_drift(event: Event, run_cmd: RunCmd) -> None:
+    """Write `<state>/faults/<apartment>.drift`: this agent's clock is off by +-2..60 minutes.
+
+    Per-agent drift is applied by the sim agent itself (sent_at and the reported
+    `clock_drift_s`), not by libfaketime: the containers share one absolute
+    timestamp file, which cannot carry a per-container offset. The fleet sees
+    exactly what a drifting base station would send.
+    """
+    container_name(event.apartment)
+    bits = zlib.crc32(event.id.encode())
+    seconds = 120 + bits % 3481
+    signed = seconds if bits & 0x10000 else -seconds
+    _write_state_file(state_dir() / "faults" / f"{event.apartment}.drift", f"{signed}\n")
 
 
 HANDLERS: dict[EventKind, Handler] = {
@@ -114,7 +137,7 @@ HANDLERS: dict[EventKind, Handler] = {
     EventKind.BACKUP: _not_yet(EventKind.BACKUP, "9c"),
     EventKind.TOKEN_EXPIRY: _not_yet(EventKind.TOKEN_EXPIRY, "9c"),
     EventKind.TENANT_CHANGE: _not_yet(EventKind.TENANT_CHANGE, "9c"),
-    EventKind.CLOCK_DRIFT: _not_yet(EventKind.CLOCK_DRIFT, "9b"),
+    EventKind.CLOCK_DRIFT: _clock_drift,
 }
 UNIMPLEMENTED_KINDS: frozenset[EventKind] = frozenset(
     {
@@ -122,7 +145,6 @@ UNIMPLEMENTED_KINDS: frozenset[EventKind] = frozenset(
         EventKind.BACKUP,
         EventKind.TOKEN_EXPIRY,
         EventKind.TENANT_CHANGE,
-        EventKind.CLOCK_DRIFT,
     }
 )
 

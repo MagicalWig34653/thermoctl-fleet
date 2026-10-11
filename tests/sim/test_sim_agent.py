@@ -225,3 +225,28 @@ def test_make_health_logs_invalid_fault_content_at_error(tmp_path, caplog):
     assert records
     text = records[0].getMessage()
     assert "sim-a03" in text and str(faults / "sim-a03.json") in text
+
+
+def test_read_drift_defaults_to_zero_and_never_raises(tmp_path: Path):
+    from tools.sim.sim_agent import read_drift
+
+    assert read_drift(tmp_path, "sim-a03") == 0.0
+    (tmp_path / "faults").mkdir()
+    (tmp_path / "faults" / "sim-a03.drift").write_text("not a number")
+    assert read_drift(tmp_path, "sim-a03") == 0.0
+    (tmp_path / "faults" / "sim-a03.drift").write_text("-300.5\n")
+    assert read_drift(tmp_path, "sim-a03") == -300.5
+    (tmp_path / "faults" / "sim-a03.drift").write_text("nan")
+    assert read_drift(tmp_path, "sim-a03") == 0.0
+
+
+def test_drift_shifts_sent_at_and_is_reported(tmp_path: Path):
+    from datetime import timedelta
+
+    from tools.sim.sim_agent import drifted_now
+
+    (tmp_path / "faults").mkdir()
+    (tmp_path / "faults" / "sim-a03.drift").write_text("600")
+    shifted = drifted_now(tmp_path, "sim-a03")()
+    assert timedelta(seconds=595) < shifted - datetime.now(UTC) < timedelta(seconds=605)
+    assert make_health(tmp_path, "sim-a03")()["system"]["clock_drift_s"] == 600.0

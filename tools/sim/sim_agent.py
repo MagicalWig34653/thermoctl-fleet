@@ -20,11 +20,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import signal
 import sys
 import threading
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,21 @@ class FaultFile:
         return data
 
 
+def read_drift(state_dir: Path, apartment: str) -> float:
+    """Seconds this agent's clock is off (`<state>/faults/<apartment>.drift`); 0.0 if unset/bad."""
+    path = FaultFile(state_dir, apartment).path.with_suffix(".drift")
+    try:
+        value = float(path.read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
+
+
+def drifted_now(state_dir: Path, apartment: str) -> Callable[[], datetime]:
+    """Clock of the agent: virtual time plus its drift (re-read on every call)."""
+    return lambda: datetime.now(UTC) + timedelta(seconds=read_drift(state_dir, apartment))
+
+
 def _overlay(base: dict[str, Any], faults: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {k: v for k, v in base.items()}
     for section, fields in _SECTIONS.items():
@@ -141,6 +157,9 @@ def make_health(state_dir: Path, apartment: str) -> Callable[[], dict[str, Any]]
 
     def health() -> dict[str, Any]:
         merged = _overlay(healthy_sections(), fault_file.read())
+        drift = read_drift(state_dir, apartment)
+        if drift:
+            merged["system"] = {**merged["system"], "clock_drift_s": drift}
         try:
             build_heartbeat(apartment, merged, datetime.now(UTC))
         except ValidationError:
@@ -227,7 +246,13 @@ def main(
     http = client or httpx.Client(
         base_url=args.fleet, follow_redirects=False, trust_env=False, timeout=10.0
     )
-    agent = SimAgent(args.apartment, http, token, make_health(args.state_dir, args.apartment))
+    agent = SimAgent(
+        args.apartment,
+        http,
+        token,
+        make_health(args.state_dir, args.apartment),
+        now=drifted_now(args.state_dir, args.apartment),
+    )
     stop = threading.Event()
     if max_ticks is None:  # pragma: no cover - signal wiring, process-level
         signal.signal(signal.SIGTERM, lambda *_: stop.set())

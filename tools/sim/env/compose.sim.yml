@@ -1,7 +1,28 @@
-# Fleet service of the usage simulation (agent services follow in Task 9b).
+# Fleet and the ten container agents (sim-a03..sim-a12) of the usage simulation.
+# sim-a01/a02 are reserved for the Lima VMs and have no service here.
 # Started by `python -m tools.sim.env.up_fleet`, which exports the SIM_* variables.
 # Every resource name starts with `thermoctl-sim`; nothing else is touched.
 name: thermoctl-sim
+
+# Shared by every agent service. Each service adds only its own container_name, command
+# and mounts. No ports, no docker.sock, no privileged; the agent sees ONLY its own token
+# file and the (non-secret) fault directory plus the shared clock directory.
+x-sim-agent: &sim-agent
+  image: thermoctl-sim-fleet:local
+  user: "${SIM_UID:?set by up_fleet}:${SIM_GID:?set by up_fleet}"
+  pull_policy: never   # built by the fleet service; never pulled
+  restart: unless-stopped
+  working_dir: /app
+  depends_on:
+    fleet:
+      condition: service_healthy
+  environment:
+    PYTHONDONTWRITEBYTECODE: "1"
+    SIM_ALLOWED_HOSTS: fleet
+    LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+    FAKETIME_TIMESTAMP_FILE: /sim-clock/clock
+    FAKETIME_NO_CACHE: "1"
+  networks: [sim-net]
 
 services:
   fleet:
@@ -44,6 +65,236 @@ services:
       # Only this directory: users.json, totp.key and registrations stay out of the container.
       - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
     networks: [sim-net]
+
+  agent-sim-a03:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a03
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a03
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a03.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a04:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a04
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a04
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a04.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a05:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a05
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a05
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a05.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a06:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a06
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a06
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a06.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a07:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a07
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a07
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a07.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a08:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a08
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a08
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a08.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a09:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a09
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a09
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a09.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a10:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a10
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a10
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a10.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a11:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a11
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a11
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a11.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
+
+  agent-sim-a12:
+    <<: *sim-agent
+    container_name: thermoctl-sim-sim-a12
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - sim-a12
+      - --fleet
+      - http://fleet:8000
+      - --token-file
+      - /run/secrets/agent.token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+    volumes:
+      - "${SIM_STATE_DIR}/agent-tokens/sim-a12.token:/run/secrets/agent.token:ro"
+      - "${SIM_STATE_DIR}/faults:/sim-state/faults:ro"
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "..:/app/tools/sim:ro"
 
 networks:
   sim-net:

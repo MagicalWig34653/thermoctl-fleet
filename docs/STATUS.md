@@ -11,6 +11,10 @@ event handlers for loss/restore/wifi/power/fault are in, the rest raise until 9b
 No product code changed. Review fixes: private registration files, strict container ids, fleet mounts only the clock dir, recoverable seeding.
 
 
+## Usage simulation: container agents (Task 9b, 2026-10-11)
+
+`tools/sim/env/` enrols sim-a03..sim-a12 through the real Storage API (`enroll.py`), runs them as ten `agent-sim-aNN` compose services (`up_fleet --agents`, `--check` prints last heartbeats); CLOCK_DRIFT is a per-agent offset file read by `sim_agent`. Not yet run live (Task 10).
+
 ## Usage simulation: browse tool hardening (2026-10-11)
 
 `tools/sim/browse.py` now also blocks WebSockets to non-allowed hosts; finding 10 corrected (never-seen apartments are skipped by the absence alarm, not alarmed).
