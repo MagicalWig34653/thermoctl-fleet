@@ -4,6 +4,11 @@ Date of run: 2026-10-11. Stack: fleet + 10 agent containers (sim-a03..a12,
 plain-http `sim_agent`, libfaketime), sim-a01/a02 not enrolled (VM apartments,
 expected to stay "never"). Personas: Haiku 5.5, low effort.
 
+Raw data of this run (31 parsed persona findings, containing week-0 rerun artefacts) was
+moved to `docs/sim-findings/smoke/findings.jsonl`; `docs/sim-findings/raw/` is left for the
+full run, so `INDEX.md` starts empty ("No findings yet.") and lists only the hand-written
+`NN-*.md` findings until then.
+
 ## What ran
 
 | Step | Result |

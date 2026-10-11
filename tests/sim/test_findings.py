@@ -118,3 +118,14 @@ def test_build_index_ignores_the_runbook(tmp_path):
     (tmp_path / "10-real.md").write_text("# Finding 10: real\n")
     text = build_index(tmp_path).read_text()
     assert "RUNBOOK" not in text and "10-real.md" in text
+
+
+def test_index_ignores_finder_duplicates_and_the_smoke_archive(tmp_path: Path) -> None:
+    _hand(tmp_path, "10-x.md", "# X\n")
+    _hand(tmp_path, "10-x 2.md", "# X copy\n")
+    smoke = tmp_path / "smoke"
+    smoke.mkdir()
+    append_findings(smoke, [Finding(1, "p", Area.UX, Severity.MINOR, "Old", "e", "a")])
+    text = build_index(tmp_path).read_text(encoding="utf-8")
+    assert "(10-x.md)" in text and "X copy" not in text
+    assert "Old" not in text and "No findings yet." in text

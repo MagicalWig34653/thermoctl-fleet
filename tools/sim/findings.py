@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -138,7 +139,12 @@ def build_index(out_dir: Path) -> Path:
                 )
             lines.append("")
     hand = (
-        sorted(f for f in out_dir.glob("[0-9][0-9]-*.md") if f.name != "00-environment-notes.md")
+        sorted(
+            f
+            for f in out_dir.glob("[0-9][0-9]-*.md")
+            # not the notes, not Finder's "name 2.md" copies
+            if f.name != "00-environment-notes.md" and not re.search(r" \d+\.md$", f.name)
+        )
         if out_dir.is_dir()
         else []
     )
