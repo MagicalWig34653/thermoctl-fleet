@@ -1,6 +1,14 @@
 # Status
 
-Last updated: 2026-10-06.
+Last updated: 2026-10-11.
+
+
+## Usage simulation: design approved (2026-10-11)
+
+Design for a 2-3 year landlord/tenant simulation (Lima VMs + container
+agents, virtual clock, Haiku personas, small fleet pentest) is in
+`docs/superpowers/specs/2026-10-11-usage-simulation-design.md`. Findings
+only, no fixes. Nothing implemented yet.
 
 
 ## README rewritten (2026-10-06)
