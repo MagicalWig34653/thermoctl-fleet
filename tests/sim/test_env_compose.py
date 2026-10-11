@@ -128,3 +128,9 @@ def test_network_name_matches_the_event_handlers(services):
     yaml = pytest.importorskip("yaml")
     doc = yaml.safe_load(up_fleet.COMPOSE_FILE.read_text())
     assert doc["networks"]["sim-net"]["name"] == NETWORK
+
+
+def test_agents_do_not_inherit_the_fleet_healthcheck(services):
+    for name, svc in services.items():
+        if name.startswith("agent-"):
+            assert svc["healthcheck"] == {"disable": True}, name

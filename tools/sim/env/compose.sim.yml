@@ -12,6 +12,8 @@ x-sim-agent: &sim-agent
   user: "${SIM_UID:?set by up_fleet}:${SIM_GID:?set by up_fleet}"
   pull_policy: never   # built by the fleet service; never pulled
   restart: unless-stopped
+  healthcheck:
+    disable: true   # the image inherits the fleet /healthz check, meaningless for an agent
   working_dir: /app
   depends_on:
     fleet:
