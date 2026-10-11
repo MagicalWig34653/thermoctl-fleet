@@ -31,9 +31,20 @@ def container_name(apartment: str) -> str:
     return f"{PREFIX}-{apartment}"
 
 
+# sim-a01/sim-a02 are VM apartments: there is no container to pause, kill or detach.
+VM_APARTMENTS = frozenset({"sim-a01", "sim-a02"})
+
+
+def _container_of(event: Event) -> str:
+    name = container_name(event.apartment)
+    if event.apartment in VM_APARTMENTS:
+        raise NotImplementedError(f"{event.kind}: {event.apartment} has no container (VM)")
+    return name
+
+
 def _docker(*verb: str) -> Handler:
     def handler(event: Event, run_cmd: RunCmd) -> None:
-        run_cmd(["docker", *verb, container_name(event.apartment)])
+        run_cmd(["docker", *verb, _container_of(event)])
 
     return handler
 
@@ -48,7 +59,7 @@ def _sequence(*handlers: Handler) -> Handler:
 
 def _wifi(action: str) -> Handler:
     def handler(event: Event, run_cmd: RunCmd) -> None:
-        run_cmd(["docker", "network", action, NETWORK, container_name(event.apartment)])
+        run_cmd(["docker", "network", action, NETWORK, _container_of(event)])
 
     return handler
 

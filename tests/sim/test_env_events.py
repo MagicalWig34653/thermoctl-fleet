@@ -179,3 +179,19 @@ def test_refresh_logins_raises_when_a_role_fails(state, monkeypatch):
     with pytest.raises(RuntimeError, match="FAILED for role.*admin") as info:
         env.refresh_logins()
     assert not isinstance(info.value, LoginsUnavailable)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        EventKind.HEARTBEAT_LOSS,
+        EventKind.HEARTBEAT_RESTORE,
+        EventKind.POWER_LOSS,
+        EventKind.WIFI_CHANGE,
+    ],
+)
+def test_container_events_for_vm_apartments_are_skipped_not_fatal(kind):
+    calls = []
+    with pytest.raises(NotImplementedError, match="no container"):
+        apply_event_with(_ev(kind, apt="sim-a01"), calls.append)
+    assert calls == []
