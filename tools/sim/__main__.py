@@ -9,20 +9,22 @@ import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+from tools.sim.env.config import state_dir
 from tools.sim.findings import build_index
 from tools.sim.haiku import ensure_persona_cwd, run_persona
 from tools.sim.personas import PERSONAS
 from tools.sim.runner import (
     TOOL_NOTES,
     LimitPause,
+    LoginsUnavailable,
     outstanding_failures,
+    record_failure,
     run,
     skipped_event_count,
 )
 from tools.sim.state import SimState
 
 ROOT = Path(__file__).resolve().parents[2]
-STATE_DIR = ROOT / "sim-state"
 FINDINGS_DIR = ROOT / "docs" / "sim-findings"
 EXIT_PAUSED = 75
 EXIT_ENV_MISSING = 2
@@ -61,29 +63,38 @@ def parse_personas(raw: str | None) -> list[str] | None:
 
 def _stack_is_up() -> bool:
     """Logins can only be refreshed once up_fleet has created the users file."""
-    return (STATE_DIR / "users.json").is_file()
+    return (state_dir() / "users.json").is_file()
 
 
-def _safe_refresh(refresh: Callable[[], None]) -> Callable[[], None]:
-    """A failed login refresh must not abort a week of simulation: warn and carry on."""
+def _safe_refresh(refresh: Callable[[], None], directory: Path) -> Callable[[], None]:
+    """A stale login must not abort a week of simulation: warn loudly and record it.
+
+    `LoginsUnavailable` (a role never had a login) is not caught: it stops the run.
+    """
 
     def hook() -> None:
         try:
             refresh()
-        except Exception as exc:  # noqa: BLE001 - any failure here is only a warning
-            print(f"warning: login refresh failed: {exc}", file=sys.stderr)
+        except LoginsUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any other failure is only a warning
+            print(f"WARNING: login refresh failed: {exc}", file=sys.stderr)
+            try:
+                week = SimState.load(directory / "state.json").week
+            except ValueError:  # pragma: no cover - the runner just validated the state
+                week = 0
+            record_failure(directory, "login-refresh", week, str(exc))
 
     return hook
 
 
 def _print_outstanding() -> None:
-    skipped = skipped_event_count(STATE_DIR)
+    skipped = skipped_event_count(state_dir())
     if skipped:
-        print(
-            f"{skipped} events skipped (not implemented), see {STATE_DIR / 'skipped-events.jsonl'}"
-        )
+        path = state_dir() / "skipped-events.jsonl"
+        print(f"{skipped} events skipped (not implemented), see {path}")
     try:
-        count = len(outstanding_failures(STATE_DIR))
+        count = len(outstanding_failures(state_dir()))
     except ValueError:  # pragma: no cover - state was just written by the run
         return
     print(f"{count} failed persona steps outstanding (retried on the next run)")
@@ -109,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "status":
         try:
-            state = SimState.load(STATE_DIR / "state.json")
+            state = SimState.load(state_dir() / "state.json")
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -126,14 +137,14 @@ def main(argv: list[str] | None = None) -> int:
             raise
         print("environment module missing: Task 9 (tools/sim/env.py)", file=sys.stderr)
         return EXIT_ENV_MISSING
-    persona_cwd = ensure_persona_cwd(STATE_DIR)
+    persona_cwd = ensure_persona_cwd(state_dir())
     child_env = persona_env(ROOT, sys.executable, os.environ)
     child_env.update(getattr(env, "persona_env_extras", dict)())
     refresh = getattr(env, "refresh_logins", None)
     try:
         run(
             weeks=args.weeks,
-            state_dir=STATE_DIR,
+            state_dir=state_dir(),
             findings_dir=FINDINGS_DIR,
             apartments=env.apartments(),
             urls=env.urls(),
@@ -143,8 +154,13 @@ def main(argv: list[str] | None = None) -> int:
             settle_s=3.0,
             seed=args.seed,
             personas=selected,
-            refresh_logins=_safe_refresh(refresh) if refresh and _stack_is_up() else None,
+            refresh_logins=_safe_refresh(refresh, state_dir())
+            if refresh and _stack_is_up()
+            else None,
         )
+    except LoginsUnavailable as exc:
+        print(f"error: {exc}; run `python -m tools.sim.env.logins --refresh`", file=sys.stderr)
+        return 1
     except ValueError as exc:  # resume with different parameters, corrupt state
         print(f"error: {exc}", file=sys.stderr)
         return 1

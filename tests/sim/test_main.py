@@ -4,12 +4,13 @@ import json
 import pytest
 
 from tools.sim import __main__ as cli
+from tools.sim.runner import LoginsUnavailable
 from tools.sim.state import SimState
 
 
 @pytest.fixture
 def dirs(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "STATE_DIR", tmp_path / "s")
+    monkeypatch.setenv("SIM_STATE_DIR", str(tmp_path / "s"))
     monkeypatch.setattr(cli, "FINDINGS_DIR", tmp_path / "f")
     return tmp_path
 
@@ -183,15 +184,50 @@ def test_run_prints_skipped_event_count(dirs, capsys, monkeypatch):
     assert f"{len(events)} events skipped" in capsys.readouterr().out
 
 
-def test_safe_refresh_swallows_errors_with_a_warning(capsys):
+def test_safe_refresh_swallows_errors_with_a_warning(dirs, capsys):
     def boom():
         raise RuntimeError("fleet down")
 
-    cli._safe_refresh(boom)()
-    assert "warning: login refresh failed: fleet down" in capsys.readouterr().err
+    cli._safe_refresh(boom, dirs / "s")()
+    assert "WARNING: login refresh failed: fleet down" in capsys.readouterr().err
+    row = json.loads((dirs / "s" / "failures.jsonl").read_text().splitlines()[0])
+    assert row["step"] == "login-refresh" and "fleet down" in row["text"]
     called = []
-    cli._safe_refresh(lambda: called.append(1))()
+    cli._safe_refresh(lambda: called.append(1), dirs / "s")()
     assert called == [1]
+
+
+def test_safe_refresh_lets_missing_logins_stop_the_run(dirs, capsys):
+    def boom():
+        raise LoginsUnavailable("no login for role(s) admin")
+
+    with pytest.raises(LoginsUnavailable):
+        cli._safe_refresh(boom, dirs / "s")()
+
+
+def test_run_exits_1_when_a_role_has_no_login(dirs, monkeypatch, capsys):
+    _fake_env(monkeypatch, [])
+    env = cli.importlib.import_module("x")
+
+    def boom():
+        raise LoginsUnavailable("no login for role(s) admin")
+
+    env.refresh_logins = staticmethod(boom)
+    (dirs / "s").mkdir()
+    (dirs / "s" / "users.json").write_text("{}")
+    assert cli.main(["run", "--weeks", "2", "--personas", "landlord"]) == 1
+    assert "no login for role(s) admin" in capsys.readouterr().err
+
+
+def test_state_dir_follows_sim_state_dir_at_call_time(tmp_path, monkeypatch, capsys):
+    other = tmp_path / "custom"
+    monkeypatch.setenv("SIM_STATE_DIR", str(other))
+    SimState(week=3, done_steps=[]).save(other / "state.json")
+    assert cli.main(["status"]) == 0
+    assert "week 3" in capsys.readouterr().out
+    assert not cli._stack_is_up()
+    (other / "users.json").write_text("{}")
+    assert cli._stack_is_up()
 
 
 def test_stack_is_up_means_users_file_exists(dirs):

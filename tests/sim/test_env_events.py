@@ -163,3 +163,19 @@ def test_clock_drift_is_deterministic_per_event_and_replaced_by_a_new_one(state)
 def test_clock_drift_validates_the_apartment_id(state):
     with pytest.raises(ValueError):
         apply_event_with(_ev(EventKind.CLOCK_DRIFT, apt="fleet"), list.append)
+
+
+def test_refresh_logins_raises_when_a_role_fails(state, monkeypatch):
+    from tools.sim.env import logins
+    from tools.sim.runner import LoginsUnavailable
+
+    monkeypatch.setattr(logins, "refresh", lambda: {"landlord": True, "admin": True})
+    env.refresh_logins()  # all ok: silent
+    monkeypatch.setattr(logins, "refresh", lambda: {"landlord": True, "admin": False})
+    with pytest.raises(LoginsUnavailable, match="admin"):  # never had a state file
+        env.refresh_logins()
+    (state / "storage-states").mkdir()
+    (state / "storage-states" / "admin.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="FAILED for role.*admin") as info:
+        env.refresh_logins()
+    assert not isinstance(info.value, LoginsUnavailable)

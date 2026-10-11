@@ -80,6 +80,15 @@ def _check_resume_parameters(
     state.seed = seed
 
 
+class LoginsUnavailable(RuntimeError):
+    """A role has no usable login at all: the run cannot continue."""
+
+
+def record_failure(state_dir: Path, step_id: str, week: int, text: str) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _record_failure(state_dir, step_id, week, text)
+
+
 def _record_failure(state_dir: Path, step_id: str, week: int, text: str) -> None:
     row = {"step": step_id, "week": week, "text": text[:_FAILURE_TEXT_MAX]}
     with (state_dir / "failures.jsonl").open("a", encoding="utf-8") as handle:

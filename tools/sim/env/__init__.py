@@ -39,7 +39,20 @@ def persona_env_extras() -> dict[str, str]:
 
 
 def refresh_logins() -> None:
-    """Log the UI users in again (cookies expire); raises RuntimeError if the setup is missing."""
-    from tools.sim.env import logins
+    """Log the UI users in again (cookies expire).
 
-    logins.refresh()
+    Raises `LoginsUnavailable` if a role failed and never had a storage state,
+    `RuntimeError` if any other role failed (the previous state is kept).
+    """
+    from tools.sim.env import logins
+    from tools.sim.runner import LoginsUnavailable
+
+    results = logins.refresh()
+    failed = sorted(role for role, ok in results.items() if not ok)
+    if not failed:
+        return
+    directory = state_dir()
+    missing = [r for r in failed if not (logins.storage_dir(directory) / f"{r}.json").is_file()]
+    if missing:
+        raise LoginsUnavailable(f"no login for role(s) {', '.join(missing)} and no earlier state")
+    raise RuntimeError(f"login refresh FAILED for role(s) {', '.join(failed)}; stale cookies kept")
