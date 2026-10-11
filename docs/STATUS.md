@@ -12319,3 +12319,9 @@ daneben). `apple-touch-icon.png` ist auf Website und in der Fleet-Oberfläche
 (`/ui/static/apple-touch-icon.png`, in `base.html`/`login.html` verlinkt)
 der iOS-Export desselben Icons. Das Favicon im Browser-Tab bleibt das flache
 SVG-Zeichen, weil es in 16 px schärfer ist.
+
+## 2026-10-11: Simulationsharness, Uhr und Checkpoint
+
+`tools/sim/clock.py` (virtuelle Uhr als libfaketime-Zeitstempeldatei) und
+`tools/sim/state.py` (atomarer Checkpoint je Persona-Schritt) mit Tests in
+`tests/sim/`. Nur Werkzeug, kein Produktcode.
