@@ -111,3 +111,10 @@ def test_index_hand_written_alongside_raw(tmp_path: Path) -> None:
 def test_index_without_hand_written_has_no_section(tmp_path: Path) -> None:
     text = build_index(tmp_path).read_text(encoding="utf-8")
     assert "Hand-written" not in text
+
+
+def test_build_index_ignores_the_runbook(tmp_path):
+    (tmp_path / "RUNBOOK.md").write_text("# Runbook\n")
+    (tmp_path / "10-real.md").write_text("# Finding 10: real\n")
+    text = build_index(tmp_path).read_text()
+    assert "RUNBOOK" not in text and "10-real.md" in text

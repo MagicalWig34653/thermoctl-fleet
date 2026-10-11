@@ -3,6 +3,10 @@
 Last updated: 2026-10-11.
 
 
+## Usage simulation: Smoke-Run-Vorbereitung (Task 10a, 2026-10-11)
+
+Drift begrenzt (+-86400 s), `run --personas/--seed` (Filter im Checkpoint, Resume mit anderem Filter abgelehnt), nicht implementierte Events landen in `skipped-events.jsonl`, Persona-Logins (`up_fleet --logins`, `env.logins --refresh`, wöchentlich im Lauf), Ablauf in `docs/sim-findings/RUNBOOK.md`. Noch nicht live gelaufen.
+
 ## Usage simulation: fleet environment (Task 9a, 2026-10-11)
 
 `tools/sim/env/` seeds a local sim fleet (3 properties, 12 apartments, 12 prepared
