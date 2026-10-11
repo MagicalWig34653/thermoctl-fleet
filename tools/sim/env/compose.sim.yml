@@ -21,7 +21,9 @@ x-sim-agent: &sim-agent
     SIM_ALLOWED_HOSTS: fleet
     LD_PRELOAD: /usr/local/lib/libfaketime.so.1
     FAKETIME_TIMESTAMP_FILE: /sim-clock/clock
-    FAKETIME_NO_CACHE: "1"
+    # NO_CACHE (re-read the file on every clock call) livelocks the fleet under load; a 1 s cache
+    # is enough, the runner settles after each clock step.
+    FAKETIME_CACHE_DURATION: "1"
   networks: [sim-net]
 
 services:
@@ -55,7 +57,9 @@ services:
       # Virtual clock: absolute timestamp file without "@" freezes time until rewritten.
       LD_PRELOAD: /usr/local/lib/libfaketime.so.1
       FAKETIME_TIMESTAMP_FILE: /sim-clock/clock
-      FAKETIME_NO_CACHE: "1"
+      # NO_CACHE (re-read the file on every clock call) livelocks the fleet under load; a 1 s cache
+      # is enough, the runner settles after each clock step.
+      FAKETIME_CACHE_DURATION: "1"
     volumes:
       - "${SIM_STATE_DIR:?set by up_fleet}/fleet-data:/data"
       - "${SIM_STATE_DIR}/backups:/backups"

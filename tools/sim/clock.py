@@ -24,7 +24,7 @@ class SimClock:
     now: datetime = SIM_START
 
     def write(self) -> None:
-        """Atomically publish the current simulated time (FAKETIME_NO_CACHE=1 readers)."""
+        """Atomically publish the current simulated time (readers, cache duration 1 s)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(self.now.strftime("%Y-%m-%d %H:%M:%S") + "\n", encoding="ascii")

@@ -118,7 +118,8 @@ def test_compose_file_only_uses_sim_names_and_loopback():
     assert fleet["image"].startswith("thermoctl-sim")
     assert all(p.startswith("127.0.0.1:8200:") for p in fleet["ports"])
     assert "volumes" not in doc  # no named volumes that down could confuse with the user's
-    assert fleet["environment"]["FAKETIME_NO_CACHE"] == "1"
+    assert "FAKETIME_NO_CACHE" not in fleet["environment"]  # livelocks the fleet (finding in smoke run)
+    assert fleet["environment"]["FAKETIME_CACHE_DURATION"] == "1"
     assert (ROOT / "tools/sim/env/Dockerfile.fleet-sim").is_file()
 
 
