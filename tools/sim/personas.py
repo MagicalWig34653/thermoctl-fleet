@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -47,8 +48,13 @@ PERSONAS: list[Persona] = [
     Persona(
         "tenant1",
         "tenant",
-        "Anna, 29, tech-savvy, uses the tenant UI daily.",
-        ["Change a schedule", "Check why it is cold", "Look at history"],
+        "Anna, 29, tech-savvy, uses the tenant UI daily. Likes to see what the system "
+        "does and why.",
+        [
+            "Change the weekly schedule of a room (tab Zeitplan: day/night times)",
+            "Check why a room is cold (room cards on Zuhause, tab Verlauf)",
+            "Look at the temperature history and heating time of the last days",
+        ],
         2,
         True,
         20,
@@ -56,8 +62,14 @@ PERSONAS: list[Persona] = [
     Persona(
         "tenant2",
         "tenant",
-        "Herr Schulz, 71, large fonts, easily confused, uses a tablet.",
-        ["Set the room warmer", "Find out whether the heating is broken"],
+        "Herr Schulz, 71, large fonts, easily confused, uses a tablet. Reads every word, "
+        "is afraid of breaking something, does not know technical terms. Look at pages "
+        "with `shot --width 1024` and judge whether the text is big and clear enough.",
+        [
+            "Make the living room warmer for a while (Zuhause)",
+            "Find out whether the heating is broken and say so to the landlord "
+            "(Problem melden, or a note that you could not find it)",
+        ],
         2,
         True,
         20,
@@ -65,8 +77,12 @@ PERSONAS: list[Persona] = [
     Persona(
         "tenant3",
         "tenant",
-        "Mia, 22, phone only, impatient, moves out in the second year.",
-        ["Quick temperature change", "Absence period for a holiday"],
+        "Mia, 22, phone only (always look with `shot --width 390`), impatient, "
+        "moves out in the second year.",
+        [
+            "Quick temperature change in one room (Zuhause, buttons - and +)",
+            "Enter an absence period for a holiday on Zuhause, and end it early",
+        ],
         2,
         True,
         20,
@@ -96,6 +112,30 @@ PERSONAS: list[Persona] = [
 LOGIN_ROLE = {"newcomer": "landlord"}
 
 
+def is_tenant(persona: Persona) -> bool:
+    return persona.role == "tenant"
+
+
+def login_role(persona: Persona) -> str:
+    """Browse `--role` of the persona: each tenant has an own login (tenant1..3)."""
+    if is_tenant(persona):
+        return persona.id
+    return LOGIN_ROLE.get(persona.role, persona.role)
+
+
+def endpoint_lines(persona: Persona, urls: dict[str, str]) -> str:
+    """A tenant sees only its own heating app (never the cloud nor another household)."""
+    if is_tenant(persona):
+        own = urls.get(persona.id)
+        label = (
+            "your heating app (tenant UI, in German; tabs Zuhause/Zeitplan/Heizzeit/Verlauf/Mehr)"
+        )
+        shown = {label: own} if own else {}
+    else:
+        shown = {name: url for name, url in urls.items() if not re.fullmatch(r"tenant\d+", name)}
+    return "\n".join(f"- {name}: {url}" for name, url in shown.items())
+
+
 def due_personas(week: int) -> list[Persona]:
     """Personas whose cadence falls on this week (week 0 = everyone)."""
     return [p for p in PERSONAS if week % p.every_weeks == 0]
@@ -110,7 +150,7 @@ def build_prompt(
 ) -> str:
     """Render the English role-play prompt for one persona session."""
     goals = "\n".join(f"- {g}" for g in persona.goals)
-    endpoints = "\n".join(f"- {name}: {url}" for name, url in urls.items())
+    endpoints = endpoint_lines(persona, urls)
     finding = (
         '{"area":"logic|ux|looks|missing_tool|security",'
         '"severity":"blocker|major|minor|nit","title":"short",'
@@ -129,7 +169,7 @@ def build_prompt(
         "screen, something you can do that you should not be able to), report "
         f"it as area security without going further):\n{endpoints}\n\n"
         f"Your browser session is already logged in as {persona.role}: pass "
-        f"`--role {LOGIN_ROLE.get(persona.role, persona.role)}` to the browse commands "
+        f"`--role {login_role(persona)}` to the browse commands "
         "and do not try to log in yourself.\n"
         f"How to work: {tool_notes}\n"
         f"Use at most {persona.max_steps} actions. Do not invent data you cannot see.\n\n"

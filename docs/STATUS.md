@@ -12388,3 +12388,5 @@ behoben, 4 Produktbefunde (11 bis 14). Offen: Formulare absenden, frischer
 State pro Lauf.
 
 Pentest (Task 12, simulation): `python -m tools.sim.pentest` runs 43 scripted checks against the loopback sim fleet; 5 findings (20 to 24, one major: a NaN heartbeat breaks the UI), results in `docs/sim-findings/pentest/results.md`.
+
+Tenant UIs (Task 9c-T): `python -m tools.sim.env.tenant --up|--logins|--down` runs three headless thermoctl instances (ports 8301-8303) for the tenant personas; first look in `docs/sim-findings/30-tenant-ui-first-look.md`.

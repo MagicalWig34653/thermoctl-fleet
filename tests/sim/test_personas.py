@@ -37,3 +37,42 @@ def test_env_urls_name_the_ui_landing_page():
     from tools.sim import env
 
     assert env.urls()["fleet web app (browser pages)"] == "http://127.0.0.1:8200/ui/"
+
+
+def _tenant_urls():
+    return {
+        "fleet": "http://127.0.0.1:8200",
+        "tenant1": "http://127.0.0.1:8301",
+        "tenant2": "http://127.0.0.1:8302",
+        "tenant3": "http://127.0.0.1:8303",
+    }
+
+
+def test_env_urls_include_the_three_tenant_uis():
+    from tools.sim import env
+
+    urls = env.urls()
+    assert [urls[f"tenant{n}"] for n in (1, 2, 3)] == [
+        "http://127.0.0.1:8301",
+        "http://127.0.0.1:8302",
+        "http://127.0.0.1:8303",
+    ]
+
+
+def test_tenant_prompt_names_only_its_own_app_and_its_own_login_role():
+    by_id = {p.id: p for p in PERSONAS}
+    text = build_prompt(by_id["tenant2"], 2, "2026-01-19", _tenant_urls(), "notes")
+    assert "http://127.0.0.1:8302" in text and "--role tenant2" in text
+    assert "8301" not in text and "8303" not in text  # no other household
+    assert "8200" not in text  # a tenant never sees the cloud
+
+
+def test_other_personas_do_not_see_tenant_apps():
+    by_id = {p.id: p for p in PERSONAS}
+    text = build_prompt(by_id["landlord"], 1, "2026-01-12", _tenant_urls(), "notes")
+    assert "http://127.0.0.1:8200" in text and "830" not in text
+
+
+def test_mia_is_told_to_use_phone_width():
+    mia = {p.id: p for p in PERSONAS}["tenant3"]
+    assert "--width 390" in mia.character

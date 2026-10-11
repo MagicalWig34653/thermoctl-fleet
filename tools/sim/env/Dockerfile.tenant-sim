@@ -1,0 +1,12 @@
+# The sibling thermoctl image plus libfaketime, so the tenant UIs run on the shared
+# virtual clock (<state>/clock). Build the base first, from the sibling repo (read-only):
+#   docker build -f <thermoctl>/docker/Dockerfile -t thermoctl-sim-tenant-base:local <thermoctl>
+ARG BASE_IMAGE=thermoctl-sim-tenant-base:local
+FROM ${BASE_IMAGE}
+# Stays root: the sibling entrypoint chowns /data and drops to `thermoctl` itself.
+USER root
+# The multiarch directory differs (aarch64/x86_64), so link a stable path.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends faketime \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -s "$(find /usr/lib -name libfaketime.so.1 | head -n 1)" /usr/local/lib/libfaketime.so.1

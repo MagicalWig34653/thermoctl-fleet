@@ -73,3 +73,4 @@
 - [Finding 12: `/openapi.json` and `/docs` are served without a login](12-openapi-and-docs-public.md)
 - [Finding 13: unknown `/ui/...` paths answer with bare JSON, not an app page](13-ui-404-raw-json.md)
 - [Finding 14: alarm and detail views use technical wording a landlord cannot act on](14-ui-technical-wording-for-laypeople.md)
+- [Findings 30: first look at the tenant UI of thermoctl](30-tenant-ui-first-look.md)

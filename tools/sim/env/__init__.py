@@ -29,8 +29,14 @@ def apartments() -> list[str]:
 
 
 def urls() -> dict[str, str]:
-    """Endpoints named in persona prompts. Tenant UIs are added by Task 9b/9c."""
-    return {"fleet": FLEET_URL, "fleet web app (browser pages)": f"{FLEET_URL}/ui/"}
+    """Endpoints named in persona prompts; `tenantN` is the heating app of persona tenantN."""
+    from tools.sim.env.tenant import tenant_urls
+
+    return {
+        "fleet": FLEET_URL,
+        "fleet web app (browser pages)": f"{FLEET_URL}/ui/",
+        **tenant_urls(),
+    }
 
 
 def persona_env_extras() -> dict[str, str]:
@@ -48,6 +54,10 @@ def refresh_logins() -> None:
     from tools.sim.runner import LoginsUnavailable
 
     results = logins.refresh()
+    from tools.sim.env import tenant
+
+    if tenant.load_users(state_dir()) is not None:  # tenant UIs were started
+        results.update(tenant.refresh_logins(state_dir()))
     failed = sorted(role for role, ok in results.items() if not ok)
     if not failed:
         return

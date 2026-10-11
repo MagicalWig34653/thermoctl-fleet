@@ -60,6 +60,24 @@ python -m tools.sim.env.up_fleet --down     # removes thermoctl-sim containers a
 Seeded data, the clock and all outputs stay in `sim-state/`; delete that
 directory (or point `SIM_STATE_DIR` elsewhere) for a clean start.
 
+## 6. Tenant instances (the tenant personas' own UI)
+
+Three headless `thermoctl` instances (one per tenant persona, own throw-away database each,
+virtual clock like the fleet), compose project `thermoctl-sim-tenants`:
+
+```sh
+python -m tools.sim.env.tenant --up      # build from ../thermoctl (read-only), start, set up, seed, log in
+python -m tools.sim.env.tenant --logins  # new storage states (sessions follow the virtual clock)
+python -m tools.sim.env.tenant --down    # removes only this project and its data volumes
+```
+
+- URLs: `http://127.0.0.1:8301` / `8302` / `8303` (roles `tenant1`..`tenant3` for `browse --role`).
+- Credentials: `<state>/tenant-users.json` (0600, generated). Sibling repo: `SIM_THERMOCTL_REPO`
+  (default `../thermoctl`).
+- `SIM_STATE_DIR` must lie under a path Docker Desktop shares (`/Users/...`, not `/tmp`),
+  and must not be deleted while the containers run (the clock mount goes stale).
+- The refresh in section 4 also refreshes the tenant logins when `tenant-users.json` exists.
+
 ## Where outputs land
 
 | What | Where |

@@ -31,6 +31,16 @@ def container_name(apartment: str) -> str:
     return f"{PREFIX}-{apartment}"
 
 
+TENANT_NUMBERS = (1, 2, 3)
+
+
+def tenant_container_name(n: int) -> str:
+    """Container of tenant instance `n` (thermoctl UI of persona tenant<n>, `env.tenant`)."""
+    if isinstance(n, bool) or n not in TENANT_NUMBERS:
+        raise ValueError(f"invalid tenant number: {n!r}")
+    return f"{PREFIX}-tenant{n}"
+
+
 # sim-a01/sim-a02 are VM apartments: there is no container to pause, kill or detach.
 VM_APARTMENTS = frozenset({"sim-a01", "sim-a02"})
 

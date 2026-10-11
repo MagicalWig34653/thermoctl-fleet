@@ -39,7 +39,10 @@ TOOL_NOTES = (
     '{"select":"<css>","value":"..."}, {"check":"<css>"} or {"wait_text":"..."}; afterwards it '
     "prints the resulting URL, status and page text. Example, confirming a maintenance "
     "command: `act --url <fleet>/ui/apartments/<id>/commands/<command>/confirm --role landlord "
-    '--steps \'[{"fill":"#reason","value":"Routine check"},{"click":"button[type=submit]"}]\'`.'
+    '--steps \'[{"fill":"#reason","value":"Routine check"},{"click":"button[type=submit]"}]\'`. '
+    "A tenant's heating app is a normal website in German: the tabs are in the page text, "
+    "pass your own `--role` (tenant1..3) and use a full URL from the Systems list. A chart "
+    'tile may still say "wird geladen" in a screenshot taken right after the page loaded.'
 )
 
 _FAILURE_TEXT_MAX = 500
