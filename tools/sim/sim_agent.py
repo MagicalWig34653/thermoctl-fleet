@@ -13,14 +13,30 @@ Faults: `<state-dir>/faults/<apartment>.json` (absent = healthy) overlays the
 healthy defaults. Top-level keys `thermoctl`, `control`, `devices`, `system`
 (objects, field-wise overlay) and `open_faults` (list of {kind, since, zone});
 unknown keys are ignored.
+
+Reactions to the environment (all through marker files under `<state-dir>/faults`,
+because the real agent loop is not running in the sim):
+
+- `<apartment>.version` (JSON `{"revision", "version"}`, written when the
+  landlord sets a new desired state): the first tick that sees a changed marker
+  only remembers it, the next tick "applies" it -- reports
+  `desired-state/result` and from then on the new `thermoctl.version`.
+  At process start the marker is adopted silently (the box already runs it).
+- `<apartment>.backup` (JSON `{"id", "kind", "size"}`): a changed marker makes
+  the agent upload one backup of that kind. The operational-data block is
+  random bytes encrypted with the real `age` format to two throw-away
+  recipients (nobody holds the identities); it is never real tenant data.
+- the token file is re-read on every tick (a rotation rewrites it in place).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
+import os
 import signal
 import sys
 import threading
@@ -32,6 +48,8 @@ from typing import Any
 import httpx
 from pydantic import ValidationError
 
+from protocol.backups import BackupKind
+from protocol.desired_state import DesiredStateOutcomeReport
 from protocol.heartbeat import Heartbeat
 from protocol.version import PROTOCOL_VERSION
 from tools.sim.http import allowed_hosts, check_url
@@ -182,6 +200,40 @@ def make_health(state_dir: Path, apartment: str) -> Callable[[], dict[str, Any]]
     return health
 
 
+def read_marker(state_dir: Path, apartment: str, suffix: str) -> dict[str, Any] | None:
+    """`<state>/faults/<apartment>.<suffix>` as a JSON object; None if absent or unusable."""
+    path = FaultFile(state_dir, apartment).path.with_suffix(f".{suffix}")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def build_backup_body(kind: BackupKind, apartment: str, size: int, version: str) -> bytes:
+    """One fictional backup body. Never real tenant data: random bytes / a tiny config.
+
+    `operational_data`: `size` random bytes, encrypted in the real age format to two
+    freshly generated recipients whose identities are dropped at once (the cloud
+    only ever sees an opaque block; nobody can decrypt it). `device_config`: plain
+    JSON without tenant relation, like section 15.1 describes it.
+    """
+    if kind is BackupKind.DEVICE_CONFIG:
+        return json.dumps(
+            {
+                "apartment": apartment,
+                "services": {"thermoctl": {"version": version}},
+                "agent": {"id": AGENT_ID},
+                "simulated": True,
+            },
+            sort_keys=True,
+        ).encode()
+    import pyrage
+
+    recipients = [pyrage.x25519.Identity.generate().to_public() for _ in range(2)]
+    return bytes(pyrage.encrypt(os.urandom(size), recipients))
+
+
 class SimAgent:
     def __init__(
         self,
@@ -191,17 +243,113 @@ class SimAgent:
         health: Callable[[], dict[str, Any]],
         *,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        token_file: Path | None = None,
+        state_dir: Path | None = None,
     ) -> None:
         self.apartment = apartment
         self._client = client
         self._token = token
         self._health = health
         self._now = now
+        self._token_file = token_file
+        self._state_dir = state_dir
+        self._version: str | None = None
+        self._pending_version: dict[str, Any] | None = None
+        self._seen_revision: object = None
+        self._seen_backup: object = None
+        if state_dir is not None:
+            marker = read_marker(state_dir, apartment, "version")
+            if marker is not None:  # a restarted box already runs what was last installed
+                self._seen_revision = marker.get("revision")
+                version = marker.get("version")
+                self._version = version if isinstance(version, str) else None
+            backup = read_marker(state_dir, apartment, "backup")
+            if backup is not None:  # a reboot does not repeat an old backup
+                self._seen_backup = backup.get("id")
+
+    def _reload_token(self) -> None:
+        if self._token_file is None:
+            return
+        try:
+            fresh = self._token_file.read_text().strip()
+        except OSError:
+            return
+        if fresh:  # empty = mid-rewrite, keep the last good one
+            self._token = fresh
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"}
+
+    def _apply_version_marker(self) -> None:
+        if self._state_dir is None:
+            return
+        marker = read_marker(self._state_dir, self.apartment, "version")
+        if marker is None:
+            return
+        if self._pending_version is not None:  # second tick: the "update" has finished
+            pending, self._pending_version = self._pending_version, None
+            version = pending.get("version")
+            revision = pending.get("revision")
+            if isinstance(version, str) and isinstance(revision, int):
+                self._version = version
+                self._seen_revision = revision
+                self._post_desired_state_result(revision)
+            return
+        if marker.get("revision") != self._seen_revision:
+            self._pending_version = marker
+
+    def _post_desired_state_result(self, revision: int) -> None:
+        report = DesiredStateOutcomeReport(
+            revision=revision, successful=True, reason="sim: applied", service="thermoctl"
+        )
+        try:
+            self._client.post(
+                "/v1/desired-state/result",
+                json=report.model_dump(mode="json"),
+                headers=self._headers(),
+            )
+        except httpx.HTTPError as exc:
+            log.warning("desired-state result failed: %s", type(exc).__name__)
+
+    def _run_backup_marker(self) -> None:
+        if self._state_dir is None:
+            return
+        marker = read_marker(self._state_dir, self.apartment, "backup")
+        if marker is None or marker.get("id") == self._seen_backup:
+            return
+        self._seen_backup = marker.get("id")
+        size = marker.get("size")
+        try:
+            kind = BackupKind(str(marker.get("kind")))
+            if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= 2_000_000:
+                raise ValueError("size")
+        except ValueError:
+            log.warning("backup marker for %s unusable; ignored", self.apartment)
+            return
+        body = build_backup_body(kind, self.apartment, size, self._version or "sim")
+        try:
+            resp = self._client.post(
+                "/v1/backups",
+                params={"kind": str(kind), "content_hash": hashlib.sha256(body).hexdigest()},
+                content=body,
+                headers={**self._headers(), "Content-Type": "application/octet-stream"},
+            )
+        except httpx.HTTPError as exc:
+            log.warning("backup upload failed: %s", type(exc).__name__)
+            return
+        if not resp.is_success:
+            log.warning("backup upload refused: HTTP %d", resp.status_code)
 
     def tick(self) -> bool:
         """Send one heartbeat. True on 2xx; never raises on transport/HTTP errors."""
+        self._reload_token()
+        self._apply_version_marker()
+        self._run_backup_marker()
         try:
-            hb = build_heartbeat(self.apartment, self._health(), self._now())
+            health = self._health()
+            if self._version is not None:
+                health = {**health, "thermoctl": {**health["thermoctl"], "version": self._version}}
+            hb = build_heartbeat(self.apartment, health, self._now())
         except ValidationError:
             log.warning("heartbeat for %s does not validate; not sent", self.apartment)
             return False
@@ -209,7 +357,7 @@ class SimAgent:
             resp = self._client.post(
                 "/v1/heartbeat",
                 json=hb.model_dump(mode="json"),
-                headers={"Authorization": f"Bearer {self._token}"},
+                headers=self._headers(),
             )
         except httpx.HTTPError as exc:
             log.warning("heartbeat for %s failed: %s", self.apartment, type(exc).__name__)
@@ -260,6 +408,8 @@ def main(
         token,
         make_health(args.state_dir, args.apartment),
         now=drifted_now(args.state_dir, args.apartment),
+        token_file=args.token_file,
+        state_dir=args.state_dir,
     )
     stop = threading.Event()
     if max_ticks is None:  # pragma: no cover - signal wiring, process-level

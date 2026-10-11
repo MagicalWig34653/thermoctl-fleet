@@ -1,8 +1,9 @@
 """Event handlers: map a scheduled `EventKind` onto docker commands / state files.
 
 Handlers take `(event, run_cmd)`; `run_cmd` receives an argv list and is
-injected so unit tests never need Docker. Kinds whose mechanism belongs to a
-later sub-task raise NotImplementedError when called (and only then).
+injected so unit tests never need Docker. The fleet-side kinds (image update, backup,
+token expiry, tenant change) live in `fleet_events`. A handler raises
+NotImplementedError only for a VM apartment that has no container/token file.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from tools.sim.env import fleet_events
 from tools.sim.env.config import NETWORK, PREFIX, state_dir, virtual_now
 from tools.sim.scenario import Event, EventKind
 
@@ -82,13 +84,6 @@ def _sequence(*handlers: Handler) -> Handler:
 def _wifi(action: str) -> Handler:
     def handler(event: Event, run_cmd: RunCmd) -> None:
         run_cmd(["docker", "network", action, NETWORK, _container_of(event)])
-
-    return handler
-
-
-def _not_yet(kind: EventKind, task: str) -> Handler:
-    def handler(event: Event, run_cmd: RunCmd) -> None:
-        raise NotImplementedError(f"{kind}: Task {task}")
 
     return handler
 
@@ -160,26 +155,31 @@ def _clock_drift(event: Event, run_cmd: RunCmd) -> None:
     _write_state_file(state_dir() / "faults" / f"{event.apartment}.drift", f"{signed}\n")
 
 
+def _fleet_side(action: Callable[[Event], None], *, container: bool = False) -> Handler:
+    """Adapt a `fleet_events` function; `container` ones need an agent container
+    (VM apartments are skipped like for pause/kill)."""
+
+    def handler(event: Event, run_cmd: RunCmd) -> None:
+        if container:
+            _container_of(event)
+        action(event)
+
+    return handler
+
+
 HANDLERS: dict[EventKind, Handler] = {
     EventKind.HEARTBEAT_LOSS: _docker("pause"),
     EventKind.HEARTBEAT_RESTORE: _docker("unpause"),
     EventKind.POWER_LOSS: _sequence(_docker("kill"), _docker("start")),
     EventKind.WIFI_CHANGE: _sequence(_wifi("disconnect"), _wifi("connect")),
     EventKind.FAULT: _fault,
-    EventKind.IMAGE_UPDATE: _not_yet(EventKind.IMAGE_UPDATE, "9c"),
-    EventKind.BACKUP: _not_yet(EventKind.BACKUP, "9c"),
-    EventKind.TOKEN_EXPIRY: _not_yet(EventKind.TOKEN_EXPIRY, "9c"),
-    EventKind.TENANT_CHANGE: _not_yet(EventKind.TENANT_CHANGE, "9c"),
+    EventKind.IMAGE_UPDATE: _fleet_side(fleet_events.image_update),
+    EventKind.BACKUP: _fleet_side(fleet_events.backup, container=True),
+    EventKind.TOKEN_EXPIRY: _fleet_side(fleet_events.token_expiry, container=True),
+    EventKind.TENANT_CHANGE: _fleet_side(fleet_events.tenant_change),
     EventKind.CLOCK_DRIFT: _clock_drift,
 }
-UNIMPLEMENTED_KINDS: frozenset[EventKind] = frozenset(
-    {
-        EventKind.IMAGE_UPDATE,
-        EventKind.BACKUP,
-        EventKind.TOKEN_EXPIRY,
-        EventKind.TENANT_CHANGE,
-    }
-)
+UNIMPLEMENTED_KINDS: frozenset[EventKind] = frozenset()  # every kind has a mechanism
 
 
 def apply_event_with(event: Event, run_cmd: RunCmd) -> None:
@@ -192,3 +192,24 @@ def _subprocess_run(cmd: list[str]) -> object:
 
 def apply_event(event: Event) -> None:
     apply_event_with(event, _subprocess_run)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m tools.sim.env.events --apply KIND APARTMENT`: apply one event once by hand."""
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="python -m tools.sim.env.events")
+    ap.add_argument("--apply", nargs=2, metavar=("KIND", "APARTMENT"), required=True)
+    kind, apartment = ap.parse_args(argv).apply
+    try:
+        event = Event(f"manual:{kind}:{apartment}", 0, EventKind(kind), apartment)
+        apply_event(event)
+    except (ValueError, NotImplementedError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f"error: {exc}")
+        return 1
+    print(f"applied {event.kind} to {apartment}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

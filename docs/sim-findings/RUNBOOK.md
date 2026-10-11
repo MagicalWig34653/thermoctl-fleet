@@ -127,6 +127,29 @@ run in their own session, so they would otherwise be orphaned), saves the state 
 exits with 143 / 130 and no traceback. The interrupted step is not a failure and is
 repeated on the next run. Check afterwards with `pgrep -f "claude -p"`.
 
+## Event coverage
+
+Every scheduled event kind has a handler (`tools/sim/env/events.py`, fleet-side ones in
+`fleet_events.py`); `UNIMPLEMENTED_KINDS` is empty. Handlers open the fleet DB from the host
+with the product's own `Storage` (short transactions, the fleet keeps running) and are safe
+to re-apply. Container-only kinds skip sim-a01/a02 (VMs, `NotImplementedError` -> skipped log).
+
+| Kind | Mechanism | Exercised | Not exercised |
+|---|---|---|---|
+| `heartbeat_loss` | `docker pause` | absence alarm | - |
+| `heartbeat_restore` | `docker unpause` | recovery | - |
+| `power_loss` | `docker kill` + `start` | gap + restart | - |
+| `wifi_change` | network disconnect + connect | short outage | - |
+| `fault` | `faults/<apt>.json` overlay | open faults / device / control health | - |
+| `clock_drift` | `faults/<apt>.drift` | skewed `sent_at`, `clock_drift_s` | real container clock |
+| `image_update` | `Storage.create_desired_state_revision` as `sim-admin` (fictional deterministic digests), marker `faults/<apt>.version`; sim agent reports the version one heartbeat later and posts `/v1/desired-state/result` | revision history, audit, outcome, version column | UI form/confirm step, rollouts, real pull/digest check/watchdog swap |
+| `backup` | marker `faults/<apt>.backup`; sim agent POSTs `/v1/backups` (random bytes, real age format via pyrage to 2 throw-away recipients, or tiny plain JSON config, alternating) | real endpoint: hash, size, age-prefix check, blob + row, retention | real thermoctl DB/Z2M content, the agent's own recipients file, decryptability (identities dropped) |
+| `token_expiry` | the product has no expiry: forced into the reauth state (as step 1 of the tenant change, no data deleted), then the rotation replayed through `issue_token_rotation_challenge` + `complete_token_rotation`; new token written in place into the token file, re-read every tick | storage side of rotation, audit | Ed25519 signature of the rotation endpoints, the real agent's 401 handling |
+| `tenant_change` | `Storage.rotate_apartment_token_for_tenant_change` as `sim-admin` (history/alarms/excerpts/bundle rows deleted, blobs removed, audit), then the same rotation replay | everything the landlord's action does, agent re-authenticates | UI form/CSRF, the signature check, the real agent's re-auth flow |
+
+Both token kinds rewrite the file in place (single-file bind mount); a missed read is retried
+on the next tick.
+
 ## Pentest: `python -m tools.sim.pentest` (pollutes the sim, read this first)
 
 The pentest is not a read-only probe. It acts on the **shared** sim:

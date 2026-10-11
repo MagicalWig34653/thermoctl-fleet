@@ -27,23 +27,23 @@ def test_every_kind_has_a_handler():
     assert set(HANDLERS) == set(EventKind)
 
 
-def test_unimplemented_set_is_exactly_the_later_subtasks():
-    assert UNIMPLEMENTED_KINDS == frozenset(
-        {
-            EventKind.IMAGE_UPDATE,
-            EventKind.BACKUP,
-            EventKind.TOKEN_EXPIRY,
-            EventKind.TENANT_CHANGE,
-        }
-    )
+def test_no_kind_is_unimplemented_any_more():
+    assert UNIMPLEMENTED_KINDS == frozenset()
 
 
-@pytest.mark.parametrize("kind", sorted(UNIMPLEMENTED_KINDS))
-def test_unimplemented_handlers_raise_at_call_time(kind):
-    cmds = []
-    with pytest.raises(NotImplementedError, match=f"^{kind}: Task 9"):
-        apply_event_with(_ev(kind), cmds.append)
-    assert cmds == []
+def test_runbook_coverage_table_lists_every_kind_with_its_status():
+    from pathlib import Path
+
+    text = (Path(__file__).parents[2] / "docs" / "sim-findings" / "RUNBOOK.md").read_text()
+    section = text.split("## Event coverage", 1)[1].split("\n## ", 1)[0]
+    rows = {
+        line.split("|")[1].strip().strip("`"): line
+        for line in section.splitlines()
+        if line.startswith("| `")
+    }
+    assert set(rows) == {str(kind) for kind in EventKind}
+    for kind in EventKind:
+        assert ("not implemented" in rows[str(kind)]) == (kind in UNIMPLEMENTED_KINDS)
 
 
 def test_loss_and_restore_target_the_apartment_container():
@@ -216,3 +216,13 @@ def test_other_docker_failures_still_raise():
         apply_event_with(_ev(EventKind.HEARTBEAT_RESTORE), fail)
     with pytest.raises(subprocess.CalledProcessError):
         apply_event_with(_ev(EventKind.POWER_LOSS), fail)
+
+
+def test_cli_applies_one_event_and_reports_errors(capsys):
+    from tools.sim.env.events import main
+
+    assert main(["--apply", "clock_drift", "sim-a03"]) == 0
+    assert "applied clock_drift" in capsys.readouterr().out
+    assert main(["--apply", "nonsense", "sim-a03"]) == 1
+    assert main(["--apply", "heartbeat_loss", "sim-a01"]) == 1  # VM: no container
+    assert main(["--apply", "clock_drift", "../x"]) == 1
