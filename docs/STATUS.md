@@ -3,6 +3,16 @@
 Last updated: 2026-10-11.
 
 
+## Usage simulation: environment notes (2026-10-11)
+
+`docs/sim-findings/00-environment-notes.md` records what the harness can rely
+on. Main finding: `python -m agent run` sends no heartbeats yet
+(`collect_heartbeat` raises `NotImplementedError`, P2.3), and `../thermoctl`
+has no `/api/v1/health`, so the sim must supply its own heartbeat sender.
+libfaketime verified (absolute timestamp without `@` freezes time). No
+product code changed.
+
+
 ## Usage simulation: design approved (2026-10-11)
 
 Design for a 2-3 year landlord/tenant simulation (Lima VMs + container
