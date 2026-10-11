@@ -35,3 +35,45 @@ def test_index_groups_by_severity_then_area(tmp_path: Path) -> None:
 def test_index_without_findings_file(tmp_path: Path) -> None:
     index = build_index(tmp_path).read_text()
     assert "no findings yet" in index.lower()
+
+
+def test_parse_requires_string_fields() -> None:
+    bad = 'FINDING: {"area":"ux","severity":"major","title":["x"]}'
+    bad2 = 'FINDING: {"area":"ux","severity":"major","title":"t","expected":5}'
+    assert parse_findings(f"{bad}\n{bad2}\n", 1, "p") == []
+
+
+def test_parse_tolerates_prefix_noise() -> None:
+    body = LINE[len("FINDING: ") :]
+    variants = [
+        "   " + LINE,
+        "FINDING:" + body,
+        "- " + LINE,
+        "* " + LINE,
+        "`" + LINE + "`",
+        "- `" + LINE + "`",
+    ]
+    for v in variants:
+        found = parse_findings(v, 1, "p")
+        assert len(found) == 1, v
+        assert found[0].title == "Button hidden"
+
+
+def test_index_skips_truncated_and_nonconforming_lines(tmp_path: Path) -> None:
+    append_findings(tmp_path, parse_findings(LINE, 3, "landlord"))
+    path = tmp_path / "raw" / "findings.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"area": "ux", "severity": "major"}\n')
+        handle.write("[1, 2]\n")
+        handle.write('{"week": 4, "persona": "x", "area": "ux", "sev')
+    index = build_index(tmp_path).read_text()
+    assert index.count("Button hidden") == 1
+
+
+def test_index_dedupes_near_duplicate_titles(tmp_path: Path) -> None:
+    a = parse_findings(LINE, 3, "landlord")
+    b = parse_findings(LINE.replace("Button hidden", "  button   HIDDEN "), 5, "tenant")
+    append_findings(tmp_path, a + b)
+    index = build_index(tmp_path).read_text()
+    assert index.count("utton") == 1
+    assert "week 3" in index

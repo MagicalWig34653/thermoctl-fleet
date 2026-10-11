@@ -58,3 +58,34 @@ def test_restore_follows_loss_for_many_seeds() -> None:
             n = loss.id.rsplit(":", 1)[1]
             restore = next(e for e in sched if e.id == f"restore:{loss.apartment}:{n}")
             assert restore.week > loss.week
+
+
+def test_loss_windows_never_overlap_per_apartment() -> None:
+    weeks = 156
+    for seed in range(30):
+        sched = build_schedule(seed, weeks, APTS)
+        for apt in APTS:
+            mine = sorted(
+                (e for e in sched if e.apartment == apt),
+                key=lambda e: (e.week, e.kind is EventKind.HEARTBEAT_LOSS),
+            )
+            open_loss = False
+            for e in mine:
+                if e.kind is EventKind.HEARTBEAT_LOSS:
+                    assert not open_loss, (seed, apt, e)
+                    open_loss = True
+                elif e.kind is EventKind.HEARTBEAT_RESTORE:
+                    assert open_loss, (seed, apt, e)
+                    open_loss = False
+            assert not open_loss, (seed, apt)
+
+
+def test_events_can_land_in_the_last_weeks() -> None:
+    weeks = 156
+    late = [
+        e
+        for seed in range(5)
+        for e in build_schedule(seed, weeks, APTS)
+        if e.week >= weeks - 3 and e.kind is not EventKind.HEARTBEAT_RESTORE
+    ]
+    assert late

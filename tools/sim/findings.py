@@ -8,7 +8,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-_PREFIX = "FINDING: "
+_PREFIX = "FINDING:"
+_NOISE = " \t-*\u2022`"
 
 
 class Area(StrEnum):
@@ -38,23 +39,31 @@ class Finding:
     evidence: str = ""
 
 
+def _text(raw: dict[str, Any], key: str, default: str | None = None) -> str:
+    value = raw.get(key, default)
+    if not isinstance(value, str):
+        raise TypeError(key)
+    return value
+
+
 def parse_findings(text: str, week: int, persona: str) -> list[Finding]:
     found: list[Finding] = []
     for line in text.splitlines():
-        if not line.startswith(_PREFIX):
+        stripped = line.strip(_NOISE)
+        if not stripped.startswith(_PREFIX):
             continue
         try:
-            raw = json.loads(line[len(_PREFIX) :])
+            raw = json.loads(stripped[len(_PREFIX) :].strip(_NOISE))
             found.append(
                 Finding(
                     week=week,
                     persona=persona,
                     area=Area(raw["area"]),
                     severity=Severity(raw["severity"]),
-                    title=raw["title"],
-                    expected=raw.get("expected", ""),
-                    actual=raw.get("actual", ""),
-                    evidence=raw.get("evidence", ""),
+                    title=_text(raw, "title"),
+                    expected=_text(raw, "expected", ""),
+                    actual=_text(raw, "actual", ""),
+                    evidence=_text(raw, "evidence", ""),
                 )
             )
         except (ValueError, KeyError, TypeError, AttributeError):
@@ -70,14 +79,36 @@ def append_findings(out_dir: Path, findings: list[Finding]) -> None:
             handle.write(json.dumps(asdict(finding), ensure_ascii=False) + "\n")
 
 
+def _load_row(line: str) -> dict[str, Any] | None:
+    """One JSONL line as a conforming row, or None (truncated, foreign, wrong types)."""
+    try:
+        raw = json.loads(line)
+        if not isinstance(raw, dict):
+            return None
+        Area(raw["area"])
+        Severity(raw["severity"])
+        if not isinstance(raw["week"], int) or not isinstance(raw["persona"], str):
+            return None
+        for key in ("title", "expected", "actual", "evidence"):
+            if not isinstance(raw[key], str):
+                return None
+    except (ValueError, KeyError, TypeError):
+        return None
+    return raw
+
+
 def build_index(out_dir: Path) -> Path:
     source = out_dir / "raw" / "findings.jsonl"
     rows: list[dict[str, Any]] = []
     if source.exists():
-        rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
+        for line in source.read_text(encoding="utf-8").splitlines():
+            row = _load_row(line)
+            if row is not None:
+                rows.append(row)
     seen: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:  # same title in the same area counts once, first week wins
-        seen.setdefault((row["area"], row["title"]), row)
+        title_key = " ".join(row["title"].casefold().split())
+        seen.setdefault((row["area"], title_key), row)
     lines = ["# Simulation findings\n"]
     if not seen:
         lines.append("No findings yet.\n")

@@ -53,11 +53,16 @@ def build_schedule(seed: int, weeks: int, apartments: list[str]) -> list[Event]:
         for apartment in apartments:
             expected = per_year * weeks / 52
             count = max(1, round(expected + rng.uniform(-0.5, 0.5) * max(expected, 1) ** 0.5))
+            cursor = 0  # first week a new loss of this apartment may start in
             for n in range(count):
                 if is_loss:
-                    # last loss week is weeks - 2, so a restore at week + 1 always fits
-                    week = rng.randrange(0, max(1, weeks - 3))
+                    # latest loss week is weeks - 2 so a restore (> week) always fits
+                    if cursor > weeks - 2:
+                        break
+                    slack = max(1, (weeks - 1 - cursor) // (count - n))
+                    week = min(weeks - 2, cursor + rng.randrange(0, slack))
                     restore = min(weeks - 1, week + rng.randint(1, 2))
+                    cursor = restore + 1  # the next loss starts after this restore
                     events.append(Event(f"{kind}:{apartment}:{n}", week, kind, apartment))
                     events.append(
                         Event(
@@ -68,7 +73,7 @@ def build_schedule(seed: int, weeks: int, apartments: list[str]) -> list[Event]:
                         )
                     )
                 else:
-                    week = rng.randrange(0, max(1, weeks - 3))
+                    week = rng.randrange(0, weeks)
                     events.append(Event(f"{kind}:{apartment}:{n}", week, kind, apartment))
     return sorted(events, key=lambda e: (e.week, e.id))
 
