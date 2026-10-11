@@ -19,7 +19,9 @@ Design for a 2-3 year landlord/tenant simulation (Lima VMs + container
 agents, virtual clock, Haiku personas, small fleet pentest) is in
 `docs/superpowers/specs/2026-10-11-usage-simulation-design.md`. Findings
 only, no fixes. Harness in `tools/sim/` (scenario schedule with
-non-overlapping outages, tolerant findings parser) in progress.
+non-overlapping outages, tolerant findings parser) in progress. Persona
+sessions are confined: local-only HTTP wrapper `tools.sim.http` instead of
+curl, file tools denied, prompt on stdin, scratch cwd, stderr-only limit detection.
 
 
 ## README rewritten (2026-10-06)
