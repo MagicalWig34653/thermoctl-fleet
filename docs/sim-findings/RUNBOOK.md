@@ -110,8 +110,10 @@ At most 20 steps, each one of `{"fill":css,"value":..}`, `{"click":css|text=Labe
 `{"select":css,"value":..}`, `{"check":css}`, `{"wait_text":..}`. It prints a per-step
 log (`ok` / `FAILED: reason`, execution stops at the first failure), then final URL,
 status of the last navigation, title, visible text and link targets. Same host guard
-as `shot`/`text`; a click that leads off the allow-list is aborted. Values for password
-fields are never echoed (`***`). Real forms: maintenance command at
+as `shot`/`text`; a click that leads off the allow-list is aborted. Typed values
+(`fill`/`select`) are never echoed: the log shows `fill <selector> (<n> chars)`, and typed
+values (4+ characters) are scrubbed from the page text too. A failed step makes `act` exit
+with code 1 (after still printing the page state). Real forms: maintenance command at
 `/ui/apartments/<id>/commands/<command>/confirm` (`#reason`, `#lines` for log fetches,
 submit `button[type=submit]`, label "Bestätigen: ..."); desired state edit (`#version_<service>`,
 `#digest_<service>`, `#window_from/until/temp`, "Weiter") then confirm (`#reason`,
@@ -124,3 +126,21 @@ SIGTERM or SIGINT to the runner kills the running persona's process group (perso
 run in their own session, so they would otherwise be orphaned), saves the state and
 exits with 143 / 130 and no traceback. The interrupted step is not a failure and is
 repeated on the next run. Check afterwards with `pgrep -f "claude -p"`.
+
+## Pentest: `python -m tools.sim.pentest` (pollutes the sim, read this first)
+
+The pentest is not a read-only probe. It acts on the **shared** sim:
+
+- it advances the SHARED virtual clock: +120 s at start (`--no-advance-clock` skips only
+  this, TOTP codes may then be rejected as reused) and +16.5 min in the login-throttle
+  check (always);
+- it leaves poisoned (NaN / 1e999) and oversized heartbeat rows plus extra events in the
+  sim database, and throttled-login state for the UI users;
+- it must NEVER run concurrently with `python -m tools.sim run`, nor against a
+  `SIM_STATE_DIR` you want to keep for the full run.
+
+Use a throw-away state: a separate `SIM_STATE_DIR` and a fresh bring-up
+(`up_fleet --down`, new state dir, `--agents`, `--logins`), then
+`python -m tools.sim.pentest`. Startup guard: if `<state>/state.json` shows any progress
+(week, done steps or applied events; or it is unreadable) the pentest refuses with exit
+code 2 and touches nothing, unless `--i-know-this-pollutes-the-run` is passed.

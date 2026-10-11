@@ -118,7 +118,7 @@ def test_main_prints_browse_result(cwd: Path, monkeypatch, capsys):  # type: ign
 
     def fake(args, allowed):  # type: ignore[no-untyped-def]
         seen["args"] = args
-        return "title: T\n\nbody"
+        return "title: T\n\nbody", True
 
     monkeypatch.setattr(browse, "_browse", fake)
     assert browse.main(["text", "--url", "http://127.0.0.1:1/"]) == 0
@@ -237,31 +237,61 @@ def test_parse_steps_limits():
         browse.parse_steps('[{"fill":"#a","value":"' + "x" * (browse.MAX_VALUE + 1) + '"}]')
 
 
-@pytest.mark.parametrize(
-    "selector",
-    [
-        "input[type=password]",
-        'input[type="password"]',
-        "input[type='PASSWORD']",
-        "#password",
-        "input[name=password]",
-    ],
-)
-def test_masked_for_password_fields(selector: str):
-    assert browse.display_value(selector, "geheim") == "***"
-
-
-def test_not_masked_for_other_fields():
-    assert browse.display_value("#reason", "Filter getauscht") == "Filter getauscht"
-    assert browse.display_value("#reason", "x" * 500) == "x" * 80 + "..."
-
-
-def test_describe_step_never_leaks_password():
-    (step,) = browse.parse_steps('[{"fill":"input[type=password]","value":"s3cret"}]')
-    assert "s3cret" not in browse.describe_step(1, step)
-    assert "***" in browse.describe_step(1, step)
+@pytest.mark.parametrize("selector", ["#restore-key-plaintext", "#reason", "input[type=password]"])
+def test_describe_step_never_echoes_values(selector: str):
+    # the real password field has no "password" in its selector: no selector heuristics
+    for kind in ("fill", "select"):
+        (step,) = browse.parse_steps(f'[{{"{kind}":"{selector}","value":"s3cret-Wert"}}]')
+        line = browse.describe_step(1, step)
+        assert "s3cret" not in line
+        assert line == f"1. {kind} {selector} (11 chars)"
     (click,) = browse.parse_steps('[{"click":"text=Bestätigen"}]')
     assert browse.describe_step(2, click) == "2. click text=Bestätigen"
+
+
+def test_scrub_values_removes_typed_values_from_page_text():
+    steps = browse.parse_steps(
+        '[{"fill":"#restore-key-plaintext","value":"hunter2-geheim"},'
+        '{"fill":"#n","value":"ab"},{"select":"#s","value":"option-eins"}]'
+    )
+    text = "Schluessel hunter2-geheim und option-eins, ab bleibt"
+    out = browse.scrub_values(text, steps)
+    assert "hunter2" not in out and "option-eins" not in out
+    assert "ab bleibt" in out  # below the minimum length: left alone
+
+
+def test_execute_steps_logs_without_values_and_stops_at_failure():
+    steps = browse.parse_steps(
+        '[{"fill":"#restore-key-plaintext","value":"hunter2-geheim"},'
+        '{"click":"#boom"},{"click":"#never"}]'
+    )
+    seen: list[str] = []
+
+    def runner(step: browse.Step) -> None:
+        seen.append(step.selector)
+        if step.selector == "#boom":
+            raise RuntimeError("could not hit #boom while hunter2-geheim was typed")
+
+    log, ok = browse.execute_steps(steps, runner)
+    assert ok is False and seen == ["#restore-key-plaintext", "#boom"]
+    blob = "\n".join(log)
+    assert "hunter2" not in blob and "FAILED" in blob and "(14 chars)" in blob
+
+
+def test_execute_steps_all_ok():
+    steps = browse.parse_steps('[{"click":"#a"}]')
+    assert browse.execute_steps(steps, lambda s: None) == (["1. click #a  -> ok"], True)
+
+
+def test_act_exits_nonzero_after_printing_state_when_a_step_failed(
+    cwd: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    monkeypatch.setattr(browse, "_browse", lambda args, allowed: ("PAGE STATE", False))
+    argv = ["act", "--url", "http://127.0.0.1:1/", "--steps", '[{"click":"#a"}]']
+    assert browse.main(argv) == 1
+    assert "PAGE STATE" in capsys.readouterr().out
+    monkeypatch.setattr(browse, "_browse", lambda args, allowed: ("PAGE STATE", True))
+    assert browse.main(argv) == 0
 
 
 def test_act_cli_args(cwd: Path):

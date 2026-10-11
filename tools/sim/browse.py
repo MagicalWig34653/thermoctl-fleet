@@ -7,7 +7,9 @@ Usage: python -m tools.sim.browse shot --url URL --out PATH [--width 390] [--dar
 
 `act` performs at most 20 steps (fill / click / select / check / wait_text) on the
 page and then prints the final URL, title, last navigation status, visible text and
-link targets. Values typed into password fields are never echoed.
+link targets. Typed values (fill / select) are never echoed, not in the step log, not
+in a failure reason and not in the page text (the log shows only their length).
+Exit code 1 when a step failed (the page state is still printed).
 
 Same allow-list as `tools.sim.http` (127.0.0.1/localhost or env
 SIM_ALLOWED_HOSTS); the browser additionally aborts every sub-request and closes every
@@ -24,7 +26,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,11 +44,10 @@ MAX_STEPS = 20
 MAX_SELECTOR = 200
 MAX_VALUE = 500
 STEP_TIMEOUT_MS = 10000
-_ECHO_MAX = 80
 _ROLE = re.compile(r"[a-z0-9_-]+")
 _STEP_KINDS = ("fill", "click", "select", "check", "wait_text")
 _WITH_VALUE = ("fill", "select")
-_PASSWORD = re.compile(r"password", re.IGNORECASE)
+_SCRUB_MIN = 4  # shorter typed values are not scrubbed from the page text (would mangle it)
 
 
 @dataclass(frozen=True)
@@ -115,18 +116,39 @@ def parse_steps(raw: str) -> list[Step]:
     return steps
 
 
-def display_value(selector: str, value: str) -> str:
-    """What may be echoed back for a typed value: nothing for password fields."""
-    if _PASSWORD.search(selector):
-        return "***"
-    return value if len(value) <= _ECHO_MAX else value[:_ECHO_MAX] + "..."
-
-
 def describe_step(number: int, step: Step) -> str:
+    """One log line; a typed value is never part of it, only its length."""
     text = f"{number}. {step.kind} {step.selector}"
     if step.value is not None:
-        text += f" = {display_value(step.selector, step.value)}"
+        text += f" ({len(step.value)} chars)"
     return text
+
+
+def scrub_values(text: str, steps: Sequence[Step]) -> str:
+    """Remove every typed value (>= _SCRUB_MIN chars) from text echoed back to the caller."""
+    values = sorted(
+        {s.value for s in steps if s.value is not None and len(s.value) >= _SCRUB_MIN},
+        key=len,
+        reverse=True,
+    )
+    for value in values:
+        text = text.replace(value, "<typed>")
+    return text
+
+
+def execute_steps(steps: Sequence[Step], runner: Callable[[Step], None]) -> tuple[list[str], bool]:
+    """Run the steps in order, stopping at the first failure; returns (log, all_ok)."""
+    log: list[str] = []
+    for number, step in enumerate(steps, 1):
+        try:
+            runner(step)
+        except Exception as exc:
+            reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            reason = scrub_values(reason, steps)
+            log.append(f"{describe_step(number, step)}  -> FAILED: {reason[:200]}")
+            return log, False
+        log.append(f"{describe_step(number, step)}  -> ok")
+    return log, True
 
 
 def format_act_report(
@@ -320,7 +342,7 @@ def _run_step(page: Any, step: Step) -> None:  # pragma: no cover
         page.get_by_text(step.selector).first.wait_for(timeout=STEP_TIMEOUT_MS)
 
 
-def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cover
+def _browse(args: BrowseArgs, allowed: frozenset[str]) -> tuple[str, bool]:  # pragma: no cover
     # Needs a real Chromium; exercised by the smoke run, not by unit tests.
     with _open_page(args, allowed) as page:
         last_status: list[int | None] = [None]
@@ -334,31 +356,24 @@ def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cov
         if args.command == "shot":
             assert args.out is not None
             page.screenshot(path=str(args.out), full_page=True)
-            return f"saved {args.out.name}"
+            return f"saved {args.out.name}", True
         if args.command == "act":
-            log: list[str] = []
-            for number, step in enumerate(args.steps, 1):
-                try:
-                    _run_step(page, step)
-                except Exception as exc:
-                    reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-                    log.append(f"{describe_step(number, step)}  -> FAILED: {reason[:200]}")
-                    break
-                log.append(f"{describe_step(number, step)}  -> ok")
+            log, ok = execute_steps(args.steps, lambda st: _run_step(page, st))
             if args.out is not None:
                 page.screenshot(path=str(args.out), full_page=True)
                 log.append(f"screenshot saved {args.out.name}")
             body, links = _page_text(page, allowed)
-            return format_act_report(
+            report = format_act_report(
                 log=log,
                 url=page.url,
                 title=page.title(),
                 status=last_status[0],
-                body=body,
-                links=links,
+                body=scrub_values(body, args.steps),
+                links=scrub_values(links, args.steps),
             )
+            return report, ok
         body, links = _page_text(page, allowed)
-        return f"title: {page.title()}\n\n{body}\n\n{links}"
+        return f"title: {page.title()}\n\n{body}\n\n{links}", True
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -369,14 +384,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     try:
-        print(_browse(args, allowed))
+        report, ok = _browse(args, allowed)
+        print(report)
     except Exception as exc:  # pragma: no cover - browser/network failure
         print(
             f"error: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}",
             file=sys.stderr,
         )
         return 1
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

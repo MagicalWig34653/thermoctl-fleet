@@ -12387,6 +12387,6 @@ virtuelle Uhr, Ausbleiben-Alarm und Persona-Pipeline laufen; 9 Harness-Fehler
 behoben, 4 Produktbefunde (11 bis 14). Offen: Formulare absenden, frischer
 State pro Lauf.
 
-Pentest (Task 12, simulation): `python -m tools.sim.pentest` runs 43 scripted checks against the loopback sim fleet; 5 findings (20 to 24, one major: a NaN heartbeat breaks the UI), results in `docs/sim-findings/pentest/results.md`.
+Pentest (Task 12, simulation): `python -m tools.sim.pentest` runs 43 scripted checks against the loopback sim fleet; 5 findings (20 to 24, one major: a NaN heartbeat breaks the UI), results in `docs/sim-findings/pentest/results.md`. It advances the shared sim clock and pollutes the sim DB: run it only against a throw-away SIM_STATE_DIR (exit 2 on a state with progress, unless `--i-know-this-pollutes-the-run`; RUNBOOK); `browse act` never echoes typed values and exits 1 on a failed step.
 
 Tenant UIs (Task 9c-T): `python -m tools.sim.env.tenant --up|--logins|--down` runs three headless thermoctl instances (ports 8301-8303) for the tenant personas; first look in `docs/sim-findings/30-tenant-ui-first-look.md`.
