@@ -202,6 +202,30 @@ def test_vm_power_loss_is_a_forced_stop_and_a_start_of_that_vm_only():
     ]
 
 
+def test_vm_power_loss_tolerates_an_already_stopped_vm():
+    import subprocess
+
+    cmds = []
+
+    def run(cmd):
+        cmds.append(cmd)
+        if cmd[1] == "stop":
+            raise subprocess.CalledProcessError(1, cmd, stderr='instance "x" is not running')
+
+    apply_event_with(_ev(EventKind.POWER_LOSS, apt="sim-a01"), run)
+    assert [c[1] for c in cmds] == ["stop", "start"]
+
+
+def test_vm_power_loss_still_fails_on_other_stop_errors():
+    import subprocess
+
+    def run(cmd):
+        raise subprocess.CalledProcessError(1, cmd, stderr="permission denied")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        apply_event_with(_ev(EventKind.POWER_LOSS, apt="sim-a01"), run)
+
+
 def test_vm_network_change_flaps_the_default_interface_detached():
     cmds = []
     apply_event_with(_ev(EventKind.WIFI_CHANGE, apt="sim-a01"), cmds.append)

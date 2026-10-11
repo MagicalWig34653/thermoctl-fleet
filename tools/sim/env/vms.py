@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -58,6 +59,7 @@ AGENT_CONTAINER = "thermoctl-agent"
 REGISTER_CONTAINER = "thermoctl-agent-register"
 STACK_UNIT = "thermoctl-sim-stack.service"
 VM_STATE_DIRNAME = "vm"  # <state>/vm/<apartment>/agent-registration.json (0600)
+CREATED_MARKER = "vms-created.json"  # <state>/vms-created.json: the VMs this sim created
 _FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -189,6 +191,52 @@ def parse_instances(json_lines: str) -> dict[str, str]:
 
 def instances(run: Runner) -> dict[str, str]:
     return parse_instances(run(["limactl", "list", "--json"]).stdout)
+
+
+# --- the marker: only VMs the sim itself created are ever adopted or deleted ---
+
+
+def created_marker(directory: Path) -> Path:
+    return directory / CREATED_MARKER
+
+
+def read_created(directory: Path) -> dict[str, str]:
+    """{instance name: creation time (ISO)} of the VMs this sim created; {} without marker."""
+    try:
+        raw = json.loads(created_marker(directory).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except ValueError as exc:
+        raise RuntimeError(f"{created_marker(directory)} is corrupt: {exc}") from exc
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+    ):
+        raise RuntimeError(f"{created_marker(directory)} is corrupt: expected {{name: time}}")
+    return dict(raw)
+
+
+def _write_created(directory: Path, created: dict[str, str]) -> None:
+    path = created_marker(directory)
+    if not created:
+        path.unlink(missing_ok=True)
+        return
+    path.unlink(missing_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(created, handle, indent=2, sort_keys=True)
+
+
+def record_created(directory: Path, name: str) -> None:
+    created = read_created(directory)
+    created[name] = datetime.now(UTC).isoformat(timespec="seconds")
+    directory.mkdir(parents=True, exist_ok=True)
+    _write_created(directory, created)
+
+
+def forget_created(directory: Path, name: str) -> None:
+    created = read_created(directory)
+    if created.pop(name, None) is not None:
+        _write_created(directory, created)
 
 
 def vm_registration_file(directory: Path, apartment: str) -> Path:
@@ -377,8 +425,15 @@ def ensure_vm(
     """Bring one VM to 'created, running, enrolled, stack up'; skips what is already done."""
     present = instances(run)
     name = vm_name(apartment)
+    if name in present and name not in read_created(directory):
+        raise RuntimeError(
+            f"Lima instance {name} exists but was not created by the sim (not in "
+            f"{created_marker(directory)}); refusing to adopt it. Delete or rename it yourself "
+            "if it is a leftover, then run --up again."
+        )
     if name not in present:
         log(f"{name}: creating")
+        record_created(directory, name)  # before the create: a half-made instance stays ours
         run(create_argv(apartment, directory), timeout=1800)
         present[name] = "Stopped"
     if present[name] != "Running":
@@ -427,13 +482,19 @@ def down(
     stop_proxy: Callable[[Path], bool] = tls_proxy.stop_background,
     log: Callable[[str], None] = print,
 ) -> None:
-    """Delete exactly the sim VMs that exist (exact name match) and stop the TLS proxy."""
+    """Delete exactly the sim VMs that exist AND that the marker lists, and stop the TLS proxy."""
     present = instances(run)
+    created = read_created(directory)
     for apartment in apartments:
         name = vm_name(check_apartment(apartment))
-        if name in present:
+        if name in present and name not in created:
+            log(f"{name}: exists but was not created by the sim; NOT deleting")
+        elif name in present:
             log(f"{name}: deleting")
             run(delete_argv(apartment), timeout=300)
+            forget_created(directory, name)
+        elif name in created:
+            forget_created(directory, name)  # gone already; drop the stale marker entry
     log("tls proxy stopped" if stop_proxy(directory) else "tls proxy was not running")
 
 

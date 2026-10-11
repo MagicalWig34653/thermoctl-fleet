@@ -171,6 +171,8 @@ def test_down_deletes_exactly_the_two_sim_vms_and_nothing_else(tmp_path):
             )
         }
     )
+    for marked in ("thermoctl-sim-a01", "thermoctl-sim-a02", "thermoctl-sim-a03"):
+        vms.record_created(tmp_path, marked)
     stopped = []
     vms.down(tmp_path, run, stop_proxy=lambda d: stopped.append(d) or True, log=lambda m: None)
     deletes = [c for c in run.calls if c[:2] == ["limactl", "delete"]]
@@ -179,6 +181,58 @@ def test_down_deletes_exactly_the_two_sim_vms_and_nothing_else(tmp_path):
         ["limactl", "delete", "--force", "thermoctl-sim-a02"],
     ]
     assert stopped == [tmp_path]
+
+
+def test_down_never_deletes_a_vm_that_is_not_in_the_marker(tmp_path):
+    run = FakeRun(
+        {
+            "list --json": (
+                0,
+                _list(**{"thermoctl-sim-a01": "Running", "thermoctl-sim-a02": "Stopped"}),
+            )
+        }
+    )
+    vms.record_created(tmp_path, "thermoctl-sim-a02")
+    messages = []
+    vms.down(tmp_path, run, stop_proxy=lambda d: False, log=messages.append)
+    deletes = [c for c in run.calls if c[:2] == ["limactl", "delete"]]
+    assert deletes == [["limactl", "delete", "--force", "thermoctl-sim-a02"]]
+    assert any("a01" in m and "NOT deleting" in m for m in messages)
+    assert vms.read_created(tmp_path) == {}  # a02 forgotten, a01 never listed
+
+
+def test_down_without_any_marker_deletes_nothing(tmp_path):
+    run = FakeRun({"list --json": (0, _list(**{"thermoctl-sim-a01": "Running"}))})
+    vms.down(tmp_path, run, stop_proxy=lambda d: False, log=lambda m: None)
+    assert not [c for c in run.calls if "delete" in c]
+
+
+def test_marker_is_private_and_roundtrips(tmp_path):
+    assert vms.read_created(tmp_path) == {}
+    vms.record_created(tmp_path, "thermoctl-sim-a01")
+    marker = tmp_path / "vms-created.json"
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    data = vms.read_created(tmp_path)
+    assert list(data) == ["thermoctl-sim-a01"] and data["thermoctl-sim-a01"].startswith("20")
+    vms.forget_created(tmp_path, "thermoctl-sim-a01")
+    assert not marker.exists()
+
+
+def test_corrupt_marker_is_an_error_not_an_empty_list(tmp_path):
+    (tmp_path / "vms-created.json").write_text("[1, 2]")
+    with pytest.raises(RuntimeError, match="corrupt"):
+        vms.read_created(tmp_path)
+    (tmp_path / "vms-created.json").write_text("{nope")
+    with pytest.raises(RuntimeError, match="corrupt"):
+        vms.read_created(tmp_path)
+
+
+def test_ensure_vm_refuses_a_vm_the_sim_did_not_create(tmp_path):
+    directory = _prepared(tmp_path)
+    run = FakeRun({"list --json": (0, _list(**{"thermoctl-sim-a01": "Running"}))})
+    with pytest.raises(RuntimeError, match="thermoctl-sim-a01.*not created by the sim"):
+        vms.up(directory, run, ["sim-a01"], start_proxy=lambda *a: 1, log=lambda m: None)
+    assert run.calls == [["limactl", "list", "--json"]]  # nothing touched
 
 
 def test_down_with_nothing_to_delete_deletes_nothing(tmp_path):
@@ -214,6 +268,7 @@ def test_up_is_idempotent_for_a_running_enrolled_vm(tmp_path):
             "find /usr/lib": (0, LIB + "\n"),
         }
     )
+    vms.record_created(directory, "thermoctl-sim-a01")
     messages = []
     vms.up(directory, run, ["sim-a01"], start_proxy=lambda *a: 99, log=messages.append)
     joined = run.joined()
@@ -238,6 +293,7 @@ def test_up_creates_and_starts_a_missing_vm_then_enrols_it(tmp_path, monkeypatch
     monkeypatch.setattr(vms, "enroll", lambda *a, **k: seen.append(a[2]) or "123456")
     vms.up(directory, run, ["sim-a02"], start_proxy=lambda *a: 99, log=lambda m: None)
     joined = run.joined()
+    assert "thermoctl-sim-a02" in vms.read_created(directory)
     assert joined[1].startswith("limactl create --name thermoctl-sim-a02")
     assert "limactl start --tty=false thermoctl-sim-a02" in joined
     assert seen == ["sim-a02"]

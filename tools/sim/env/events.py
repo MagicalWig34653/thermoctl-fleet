@@ -68,6 +68,7 @@ def _container_of(event: Event) -> str:
     return name
 
 
+_VM_ALREADY_STOPPED = ("is not running", "expected status", "already stopped", "is stopped")
 _ALREADY_THERE = ("is not paused", "is not running", "is already paused")
 
 
@@ -150,7 +151,12 @@ def _power_loss(event: Event, run_cmd: RunCmd) -> None:
     if event.apartment in VM_APARTMENTS:
         container_name(event.apartment)
         name = vm_name(event.apartment)
-        run_cmd(["limactl", "stop", "--force", name])
+        try:
+            run_cmd(["limactl", "stop", "--force", name])
+        except subprocess.CalledProcessError as exc:
+            # already stopped (a repeated or resumed event): the state asked for is reached
+            if not any(text in str(exc.stderr) for text in _VM_ALREADY_STOPPED):
+                raise
         run_cmd(["limactl", "start", "--tty=false", name])
         return
     _sequence(_docker("kill"), _docker("start"))(event, run_cmd)
