@@ -124,3 +124,33 @@ def test_main_prints_browse_result(cwd: Path, monkeypatch, capsys):  # type: ign
     assert browse.main(["text", "--url", "http://127.0.0.1:1/"]) == 0
     assert capsys.readouterr().out == "title: T\n\nbody\n"
     assert seen["args"].command == "text"
+
+
+@pytest.mark.parametrize(
+    ("url", "ok"),
+    [
+        ("ws://127.0.0.1:8200/x", True),
+        ("wss://localhost/x", True),
+        ("wss://evil.com/", False),
+        ("ws://127.0.0.1.evil.test/", False),
+        ("ws://u@127.0.0.1/x", False),
+        ("ws://u:p@127.0.0.1/x", False),
+        ("http://127.0.0.1/x", False),
+        ("ftp://127.0.0.1/x", False),
+    ],
+)
+def test_websocket_allowed(url: str, ok: bool):
+    assert browse.websocket_allowed(url, LOCAL) is ok
+
+
+def test_websocket_allowed_respects_env_hosts():
+    assert browse.websocket_allowed("wss://fleet.test/ws", frozenset({"fleet.test"}))
+    assert not browse.websocket_allowed("ws://127.0.0.1/", frozenset({"fleet.test"}))
+
+
+def test_anonymous_note():
+    assert browse.anonymous_note("landlord", None) == (
+        "note: running anonymous (no stored login for role landlord)"
+    )
+    assert browse.anonymous_note(None, None) is None
+    assert browse.anonymous_note("landlord", Path("/x/landlord.json")) is None

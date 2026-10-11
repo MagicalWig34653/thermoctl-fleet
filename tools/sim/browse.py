@@ -5,8 +5,8 @@ Usage: python -m tools.sim.browse shot --url URL --out PATH [--width 390] [--dar
        python -m tools.sim.browse text --url URL [--role ROLE]
 
 Same allow-list as `tools.sim.http` (127.0.0.1/localhost or env
-SIM_ALLOWED_HOSTS); the browser additionally aborts every sub-request to a host
-outside it. `--out` must lie inside the working directory. With `--role`, the
+SIM_ALLOWED_HOSTS); the browser additionally aborts every sub-request and closes every
+WebSocket to a host outside it. `--out` must lie inside the working directory. With `--role`, the
 Playwright storage state `<SIM_STORAGE_STATE_DIR>/<role>.json` is loaded when it
 exists (missing file = anonymous). HTTPS errors are never ignored, service
 workers and downloads are off.
@@ -65,6 +65,22 @@ def request_allowed(url: str, allowed: frozenset[str] | set[str]) -> bool:
     return True
 
 
+def websocket_allowed(url: str, allowed: frozenset[str] | set[str]) -> bool:
+    """Host-block predicate for WebSockets: ws/wss get the http/https host checks."""
+    parts = urlsplit(url)
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme)
+    if scheme is None:
+        return False
+    return request_allowed(parts._replace(scheme=scheme).geturl(), allowed)
+
+
+def anonymous_note(role: str | None, state: Path | None) -> str | None:
+    """Stderr hint when a role was asked for but no stored login applies."""
+    if role is None or state is not None:
+        return None
+    return f"note: running anonymous (no stored login for role {role})"
+
+
 def storage_state_path(role: str | None, env: Mapping[str, str]) -> Path | None:
     """Storage-state file of `role`, or None (no role, no dir configured, no file)."""
     directory = env.get("SIM_STORAGE_STATE_DIR")
@@ -104,9 +120,20 @@ def build_cli_args(
 
 def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cover
     # Needs a real Chromium; exercised by the smoke run, not by unit tests.
-    from playwright.sync_api import Route, sync_playwright
+    from playwright.sync_api import Route, WebSocketRoute, sync_playwright
 
     state = storage_state_path(args.role, os.environ)
+    note = anonymous_note(args.role, state)
+    if note:
+        print(note, file=sys.stderr)
+
+    def guard_ws(ws: WebSocketRoute) -> None:
+        # Context routes do not see WebSockets; without connect_to_server the
+        # socket never reaches the server.
+        if websocket_allowed(ws.url, allowed):
+            ws.connect_to_server()
+        else:
+            ws.close()
 
     def guard(route: Route) -> None:
         if request_allowed(route.request.url, allowed):
@@ -126,6 +153,7 @@ def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cov
                 accept_downloads=False,
             )
             context.route("**/*", guard)
+            context.route_web_socket("**/*", guard_ws)
             page = context.new_page()
             page.goto(args.url, wait_until="load", timeout=NAV_TIMEOUT_MS)
             if args.command == "shot":

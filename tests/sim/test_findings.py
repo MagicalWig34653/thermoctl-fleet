@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from tools.sim.findings import Area, Severity, append_findings, build_index, parse_findings
+from tools.sim.findings import Area, Finding, Severity, append_findings, build_index, parse_findings
 
 LINE = (
     'FINDING: {"area":"ux","severity":"major","title":"Button hidden",'
@@ -82,3 +82,32 @@ def test_index_dedupes_near_duplicate_titles(tmp_path: Path) -> None:
 def test_build_index_creates_missing_directory(tmp_path):
     path = build_index(tmp_path / "nope" / "f")
     assert "No findings yet" in path.read_text(encoding="utf-8")
+
+
+def _hand(tmp_path: Path, name: str, text: str) -> None:
+    (tmp_path / name).write_text(text, encoding="utf-8")
+
+
+def test_index_lists_hand_written_findings(tmp_path: Path) -> None:
+    _hand(tmp_path, "00-environment-notes.md", "# Env\n")
+    _hand(tmp_path, "10-agent-heartbeat-gap.md", "\nintro\n# Finding 10: no heartbeat\n")
+    _hand(tmp_path, "notes.md", "# Not numbered\n")
+    _hand(tmp_path, "11-untitled.md", "no heading\n")
+    text = build_index(tmp_path).read_text(encoding="utf-8")
+    assert "## Hand-written findings" in text
+    assert "- [Finding 10: no heartbeat](10-agent-heartbeat-gap.md)" in text
+    assert "- [11-untitled](11-untitled.md)" in text
+    assert "00-environment-notes" not in text and "Not numbered" not in text
+    assert "No findings yet." in text  # no raw findings, hand-written still listed
+
+
+def test_index_hand_written_alongside_raw(tmp_path: Path) -> None:
+    append_findings(tmp_path, [Finding(1, "p", Area.UX, Severity.MINOR, "T", "e", "a")])
+    _hand(tmp_path, "10-x.md", "# X\n")
+    text = build_index(tmp_path).read_text(encoding="utf-8")
+    assert "### ux" in text and "- [X](10-x.md)" in text
+
+
+def test_index_without_hand_written_has_no_section(tmp_path: Path) -> None:
+    text = build_index(tmp_path).read_text(encoding="utf-8")
+    assert "Hand-written" not in text

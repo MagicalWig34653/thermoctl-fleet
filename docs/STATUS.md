@@ -11,6 +11,11 @@ event handlers for loss/restore/wifi/power/fault are in, the rest raise until 9b
 No product code changed.
 
 
+## Usage simulation: browse tool hardening (2026-10-11)
+
+`tools/sim/browse.py` now also blocks WebSockets to non-allowed hosts; finding 10 corrected (never-seen apartments are skipped by the absence alarm, not alarmed).
+
+
 ## Usage simulation: environment notes (2026-10-11)
 
 `docs/sim-findings/00-environment-notes.md` records what the harness can rely

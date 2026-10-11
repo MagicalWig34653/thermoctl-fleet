@@ -97,6 +97,14 @@ def _load_row(line: str) -> dict[str, Any] | None:
     return raw
 
 
+def _md_title(path: Path) -> str:
+    """First `# ` heading of a markdown file, else the file stem."""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("# "):
+            return line[2:].strip() or path.stem
+    return path.stem
+
+
 def build_index(out_dir: Path) -> Path:
     source = out_dir / "raw" / "findings.jsonl"
     rows: list[dict[str, Any]] = []
@@ -129,6 +137,16 @@ def build_index(out_dir: Path) -> Path:
                     + (f" -- `{r['evidence']}`" if r["evidence"] else "")
                 )
             lines.append("")
+    hand = (
+        sorted(f for f in out_dir.glob("[0-9][0-9]-*.md") if f.name != "00-environment-notes.md")
+        if out_dir.is_dir()
+        else []
+    )
+    if hand:
+        lines.append("## Hand-written findings\n")
+        for f in hand:
+            lines.append(f"- [{_md_title(f)}]({f.name})")
+        lines.append("")
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "INDEX.md"
     path.write_text("\n".join(lines), encoding="utf-8")

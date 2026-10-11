@@ -10,20 +10,32 @@
 `python -m agent run` never sends a heartbeat: `collect_heartbeat` and
 `send_heartbeat` raise `NotImplementedError`, and thermoctl exposes no health
 API the agent could read. A deployed base station can therefore currently never
-register presence, and the absence alarm would fire for every apartment.
+register presence: the fleet is blind (no apartment ever shows as present), and
+the absence alarm never fires for these never-seen apartments either.
 
 ## Expected
 
 A running agent collects health data from thermoctl and posts
 `POST /v1/heartbeat` at the heartbeat interval (specification sections 5, 10),
 so the fleet service sees the apartment as present and alarms only on a real
-absence.
+absence. A registered device that has never reported should arguably alarm as
+well, after a grace period (see the specification question below).
 
 ## Actual
 
-No heartbeat leaves the agent. The fleet's absence alarm
-(`fleet/alarms.py:561`, `check_absence_alarms`) has nothing to measure against
-and would report every apartment as missing.
+No heartbeat leaves the agent, so the fleet has no data on any apartment. The
+absence alarm does not compensate: `check_absence_alarms`
+(`fleet/alarms.py:561`) does `if latest_heartbeat is None: continue`
+(`fleet/alarms.py:597`), so an apartment that never sent a heartbeat is skipped,
+not alarmed (documented at `fleet/alarms.py:575`). The result is silent: no
+presence, no alarm, nothing for the landlord to see.
+
+Specification question: section 8 (`docs/specification.md:213-219`) defines
+"Apartment not reporting" as "three heartbeats missing (6 min)" and is silent
+on an apartment that has never reported (already an open point in
+`docs/STATUS.md`). A registered device that never sends a first heartbeat
+should arguably alarm after a grace period; the project owner needs to decide
+the rule.
 
 ## Evidence
 
