@@ -80,6 +80,8 @@ class FaultFile:
     """Reads `<state_dir>/faults/<apartment>.json`; never raises."""
 
     def __init__(self, state_dir: Path, apartment: str) -> None:
+        if not apartment or any(bad in apartment for bad in ("/", "\\", "..")):
+            raise ValueError(f"invalid apartment id: {apartment!r}")
         self.path = state_dir / "faults" / f"{apartment}.json"
         self.apartment = apartment
 
@@ -133,7 +135,7 @@ def make_health(state_dir: Path, apartment: str) -> Callable[[], dict[str, Any]]
     """Health factory: healthy defaults overlaid with the apartment's fault file.
 
     The file is re-read on every call. Content that does not validate against
-    the protocol model falls back to healthy, with a warning.
+    the protocol model falls back to healthy, logged at ERROR.
     """
     fault_file = FaultFile(state_dir, apartment)
 
@@ -142,7 +144,11 @@ def make_health(state_dir: Path, apartment: str) -> Callable[[], dict[str, Any]]
         try:
             build_heartbeat(apartment, merged, datetime.now(UTC))
         except ValidationError:
-            log.warning("fault file for %s does not fit the heartbeat model; healthy", apartment)
+            log.error(
+                "fault file %s for %s does not fit the heartbeat model; sending healthy",
+                fault_file.path,
+                apartment,
+            )
             return healthy_sections()
         return merged
 

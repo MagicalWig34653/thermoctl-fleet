@@ -206,3 +206,22 @@ def test_tick_with_invalid_health_is_false_and_sends_nothing():
         raise AssertionError("must not be called")
 
     assert _agent(handler, lambda: {}).tick() is False
+
+
+@pytest.mark.parametrize("bad", ["../x", "a/b", "a\\b", "..", "a..b"])
+def test_fault_file_rejects_path_traversal_ids(tmp_path, bad):
+    with pytest.raises(ValueError):
+        FaultFile(tmp_path, bad)
+
+
+def test_make_health_logs_invalid_fault_content_at_error(tmp_path, caplog):
+    faults = tmp_path / "faults"
+    faults.mkdir()
+    (faults / "sim-a03.json").write_text(json.dumps({"system": {"memory_free_percent": 500}}))
+    with caplog.at_level(logging.ERROR, logger="sim_agent"):
+        health = make_health(tmp_path, "sim-a03")()
+    assert health == healthy_sections()
+    records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert records
+    text = records[0].getMessage()
+    assert "sim-a03" in text and str(faults / "sim-a03.json") in text
