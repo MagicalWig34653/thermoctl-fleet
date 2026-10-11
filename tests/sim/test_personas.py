@@ -23,3 +23,17 @@ def test_prompt_contains_contract_and_forbids_deliberate_attacks():
     assert "never deliberately attack" in text.lower()
     assert "area security" in text
     assert "curl" not in text
+
+
+def test_prompt_says_the_login_is_done_and_names_the_role():
+    by_id = {p.id: p for p in PERSONAS}
+    text = build_prompt(by_id["caretaker"], 1, "2026-01-12", {"fleet": "http://x"}, "notes")
+    assert "already logged in" in text and "--role caretaker" in text
+    newcomer = build_prompt(by_id["newcomer"], 1, "2026-01-12", {"fleet": "http://x"}, "notes")
+    assert "--role landlord" in newcomer  # the newcomer works with a landlord account
+
+
+def test_env_urls_name_the_ui_landing_page():
+    from tools.sim import env
+
+    assert env.urls()["fleet web app (browser pages)"] == "http://127.0.0.1:8200/ui/"

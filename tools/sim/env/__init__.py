@@ -30,7 +30,7 @@ def apartments() -> list[str]:
 
 def urls() -> dict[str, str]:
     """Endpoints named in persona prompts. Tenant UIs are added by Task 9b/9c."""
-    return {"fleet": FLEET_URL}
+    return {"fleet": FLEET_URL, "fleet web app (browser pages)": f"{FLEET_URL}/ui/"}
 
 
 def persona_env_extras() -> dict[str, str]:

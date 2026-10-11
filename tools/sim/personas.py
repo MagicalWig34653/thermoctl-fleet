@@ -92,6 +92,10 @@ PERSONAS: list[Persona] = [
 ]
 
 
+# Browser logins exist per fleet role; the newcomer is a new landlord employee.
+LOGIN_ROLE = {"newcomer": "landlord"}
+
+
 def due_personas(week: int) -> list[Persona]:
     """Personas whose cadence falls on this week (week 0 = everyone)."""
     return [p for p in PERSONAS if week % p.every_weeks == 0]
@@ -124,6 +128,9 @@ def build_prompt(
         "shows something unsafe (another person's data visible, secrets on "
         "screen, something you can do that you should not be able to), report "
         f"it as area security without going further):\n{endpoints}\n\n"
+        f"Your browser session is already logged in as {persona.role}: pass "
+        f"`--role {LOGIN_ROLE.get(persona.role, persona.role)}` to the browse commands "
+        "and do not try to log in yourself.\n"
         f"How to work: {tool_notes}\n"
         f"Use at most {persona.max_steps} actions. Do not invent data you cannot see.\n\n"
         "When something is wrong, confusing, ugly, missing, or too slow, "
