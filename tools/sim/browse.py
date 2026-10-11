@@ -3,6 +3,11 @@
 Usage: python -m tools.sim.browse shot --url URL --out PATH [--width 390] [--dark]
                                        [--role ROLE]
        python -m tools.sim.browse text --url URL [--role ROLE]
+       python -m tools.sim.browse act --url URL [--role ROLE] --steps JSON [--shot PATH]
+
+`act` performs at most 20 steps (fill / click / select / check / wait_text) on the
+page and then prints the final URL, title, last navigation status, visible text and
+link targets. Values typed into password fields are never echoed.
 
 Same allow-list as `tools.sim.http` (127.0.0.1/localhost or env
 SIM_ALLOWED_HOSTS); the browser additionally aborts every sub-request and closes every
@@ -15,13 +20,15 @@ workers and downloads are off.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 from tools.sim.http import allowed_hosts, check_url, confine_to_cwd
@@ -31,17 +38,33 @@ DEFAULT_WIDTH = 390
 VIEWPORT_HEIGHT = 844
 NAV_TIMEOUT_MS = 30000
 MAX_LINKS = 60
+MAX_STEPS = 20
+MAX_SELECTOR = 200
+MAX_VALUE = 500
+STEP_TIMEOUT_MS = 10000
+_ECHO_MAX = 80
 _ROLE = re.compile(r"[a-z0-9_-]+")
+_STEP_KINDS = ("fill", "click", "select", "check", "wait_text")
+_WITH_VALUE = ("fill", "select")
+_PASSWORD = re.compile(r"password", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class Step:
+    kind: str  # one of _STEP_KINDS
+    selector: str  # CSS selector, `text=Label`, or the text for wait_text
+    value: str | None = None
 
 
 @dataclass(frozen=True)
 class BrowseArgs:
-    command: str  # "shot" | "text"
+    command: str  # "shot" | "text" | "act"
     url: str
     out: Path | None = None
     width: int = DEFAULT_WIDTH
     dark: bool = False
     role: str | None = None
+    steps: tuple[Step, ...] = ()
 
 
 class _Parser(argparse.ArgumentParser):
@@ -53,6 +76,71 @@ def validate_role(role: str) -> str:
     if not _ROLE.fullmatch(role):
         raise ValueError(f"role {role!r} must match [a-z0-9_-]+")
     return role
+
+
+def parse_steps(raw: str) -> list[Step]:
+    """Parse and validate the `--steps` JSON; raises ValueError on anything off-list."""
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"--steps is not valid JSON: {exc}") from None
+    if not isinstance(data, list) or not data:
+        raise ValueError("--steps must be a non-empty JSON list")
+    if len(data) > MAX_STEPS:
+        raise ValueError(f"--steps allows at most {MAX_STEPS} steps")
+    steps: list[Step] = []
+    for number, item in enumerate(data, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"step {number}: must be an object")
+        kinds = [k for k in item if k in _STEP_KINDS]
+        if len(kinds) != 1:
+            raise ValueError(f"step {number}: exactly one of {', '.join(_STEP_KINDS)}")
+        kind = kinds[0]
+        allowed_keys = {kind, "value"} if kind in _WITH_VALUE else {kind}
+        if set(item) - allowed_keys:
+            raise ValueError(f"step {number}: unexpected keys {sorted(set(item) - allowed_keys)}")
+        selector = item[kind]
+        if not isinstance(selector, str) or not selector:
+            raise ValueError(f"step {number}: selector must be a non-empty string")
+        if len(selector) > MAX_SELECTOR:
+            raise ValueError(f"step {number}: selector longer than {MAX_SELECTOR} characters")
+        value: str | None = None
+        if kind in _WITH_VALUE:
+            value = item.get("value")
+            if not isinstance(value, str):
+                raise ValueError(f"step {number}: {kind} needs a string value")
+            if len(value) > MAX_VALUE:
+                raise ValueError(f"step {number}: value longer than {MAX_VALUE} characters")
+        steps.append(Step(kind, selector, value))
+    return steps
+
+
+def display_value(selector: str, value: str) -> str:
+    """What may be echoed back for a typed value: nothing for password fields."""
+    if _PASSWORD.search(selector):
+        return "***"
+    return value if len(value) <= _ECHO_MAX else value[:_ECHO_MAX] + "..."
+
+
+def describe_step(number: int, step: Step) -> str:
+    text = f"{number}. {step.kind} {step.selector}"
+    if step.value is not None:
+        text += f" = {display_value(step.selector, step.value)}"
+    return text
+
+
+def format_act_report(
+    *,
+    log: Sequence[str],
+    url: str,
+    title: str,
+    status: int | None,
+    body: str,
+    links: str,
+) -> str:
+    shown = "unknown" if status is None else str(status)
+    head = "\n".join(["steps:", *log])
+    return f"{head}\n\nurl: {url}\nstatus: {shown}\ntitle: {title}\n\n{body[:MAX_TEXT]}\n\n{links}"
 
 
 def request_allowed(url: str, allowed: frozenset[str] | set[str]) -> bool:
@@ -106,12 +194,25 @@ def build_cli_args(
     text = sub.add_parser("text")
     text.add_argument("--url", required=True)
     text.add_argument("--role")
+    act = sub.add_parser("act")
+    act.add_argument("--url", required=True)
+    act.add_argument("--role")
+    act.add_argument("--steps", required=True)
+    act.add_argument("--shot", type=Path)
     ns = ap.parse_args(list(argv))
 
     check_url(ns.url, allowed if allowed is not None else allowed_hosts())
     role = validate_role(ns.role) if ns.role is not None else None
     if ns.command == "text":
         return BrowseArgs("text", ns.url, role=role)
+    if ns.command == "act":
+        return BrowseArgs(
+            "act",
+            ns.url,
+            out=confine_to_cwd(ns.shot) if ns.shot is not None else None,
+            role=role,
+            steps=tuple(parse_steps(ns.steps)),
+        )
     if not 200 <= ns.width <= 3000:
         raise ValueError("--width must be between 200 and 3000")
     return BrowseArgs(
@@ -151,8 +252,9 @@ def format_links(
     return "\n".join(["links:", *lines]) if lines else "links: none"
 
 
-def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cover
-    # Needs a real Chromium; exercised by the smoke run, not by unit tests.
+@contextmanager
+def _open_page(args: BrowseArgs, allowed: frozenset[str]) -> Iterator[Any]:  # pragma: no cover
+    """One guarded browser context and page; shared by shot, text and act."""
     from playwright.sync_api import Route, WebSocketRoute, sync_playwright
 
     state = storage_state_path(args.role, os.environ)
@@ -187,21 +289,76 @@ def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cov
             )
             context.route("**/*", guard)
             context.route_web_socket("**/*", guard_ws)
-            page = context.new_page()
-            page.goto(args.url, wait_until="load", timeout=NAV_TIMEOUT_MS)
-            if args.command == "shot":
-                assert args.out is not None
-                page.screenshot(path=str(args.out), full_page=True)
-                return f"saved {args.out.name}"
-            body = page.inner_text("body")[:MAX_TEXT]
-            anchors = page.eval_on_selector_all(
-                "a[href]",
-                "els => els.map(e => [e.innerText || e.getAttribute('aria-label') || '', e.href])",
-            )
-            links = format_links([(str(t), str(h)) for t, h in anchors], page.url, allowed)
-            return f"title: {page.title()}\n\n{body}\n\n{links}"
+            yield context.new_page()
         finally:
             browser.close()
+
+
+def _page_text(page: Any, allowed: frozenset[str]) -> tuple[str, str]:  # pragma: no cover
+    body = page.inner_text("body")[:MAX_TEXT]
+    anchors = page.eval_on_selector_all(
+        "a[href]",
+        "els => els.map(e => [e.innerText || e.getAttribute('aria-label') || '', e.href])",
+    )
+    return body, format_links([(str(t), str(h)) for t, h in anchors], page.url, allowed)
+
+
+def _run_step(page: Any, step: Step) -> None:  # pragma: no cover
+    if step.kind == "fill":
+        assert step.value is not None
+        page.fill(step.selector, step.value, timeout=STEP_TIMEOUT_MS)
+    elif step.kind == "click":
+        page.click(step.selector, timeout=STEP_TIMEOUT_MS)
+        with suppress(Exception):  # no navigation followed
+            page.wait_for_load_state("load", timeout=STEP_TIMEOUT_MS)
+    elif step.kind == "select":
+        assert step.value is not None
+        page.select_option(step.selector, step.value, timeout=STEP_TIMEOUT_MS)
+    elif step.kind == "check":
+        page.check(step.selector, timeout=STEP_TIMEOUT_MS)
+    else:
+        page.get_by_text(step.selector).first.wait_for(timeout=STEP_TIMEOUT_MS)
+
+
+def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cover
+    # Needs a real Chromium; exercised by the smoke run, not by unit tests.
+    with _open_page(args, allowed) as page:
+        last_status: list[int | None] = [None]
+
+        def on_response(response: Any) -> None:
+            if response.request.is_navigation_request() and response.frame == page.main_frame:
+                last_status[0] = response.status
+
+        page.on("response", on_response)
+        page.goto(args.url, wait_until="load", timeout=NAV_TIMEOUT_MS)
+        if args.command == "shot":
+            assert args.out is not None
+            page.screenshot(path=str(args.out), full_page=True)
+            return f"saved {args.out.name}"
+        if args.command == "act":
+            log: list[str] = []
+            for number, step in enumerate(args.steps, 1):
+                try:
+                    _run_step(page, step)
+                except Exception as exc:
+                    reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+                    log.append(f"{describe_step(number, step)}  -> FAILED: {reason[:200]}")
+                    break
+                log.append(f"{describe_step(number, step)}  -> ok")
+            if args.out is not None:
+                page.screenshot(path=str(args.out), full_page=True)
+                log.append(f"screenshot saved {args.out.name}")
+            body, links = _page_text(page, allowed)
+            return format_act_report(
+                log=log,
+                url=page.url,
+                title=page.title(),
+                status=last_status[0],
+                body=body,
+                links=links,
+            )
+        body, links = _page_text(page, allowed)
+        return f"title: {page.title()}\n\n{body}\n\n{links}"
 
 
 def main(argv: Sequence[str] | None = None) -> int:

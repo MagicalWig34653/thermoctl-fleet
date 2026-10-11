@@ -266,3 +266,9 @@ def test_refresh_logins_called_once_per_week_after_the_first(tmp_path):
     calls = []
     run(**make(tmp_path, lambda p: GOOD, []), refresh_logins=lambda: calls.append(1))
     assert len(calls) == 2
+
+
+def test_tool_notes_describe_act_with_a_real_form_example():
+    assert "browse act" in TOOL_NOTES
+    assert "--steps" in TOOL_NOTES and "#reason" in TOOL_NOTES
+    assert "/commands/<command>/confirm" in TOOL_NOTES

@@ -182,3 +182,133 @@ def test_format_links_empty_and_capped():
     many = [(f"n{i}", f"http://127.0.0.1/p{i}") for i in range(200)]
     out = browse.format_links(many, "http://127.0.0.1/", {"127.0.0.1"})
     assert len(out.splitlines()) == browse.MAX_LINKS + 1
+
+
+# --- act: click and fill steps -------------------------------------------------
+
+
+def test_parse_steps_all_kinds():
+    steps = browse.parse_steps(
+        '[{"fill":"#reason","value":"Filter"},{"click":"text=Bestätigen"},'
+        '{"select":"select#x","value":"a"},{"check":"#ok"},{"wait_text":"Erledigt"}]'
+    )
+    assert [(s.kind, s.selector, s.value) for s in steps] == [
+        ("fill", "#reason", "Filter"),
+        ("click", "text=Bestätigen", None),
+        ("select", "select#x", "a"),
+        ("check", "#ok", None),
+        ("wait_text", "Erledigt", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json",
+        "{}",
+        "[]",
+        '["click"]',
+        '[{"click":"a","value":"b"}]',  # value only for fill/select
+        '[{"fill":"#a"}]',  # fill needs value
+        '[{"fill":"#a","value":3}]',
+        '[{"select":"#a"}]',
+        '[{"click":"a","check":"b"}]',  # two verbs
+        '[{"hover":"a"}]',
+        '[{"click":""}]',
+        '[{"click":5}]',
+        '[{"click":"a","extra":1}]',
+    ],
+)
+def test_parse_steps_rejects(raw: str):
+    with pytest.raises(ValueError):
+        browse.parse_steps(raw)
+
+
+def test_parse_steps_limits():
+    ok = "[" + ",".join(['{"click":"a"}'] * browse.MAX_STEPS) + "]"
+    assert len(browse.parse_steps(ok)) == browse.MAX_STEPS
+    too_many = "[" + ",".join(['{"click":"a"}'] * (browse.MAX_STEPS + 1)) + "]"
+    with pytest.raises(ValueError, match="at most"):
+        browse.parse_steps(too_many)
+    with pytest.raises(ValueError, match="selector"):
+        browse.parse_steps('[{"click":"' + "a" * (browse.MAX_SELECTOR + 1) + '"}]')
+    assert browse.parse_steps('[{"click":"' + "a" * browse.MAX_SELECTOR + '"}]')
+    with pytest.raises(ValueError, match="value"):
+        browse.parse_steps('[{"fill":"#a","value":"' + "x" * (browse.MAX_VALUE + 1) + '"}]')
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "input[type=password]",
+        'input[type="password"]',
+        "input[type='PASSWORD']",
+        "#password",
+        "input[name=password]",
+    ],
+)
+def test_masked_for_password_fields(selector: str):
+    assert browse.display_value(selector, "geheim") == "***"
+
+
+def test_not_masked_for_other_fields():
+    assert browse.display_value("#reason", "Filter getauscht") == "Filter getauscht"
+    assert browse.display_value("#reason", "x" * 500) == "x" * 80 + "..."
+
+
+def test_describe_step_never_leaks_password():
+    (step,) = browse.parse_steps('[{"fill":"input[type=password]","value":"s3cret"}]')
+    assert "s3cret" not in browse.describe_step(1, step)
+    assert "***" in browse.describe_step(1, step)
+    (click,) = browse.parse_steps('[{"click":"text=Bestätigen"}]')
+    assert browse.describe_step(2, click) == "2. click text=Bestätigen"
+
+
+def test_act_cli_args(cwd: Path):
+    a = browse.build_cli_args(
+        [
+            "act",
+            "--url",
+            "http://127.0.0.1:8200/ui/x",
+            "--role",
+            "landlord",
+            "--steps",
+            '[{"click":"text=Bestätigen"}]',
+            "--shot",
+            "after.png",
+        ]
+    )
+    assert a.command == "act" and a.role == "landlord"
+    assert a.out == cwd.resolve() / "after.png"
+    assert [s.kind for s in a.steps] == ["click"]
+
+
+def test_act_cli_refusals(cwd: Path):
+    base = ["act", "--url", "http://127.0.0.1:8200/", "--steps", '[{"click":"a"}]']
+    assert browse.build_cli_args(base).out is None
+    with pytest.raises(ValueError):
+        browse.build_cli_args(["act", "--url", "http://evil.example/", "--steps", "[]"])
+    with pytest.raises(ValueError):
+        browse.build_cli_args(["act", "--url", "http://127.0.0.1/", "--steps", "nope"])
+    with pytest.raises(ValueError):
+        browse.build_cli_args([*base, "--shot", "../escape.png"])
+    with pytest.raises(ValueError):
+        browse.build_cli_args([*base, "--role", "../x"])
+
+
+def test_format_act_report():
+    out = browse.format_act_report(
+        log=["1. click text=OK"],
+        url="http://127.0.0.1:8200/ui/x",
+        title="T",
+        status=303,
+        body="b" * (browse.MAX_TEXT + 50),
+        links="links: none",
+    )
+    assert out.startswith("steps:\n1. click text=OK\n")
+    assert "url: http://127.0.0.1:8200/ui/x" in out and "status: 303" in out
+    assert "title: T" in out and out.endswith("links: none")
+    assert "b" * browse.MAX_TEXT in out and "b" * (browse.MAX_TEXT + 1) not in out
+    assert "status: unknown" in browse.format_act_report(
+        log=[], url="u", title="t", status=None, body="", links=""
+    )

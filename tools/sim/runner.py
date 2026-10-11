@@ -29,7 +29,14 @@ TOOL_NOTES = (
     "[--role <role>]` takes a full-page screenshot into the working directory and "
     "`python -m tools.sim.browse text --url <url> [--role <role>]` prints the title and "
     "visible text of a page, as a person in a browser would see it, followed by a `links:` "
-    "list of where each button or link on the page leads (use those paths; do not guess URLs)."
+    "list of where each button or link on the page leads (use those paths; do not guess URLs). "
+    "`python -m tools.sim.browse act --url <url> [--role <role>] --steps '<json list>' "
+    "[--shot <name.png>]` fills in and submits forms like a person would: up to 20 steps of "
+    '{"fill":"<css>","value":"..."}, {"click":"<css or text=Label>"}, '
+    '{"select":"<css>","value":"..."}, {"check":"<css>"} or {"wait_text":"..."}; afterwards it '
+    "prints the resulting URL, status and page text. Example, confirming a maintenance "
+    "command: `act --url <fleet>/ui/apartments/<id>/commands/<command>/confirm --role landlord "
+    '--steps \'[{"fill":"#reason","value":"Routine check"},{"click":"button[type=submit]"}]\'`.'
 )
 
 _FAILURE_TEXT_MAX = 500
