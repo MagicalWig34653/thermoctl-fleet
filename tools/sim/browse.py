@@ -30,6 +30,7 @@ MAX_TEXT = 20000
 DEFAULT_WIDTH = 390
 VIEWPORT_HEIGHT = 844
 NAV_TIMEOUT_MS = 30000
+MAX_LINKS = 60
 _ROLE = re.compile(r"[a-z0-9_-]+")
 
 
@@ -118,6 +119,38 @@ def build_cli_args(
     )
 
 
+def format_links(
+    raw: Sequence[tuple[str, str]], page_url: str, allowed: frozenset[str] | set[str]
+) -> str:
+    """Link targets of a page as a person would find them by hovering: text -> path.
+
+    Same-host links are shown as paths, other hosts as full URLs marked external;
+    anchors, javascript: and duplicates are dropped. Without this a text-only
+    view has no way to discover where a button leads.
+    """
+    here = urlsplit(page_url)
+    seen: set[str] = set()
+    lines: list[str] = []
+    for text, href in raw:
+        parts = urlsplit(href)
+        if parts.scheme not in ("http", "https"):
+            continue
+        if parts.netloc == here.netloc and parts.path == here.path and not parts.query:
+            continue  # same page (anchor / skip link)
+        target = parts.path + (f"?{parts.query}" if parts.query else "")
+        if parts.netloc != here.netloc:
+            target = f"{href} (external)"
+        label = " ".join(text.split()) or "(no text)"
+        entry = f"- {label[:60]} -> {target}"
+        if entry in seen:
+            continue
+        seen.add(entry)
+        lines.append(entry)
+        if len(lines) >= MAX_LINKS:
+            break
+    return "\n".join(["links:", *lines]) if lines else "links: none"
+
+
 def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cover
     # Needs a real Chromium; exercised by the smoke run, not by unit tests.
     from playwright.sync_api import Route, WebSocketRoute, sync_playwright
@@ -161,7 +194,12 @@ def _browse(args: BrowseArgs, allowed: frozenset[str]) -> str:  # pragma: no cov
                 page.screenshot(path=str(args.out), full_page=True)
                 return f"saved {args.out.name}"
             body = page.inner_text("body")[:MAX_TEXT]
-            return f"title: {page.title()}\n\n{body}"
+            anchors = page.eval_on_selector_all(
+                "a[href]",
+                "els => els.map(e => [e.innerText || e.getAttribute('aria-label') || '', e.href])",
+            )
+            links = format_links([(str(t), str(h)) for t, h in anchors], page.url, allowed)
+            return f"title: {page.title()}\n\n{body}\n\n{links}"
         finally:
             browser.close()
 

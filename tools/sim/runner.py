@@ -28,7 +28,8 @@ TOOL_NOTES = (
     "`python -m tools.sim.browse shot --url <url> --out <name.png> [--width 390] [--dark] "
     "[--role <role>]` takes a full-page screenshot into the working directory and "
     "`python -m tools.sim.browse text --url <url> [--role <role>]` prints the title and "
-    "visible text of a page, as a person in a browser would see it."
+    "visible text of a page, as a person in a browser would see it, followed by a `links:` "
+    "list of where each button or link on the page leads (use those paths; do not guess URLs)."
 )
 
 _FAILURE_TEXT_MAX = 500

@@ -154,3 +154,31 @@ def test_anonymous_note():
     )
     assert browse.anonymous_note(None, None) is None
     assert browse.anonymous_note("landlord", Path("/x/landlord.json")) is None
+
+
+def test_format_links_lists_targets_once_and_skips_noise():
+    raw = [
+        ("Ansehen", "http://127.0.0.1:8200/ui/apartments/sim-a01"),
+        ("Ansehen", "http://127.0.0.1:8200/ui/apartments/sim-a02"),
+        ("Ansehen", "http://127.0.0.1:8200/ui/apartments/sim-a01"),  # duplicate
+        ("", "http://127.0.0.1:8200/ui/tasks"),
+        ("Hoch", "http://127.0.0.1:8200/ui/#main"),
+        ("x", "javascript:alert(1)"),
+        ("Hilfe", "https://example.com/help"),
+    ]
+    text = browse.format_links(raw, "http://127.0.0.1:8200/ui/", {"127.0.0.1"})
+    lines = text.splitlines()
+    assert lines[0] == "links:"
+    assert "- Ansehen -> /ui/apartments/sim-a01" in lines
+    assert "- Ansehen -> /ui/apartments/sim-a02" in lines
+    assert "- (no text) -> /ui/tasks" in lines
+    assert sum("sim-a01" in line for line in lines) == 1
+    assert not any("javascript" in line or "#main" in line for line in lines)
+    assert "- Hilfe -> https://example.com/help (external)" in lines
+
+
+def test_format_links_empty_and_capped():
+    assert browse.format_links([], "http://127.0.0.1/", {"127.0.0.1"}) == "links: none"
+    many = [(f"n{i}", f"http://127.0.0.1/p{i}") for i in range(200)]
+    out = browse.format_links(many, "http://127.0.0.1/", {"127.0.0.1"})
+    assert len(out.splitlines()) == browse.MAX_LINKS + 1
