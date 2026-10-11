@@ -12344,3 +12344,7 @@ Nur Werkzeug, kein Produktcode.
 `<state>/faults/<apartment>.json`, baut das echte `protocol.heartbeat`-Modell)
 mit Tests in `tests/sim/`; `tools/sim/http.py` sperrt `--cookie-jar` auf das
 Arbeitsverzeichnis. Nur Werkzeug, kein Produktcode.
+
+Persona-Sitzungen laufen mit `PYTHONPATH` und dem Venv-Interpreter vorn auf
+`PATH`; defekte `failures.jsonl`-Zeilen werden übersprungen, `status` meldet
+einen defekten Checkpoint einzeilig, der Lauf nennt offene Fehlschritte.

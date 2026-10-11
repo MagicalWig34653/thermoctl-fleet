@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from datetime import timedelta
@@ -17,15 +18,21 @@ from tools.sim.state import SimState
 
 # Exactly the tools a persona session has (see haiku.DEFAULT_ALLOWED_TOOLS).
 TOOL_NOTES = (
-    "You can only use two commands. "
-    "`python -m tools.sim.http GET <url>` or `python -m tools.sim.http POST <url> <json>` "
-    "talks to the local systems listed above. "
-    "`python -m tools.sim.browse shot <url> <name>` takes a screenshot of a page and "
-    "`python -m tools.sim.browse text <url>` prints the visible text of a page, as a "
-    "person in a browser would see it."
+    "You can only use two commands, both run from a scratch working directory "
+    "that contains no project files. "
+    "`python -m tools.sim.http GET|POST <url> [--json '<json>'] [--form key=value ...] "
+    "[--cookie-jar <file>]` talks to the local systems listed above: --json sends a JSON "
+    "body, --form sends form fields (repeat the option), and --cookie-jar stores and "
+    "replays cookies; the cookie jar must be a plain file name inside the working "
+    "directory (for example `jar.json`), not a path elsewhere. "
+    "`python -m tools.sim.browse shot --url <url> --out <name.png> [--width 390] [--dark] "
+    "[--role <role>]` takes a full-page screenshot into the working directory and "
+    "`python -m tools.sim.browse text --url <url> [--role <role>]` prints the title and "
+    "visible text of a page, as a person in a browser would see it."
 )
 
 _FAILURE_TEXT_MAX = 500
+_STEP_ID = re.compile(r"w\d+:[A-Za-z0-9_-]+")
 
 
 class LimitPause(Exception):
@@ -45,10 +52,18 @@ def _failed_steps(state_dir: Path) -> list[str]:
     steps: dict[str, None] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
-            steps[json.loads(line)["step"]] = None
+            step = json.loads(line)["step"]
         except (ValueError, KeyError, TypeError):
             continue  # a torn last line must not block the run
+        if isinstance(step, str) and _STEP_ID.fullmatch(step):
+            steps[step] = None  # anything else is a malformed row: skipped
     return list(steps)
+
+
+def outstanding_failures(state_dir: Path) -> list[str]:
+    """Failed persona steps that are not done yet (what the next run will retry)."""
+    state = SimState.load(state_dir / "state.json")
+    return [step for step in _failed_steps(state_dir) if not state.is_done(step)]
 
 
 def run(

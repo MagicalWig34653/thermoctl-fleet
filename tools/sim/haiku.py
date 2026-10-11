@@ -6,7 +6,7 @@ import os
 import re
 import signal
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -73,6 +73,7 @@ def run_persona(
     model: str = "claude-haiku-5-5",
     effort: str = "low",
     timeout_s: int = 900,
+    env: Mapping[str, str] | None = None,
     allowed_tools: Sequence[str] = DEFAULT_ALLOWED_TOOLS,
     disallowed_tools: Sequence[str] = DEFAULT_DISALLOWED_TOOLS,
     popen: Callable[..., Any] = subprocess.Popen,
@@ -81,7 +82,8 @@ def run_persona(
     """Run `claude -p` once; the prompt goes via stdin so `ps` does not show it.
 
     A usage limit only counts on a non-zero exit. On timeout the whole process
-    group is killed and partial stdout is kept.
+    group is killed and partial stdout is kept. `env` defaults to the current
+    environment.
     """
     cmd = [
         "claude",
@@ -101,6 +103,7 @@ def run_persona(
     proc = popen(
         cmd,
         cwd=cwd,
+        env=dict(env) if env is not None else os.environ.copy(),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

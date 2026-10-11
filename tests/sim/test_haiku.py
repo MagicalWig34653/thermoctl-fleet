@@ -126,3 +126,13 @@ def test_timeout_kills_process_group_and_keeps_partial_output(tmp_path: Path):
     assert kills == [(4242, signal.SIGKILL)]
     assert not res.ok and not res.limit_hit
     assert res.text == "partial FINDING: {}"
+
+
+def test_env_is_passed_to_popen_and_defaults_to_os_environ(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SIM_MARKER", "yes")
+    p = fake(stdout="ok")
+    run_persona("hi", cwd=tmp_path, popen=p)
+    assert p.kw["env"]["SIM_MARKER"] == "yes"  # type: ignore[attr-defined]
+    p = fake(stdout="ok")
+    run_persona("hi", cwd=tmp_path, popen=p, env={"PYTHONPATH": "/x"})
+    assert p.kw["env"] == {"PYTHONPATH": "/x"}  # type: ignore[attr-defined]

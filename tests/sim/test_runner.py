@@ -90,3 +90,48 @@ def test_tool_notes_name_both_tools():
     assert "tools.sim.http" in TOOL_NOTES
     assert "tools.sim.browse" in TOOL_NOTES
     assert "shot" in TOOL_NOTES and "text" in TOOL_NOTES
+
+
+def test_malformed_failure_rows_are_skipped_not_fatal(tmp_path):
+    events, calls = [], []
+    sdir = tmp_path / "s"
+    sdir.mkdir()
+    rows = [
+        '{"step": "nonsense"}',
+        '{"step": 5}',
+        '{"step": ["a"]}',
+        '"just a string"',
+        "[1, 2]",
+        '{"step": "wX:landlord"}',
+        '{"step": "w000:"}',
+        "{torn",
+    ]
+    (sdir / "failures.jsonl").write_text("\n".join(rows) + "\n")
+
+    def fn(prompt):
+        calls.append(prompt)
+        return GOOD
+
+    run(**make(tmp_path, fn, events, weeks=1))  # must not raise
+    assert calls  # normal week ran
+
+
+def test_outstanding_failures_excludes_done_steps(tmp_path):
+    from tools.sim.runner import outstanding_failures
+
+    sdir = tmp_path / "s"
+    sdir.mkdir()
+    (sdir / "failures.jsonl").write_text(
+        '{"step": "w000:a", "week": 0, "text": ""}\n'
+        '{"step": "w001:b", "week": 1, "text": ""}\n'
+        "garbage\n"
+    )
+    SimState(done_steps=["w000:a"]).save(sdir / "state.json")
+    assert outstanding_failures(sdir) == ["w001:b"]
+
+
+def test_tool_notes_describe_working_dir_jar_and_options():
+    assert "scratch" in TOOL_NOTES and "no project files" in TOOL_NOTES
+    assert "--cookie-jar" in TOOL_NOTES and "file name" in TOOL_NOTES
+    for opt in ("--json", "--form", "--url", "--out", "--width", "--dark", "--role"):
+        assert opt in TOOL_NOTES
