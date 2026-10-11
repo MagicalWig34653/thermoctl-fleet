@@ -12377,3 +12377,8 @@ abgebrochen) mit Tests in `tests/sim/`. Nur Werkzeug, kein Produktcode.
 `docs/sim-findings/10-agent-heartbeat-gap.md`: erster Befund der Simulation
 (Blocker: der Agent sendet keinen Heartbeat, die Ausbleiben-Warnung träfe
 jede Wohnung).
+
+Simulation, erster Livelauf (Task 10, `docs/sim-findings/01-smoke-run.md`): Stack,
+virtuelle Uhr, Ausbleiben-Alarm und Persona-Pipeline laufen; 9 Harness-Fehler
+behoben, 4 Produktbefunde (11 bis 14). Offen: Formulare absenden, frischer
+State pro Lauf.
