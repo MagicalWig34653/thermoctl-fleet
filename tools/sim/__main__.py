@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from tools.sim.env.config import state_dir
+from tools.sim.env.config import APARTMENT_IDS, state_dir
 from tools.sim.findings import build_index
 from tools.sim.haiku import ensure_persona_cwd, run_persona
 from tools.sim.personas import PERSONAS
@@ -109,17 +109,36 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--weeks", type=int, default=156)
     run_p.add_argument("--seed", type=int, default=1)
     run_p.add_argument("--personas", default=None, help="comma list of persona ids (default all)")
+    pre_p = sub.add_parser(
+        "preflight", help="check the stack and tools are ready (changes nothing)"
+    )
+    pre_p.add_argument("--personas", default=None, help="comma list of persona ids (default all)")
+    pre_p.add_argument("--seed", type=int, default=1)
     sub.add_parser("status")
     sub.add_parser("report")
     args = parser.parse_args(argv)
     selected: list[str] | None = None
-    if args.cmd == "run":
+    if args.cmd in ("run", "preflight"):
         try:
             selected = parse_personas(args.personas)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
+    if args.cmd == "preflight":
+        from tools.sim import preflight
+        from tools.sim.env.tenant import tenant_urls
+
+        checks = preflight.run_preflight(
+            state_dir(),
+            preflight.real_probes(),
+            personas=selected,
+            seed=args.seed,
+            apartments=APARTMENT_IDS,
+            tenant_urls=tenant_urls(),
+        )
+        print(preflight.format_table(checks))
+        return preflight.exit_code(checks)
     if args.cmd == "status":
         try:
             state = SimState.load(state_dir() / "state.json")

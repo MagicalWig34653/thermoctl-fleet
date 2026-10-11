@@ -6,6 +6,38 @@ Run everything from the repository root with the project venv's `python`
 resources named `thermoctl-sim*` are ever created or removed. The state
 directory is `sim-state/` (git-ignored) unless `SIM_STATE_DIR` is set.
 
+## Full run (156 weeks): the exact sequence
+
+Use a fresh `SIM_STATE_DIR` under your home (not `/tmp`; Docker must share it). Start from
+a state without progress; the harness data of the smoke run is archived in `smoke/`.
+
+```sh
+export SIM_STATE_DIR="$HOME/sim-state-full"
+python -m tools.sim.env.stack --up          # fleet + agents, VMs, tenant UIs, then all logins
+python -m tools.sim preflight               # changes nothing; every line must be OK (exit 0)
+python -m tools.sim run --weeks 156 --seed 1   # all 7 personas (the default)
+python -m tools.sim.env.stack --down        # when finished
+```
+
+- `stack --up` is the right order and idempotent where its parts are: `up_fleet --agents`,
+  `vms --up`, `tenant --up`, `up_fleet --logins`, `tenant --logins`. It stops at the first
+  failing step. `stack --status` lists what runs (containers `thermoctl-sim*`, the two sim
+  VMs). `stack --down` runs the reverse and only the sim-scoped downs (tenant project, the
+  VMs the marker `vms-created.json` lists, the fleet project); it keeps going after a failed
+  step so nothing is left half up.
+- `preflight` checks: state dir is Docker-shareable, `state.json` fresh (or, with progress,
+  consistent with `--personas`/`--seed`: WARN, a different value is FAIL), `claude` runs and
+  accepts the persona flags, fleet `/healthz`, all 12 apartments with a heartbeat within 15
+  virtual minutes, tenant UIs 8301 to 8303 answer 200 on `/login`, non-empty storage states
+  for exactly the roles the personas use (landlord, caretaker, admin, tenant1 to tenant3; the
+  newcomer uses the landlord login), Playwright importable, at least 5 GiB free. Pass the
+  same `--personas`/`--seed` to preflight as to `run`.
+- Resume: the run exits with code **75** when the usage limit is hit (see section 3). Wait
+  for the owner's go, run `python -m tools.sim preflight` again (expect a WARN for the
+  non-fresh state, no FAIL; logins are refreshed by the run itself), then rerun the identical
+  `run` command. Any other non-zero exit: read the error, fix, rerun the same command.
+- The watchdog is not exercised in this run (findings 40, 41).
+
 ## 1. Bring the stack up
 
 ```sh

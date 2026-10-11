@@ -282,3 +282,27 @@ def test_run_terminated_returns_signal_exit_code_without_traceback(dirs, capsys,
     assert cli.main(["run", "--weeks", "1"]) == 143
     out = capsys.readouterr()
     assert "Traceback" not in out.err and "terminated" in out.out
+
+
+def test_preflight_prints_the_table_and_exits_with_the_aggregate(dirs, monkeypatch, capsys):
+    from tools.sim import preflight
+
+    seen = {}
+
+    def fake(directory, probes, **kw):
+        seen.update(kw)
+        return [preflight.Check("x", preflight.Status.FAIL, "boom")]
+
+    monkeypatch.setattr(preflight, "run_preflight", fake)
+    monkeypatch.setattr(preflight, "real_probes", lambda: None)
+    assert cli.main(["preflight", "--personas", "newcomer", "--seed", "4"]) == 1
+    assert "FAIL  x  boom" in capsys.readouterr().out
+    assert seen["personas"] == ["newcomer"] and seen["seed"] == 4
+    assert len(seen["apartments"]) == 12 and set(seen["tenant_urls"]) == {
+        "tenant1", "tenant2", "tenant3",
+    }  # fmt: skip
+
+
+def test_preflight_rejects_an_unknown_persona(dirs, capsys):
+    assert cli.main(["preflight", "--personas", "nobody"]) == 1
+    assert "unknown persona" in capsys.readouterr().err
