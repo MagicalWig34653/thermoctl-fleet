@@ -6,7 +6,7 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tools.sim.clock import SIM_START
+from tools.sim.clock import SIM_START, clock_path
 
 ROOT = Path(__file__).resolve().parents[3]
 PREFIX = "thermoctl-sim"  # every docker resource of the sim starts with this
@@ -25,9 +25,9 @@ def state_dir() -> Path:
 
 
 def virtual_now(directory: Path) -> datetime:
-    """Time of the shared virtual clock (`<state>/clock`); `SIM_START` before it exists."""
+    """Time of the shared virtual clock (`<state>/clock/clock`); `SIM_START` before it exists."""
     try:
-        raw = (directory / "clock").read_text(encoding="ascii").strip()
+        raw = clock_path(directory).read_text(encoding="ascii").strip()
         return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
     except (OSError, ValueError):
         return SIM_START

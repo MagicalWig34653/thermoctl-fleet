@@ -3,6 +3,7 @@ from collections import Counter
 
 import pytest
 
+from tools.sim.clock import clock_path
 from tools.sim.haiku import PersonaResult
 from tools.sim.runner import TOOL_NOTES, LimitPause, run
 from tools.sim.state import SimState
@@ -31,7 +32,7 @@ def test_full_run_advances_clock_and_writes_index(tmp_path):
     events = []
     run(**make(tmp_path, lambda p: GOOD, events))
     assert (tmp_path / "f" / "INDEX.md").exists()
-    assert (tmp_path / "s" / "clock").read_text().startswith("2026-01-26")
+    assert clock_path(tmp_path / "s").read_text().startswith("2026-01-26")
     assert events, "scenario events must have been applied"
     assert SimState.load(tmp_path / "s" / "state.json").week == 3
 
@@ -58,7 +59,7 @@ def test_limit_pause_then_resume_does_not_repeat_work(tmp_path):
     ids = [e.id for e in events]
     assert len(ids) == len(set(ids)), "an event was applied twice"
     assert sorted(ids) == sorted(e.id for e in ref_events)
-    assert (tmp_path / "s" / "clock").read_text() == (tmp_path / "ref" / "s" / "clock").read_text()
+    assert clock_path(tmp_path / "s").read_text() == clock_path(tmp_path / "ref" / "s").read_text()
 
 
 def test_failed_persona_is_recorded_not_marked_and_retried(tmp_path):

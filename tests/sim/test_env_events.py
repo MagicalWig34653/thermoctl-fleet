@@ -6,6 +6,7 @@ import pytest
 from protocol.heartbeat import Heartbeat
 from protocol.version import PROTOCOL_VERSION
 from tools.sim import env
+from tools.sim.clock import clock_path
 from tools.sim.env import HANDLERS, UNIMPLEMENTED_KINDS, apply_event_with
 from tools.sim.env.events import FAULT_SHAPES, container_name
 from tools.sim.scenario import Event, EventKind
@@ -74,7 +75,9 @@ def test_wifi_change_cycles_the_sim_network():
     ]
 
 
-@pytest.mark.parametrize("bad", ["../x", "a/b", "sim a", "", "-x", "A;rm"])
+@pytest.mark.parametrize(
+    "bad", ["../x", "a/b", "sim a", "", "-x", "A;rm", "fleet", "sim-a1", "sim-a001", "sim-a01x"]
+)
 def test_container_name_rejects_unsafe_ids(bad):
     with pytest.raises(ValueError):
         container_name(bad)
@@ -107,7 +110,8 @@ def test_every_fault_shape_validates_against_the_protocol_model():
 
 
 def test_fault_choice_is_deterministic_and_uses_virtual_clock(state):
-    (state / "clock").write_text("2026-03-02 08:00:00\n")
+    clock_path(state).parent.mkdir()
+    clock_path(state).write_text("2026-03-02 08:00:00\n")
     apply_event_with(_ev(EventKind.FAULT, n="7"), lambda c: None)
     first = (state / "faults" / "sim-a03.json").read_text()
     (state / "faults" / "sim-a03.json").unlink()

@@ -8,7 +8,7 @@ Last updated: 2026-10-11.
 `tools/sim/env/` seeds a local sim fleet (3 properties, 12 apartments, 12 prepared
 devices, 3 UI users) and runs it in Docker under libfaketime (`up_fleet`, `--down`);
 event handlers for loss/restore/wifi/power/fault are in, the rest raise until 9b/9c.
-No product code changed.
+No product code changed. Review fixes: private registration files, strict container ids, fleet mounts only the clock dir, recoverable seeding.
 
 
 ## Usage simulation: browse tool hardening (2026-10-11)

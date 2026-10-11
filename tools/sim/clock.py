@@ -10,6 +10,14 @@ from pathlib import Path
 SIM_START = datetime(2026, 1, 5, 8, 0, 0, tzinfo=UTC)  # a Monday
 
 
+CLOCK_DIRNAME = "clock"  # own directory: the fleet container mounts only this, read-only
+
+
+def clock_path(state_dir: Path) -> Path:
+    """The one place that defines where the shared clock file lives."""
+    return state_dir / CLOCK_DIRNAME / "clock"
+
+
 @dataclass
 class SimClock:
     path: Path
@@ -17,6 +25,7 @@ class SimClock:
 
     def write(self) -> None:
         """Atomically publish the current simulated time (FAKETIME_NO_CACHE=1 readers)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(self.now.strftime("%Y-%m-%d %H:%M:%S") + "\n", encoding="ascii")
         os.replace(tmp, self.path)

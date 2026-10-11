@@ -50,9 +50,34 @@ class SeedResult:
 
 
 def _write_private(path: Path, content: str) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as out:
+    """Write atomically: a private temp file, then rename (no half-written marker)."""
+    tmp = path.with_name(path.name + ".tmp")
+    _precreate_private(tmp)
+    with open(tmp, "w", encoding="utf-8") as out:
         out.write(content)
+    os.replace(tmp, path)
+
+
+def _db_file(database_url: str) -> str:
+    return database_url.removeprefix("sqlite:///")
+
+
+def _partial(what: str, database_url: str) -> RuntimeError:
+    return RuntimeError(
+        f"partial {what} found from an interrupted run; delete {_db_file(database_url)} "
+        "and run again"
+    )
+
+
+def _create_private_dir(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def _precreate_private(path: Path) -> None:
+    """Create `path` empty with mode 0600 (replacing a stale one) before any secret is written."""
+    path.unlink(missing_ok=True)
+    os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
 
 
 def seed_fleet(
@@ -67,11 +92,13 @@ def seed_fleet(
 
     upgrade(database_url)
     storage = Storage(create_engine_from_url(database_url))
-    if storage.get_apartment(APARTMENT_IDS[0]) is not None:
-        raise RuntimeError("sim fleet already seeded; remove the state dir to start over")
-    when = now or virtual_now(state_dir)
     out_dir = state_dir / "registrations"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if (out_dir / "_index.json").exists():
+        raise RuntimeError("sim fleet already seeded; remove the state dir to start over")
+    if storage.list_properties() or storage.list_apartments() or storage.list_devices():
+        raise _partial("sim inventory", database_url)
+    when = now or virtual_now(state_dir)
+    _create_private_dir(out_dir)
 
     device_ids: dict[str, str] = {}
     codes: dict[str, str] = {}
@@ -103,13 +130,14 @@ def seed_fleet(
             )
             device_ids[apt] = device_id
             target = out_dir / f"{apt}.json"
+            _precreate_private(target)
             write_registration_file(
                 target,
                 fleet_address=fleet_address,
                 certificate_fingerprint=NO_TLS_FINGERPRINT,
                 registration_code=codes[apt],
             )
-            target.chmod(0o600)
+    # Written last and atomically: its existence is the "seeded" marker.
     _write_private(
         out_dir / "_index.json",
         json.dumps({apt: {"device_id": dev} for apt, dev in device_ids.items()}, indent=2) + "\n",
@@ -126,6 +154,10 @@ def create_sim_users(
     names differ only by persona, not by permission.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
+    from fleet.storage import create_storage
+
+    if create_storage(database_url).list_ui_users():
+        raise _partial("UI users", database_url)
     users: dict[str, dict[str, str]] = {}
     for username in UI_USERS:
         password = secrets.token_urlsafe(24)

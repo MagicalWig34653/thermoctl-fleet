@@ -4,6 +4,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tools.sim.clock import clock_path
 from tools.sim.env import up_fleet
 from tools.sim.env.config import ROOT
 
@@ -12,15 +13,16 @@ def test_prepare_state_creates_private_key_clock_and_dirs(tmp_path):
     url, key = up_fleet.prepare_state(tmp_path)
     assert url == f"sqlite:///{tmp_path / 'fleet-data' / 'fleet.db'}"
     assert stat.S_IMODE((tmp_path / "totp.key").stat().st_mode) == 0o600
-    assert (tmp_path / "clock").read_text().strip() == "2026-01-05 08:00:00"
+    assert clock_path(tmp_path).read_text().strip() == "2026-01-05 08:00:00"
     assert (tmp_path / "faults").is_dir() and (tmp_path / "backups").is_dir()
     assert up_fleet.prepare_state(tmp_path) == (url, key)  # idempotent, key kept
 
 
 def test_prepare_state_keeps_an_existing_clock(tmp_path):
-    (tmp_path / "clock").write_text("2026-06-01 08:00:00\n")
+    clock_path(tmp_path).parent.mkdir()
+    clock_path(tmp_path).write_text("2026-06-01 08:00:00\n")
     up_fleet.prepare_state(tmp_path)
-    assert (tmp_path / "clock").read_text() == "2026-06-01 08:00:00\n"
+    assert clock_path(tmp_path).read_text() == "2026-06-01 08:00:00\n"
 
 
 def test_up_builds_base_then_composes_then_waits(tmp_path, monkeypatch):
@@ -53,6 +55,8 @@ def test_up_seeds_when_users_file_missing(tmp_path, monkeypatch):
         "tools.sim.env.fleet_setup.create_sim_users", lambda *a, **k: seen.append("users")
     )
     assert up_fleet.seed_if_needed(tmp_path, "sqlite:///x", "k") is True
+    (tmp_path / "registrations").mkdir()
+    (tmp_path / "registrations" / "_index.json").write_text("{}")
     (tmp_path / "users.json").write_text("{}")
     assert up_fleet.seed_if_needed(tmp_path, "sqlite:///x", "k") is False
     assert seen == ["seed", "users"]
@@ -123,3 +127,29 @@ def test_main_up_prints_where_credentials_are(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(up_fleet, "up", lambda d, run: None)
     assert up_fleet.main([]) == 0
     assert "users.json" in capsys.readouterr().out
+
+
+def test_up_seeds_only_missing_steps(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr("tools.sim.env.fleet_setup.seed_fleet", lambda *a, **k: seen.append("seed"))
+    monkeypatch.setattr(
+        "tools.sim.env.fleet_setup.create_sim_users", lambda *a, **k: seen.append("users")
+    )
+    (tmp_path / "registrations").mkdir()
+    (tmp_path / "registrations" / "_index.json").write_text("{}")
+    assert up_fleet.seed_if_needed(tmp_path, "sqlite:///x", "k") is True
+    assert seen == ["users"]
+
+
+def test_fleet_container_mounts_expose_no_secrets():
+    yaml = pytest.importorskip("yaml")
+    doc = yaml.safe_load(Path(up_fleet.COMPOSE_FILE).read_text())
+    mounts = doc["services"]["fleet"]["volumes"]
+    sources = [m.split(":")[0] for m in mounts]
+    assert "${SIM_STATE_DIR}" not in sources
+    for secret in ("users.json", "totp.key", "registrations"):
+        assert not any(secret in m for m in mounts)
+    clock = [m for m in mounts if m.endswith(":/sim-clock:ro")]
+    assert clock == ["${SIM_STATE_DIR}/clock:/sim-clock:ro"]
+    env = doc["services"]["fleet"]["environment"]
+    assert env["FAKETIME_TIMESTAMP_FILE"] == "/sim-clock/clock"

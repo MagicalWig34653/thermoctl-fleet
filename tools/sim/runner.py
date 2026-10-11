@@ -9,7 +9,7 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
-from tools.sim.clock import SIM_START, SimClock
+from tools.sim.clock import SIM_START, SimClock, clock_path
 from tools.sim.findings import append_findings, build_index, parse_findings
 from tools.sim.haiku import PersonaResult
 from tools.sim.personas import PERSONAS, build_prompt, due_personas
@@ -88,7 +88,7 @@ def run(
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
     state = SimState.load(state_path)
-    clock = SimClock(state_dir / "clock")
+    clock = SimClock(clock_path(state_dir))
     clock.now = SIM_START + timedelta(weeks=state.week)
     clock.write()
     schedule = build_schedule(seed, weeks, apartments)

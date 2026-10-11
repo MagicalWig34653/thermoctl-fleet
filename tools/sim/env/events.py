@@ -21,7 +21,7 @@ from tools.sim.scenario import Event, EventKind
 RunCmd = Callable[[list[str]], object]
 Handler = Callable[[Event, RunCmd], None]
 
-_SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+_SAFE_ID = re.compile(r"^sim-a\d\d$")  # only apartment agents, never e.g. the fleet
 
 
 def container_name(apartment: str) -> str:

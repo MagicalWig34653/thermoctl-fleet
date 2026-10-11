@@ -33,7 +33,7 @@ services:
       FLEET_DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_S: "300"
       # Virtual clock: absolute timestamp file without "@" freezes time until rewritten.
       LD_PRELOAD: /usr/local/lib/libfaketime.so.1
-      FAKETIME_TIMESTAMP_FILE: /sim/clock
+      FAKETIME_TIMESTAMP_FILE: /sim-clock/clock
       FAKETIME_NO_CACHE: "1"
     volumes:
       - "${SIM_STATE_DIR:?set by up_fleet}/fleet-data:/data"
@@ -41,7 +41,8 @@ services:
       - "${SIM_STATE_DIR}/diagnostic-bundles:/bundles"
       # The directory, not the file: SimClock replaces the file by rename, which a
       # single-file bind mount would never see.
-      - "${SIM_STATE_DIR}:/sim:ro"
+      # Only this directory: users.json, totp.key and registrations stay out of the container.
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
     networks: [sim-net]
 
 networks:

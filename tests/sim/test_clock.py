@@ -28,3 +28,11 @@ def test_week_index(tmp_path):
     assert clock.week_index() == 0
     clock.advance(timedelta(days=15))
     assert clock.week_index() == 2
+
+
+def test_clock_path_lives_in_its_own_directory_created_on_write(tmp_path):
+    from tools.sim.clock import CLOCK_DIRNAME, clock_path
+
+    assert clock_path(tmp_path) == tmp_path / CLOCK_DIRNAME / "clock"
+    SimClock(clock_path(tmp_path)).write()
+    assert clock_path(tmp_path).is_file()

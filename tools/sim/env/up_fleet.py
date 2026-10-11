@@ -21,7 +21,7 @@ from pathlib import Path
 
 import httpx
 
-from tools.sim.clock import SIM_START
+from tools.sim.clock import SIM_START, clock_path
 from tools.sim.env.config import FLEET_URL, PREFIX, ROOT, state_dir
 
 COMPOSE_FILE = Path(__file__).with_name("compose.sim.yml")
@@ -44,7 +44,8 @@ def prepare_state(directory: Path) -> tuple[str, str]:
     if not key_path.exists():
         key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
         _write_private(key_path, key + "\n")
-    clock = directory / "clock"
+    clock = clock_path(directory)
+    clock.parent.mkdir(exist_ok=True)
     if not clock.exists():
         clock.write_text(SIM_START.strftime("%Y-%m-%d %H:%M:%S") + "\n", encoding="ascii")
     url = f"sqlite:///{directory / 'fleet-data' / 'fleet.db'}"
@@ -72,11 +73,14 @@ def seed_if_needed(directory: Path, database_url: str, totp_key: str) -> bool:
     """Seed inventory and UI users once; returns True if it did."""
     from tools.sim.env.fleet_setup import create_sim_users, seed_fleet
 
-    if (directory / "users.json").exists():
-        return False
-    seed_fleet(directory, database_url)
-    create_sim_users(directory, database_url, totp_key=totp_key)
-    return True
+    did = False
+    if not (directory / "registrations" / "_index.json").exists():
+        seed_fleet(directory, database_url)
+        did = True
+    if not (directory / "users.json").exists():
+        create_sim_users(directory, database_url, totp_key=totp_key)
+        did = True
+    return did
 
 
 def wait_healthy(
