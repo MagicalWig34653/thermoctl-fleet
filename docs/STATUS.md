@@ -12329,3 +12329,8 @@ SVG-Zeichen, weil es in 16 px schärfer ist.
 `tools/sim/scenario.py` (deterministischer Ereignisplan, kein LLM) und
 `tools/sim/findings.py` (Befunde als JSONL, `INDEX.md` nach Schwere und
 Bereich) mit Tests in `tests/sim/`. Nur Werkzeug, kein Produktcode.
+
+`tools/sim/personas.py` (sieben Personas, Kadenz, englischer Rollenspiel-Prompt)
+und `tools/sim/haiku.py` (headless `claude -p`, enge `--allowedTools`,
+Usage-Limit-Erkennung nur bei Exit-Code != 0) mit Tests in `tests/sim/`.
+Nur Werkzeug, kein Produktcode.

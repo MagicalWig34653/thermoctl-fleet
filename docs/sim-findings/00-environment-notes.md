@@ -271,3 +271,13 @@ use `command claude` or the binary directly in scripts):
   `--session-id <uuid>`, `--fallback-model`.
 - Not found in `--help`: a `--max-turns` flag (grep over the help output
   returned nothing), so turn limits must be enforced by budget or prompt.
+
+### Verified headless persona flags (claude 2.1.296, Task 7)
+
+`--effort low|medium|high|xhigh|max` is the real effort flag (matches the
+brief). `tools/sim/haiku.py` runs
+`claude -p <prompt> --model <m> --effort <e> --permission-prompts none
+--no-session-persistence --allowedTools Bash(curl:*) Bash(python -m
+tools.sim.browse:*)`. Unlisted tools are auto-denied instead of hanging;
+no `--dangerously-skip-permissions`. `--allowedTools` is variadic, so it is
+the last option and the prompt precedes it.
