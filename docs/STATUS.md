@@ -12325,3 +12325,7 @@ SVG-Zeichen, weil es in 16 px schärfer ist.
 `tools/sim/clock.py` (virtuelle Uhr als libfaketime-Zeitstempeldatei) und
 `tools/sim/state.py` (atomarer Checkpoint je Persona-Schritt) mit Tests in
 `tests/sim/`. Nur Werkzeug, kein Produktcode.
+
+`tools/sim/scenario.py` (deterministischer Ereignisplan, kein LLM) und
+`tools/sim/findings.py` (Befunde als JSONL, `INDEX.md` nach Schwere und
+Bereich) mit Tests in `tests/sim/`. Nur Werkzeug, kein Produktcode.
