@@ -181,20 +181,63 @@ def test_refresh_logins_raises_when_a_role_fails(state, monkeypatch):
     assert not isinstance(info.value, LoginsUnavailable)
 
 
-@pytest.mark.parametrize(
-    "kind",
-    [
-        EventKind.HEARTBEAT_LOSS,
-        EventKind.HEARTBEAT_RESTORE,
-        EventKind.POWER_LOSS,
-        EventKind.WIFI_CHANGE,
-    ],
-)
-def test_container_events_for_vm_apartments_are_skipped_not_fatal(kind):
-    calls = []
-    with pytest.raises(NotImplementedError, match="no container"):
-        apply_event_with(_ev(kind, apt="sim-a01"), calls.append)
-    assert calls == []
+def test_vm_heartbeat_loss_and_restore_pause_the_sim_sender_inside_the_vm():
+    cmds = []
+    apply_event_with(_ev(EventKind.HEARTBEAT_LOSS, apt="sim-a01"), cmds.append)
+    apply_event_with(_ev(EventKind.HEARTBEAT_RESTORE, apt="sim-a02"), cmds.append)
+    assert cmds == [
+        ["limactl", "shell", "thermoctl-sim-a01", "--", "sudo", "docker", "pause",
+         "thermoctl-sim-agent"],
+        ["limactl", "shell", "thermoctl-sim-a02", "--", "sudo", "docker", "unpause",
+         "thermoctl-sim-agent"],
+    ]  # fmt: skip
+
+
+def test_vm_power_loss_is_a_forced_stop_and_a_start_of_that_vm_only():
+    cmds = []
+    apply_event_with(_ev(EventKind.POWER_LOSS, apt="sim-a02"), cmds.append)
+    assert cmds == [
+        ["limactl", "stop", "--force", "thermoctl-sim-a02"],
+        ["limactl", "start", "--tty=false", "thermoctl-sim-a02"],
+    ]
+
+
+def test_vm_network_change_flaps_the_default_interface_detached():
+    cmds = []
+    apply_event_with(_ev(EventKind.WIFI_CHANGE, apt="sim-a01"), cmds.append)
+    (cmd,) = cmds
+    assert cmd[:6] == ["limactl", "shell", "thermoctl-sim-a01", "--", "sudo", "systemd-run"]
+    assert "--collect" in cmd and cmd[-3:-1] == ["sh", "-c"]
+    script = cmd[-1]
+    assert 'ip link set "$IF" down' in script and 'ip link set "$IF" up' in script
+    assert "sim-a01" not in script  # nothing from the event is spliced into the script
+
+
+def test_vm_commands_validate_the_id_and_never_touch_other_vms():
+    from tools.sim.env.config import vm_name
+
+    for bad in ("sim-a03", "thermoctl-test-vm", "sim-a01x", "../sim-a01"):
+        with pytest.raises(ValueError):
+            vm_name(bad)
+    cmds = []
+    # container apartments still use docker, not limactl
+    apply_event_with(_ev(EventKind.POWER_LOSS, apt="sim-a03"), cmds.append)
+    assert all(c[0] == "docker" for c in cmds)
+
+
+@pytest.mark.parametrize("kind", [EventKind.BACKUP, EventKind.TOKEN_EXPIRY])
+def test_container_only_kinds_are_still_skipped_for_vm_apartments(kind):
+    with pytest.raises(NotImplementedError):
+        apply_event_with(_ev(kind, apt="sim-a01"), lambda cmd: pytest.fail("no command"))
+
+
+def test_vm_pause_already_reached_is_not_an_error():
+    import subprocess
+
+    def fail(cmd):
+        raise subprocess.CalledProcessError(1, cmd, stderr="Error: Container x is not paused")
+
+    apply_event_with(_ev(EventKind.HEARTBEAT_RESTORE, apt="sim-a01"), fail)
 
 
 def test_unpause_after_power_loss_is_not_an_error():
@@ -224,5 +267,5 @@ def test_cli_applies_one_event_and_reports_errors(capsys):
     assert main(["--apply", "clock_drift", "sim-a03"]) == 0
     assert "applied clock_drift" in capsys.readouterr().out
     assert main(["--apply", "nonsense", "sim-a03"]) == 1
-    assert main(["--apply", "heartbeat_loss", "sim-a01"]) == 1  # VM: no container
+    assert main(["--apply", "backup", "sim-a01"]) == 1  # VM: no token file / container
     assert main(["--apply", "clock_drift", "../x"]) == 1

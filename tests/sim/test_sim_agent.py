@@ -278,3 +278,106 @@ def test_read_drift_missing_file_is_zero(tmp_path: Path):
     from tools.sim.sim_agent import read_drift
 
     assert read_drift(tmp_path, "sim-a09") == 0.0
+
+
+def _args(tmp_path: Path, *extra: str):
+    return sim_agent.parse_args(
+        ["--apartment", "a", "--fleet", "https://host.lima.internal:8243", "--token-file", "t",
+         "--state-dir", str(tmp_path), *extra]
+    )  # fmt: skip
+
+
+def test_http_client_plain_without_tls_options(tmp_path: Path):
+    client = sim_agent.build_http_client(
+        sim_agent.parse_args(
+            [
+                "--apartment",
+                "a",
+                "--fleet",
+                "http://127.0.0.1:1",
+                "--token-file",
+                "t",
+                "--state-dir",
+                str(tmp_path),
+            ]
+        )  # fmt: skip
+    )
+    assert str(client.base_url) == "http://127.0.0.1:1"
+    assert client.trust_env is False
+
+
+def test_ca_file_without_pin_is_refused(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(ValueError, match="--pinned-fingerprint"):
+        sim_agent.build_http_client(_args(tmp_path, "--ca-file", str(tmp_path / "ca.pem")))
+    tok = tmp_path / "tok"
+    tok.write_text(TOKEN)
+    rc = sim_agent.main(
+        ["--apartment", "a", "--fleet", "https://host.lima.internal:8243",
+         "--token-file", str(tok), "--state-dir", str(tmp_path),
+         "--ca-file", str(tmp_path / "ca.pem")]
+    )  # fmt: skip
+    # host.lima.internal is not allowed unless SIM_ALLOWED_HOSTS names it: refused first.
+    assert rc == 2 and "refused" in capsys.readouterr().err
+
+
+def test_pinned_client_checks_the_fingerprint_and_the_ca(tmp_path: Path, monkeypatch):
+    """The VM sim agent uses the real agent's pinned client: right pin works, wrong pin and a
+    CA nobody trusts both fail (verification is never relaxed)."""
+    import http.server
+    import ssl
+    import threading
+
+    from tools.sim.env.tls import COMMON_NAME, ensure_tls
+
+    material = ensure_tls(tmp_path)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(material.cert_file), str(material.key_file))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    # The certificate names host.lima.internal; resolve it to loopback for the test only.
+    import socket
+
+    real = socket.getaddrinfo
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, *a, **k: real("127.0.0.1" if host == COMMON_NAME else host, *a, **k),
+    )
+    try:
+        fleet = f"https://{COMMON_NAME}:{port}"
+        base = ["--apartment", "a", "--fleet", fleet, "--token-file", "t", "--state-dir", "s"]
+        good = sim_agent.parse_args(
+            [
+                *base,
+                "--ca-file",
+                str(material.ca_file),
+                "--pinned-fingerprint",
+                material.fingerprint,
+            ]
+        )
+        with sim_agent.build_http_client(good) as client:
+            assert client.get("/").status_code == 204
+        wrong = sim_agent.parse_args(
+            [*base, "--ca-file", str(material.ca_file),
+             "--pinned-fingerprint", "sha256:" + "0" * 64]
+        )  # fmt: skip
+        with sim_agent.build_http_client(wrong) as client, pytest.raises(httpx.TransportError):
+            client.get("/")
+        no_ca = sim_agent.parse_args([*base, "--pinned-fingerprint", material.fingerprint])
+        with sim_agent.build_http_client(no_ca) as client, pytest.raises(httpx.TransportError):
+            client.get("/")
+    finally:
+        server.shutdown()
+        server.server_close()

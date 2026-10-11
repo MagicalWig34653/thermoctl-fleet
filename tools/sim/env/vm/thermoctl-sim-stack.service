@@ -1,0 +1,19 @@
+# VM-only (simulation): starts the real agent and the sim heartbeat sender after a boot.
+# Installed by tools/sim/env/vms.py once the agent is enrolled. Waits for the Lima mounts
+# (virtual clock, fault markers) that docker would otherwise bind-mount empty.
+[Unit]
+Description=thermoctl sim: agent and sim heartbeat sender (local image)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=300
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 240); do mountpoint -q /sim-clock && mountpoint -q /sim-faults && exit 0; sleep 1; done; echo "Lima mounts missing" >&2; exit 1'
+ExecStart=/usr/bin/docker compose --env-file /etc/thermoctl-agent/.env --env-file /opt/thermoctl-sim/stack.env -f /opt/thermoctl-sim/compose.yml up -d --force-recreate
+ExecStop=/usr/bin/docker compose --env-file /etc/thermoctl-agent/.env --env-file /opt/thermoctl-sim/stack.env -f /opt/thermoctl-sim/compose.yml down
+
+[Install]
+WantedBy=multi-user.target

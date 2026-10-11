@@ -375,7 +375,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--token-file", required=True, type=Path)
     ap.add_argument("--state-dir", required=True, type=Path)
     ap.add_argument("--interval-s", type=float, default=5.0)
+    ap.add_argument(
+        "--ca-file",
+        type=Path,
+        default=None,
+        help="trust this CA for an https fleet (VM base stations); never disables verification",
+    )
+    ap.add_argument(
+        "--pinned-fingerprint",
+        default=None,
+        help="sha256:<hex> of the fleet's leaf certificate, checked on top of --ca-file "
+        "(same pin as agent-registration.json)",
+    )
     return ap.parse_args(argv)
+
+
+def build_http_client(args: argparse.Namespace) -> httpx.Client:
+    """Plain http client (container agents), or, with `--ca-file`, the real agent's pinned
+    TLS client (`agent.transport.build_client`): ordinary verification stays on and the leaf
+    fingerprint must match. `--pinned-fingerprint` without `--ca-file` uses the system CAs."""
+    if args.pinned_fingerprint is None and args.ca_file is None:
+        return httpx.Client(
+            base_url=args.fleet, follow_redirects=False, trust_env=False, timeout=10.0
+        )
+    if args.pinned_fingerprint is None:
+        raise ValueError("--ca-file needs --pinned-fingerprint")
+    from agent.transport import build_client
+
+    return build_client(args.fleet, args.pinned_fingerprint, ca_file=args.ca_file, timeout=10.0)
 
 
 def main(
@@ -399,9 +426,11 @@ def main(
         print("error: token file is empty", file=sys.stderr)
         return 2
 
-    http = client or httpx.Client(
-        base_url=args.fleet, follow_redirects=False, trust_env=False, timeout=10.0
-    )
+    try:
+        http = client or build_http_client(args)
+    except ValueError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
     agent = SimAgent(
         args.apartment,
         http,

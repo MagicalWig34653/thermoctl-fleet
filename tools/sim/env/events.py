@@ -1,8 +1,11 @@
 """Event handlers: map a scheduled `EventKind` onto docker commands / state files.
 
 Handlers take `(event, run_cmd)`; `run_cmd` receives an argv list and is
-injected so unit tests never need Docker. The fleet-side kinds (image update, backup,
-token expiry, tenant change) live in `fleet_events`. A handler raises
+injected so unit tests never need Docker or Lima. The fleet-side kinds (image update,
+backup, token expiry, tenant change) live in `fleet_events`. The two VM apartments
+(sim-a01, sim-a02) have real variants of heartbeat loss/restore (`docker pause` of the sim
+heartbeat sender inside the VM), power loss (the VM is force-stopped and started again) and
+network change (the VM's default interface goes down and up); a handler raises
 NotImplementedError only for a VM apartment that has no container/token file.
 """
 
@@ -18,7 +21,17 @@ from pathlib import Path
 from typing import Any
 
 from tools.sim.env import fleet_events
-from tools.sim.env.config import NETWORK, PREFIX, state_dir, virtual_now
+from tools.sim.env.config import (
+    NETWORK,
+    PREFIX,
+    VM_SIM_CONTAINER,
+    state_dir,
+    virtual_now,
+    vm_name,
+)
+from tools.sim.env.config import (
+    VM_APARTMENTS as _VM_IDS,
+)
 from tools.sim.scenario import Event, EventKind
 
 RunCmd = Callable[[list[str]], object]
@@ -43,8 +56,9 @@ def tenant_container_name(n: int) -> str:
     return f"{PREFIX}-tenant{n}"
 
 
-# sim-a01/sim-a02 are VM apartments: there is no container to pause, kill or detach.
-VM_APARTMENTS = frozenset({"sim-a01", "sim-a02"})
+# sim-a01/sim-a02 are VM apartments: no per-apartment container on the sim network; the
+# kinds below that need one have a VM variant or are skipped with NotImplementedError.
+VM_APARTMENTS = frozenset(_VM_IDS)
 
 
 def _container_of(event: Event) -> str:
@@ -57,9 +71,20 @@ def _container_of(event: Event) -> str:
 _ALREADY_THERE = ("is not paused", "is not running", "is already paused")
 
 
+def _vm_shell(event: Event, *command: str) -> list[str]:
+    """`limactl shell <vm> -- sudo <command...>` for a (validated) VM apartment."""
+    container_name(event.apartment)
+    return ["limactl", "shell", vm_name(event.apartment), "--", "sudo", *command]
+
+
 def _docker(*verb: str) -> Handler:
     def handler(event: Event, run_cmd: RunCmd) -> None:
         try:
+            if event.apartment in VM_APARTMENTS and verb[0] in ("pause", "unpause"):
+                # The real agent keeps running: only the heartbeats stop, like a base
+                # station whose reporting is stuck.
+                run_cmd(_vm_shell(event, "docker", *verb, VM_SIM_CONTAINER))
+                return
             run_cmd(["docker", *verb, _container_of(event)])
         except subprocess.CalledProcessError as exc:
             # A power loss (kill + start) between a pause and its unpause already ended
@@ -86,6 +111,49 @@ def _wifi(action: str) -> Handler:
         run_cmd(["docker", "network", action, NETWORK, _container_of(event)])
 
     return handler
+
+
+# Fixed script (no event data in it): the VM's default interface goes down for a few seconds
+# and comes back, as a Wi-Fi change or a router restart would. Detached via systemd-run,
+# because the limactl session itself runs over that network.
+VM_NETWORK_FLAP_SECONDS = 8
+VM_NETWORK_FLAP_SCRIPT = (
+    "IF=$(ip -o route show default | awk '{print $5; exit}'); "
+    '[ -n "$IF" ] || exit 1; '
+    'ip link set "$IF" down; '
+    f"sleep {VM_NETWORK_FLAP_SECONDS}; "
+    'ip link set "$IF" up; '
+    '(nmcli device connect "$IF" || networkctl reconfigure "$IF") >/dev/null 2>&1 || true'
+)
+
+
+def _network_change(event: Event, run_cmd: RunCmd) -> None:
+    if event.apartment in VM_APARTMENTS:
+        run_cmd(
+            _vm_shell(
+                event,
+                "systemd-run",
+                "--collect",
+                "--unit=thermoctl-sim-network-flap",
+                "sh",
+                "-c",
+                VM_NETWORK_FLAP_SCRIPT,
+            )  # fmt: skip
+        )
+        return
+    _sequence(_wifi("disconnect"), _wifi("connect"))(event, run_cmd)
+
+
+def _power_loss(event: Event, run_cmd: RunCmd) -> None:
+    """Container: kill + start. VM: the real thing, force-stop (no clean shutdown) and boot
+    again; the agent and the sim sender must come back through systemd on their own."""
+    if event.apartment in VM_APARTMENTS:
+        container_name(event.apartment)
+        name = vm_name(event.apartment)
+        run_cmd(["limactl", "stop", "--force", name])
+        run_cmd(["limactl", "start", "--tty=false", name])
+        return
+    _sequence(_docker("kill"), _docker("start"))(event, run_cmd)
 
 
 # --- fault shapes: only fields of protocol.heartbeat; no tenant/room data ---
@@ -170,8 +238,8 @@ def _fleet_side(action: Callable[[Event], None], *, container: bool = False) -> 
 HANDLERS: dict[EventKind, Handler] = {
     EventKind.HEARTBEAT_LOSS: _docker("pause"),
     EventKind.HEARTBEAT_RESTORE: _docker("unpause"),
-    EventKind.POWER_LOSS: _sequence(_docker("kill"), _docker("start")),
-    EventKind.WIFI_CHANGE: _sequence(_wifi("disconnect"), _wifi("connect")),
+    EventKind.POWER_LOSS: _power_loss,
+    EventKind.WIFI_CHANGE: _network_change,
     EventKind.FAULT: _fault,
     EventKind.IMAGE_UPDATE: _fleet_side(fleet_events.image_update),
     EventKind.BACKUP: _fleet_side(fleet_events.backup, container=True),

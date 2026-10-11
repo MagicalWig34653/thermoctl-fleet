@@ -1,0 +1,81 @@
+# VM base station of the usage simulation (sim-a01 / sim-a02), INSIDE the Lima VM at
+# /opt/thermoctl-sim/compose.yml. Started by thermoctl-sim-stack.service.
+#
+# Like tools/mac-test-vm.agent-compose.local.yml, this runs the LOCALLY BUILT image
+# (thermoctl-agent:local) directly: it has no registry digest, so the real watchdog-driven
+# swap (`docker tag <digest> thermoctl-agent:current`) cannot be exercised. Nothing in agent/
+# or watchdog/ is changed for this. Differences from the real /etc/thermoctl-agent/compose.yml:
+#   - image thermoctl-agent:local (not :current)
+#   - no thermoctl / Zigbee2MQTT mounts (no such services here)
+#   - the fleet's CA bundle is mounted over the image's (the fleet certificate is the sim CA's)
+#   - the virtual clock: libfaketime from the VM host, reading /sim-clock/clock (a Lima mount
+#     of <state>/clock), so command expiry etc. follow the same clock as the sim fleet
+#   - restart "no": the systemd unit brings the containers back after a reboot
+# Plus a second container, the sim heartbeat sender (the real agent sends no heartbeats,
+# docs/sim-findings/10): same image, tools/sim copied into the VM.
+# Variables come from /etc/thermoctl-agent/.env (DOCKER_GID, written by image/common/install.sh)
+# and /opt/thermoctl-sim/stack.env (SIM_*).
+name: thermoctl-sim-vm
+
+x-faketime: &faketime
+  LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+  FAKETIME_TIMESTAMP_FILE: /sim-clock/clock
+  FAKETIME_CACHE_DURATION: "1"
+
+services:
+  agent:
+    image: thermoctl-agent:local
+    container_name: thermoctl-agent
+    pull_policy: never
+    restart: "no"
+    command: ["python", "-m", "agent", "run"]
+    group_add:
+      - "${DOCKER_GID:?DOCKER_GID is missing -- see image/common/README.md}"
+    environment: *faketime
+    volumes:
+      - /var/lib/thermoctl-watchdog:/var/lib/thermoctl-watchdog
+      - /run/thermoctl-agent:/run/thermoctl-agent
+      - /var/lib/thermoctl-agent:/var/lib/thermoctl-agent
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /boot/firmware/thermoctl:/boot/firmware/thermoctl:ro
+      - /boot/firmware/agent-registration.json:/boot/firmware/agent-registration.json:ro
+      - /etc/ssl/certs/ca-certificates.crt:/usr/lib/ssl/cert.pem:ro
+      - ${SIM_FAKETIME_LIB:?set in stack.env}:/usr/local/lib/libfaketime.so.1:ro
+      - /sim-clock:/sim-clock:ro
+
+  sim-agent:
+    image: thermoctl-agent:local
+    container_name: thermoctl-sim-agent
+    pull_policy: never
+    restart: "no"
+    working_dir: /app
+    command:
+      - python
+      - -m
+      - tools.sim.sim_agent
+      - --apartment
+      - "${SIM_APARTMENT:?set in stack.env}"
+      - --fleet
+      - "${SIM_FLEET_URL:?set in stack.env}"
+      - --token-file
+      - /agent-data/agent_token
+      - --state-dir
+      - /sim-state
+      - --interval-s
+      - "5"
+      - --ca-file
+      - /usr/lib/ssl/cert.pem
+      - --pinned-fingerprint
+      - "${SIM_FINGERPRINT:?set in stack.env}"
+    environment:
+      <<: *faketime
+      PYTHONDONTWRITEBYTECODE: "1"
+      SIM_ALLOWED_HOSTS: host.lima.internal
+    volumes:
+      # read-only: the sender only ever reads the token the REAL agent obtained
+      - /var/lib/thermoctl-agent:/agent-data:ro
+      - /sim-faults:/sim-state/faults:ro
+      - /opt/thermoctl-sim/tools:/app/tools:ro
+      - /etc/ssl/certs/ca-certificates.crt:/usr/lib/ssl/cert.pem:ro
+      - ${SIM_FAKETIME_LIB:?set in stack.env}:/usr/local/lib/libfaketime.so.1:ro
+      - /sim-clock:/sim-clock:ro

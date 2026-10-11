@@ -12392,3 +12392,5 @@ Pentest (Task 12, simulation): `python -m tools.sim.pentest` runs 43 scripted ch
 Tenant UIs (Task 9c-T): `python -m tools.sim.env.tenant --up|--logins|--down` runs three headless thermoctl instances (ports 8301-8303) for the tenant personas; first look in `docs/sim-findings/30-tenant-ui-first-look.md`.
 
 Event handlers (Task 9c): image_update, backup, token_expiry and tenant_change are implemented (`tools/sim/env/fleet_events.py`, sim agent reacts to marker files); `UNIMPLEMENTED_KINDS` is empty, coverage table in the sim RUNBOOK ("Event coverage").
+
+VM base stations (Task 9d): `python -m tools.sim.env.vms --up|--down|--status|--logs` runs sim-a01/a02 as real Lima VMs with the real agent (register + run) behind a loopback TLS proxy; live run in `docs/sim-findings/02-vm-run.md`, product findings 40-42 (watchdog user missing, preset state file rejected, SSE timeout shorter than ping).

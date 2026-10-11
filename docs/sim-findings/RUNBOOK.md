@@ -14,9 +14,17 @@ python -m tools.sim.env.up_fleet --logins   # log the UI users in, write storage
 python -m tools.sim.env.up_fleet --check    # last heartbeat per apartment (virtual time)
 ```
 
-`--check` should show a recent heartbeat for every apartment (sim-a01 and
-sim-a02 are driven without containers; sim-a03..sim-a12 are agent containers).
-If one says `never`, wait a few seconds and run it again before going on.
+Then start the two VM base stations (after the fleet, before logins/runs; first time about
+3 min per VM, see "VM base stations" below):
+
+```sh
+python -m tools.sim.env.vms --up            # sim-a01, sim-a02 (idempotent), TLS proxy on 127.0.0.1:8243
+python -m tools.sim.env.vms --status
+```
+
+`--check` should show a recent heartbeat for every apartment (sim-a01 and sim-a02 are the
+VMs, sim-a03..sim-a12 are agent containers). If one says `never`, wait a few seconds and run
+it again before going on.
 
 ## 2. Run
 
@@ -54,6 +62,7 @@ with a warning; a persona then sees the anonymous page.
 ## 5. Tear down
 
 ```sh
+python -m tools.sim.env.vms --down          # deletes ONLY thermoctl-sim-a01/a02, stops the TLS proxy
 python -m tools.sim.env.up_fleet --down     # removes thermoctl-sim containers and network
 ```
 
@@ -133,14 +142,14 @@ Every scheduled event kind has a handler (`tools/sim/env/events.py`, fleet-side 
 `fleet_events.py`); `UNIMPLEMENTED_KINDS` is empty. Database work runs inside the fleet container (`docker exec ... python -c`, `env/fleet_ops.py`)
 with the product's own `Storage`: a host-side write to the bind-mounted SQLite file is NOT seen
 by the running fleet on Docker Desktop (found live, a rotated token stayed refused). Handlers
-are safe to re-apply. Container-only kinds skip sim-a01/a02 (VMs, `NotImplementedError` -> skipped log).
+are safe to re-apply. `backup` and `token_expiry` skip sim-a01/a02 (VMs, `NotImplementedError` -> skipped log); `heartbeat_*`, `power_loss` and `wifi_change` have VM variants.
 
 | Kind | Mechanism | Exercised | Not exercised |
 |---|---|---|---|
-| `heartbeat_loss` | `docker pause` | absence alarm | - |
+| `heartbeat_loss` | `docker pause` (VMs: of the sim sender inside the VM, via `limactl shell`) | absence alarm | VM: the real agent keeps running |
 | `heartbeat_restore` | `docker unpause` | recovery | - |
-| `power_loss` | `docker kill` + `start` | gap + restart | - |
-| `wifi_change` | network disconnect + connect | short outage | - |
+| `power_loss` | `docker kill` + `start` (VMs: `limactl stop --force` + `start`, ~12 s) | gap + restart; VM: boot, systemd brings the agent and sender back | VM: no clean-shutdown data loss modelled |
+| `wifi_change` | network disconnect + connect (VMs: default interface down 8 s, up, detached `systemd-run`) | short outage | no real Wi-Fi/NM roaming |
 | `fault` | `faults/<apt>.json` overlay | open faults / device / control health | - |
 | `clock_drift` | `faults/<apt>.drift` | skewed `sent_at`, `clock_drift_s` | real container clock |
 | `image_update` | `Storage.create_desired_state_revision` as `sim-admin` (fictional deterministic digests), marker `faults/<apt>.version`; sim agent reports the version one heartbeat later and posts `/v1/desired-state/result` | revision history, audit, outcome, version column | UI form/confirm step, rollouts, real pull/digest check/watchdog swap |
@@ -150,6 +159,38 @@ are safe to re-apply. Container-only kinds skip sim-a01/a02 (VMs, `NotImplemente
 
 Both token kinds rewrite the file in place (single-file bind mount); a missed read is retried
 on the next tick.
+
+## VM base stations (sim-a01, sim-a02)
+
+`python -m tools.sim.env.vms --up|--down|--status|--logs [sim-a01|sim-a02]`. Needs `limactl`
+(Lima 2, vz) and a running fleet (`up_fleet`). Details and timings: `02-vm-run.md`.
+
+- The VMs are `thermoctl-sim-a01` / `thermoctl-sim-a02` (2 CPU, 3 GiB, 8 GiB), built from
+  `tools/mac-test-vm.lima.yaml` with the shared recipe (`image/common/install.sh`, real Go
+  watchdog build). They are created from scratch (about 3 min each); `limactl clone` is not used
+  because a clone would carry the first VM's identity and enrolment. `--down` deletes exactly
+  those two names (matched against `limactl list --json`); the user's `thermoctl-test-vm` and
+  `thermoctl-e2e-basestation` are never touched. `--up` is idempotent.
+- Enrolment is the real flow: `python -m agent register` runs in the VM, the verification code
+  is read from the fleet database (and compared with what the agent printed), the device is
+  confirmed as `sim-admin` (`fleet_ops` ops `device_report`/`confirm_device`), the agent fetches
+  its token itself. Then `thermoctl-sim-stack.service` (VM) starts, from the locally built
+  `thermoctl-agent:local` (no registry digest, so the watchdog swap is NOT exercised), the real
+  `python -m agent run` and `tools.sim.sim_agent` (the real agent sends no heartbeats, finding 10).
+  Both come back after a reboot through that unit.
+- Reachability: the sim fleet is plain http on `127.0.0.1:8200`. A TLS terminator
+  (`tools/sim/env/tls_proxy.py`, stdlib, a plain TCP pipe below TLS, so SSE is not buffered)
+  listens ONLY on `127.0.0.1:8243` on the Mac; Lima's user-mode network exposes the Mac's
+  loopback to the VM as `host.lima.internal` (192.168.5.2). Nothing listens on 0.0.0.0 (the
+  proxy refuses a wildcard address; `SIM_TLS_LISTEN_HOST` can name another address on purpose).
+  Certificate: `<state>/tls/` (key 0600), a throw-away CA + leaf like `fleet_local`, but valid from
+  2020 because the VM containers run on the virtual clock (2026-01); its fingerprint is pinned in
+  the registration file `<state>/vm/<apt>/agent-registration.json`; the CA is installed in the VM.
+- Virtual clock: the two containers use libfaketime from the VM (`/sim-clock/clock`, a read-only
+  Lima mount of `<state>/clock`). The VM itself runs on real time (see `02-vm-run.md`).
+- Limits: nothing but the fleet protocol is exercised; no thermoctl, Z2M, WireGuard, hardware
+  watchdog, digest swap. The VM events apply one at a time and block (power loss about 12 s).
+  Findings 40-42 describe what the real image does badly; the harness does not paper over them.
 
 ## Pentest: `python -m tools.sim.pentest` (pollutes the sim, read this first)
 

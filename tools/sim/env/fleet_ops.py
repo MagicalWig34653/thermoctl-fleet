@@ -24,11 +24,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from fleet.bundle_storage import DiagnosticBundleBlobStorage
 from fleet.desired_state_sources import DISPLAY_SOURCES
-from fleet.storage import ApartmentRecord, Storage, create_storage, hash_token
+from fleet.storage import (
+    ApartmentRecord,
+    DeviceRegistrationRecord,
+    Storage,
+    create_storage,
+    hash_token,
+)
+from protocol.commands import CommandType
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 from protocol.registration import encode_bytes
 
@@ -154,9 +161,91 @@ def tenant_change(
     return {"token": complete_rotation(storage, apartment, now)}
 
 
+def device_report(storage: Storage, device_id: str) -> dict[str, Any]:
+    """State of a device and, once its agent has reported, the verification code the agent
+    prints (the landlord compares both in the UI before confirming). Never a secret: the
+    code is shown on the device and in the UI by design."""
+    device = storage.get_device(device_id)
+    if device is None:
+        raise RuntimeError(f"device {device_id} unknown")
+    with storage.session() as session:
+        record = session.scalar(
+            select(DeviceRegistrationRecord)
+            .where(DeviceRegistrationRecord.device_id == device_id)
+            .order_by(DeviceRegistrationRecord.id.desc())
+            .limit(1)
+        )
+        code = None if record is None else record.verification_code
+    return {"state": device.state, "verification_code": code}
+
+
+def confirm_device(
+    storage: Storage, apartment: str, device_id: str, verification_code: str, now: datetime
+) -> dict[str, Any]:
+    """`Storage.confirm_device` as the landlord's confirm step calls it, user `sim-admin`.
+    The code is compared against the one in the database by the product itself (a wrong
+    code raises ValueError); already in service is not an error (idempotent)."""
+    state = storage.get_device(device_id)
+    if state is not None and state.state == "in_service":
+        return {"state": "in_service"}
+    done = storage.confirm_device(
+        device_id,
+        apartment,
+        verification_code,
+        ui_user=UI_USER,
+        reason="simulation: VM base station",
+        replace_previous=False,
+        previous_device_target_state=None,
+        now=now,
+    )
+    return {"state": done.state}
+
+
+def send_command(
+    storage: Storage, apartment: str, command_type: str, now: datetime
+) -> dict[str, Any]:
+    """`Storage.create_command_unless_duplicate`, the call behind the UI's confirmed
+    command form (user `sim-admin`, with a reason). Only a stage-1 `CommandType` value."""
+    kind = CommandType(command_type)
+    created = storage.create_command_unless_duplicate(
+        apartment,
+        kind,
+        lines=100 if kind is CommandType.FETCH_LOGS else None,
+        ui_username=UI_USER,
+        reason="simulation: command channel check",
+        now=now,
+    )
+    return {"command_id": None if created is None else created.id, "duplicate": created is None}
+
+
+def command_status(storage: Storage, apartment: str) -> dict[str, Any]:
+    """Delivery and result of the newest command of an apartment (no payload)."""
+    commands = storage.list_commands_for_apartment(apartment)
+    if not commands:
+        return {"found": False}
+    newest = commands[0]
+    return {
+        "found": True,
+        "command_id": newest.command_id,
+        "type": newest.command_type,
+        "delivered": newest.delivered_at is not None,
+        "result_received": newest.result_received_at is not None,
+        "successful": newest.successful,
+        "error_text": newest.error_text,
+    }
+
+
 def run_op(storage: Storage, op: str, args: dict[str, Any], bundle_root: Path | None) -> Any:
     now = datetime.fromisoformat(args["now"])
     apartment = args["apartment"]
+    if op == "device_report":
+        return device_report(storage, args["device_id"])
+    if op == "confirm_device":
+        return confirm_device(storage, apartment, args["device_id"], args["verification_code"], now)
+    if op == "send_command":
+        return send_command(storage, apartment, args["command_type"], now)
+    if op == "command_status":
+        return command_status(storage, apartment)
     if op == "image_update":
         return set_desired_state(storage, apartment, args["event_id"], now)
     if op == "token_expiry":
