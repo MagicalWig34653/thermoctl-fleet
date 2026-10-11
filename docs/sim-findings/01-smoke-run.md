@@ -13,7 +13,7 @@ expected to stay "never"). Personas: Haiku 5.5, low effort.
 | Clock in containers | `date` in fleet and agent containers equals `sim-state/clock/clock`; follows `SimClock.advance` within about 1 s. |
 | Logins (`--logins`) | landlord, caretaker, admin ok in about 3 s; storage states mode 0600; `browse text` shows the portfolio, `shot` renders the (mobile-width) overview correctly. Chromium was already available in the main venv: nothing installed. |
 | Absence alarm | Agent a03 stopped, last heartbeat 08:00:00: no alarm at +5 and +6 min, `not_reporting` raised at the check after +7 min (rule is strictly "older than 6 min", `fleet/alarms.py` `ABSENCE_THRESHOLD`), cleared at the first heartbeat after restart (+8 min). No phantom alarms on the healthy agents. Check interval in the sim is 2 s (`FLEET_ALARM_CHECK_INTERVAL_S`), so raise latency is negligible; the product default was not measured. Apartments that never reported (a01, a02) are not alarmed by the check (known, finding 10), but the UI lists them as "noch nie gemeldet" tasks. |
-| 2-week persona run | Completed: 6 persona calls (landlord and caretaker weeks 0 and 1, admin and newcomer week 0), 28 findings parsed, 0 failed steps, 56 events skipped as not implemented (backup, image_update, token_expiry, tenant_change; VM-apartment container events). Wall-clock 3:08 total including logins and events. |
+| 2-week persona run | Completed: 6 persona calls (landlord and caretaker weeks 0 and 1, admin and newcomer week 0), 31 findings parsed, 0 failed steps, 56 events skipped as not implemented (backup, image_update, token_expiry, tenant_change; VM-apartment container events). Wall-clock 3:08 total including logins and events. |
 | Resume | Run killed after the first persona (`w000:landlord`), rerun: landlord not repeated (8 findings stay 8), caretaker added; no step done twice. |
 | Teardown | `--down`: no `thermoctl-sim*` container, network or volume left; other Docker resources untouched. |
 
@@ -43,7 +43,7 @@ expected to stay "never"). Personas: Haiku 5.5, low effort.
 - `13-ui-404-raw-json.md` (minor, ux)
 - `14-ui-technical-wording-for-laypeople.md` (minor, ux; persona-reported, not verified one by one)
 
-Findings feed: `docs/sim-findings/raw/findings.jsonl` (28 rows of the 2-week run) and `INDEX.md`.
+Findings feed: `docs/sim-findings/raw/findings.jsonl` (31 rows of the 2-week run) and `INDEX.md`.
 
 ## Open problems
 
