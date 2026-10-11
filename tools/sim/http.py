@@ -42,6 +42,20 @@ def check_url(url: str, allowed: frozenset[str] | set[str]) -> None:
         raise ValueError(f"host {host!r} not allowed")
 
 
+def confine_to_cwd(path: Path) -> Path:
+    """Resolve `path` (symlinks included) and require it to lie inside the cwd.
+
+    Persona sessions run in a scratch dir; every file a tool writes must stay there.
+    Raises ValueError otherwise.
+    """
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(Path.cwd().resolve())
+    except (OSError, ValueError) as exc:
+        raise ValueError("path must be inside the working directory") from exc
+    return resolved
+
+
 def _load_jar(path: Path) -> dict[str, str]:
     try:
         data = json.loads(path.read_text())
@@ -62,12 +76,10 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
     if args.cookie_jar is not None:
         # Confine the jar to the persona scratch dir (= cwd): no writes elsewhere.
         try:
-            resolved = args.cookie_jar.resolve()
-            resolved.relative_to(Path.cwd().resolve())
-        except (OSError, ValueError):
+            args.cookie_jar = confine_to_cwd(args.cookie_jar)
+        except ValueError:
             print("refused: --cookie-jar must be inside the working directory", file=sys.stderr)
             return 2
-        args.cookie_jar = resolved
 
     try:
         check_url(args.url, allowed_hosts())

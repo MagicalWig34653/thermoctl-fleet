@@ -12348,3 +12348,7 @@ Arbeitsverzeichnis. Nur Werkzeug, kein Produktcode.
 Persona-Sitzungen laufen mit `PYTHONPATH` und dem Venv-Interpreter vorn auf
 `PATH`; defekte `failures.jsonl`-Zeilen werden übersprungen, `status` meldet
 einen defekten Checkpoint einzeilig, der Lauf nennt offene Fehlschritte.
+
+`tools/sim/browse.py` (Playwright-Browserwerkzeug für Personas: `shot`/`text`,
+nur lokale Hosts, Ausgabe nur im Arbeitsverzeichnis, fremde Unteranfragen
+abgebrochen) mit Tests in `tests/sim/`. Nur Werkzeug, kein Produktcode.
