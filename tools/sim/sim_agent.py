@@ -105,14 +105,22 @@ class FaultFile:
         return data
 
 
+MAX_DRIFT_S = 86400.0  # one day: more would overflow timedelta and means nothing here
+
+
 def read_drift(state_dir: Path, apartment: str) -> float:
-    """Seconds this agent's clock is off (`<state>/faults/<apartment>.drift`); 0.0 if unset/bad."""
+    """Seconds this agent's clock is off (`<state>/faults/<apartment>.drift`).
+
+    0.0 if unset, unreadable or non-finite; clamped to +/-MAX_DRIFT_S.
+    """
     path = FaultFile(state_dir, apartment).path.with_suffix(".drift")
     try:
         value = float(path.read_text().strip())
     except (OSError, ValueError):
         return 0.0
-    return value if math.isfinite(value) else 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return max(-MAX_DRIFT_S, min(MAX_DRIFT_S, value))
 
 
 def drifted_now(state_dir: Path, apartment: str) -> Callable[[], datetime]:

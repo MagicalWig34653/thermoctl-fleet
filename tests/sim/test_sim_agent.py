@@ -250,3 +250,31 @@ def test_drift_shifts_sent_at_and_is_reported(tmp_path: Path):
     shifted = drifted_now(tmp_path, "sim-a03")()
     assert timedelta(seconds=595) < shifted - datetime.now(UTC) < timedelta(seconds=605)
     assert make_health(tmp_path, "sim-a03")()["system"]["clock_drift_s"] == 600.0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("nan", 0.0),
+        ("inf", 0.0),
+        ("-inf", 0.0),
+        ("1e30", 86400.0),
+        ("-1e30", -86400.0),
+        ("99999999999", 86400.0),
+        ("-12.5", -12.5),
+        ("garbage \x00 text", 0.0),
+        ("", 0.0),
+    ],
+)
+def test_read_drift_clamps_and_ignores_non_finite(tmp_path: Path, text: str, expected: float):
+    from tools.sim.sim_agent import read_drift
+
+    (tmp_path / "faults").mkdir()
+    (tmp_path / "faults" / "sim-a03.drift").write_text(text)
+    assert read_drift(tmp_path, "sim-a03") == expected
+
+
+def test_read_drift_missing_file_is_zero(tmp_path: Path):
+    from tools.sim.sim_agent import read_drift
+
+    assert read_drift(tmp_path, "sim-a09") == 0.0
