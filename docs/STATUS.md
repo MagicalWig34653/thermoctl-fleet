@@ -12394,3 +12394,13 @@ Tenant UIs (Task 9c-T): `python -m tools.sim.env.tenant --up|--logins|--down` ru
 Event handlers (Task 9c): image_update, backup, token_expiry and tenant_change are implemented (`tools/sim/env/fleet_events.py`, sim agent reacts to marker files); `UNIMPLEMENTED_KINDS` is empty, coverage table in the sim RUNBOOK ("Event coverage").
 
 VM base stations (Task 9d): `python -m tools.sim.env.vms --up|--down|--status|--logs` runs sim-a01/a02 as real Lima VMs with the real agent (register + run) behind a loopback TLS proxy; live run in `docs/sim-findings/02-vm-run.md`, product findings 40-42 (watchdog user missing, preset state file rejected, SSE timeout shorter than ping).
+
+Simulation, Task 13-prep: the VM helper adopts and deletes only VMs it created (`<state>/vms-created.json`), and a VM power loss tolerates an already stopped VM.
+
+Simulation, Task 13-prep: `tests/sim/test_product_findings.py` holds strict-xfail static regression tests for findings 40, 41, 42; they flip loudly when the product is fixed.
+
+Simulation, Task 13-prep: findings 25 (device tokens never expire, by design) and 26 (UI accepts a revision for a non-pilot apartment) written; RUNBOOK states the watchdog was not exercised.
+
+Simulation, Task 13-prep: smoke-run raw findings archived to `docs/sim-findings/smoke/`, the index starts empty for the full run.
+
+Simulation, Task 13-prep: `python -m tools.sim preflight` (read-only readiness table) and `python -m tools.sim.env.stack --up|--down|--status`; RUNBOOK "Full run" has the exact sequence.
