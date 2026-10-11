@@ -1,0 +1,12 @@
+# The repo's fleet image plus libfaketime, so the fleet runs on the shared
+# virtual clock (<state>/clock). Build the base first:
+#   docker build -f docker/Dockerfile.fleet -t thermoctl-sim-fleet-base:local .
+ARG BASE_IMAGE=thermoctl-sim-fleet-base:local
+FROM ${BASE_IMAGE}
+USER root
+# The multiarch directory differs (aarch64/x86_64), so link a stable path.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends faketime \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -s "$(find /usr/lib -name libfaketime.so.1 | head -n 1)" /usr/local/lib/libfaketime.so.1
+USER fleet

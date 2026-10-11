@@ -1,0 +1,49 @@
+# Fleet service of the usage simulation (agent services follow in Task 9b).
+# Started by `python -m tools.sim.env.up_fleet`, which exports the SIM_* variables.
+# Every resource name starts with `thermoctl-sim`; nothing else is touched.
+name: thermoctl-sim
+
+services:
+  fleet:
+    container_name: thermoctl-sim-fleet
+    image: thermoctl-sim-fleet:local
+    build:
+      context: ../../..
+      dockerfile: tools/sim/env/Dockerfile.fleet-sim
+      args:
+        BASE_IMAGE: thermoctl-sim-fleet-base:local
+    # Run as the host user so the host can seed the same SQLite file.
+    user: "${SIM_UID:?set by up_fleet}:${SIM_GID:?set by up_fleet}"
+    ports:
+      - "127.0.0.1:8200:8000"
+    environment:
+      FLEET_DATABASE_URL: "sqlite:////data/fleet.db"
+      FLEET_TOTP_KEY: "${SIM_TOTP_KEY:?set by up_fleet}"
+      FLEET_BACKUP_STORAGE_DIR: /backups
+      FLEET_DIAGNOSTIC_BUNDLE_STORAGE_DIR: /bundles
+      FLEET_PUBLIC_URL: "http://127.0.0.1:8200"
+      FLEET_CERT_FINGERPRINT: "none-sim-plain-http"
+      FLEET_WEBAUTHN_RP_ID: localhost
+      FLEET_WEBAUTHN_ORIGIN: "http://localhost:8200"
+      FLEET_ALARM_CHECK_INTERVAL_S: "2"
+      FLEET_ROLLOUT_WORKER_INTERVAL_S: "10"
+      FLEET_RETENTION_INTERVAL_S: "300"
+      FLEET_BACKUP_RETENTION_INTERVAL_S: "300"
+      FLEET_LOG_RETENTION_CHECK_INTERVAL_S: "300"
+      FLEET_DIAGNOSTIC_BUNDLE_RETENTION_CHECK_INTERVAL_S: "300"
+      # Virtual clock: absolute timestamp file without "@" freezes time until rewritten.
+      LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+      FAKETIME_TIMESTAMP_FILE: /sim/clock
+      FAKETIME_NO_CACHE: "1"
+    volumes:
+      - "${SIM_STATE_DIR:?set by up_fleet}/fleet-data:/data"
+      - "${SIM_STATE_DIR}/backups:/backups"
+      - "${SIM_STATE_DIR}/diagnostic-bundles:/bundles"
+      # The directory, not the file: SimClock replaces the file by rename, which a
+      # single-file bind mount would never see.
+      - "${SIM_STATE_DIR}:/sim:ro"
+    networks: [sim-net]
+
+networks:
+  sim-net:
+    name: thermoctl-sim-net

@@ -3,6 +3,14 @@
 Last updated: 2026-10-11.
 
 
+## Usage simulation: fleet environment (Task 9a, 2026-10-11)
+
+`tools/sim/env/` seeds a local sim fleet (3 properties, 12 apartments, 12 prepared
+devices, 3 UI users) and runs it in Docker under libfaketime (`up_fleet`, `--down`);
+event handlers for loss/restore/wifi/power/fault are in, the rest raise until 9b/9c.
+No product code changed.
+
+
 ## Usage simulation: environment notes (2026-10-11)
 
 `docs/sim-findings/00-environment-notes.md` records what the harness can rely

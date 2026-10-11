@@ -13,11 +13,9 @@ import re
 import subprocess
 import zlib
 from collections.abc import Callable
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
-from tools.sim.env.config import NETWORK, PREFIX, state_dir
+from tools.sim.env.config import NETWORK, PREFIX, state_dir, virtual_now
 from tools.sim.scenario import Event, EventKind
 
 RunCmd = Callable[[list[str]], object]
@@ -91,16 +89,6 @@ FAULT_SHAPES: tuple[FaultShape, ...] = (
 )
 
 
-def _virtual_now(directory: Path) -> str:
-    """ISO timestamp of the shared virtual clock (`<state>/clock`), else real UTC now."""
-    try:
-        raw = (directory / "clock").read_text(encoding="ascii").strip()
-        stamp = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-    except (OSError, ValueError):
-        stamp = datetime.now(UTC)
-    return stamp.isoformat()
-
-
 def _fault(event: Event, run_cmd: RunCmd) -> None:
     """Write `<state>/faults/<apartment>.json`; a new FAULT replaces the previous one."""
     container_name(event.apartment)  # same id validation as every other handler
@@ -112,7 +100,7 @@ def _fault(event: Event, run_cmd: RunCmd) -> None:
     tmp = target.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as out:
-        json.dump(shape(_virtual_now(directory)), out)
+        json.dump(shape(virtual_now(directory).isoformat()), out)
     os.replace(tmp, target)
 
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
+
+from tools.sim.clock import SIM_START
 
 ROOT = Path(__file__).resolve().parents[3]
 PREFIX = "thermoctl-sim"  # every docker resource of the sim starts with this
@@ -19,3 +22,12 @@ def state_dir() -> Path:
     """`SIM_STATE_DIR` or `<repo>/sim-state` (git-ignored)."""
     override = os.environ.get("SIM_STATE_DIR")
     return Path(override) if override else ROOT / "sim-state"
+
+
+def virtual_now(directory: Path) -> datetime:
+    """Time of the shared virtual clock (`<state>/clock`); `SIM_START` before it exists."""
+    try:
+        raw = (directory / "clock").read_text(encoding="ascii").strip()
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except (OSError, ValueError):
+        return SIM_START
