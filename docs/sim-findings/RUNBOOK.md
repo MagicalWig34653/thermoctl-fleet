@@ -130,9 +130,10 @@ repeated on the next run. Check afterwards with `pgrep -f "claude -p"`.
 ## Event coverage
 
 Every scheduled event kind has a handler (`tools/sim/env/events.py`, fleet-side ones in
-`fleet_events.py`); `UNIMPLEMENTED_KINDS` is empty. Handlers open the fleet DB from the host
-with the product's own `Storage` (short transactions, the fleet keeps running) and are safe
-to re-apply. Container-only kinds skip sim-a01/a02 (VMs, `NotImplementedError` -> skipped log).
+`fleet_events.py`); `UNIMPLEMENTED_KINDS` is empty. Database work runs inside the fleet container (`docker exec ... python -c`, `env/fleet_ops.py`)
+with the product's own `Storage`: a host-side write to the bind-mounted SQLite file is NOT seen
+by the running fleet on Docker Desktop (found live, a rotated token stayed refused). Handlers
+are safe to re-apply. Container-only kinds skip sim-a01/a02 (VMs, `NotImplementedError` -> skipped log).
 
 | Kind | Mechanism | Exercised | Not exercised |
 |---|---|---|---|

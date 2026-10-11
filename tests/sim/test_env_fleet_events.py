@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -16,7 +17,7 @@ from protocol.backups import BackupKind
 from protocol.desired_state import DesiredState
 from protocol.heartbeat import Heartbeat
 from tools.sim.clock import clock_path
-from tools.sim.env import HANDLERS, apply_event_with, fleet_events
+from tools.sim.env import HANDLERS, apply_event_with, fleet_events, fleet_ops
 from tools.sim.env.enroll import CONFIRM_USER, enroll_container_apartments
 from tools.sim.env.fleet_setup import seed_fleet
 from tools.sim.scenario import Event, EventKind
@@ -43,7 +44,13 @@ def fleet(tmp_path, monkeypatch):
     url = f"sqlite:///{tmp_path / 'fleet-data' / 'fleet.db'}"
     seed_fleet(tmp_path, url)
     tokens = enroll_container_apartments(tmp_path, url, NOW)
-    return tmp_path, create_storage(url), tokens
+    storage = create_storage(url)
+
+    def local_op(op, args):  # the fleet container's job, here on the same Storage
+        return fleet_ops.run_op(storage, op, args, tmp_path / "diagnostic-bundles")
+
+    monkeypatch.setattr(fleet_events, "run_op", local_op)
+    return tmp_path, storage, tokens
 
 
 @pytest.fixture
@@ -128,12 +135,6 @@ def test_image_update_also_applies_to_vm_apartments(fleet):
     _, storage, _ = fleet
     _apply(_ev(EventKind.IMAGE_UPDATE, apt="sim-a01"))
     assert storage.get_desired_state("sim-a01").revision == 1
-
-
-def test_image_update_without_a_database_is_a_clear_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("SIM_STATE_DIR", str(tmp_path))
-    with pytest.raises(RuntimeError, match="not found"):
-        _apply(_ev(EventKind.IMAGE_UPDATE))
 
 
 def test_apartment_ids_are_validated():
@@ -347,8 +348,8 @@ def test_token_expiry_is_idempotent(fleet, client):
 
 def test_token_expiry_completes_a_half_done_rotation(fleet, client):
     _, storage, tokens = fleet
-    assert fleet_events.force_reauth(storage, APT) is True  # run died after step one
-    assert fleet_events.force_reauth(storage, APT) is False
+    assert fleet_ops.force_reauth(storage, APT) is True  # run died after step one
+    assert fleet_ops.force_reauth(storage, APT) is False
     agent = _agent(client, fleet)
     assert agent.tick() is False
     _apply(_ev(EventKind.TOKEN_EXPIRY))
@@ -364,8 +365,8 @@ def test_token_expiry_skips_vm_apartments(fleet):
 
 def test_force_reauth_unknown_or_tokenless_apartment_is_false(fleet):
     _, storage, _ = fleet
-    assert fleet_events.force_reauth(storage, "sim-a01") is False
-    assert fleet_events.force_reauth(storage, "sim-a77") is False
+    assert fleet_ops.force_reauth(storage, "sim-a01") is False
+    assert fleet_ops.force_reauth(storage, "sim-a77") is False
 
 
 def test_tenant_change_wipes_history_rotates_token_and_is_audited(fleet, client):
@@ -450,3 +451,56 @@ def test_tenant_change_unknown_apartment_in_database(fleet, monkeypatch):
 
 def test_every_kind_has_a_fleet_side_or_container_handler():
     assert set(HANDLERS) == set(EventKind)
+
+
+def test_docker_exec_ships_source_and_args_into_the_fleet_container(monkeypatch, tmp_path):
+    import subprocess
+
+    monkeypatch.setenv("SIM_STATE_DIR", str(tmp_path))
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout='noise\n{"token": "t"}\n', stderr="")
+
+    monkeypatch.setattr(fleet_events.subprocess, "run", fake_run)
+    out = fleet_events.docker_exec_op("token_expiry", {"apartment": "sim-a03", "now": "x"})
+    assert out == {"token": "t"}
+    cmd = seen["cmd"]
+    assert cmd[:5] == ["docker", "exec", "thermoctl-sim-fleet", "python", "-c"]
+    assert "def run_op" in cmd[5] and json.loads(cmd[6])["op"] == "token_expiry"
+    assert len(cmd) == 7  # no shell, no -i, nothing else
+
+
+def test_docker_exec_failure_names_the_op_without_leaking_output(monkeypatch):
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="agent_secret", stderr="a\nboom")
+
+    monkeypatch.setattr(fleet_events.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="image_update.*boom") as err:
+        fleet_events.docker_exec_op("image_update", {})
+    assert "agent_secret" not in str(err.value)
+
+
+def test_shipped_source_stands_alone():
+    """The file is sent as `python -c`: it may import only fleet, protocol, sqlalchemy
+    and the standard library."""
+    import ast
+    import sys
+
+    tree = ast.parse(Path(fleet_ops.__file__).read_text())
+    roots = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            roots.add((node.module or "").split(".")[0])
+    assert roots <= set(sys.stdlib_module_names) | {"fleet", "protocol", "sqlalchemy"}
+
+
+def test_unknown_op_is_rejected(fleet):
+    _, storage, _ = fleet
+    with pytest.raises(ValueError, match="unknown op"):
+        fleet_ops.run_op(storage, "format_disk", {"now": NOW.isoformat(), "apartment": APT}, None)
