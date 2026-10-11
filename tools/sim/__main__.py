@@ -6,7 +6,7 @@ import argparse
 import importlib
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from tools.sim.findings import build_index
@@ -57,6 +57,23 @@ def parse_personas(raw: str | None) -> list[str] | None:
             f"unknown persona(s): {', '.join(unknown)}; choose from: {', '.join(known)}"
         )
     return list(dict.fromkeys(ids))
+
+
+def _stack_is_up() -> bool:
+    """Logins can only be refreshed once up_fleet has created the users file."""
+    return (STATE_DIR / "users.json").is_file()
+
+
+def _safe_refresh(refresh: Callable[[], None]) -> Callable[[], None]:
+    """A failed login refresh must not abort a week of simulation: warn and carry on."""
+
+    def hook() -> None:
+        try:
+            refresh()
+        except Exception as exc:  # noqa: BLE001 - any failure here is only a warning
+            print(f"warning: login refresh failed: {exc}", file=sys.stderr)
+
+    return hook
 
 
 def _print_outstanding() -> None:
@@ -112,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     persona_cwd = ensure_persona_cwd(STATE_DIR)
     child_env = persona_env(ROOT, sys.executable, os.environ)
     child_env.update(getattr(env, "persona_env_extras", dict)())
+    refresh = getattr(env, "refresh_logins", None)
     try:
         run(
             weeks=args.weeks,
@@ -125,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
             settle_s=3.0,
             seed=args.seed,
             personas=selected,
+            refresh_logins=_safe_refresh(refresh) if refresh and _stack_is_up() else None,
         )
     except ValueError as exc:  # resume with different parameters, corrupt state
         print(f"error: {exc}", file=sys.stderr)

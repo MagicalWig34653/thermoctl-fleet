@@ -1,7 +1,7 @@
 """Simulation environment: what `python -m tools.sim run` imports lazily.
 
-`apartments()`, `urls()`, `apply_event(event)` and `persona_env_extras()` are
-the whole surface; fleet seeding and start/stop live in `fleet_setup` and
+`apartments()`, `urls()`, `apply_event(event)`, `persona_env_extras()` and
+`refresh_logins()` are the whole surface; fleet seeding and start/stop live in `fleet_setup` and
 `up_fleet` (run as CLIs, not imported here).
 """
 
@@ -19,6 +19,7 @@ __all__ = [
     "apply_event_with",
     "events",
     "persona_env_extras",
+    "refresh_logins",
     "urls",
 ]
 
@@ -34,4 +35,11 @@ def urls() -> dict[str, str]:
 
 def persona_env_extras() -> dict[str, str]:
     """Extra environment for persona sessions (Playwright storage state per role)."""
-    return {"SIM_STORAGE_STATE_DIR": str(state_dir() / "storage-state")}
+    return {"SIM_STORAGE_STATE_DIR": str(state_dir() / "storage-states")}
+
+
+def refresh_logins() -> None:
+    """Log the UI users in again (cookies expire); raises RuntimeError if the setup is missing."""
+    from tools.sim.env import logins
+
+    logins.refresh()

@@ -262,7 +262,7 @@ def test_pause_then_resume_with_filter_keeps_working(tmp_path):
     assert SimState.load(tmp_path / "s" / "state.json").week == 3
 
 
-def test_refresh_logins_called_once_per_week(tmp_path):
+def test_refresh_logins_called_once_per_week_after_the_first(tmp_path):
     calls = []
     run(**make(tmp_path, lambda p: GOOD, []), refresh_logins=lambda: calls.append(1))
-    assert len(calls) == 3
+    assert len(calls) == 2

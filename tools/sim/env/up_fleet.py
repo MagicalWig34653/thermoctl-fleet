@@ -170,12 +170,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tools.sim.env.up_fleet", description=__doc__)
     parser.add_argument("--down", action="store_true", help="remove thermoctl-sim containers")
     parser.add_argument("--agents", action="store_true", help="also enrol and start the agents")
+    parser.add_argument("--logins", action="store_true", help="refresh persona logins (stack up)")
     parser.add_argument("--check", action="store_true", help="print last heartbeat per apartment")
     args = parser.parse_args(argv)
     directory = state_dir()
     try:
         if args.down:
             down(directory, _run)
+        elif args.logins:
+            from tools.sim.env import logins
+
+            if not all(logins.refresh(directory).values()):
+                return 1
         elif args.check:
             print(check(directory))
         else:

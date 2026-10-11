@@ -135,7 +135,7 @@ def test_apply_event_uses_subprocess(monkeypatch):
 
 
 def test_persona_env_extras_points_at_storage_state(state):
-    assert env.persona_env_extras() == {"SIM_STORAGE_STATE_DIR": str(state / "storage-state")}
+    assert env.persona_env_extras() == {"SIM_STORAGE_STATE_DIR": str(state / "storage-states")}
 
 
 def test_clock_drift_writes_a_bounded_signed_offset_the_agent_applies(state):

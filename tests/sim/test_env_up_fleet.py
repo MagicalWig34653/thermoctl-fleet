@@ -224,3 +224,14 @@ def test_check_reads_heartbeats_from_the_fleet_db(tmp_path, monkeypatch):
     assert "sim-a04: never" in lines
     monkeypatch.setenv("SIM_STATE_DIR", str(tmp_path))
     assert up_fleet.main(["--check"]) == 0
+
+
+def test_main_logins_refreshes_and_reports_failure(tmp_path, monkeypatch):
+    from tools.sim.env import logins
+
+    monkeypatch.setattr(up_fleet, "state_dir", lambda: tmp_path)
+    seen = []
+    monkeypatch.setattr(logins, "refresh", lambda d: seen.append(d) or {"a": True})
+    assert up_fleet.main(["--logins"]) == 0 and seen == [tmp_path]
+    monkeypatch.setattr(logins, "refresh", lambda d: {"a": True, "b": False})
+    assert up_fleet.main(["--logins"]) == 1

@@ -132,7 +132,7 @@ def run(
     in the state and a resume with different values raises ValueError. An event whose
     handler raises NotImplementedError is logged to `skipped-events.jsonl` and counted
     as applied; any other exception aborts the run (state saved). `refresh_logins`,
-    if given, is called once at the start of every simulated week.
+    if given, is called at the start of every simulated week after the first.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
@@ -171,7 +171,7 @@ def run(
 
     for week in range(state.week, weeks):
         state.week = week
-        if refresh_logins is not None:
+        if refresh_logins is not None and week > 0:  # week 0: fresh from up_fleet --logins
             refresh_logins()
         for event in due_events(schedule, week, state.applied_events):
             try:

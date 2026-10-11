@@ -181,3 +181,40 @@ def test_run_prints_skipped_event_count(dirs, capsys, monkeypatch):
     assert cli.main(["run", "--weeks", "30", "--personas", "landlord"]) == 0
     assert events
     assert f"{len(events)} events skipped" in capsys.readouterr().out
+
+
+def test_safe_refresh_swallows_errors_with_a_warning(capsys):
+    def boom():
+        raise RuntimeError("fleet down")
+
+    cli._safe_refresh(boom)()
+    assert "warning: login refresh failed: fleet down" in capsys.readouterr().err
+    called = []
+    cli._safe_refresh(lambda: called.append(1))()
+    assert called == [1]
+
+
+def test_stack_is_up_means_users_file_exists(dirs):
+    assert not cli._stack_is_up()
+    (dirs / "s").mkdir()
+    (dirs / "s" / "users.json").write_text("{}")
+    assert cli._stack_is_up()
+
+
+def test_run_wires_login_refresh_only_when_stack_is_up(dirs, monkeypatch):
+    seen = []
+    _fake_env(monkeypatch, [])
+    env = cli.importlib.import_module("x")
+    env.refresh_logins = staticmethod(lambda: None)
+    real = cli.run
+
+    def spy(**kw):
+        seen.append(kw["refresh_logins"])
+        return real(**kw)
+
+    monkeypatch.setattr(cli, "run", spy)
+    cli.main(["run", "--weeks", "1", "--personas", "landlord"])
+    assert seen[-1] is None
+    (dirs / "s" / "users.json").write_text("{}")
+    cli.main(["run", "--weeks", "1", "--personas", "landlord"])
+    assert seen[-1] is not None
