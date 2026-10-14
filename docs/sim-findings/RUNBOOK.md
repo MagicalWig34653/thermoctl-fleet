@@ -79,13 +79,15 @@ saved, nothing repeats. Wait for the owner's go (the limit must have reset),
 then rerun the exact same command. Failed persona steps listed in
 `failures.jsonl` are retried first.
 
-How a limit is recognised (`tools/sim/haiku.py`): only on a non-zero exit of `claude -p`, and
-only if stderr matches a known phrasing, or stdout (whole, under 400 chars, or its last 3
-lines) holds a limit notice such as "You've hit your monthly spend limit ... raise it at ...",
-"session limit", "weekly limit ... resets", 429, overloaded, credit balance, quota exceeded.
-A persona finding that merely mentions a "rate limit" never counts.
+How a limit is recognised (`tools/sim/haiku.py`), independent of the exit code of `claude -p`
+(the exit code of a limit notice is unknown): stderr matches a known phrasing, or stdout is
+short (under 400 chars) with no `DONE` and no `FINDING:` line and holds a notice such as
+"You've hit your monthly spend limit ... raise it at ...", "session limit", "weekly limit ...
+resets", 429, overloaded, credit balance, quota exceeded. A persona answer that merely mentions
+a "rate limit" never counts. An exit 0 with a short answer lacking `DONE` and `FINDING:` (or
+empty) is a failed step: it lands in `failures.jsonl` and is retried, not marked done.
 
-**Exit code 76 (circuit breaker).** After 3 persona failures in a row that are not limit hits
+**Exit code 76 (circuit breaker).** After 3 persona failures in a row that are not limit hits (or 3 weekly login refreshes in a row failing for the same role)
 the run stops cleanly (`TooManyFailures`): state is saved, the message names the last failing
 step and its text, and no further week is started. Read `sim-state/failures.jsonl`, fix the
 cause (login, tool, billing), run `python -m tools.sim preflight`, then rerun the identical

@@ -3,6 +3,10 @@
 Last updated: 2026-10-11.
 
 
+## Usage simulation: Limit-Erkennung unabhängig vom Exit-Code (2026-10-14)
+
+`tools/sim/haiku.py` erkennt Limit-Hinweise (stderr oder kurze Stdout-Meldung ohne `DONE`/`FINDING:`) bei jedem Exit-Code. Exit 0 mit kurzer/leerer Antwort ohne `DONE`/`FINDING:` ist ein Fehlschlag (wird wiederholt), nie ein erledigter Schritt. Drei wöchentliche Login-Refreshes in Folge für dieselbe Rolle stoppen den Lauf (`TooManyFailures`). Lauf-1-Bericht korrigiert (Wochen 17 bis 138 unbeobachtet).
+
 ## Usage simulation: Formulare und Signale (Task 10b, 2026-10-11)
 
 `browse act` (fill/click/select/check/wait_text, max. 20 Schritte, Passwortwerte maskiert) lässt Personas Formulare absenden; SIGTERM/SIGINT beenden die Persona-Prozessgruppe, speichern den Zustand und enden mit 143/130. Noch nicht live gelaufen.
