@@ -210,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 persona_fn=lambda prompt: run_persona(prompt, cwd=persona_cwd, env=child_env),
                 tool_notes=TOOL_NOTES,
                 settle_s=3.0,
+                wait_for_heartbeats=getattr(env, "wait_for_heartbeats", None),
                 seed=args.seed,
                 personas=selected,
                 refresh_logins=_safe_refresh(refresh, state_dir())

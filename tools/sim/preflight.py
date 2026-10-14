@@ -21,6 +21,7 @@ from pathlib import Path
 from tools.sim.env.config import FLEET_URL, virtual_now
 from tools.sim.env.logins import storage_dir
 from tools.sim.personas import PERSONAS, login_role
+from tools.sim.scenario import silent_apartments
 from tools.sim.state import SimState
 
 MIN_FREE_BYTES = 5 * 1024**3
@@ -148,19 +149,32 @@ def check_http(name: str, url: str, probes: Probes) -> Check:
 
 
 def check_heartbeats(
-    seen: Mapping[str, datetime | None], now: datetime, expected: Sequence[str]
+    seen: Mapping[str, datetime | None],
+    now: datetime,
+    expected: Sequence[str],
+    silent: frozenset[str] = frozenset(),
 ) -> Check:
+    """FAIL for a stale apartment; WARN only if every stale one is inside an intended
+    heartbeat-loss window (`silent`: its sender is paused on purpose)."""
     stale: list[str] = []
+    quiet: list[str] = []
     for apartment in expected:
         last = seen.get(apartment)
         if last is None:
-            stale.append(f"{apartment} never")
-            continue
-        last_utc = last.replace(tzinfo=UTC) if last.tzinfo is None else last.astimezone(UTC)
-        if (now - last_utc).total_seconds() > HEARTBEAT_MAX_AGE_S:
-            stale.append(f"{apartment} {int((now - last_utc).total_seconds() // 60)} min old")
+            text = f"{apartment} never"
+        else:
+            last_utc = last.replace(tzinfo=UTC) if last.tzinfo is None else last.astimezone(UTC)
+            age = (now - last_utc).total_seconds()
+            if age <= HEARTBEAT_MAX_AGE_S:
+                continue
+            text = f"{apartment} {int(age // 60)} min old"
+        (quiet if apartment in silent else stale).append(text)
     if stale:
         return Check("heartbeats", Status.FAIL, "; ".join(stale))
+    if quiet:
+        return Check(
+            "heartbeats", Status.WARN, "inside an intended loss window: " + "; ".join(quiet)
+        )
     return Check(
         "heartbeats",
         Status.OK,
@@ -195,6 +209,14 @@ def check_disk(directory: Path, probes: Probes) -> Check:
     return Check("disk", Status.FAIL, f"{gib:.1f} GiB free, need {MIN_FREE_BYTES // 1024**3}")
 
 
+def _silent_now(directory: Path) -> frozenset[str]:
+    """Apartments inside an open heartbeat-loss window of the saved run (none without one)."""
+    try:
+        return silent_apartments(SimState.load(directory / "state.json").applied_events)
+    except (OSError, ValueError):
+        return frozenset()
+
+
 def run_preflight(
     directory: Path,
     probes: Probes,
@@ -213,7 +235,12 @@ def run_preflight(
     ]
     try:
         checks.append(
-            check_heartbeats(probes.heartbeats(directory), virtual_now(directory), apartments)
+            check_heartbeats(
+                probes.heartbeats(directory),
+                virtual_now(directory),
+                apartments,
+                _silent_now(directory),
+            )
         )
     except Exception as exc:  # noqa: BLE001 - any failure to read the fleet database is a FAIL
         checks.append(Check("heartbeats", Status.FAIL, f"cannot read heartbeats: {exc}"))

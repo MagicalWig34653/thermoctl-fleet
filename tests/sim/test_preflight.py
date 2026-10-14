@@ -242,3 +242,42 @@ def test_virtual_now_is_used_for_the_heartbeat_age(tmp_path, monkeypatch):
     old = {a: datetime(2026, 3, 1, 9, 50, tzinfo=UTC) for a in APARTMENT_IDS}
     by = _by_name(_run(tmp_path, _probes(heartbeats=lambda d: old)))
     assert by["heartbeats"].status is Status.OK
+
+
+def test_stale_apartment_in_an_intended_loss_window_only_warns():
+    now = SIM_START
+    seen = {a: now for a in APARTMENT_IDS}
+    seen["sim-a02"] = now - timedelta(days=1)
+    warn = pf.check_heartbeats(seen, now, APARTMENT_IDS, frozenset({"sim-a02"}))
+    assert warn.status is Status.WARN and "sim-a02" in warn.detail
+    seen["sim-a05"] = None  # a second, NOT silent apartment makes it a FAIL again
+    bad = pf.check_heartbeats(seen, now, APARTMENT_IDS, frozenset({"sim-a02"}))
+    assert bad.status is Status.FAIL and "sim-a05 never" in bad.detail
+    assert "sim-a02" not in bad.detail
+
+
+def test_a_silent_apartment_that_is_fresh_is_ok():
+    seen = {a: SIM_START for a in APARTMENT_IDS}
+    ok = pf.check_heartbeats(seen, SIM_START, APARTMENT_IDS, frozenset({"sim-a02"}))
+    assert ok.status is Status.OK
+
+
+def test_preflight_reads_the_loss_window_from_the_saved_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "docker_shareable", lambda p, plat: True)
+    _states(tmp_path, pf.roles_needed(None))
+    clock = tmp_path / "clock" / "clock"
+    clock.parent.mkdir()
+    clock.write_text("2026-03-01 10:00:00")
+    (tmp_path / "state.json").write_text(
+        '{"week": 5, "done_steps": [], "applied_events": ["heartbeat_loss:sim-a02:0"], '
+        '"personas": null, "seed": 1}'
+    )
+    old = {a: datetime(2026, 3, 1, 10, 0, tzinfo=UTC) for a in APARTMENT_IDS}
+    old["sim-a02"] = datetime(2026, 2, 28, 10, 0, tzinfo=UTC)
+    by = _by_name(_run(tmp_path, _probes(heartbeats=lambda d: old), seed=1))
+    assert by["heartbeats"].status is Status.WARN
+
+
+def test_unreadable_state_means_no_silent_apartments(tmp_path):
+    (tmp_path / "state.json").write_text("{not json")
+    assert pf._silent_now(tmp_path) == frozenset()

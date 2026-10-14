@@ -8,7 +8,7 @@ import signal
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import FrameType
 
@@ -16,7 +16,7 @@ from tools.sim.clock import SIM_START, SimClock, clock_path
 from tools.sim.findings import append_findings, build_index, parse_findings
 from tools.sim.haiku import REGISTRY, ChildRegistry, PersonaResult
 from tools.sim.personas import PERSONAS, build_prompt, due_personas
-from tools.sim.scenario import Event, build_schedule, due_events
+from tools.sim.scenario import Event, build_schedule, due_events, silent_apartments
 from tools.sim.state import SimState
 
 # Exactly the tools a persona session has (see haiku.DEFAULT_ALLOWED_TOOLS).
@@ -203,6 +203,7 @@ def run(
     settle_s: float = 0.0,
     personas: Sequence[str] | None = None,
     refresh_logins: Callable[[], None] | None = None,
+    wait_for_heartbeats: Callable[[datetime, frozenset[str]], list[str]] | None = None,
 ) -> None:
     """Run (or resume) the simulation up to `weeks`.
 
@@ -219,6 +220,11 @@ def run(
     A limit hit raises `LimitPause` before the week advances (the failed persona is
     retried first on resume); `MAX_CONSECUTIVE_FAILURES` failures in a row that are not
     limit hits raise `TooManyFailures`, also with the state saved. Any success resets the count.
+
+    `wait_for_heartbeats(now, silent)`, if given, is called after the seventh daily advance
+    of each week: it blocks until every apartment except the `silent` ones (open
+    heartbeat-loss window) reported for the new virtual day and returns the ones that did
+    not; they are printed as one warning per week (never written to failures.jsonl).
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
@@ -302,6 +308,13 @@ def run(
             for _ in range(7):  # day steps so periodic jobs (alarm checks) see time pass
                 clock.advance(timedelta(days=1))
                 time.sleep(settle_s)
+            if wait_for_heartbeats is not None:
+                missing = wait_for_heartbeats(clock.now, silent_apartments(state.applied_events))
+                if missing:
+                    print(
+                        f"warning: week {week}: no fresh heartbeat after the last clock step "
+                        f"from {', '.join(missing)}"
+                    )
             state.week = week + 1
             state.save(state_path)
     except Terminated:

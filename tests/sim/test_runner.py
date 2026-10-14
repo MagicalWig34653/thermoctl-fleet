@@ -454,3 +454,35 @@ def test_silent_exit_zero_answer_is_a_failure_and_the_step_stays_undone(tmp_path
     assert rows and all(
         not SimState.load(state_dir / "state.json").is_done(r["step"]) for r in rows
     )
+
+
+def test_waiter_runs_after_the_seventh_advance_with_the_silent_set(tmp_path, capsys):
+    calls = []
+
+    def waiter(now, silent):
+        calls.append((now, silent))
+        return ["sim-a04"] if len(calls) == 1 else []
+
+    kwargs = make(tmp_path, lambda p: GOOD, [], weeks=2)
+    kwargs["wait_for_heartbeats"] = waiter
+    run(**kwargs)
+    assert [c[0].date().isoformat() for c in calls] == ["2026-01-12", "2026-01-19"]
+    assert all(isinstance(c[1], frozenset) for c in calls)
+    out = capsys.readouterr().out
+    assert out.count("warning") == 1 and "sim-a04" in out  # once, for the week that missed it
+    assert not (tmp_path / "s" / "failures.jsonl").exists()
+
+
+def test_waiter_is_told_who_is_deliberately_silent(tmp_path):
+    seen = []
+    events = []
+    kwargs = make(tmp_path, lambda p: GOOD, events, weeks=3)
+    kwargs["wait_for_heartbeats"] = lambda now, silent: (seen.append(silent), [])[1]
+    run(**kwargs)
+    # in every week a loss window is open, exactly the apartments of an unrestored loss
+    for week_index, silent in enumerate(seen):
+        applied = {e.id for e in events if e.week <= week_index}
+        open_ = {e.apartment for e in events if e.kind == "heartbeat_loss" and e.id in applied} - {
+            e.apartment for e in events if e.kind == "heartbeat_restore" and e.id in applied
+        }
+        assert silent == open_

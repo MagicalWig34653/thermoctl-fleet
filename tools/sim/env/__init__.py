@@ -1,11 +1,13 @@
 """Simulation environment: what `python -m tools.sim run` imports lazily.
 
-`apartments()`, `urls()`, `apply_event(event)`, `persona_env_extras()` and
-`refresh_logins()` are the whole surface; fleet seeding and start/stop live in `fleet_setup` and
-`up_fleet` (run as CLIs, not imported here).
+`apartments()`, `urls()`, `apply_event(event)`, `persona_env_extras()`, `refresh_logins()` and
+`wait_for_heartbeats(now, silent)` are the whole surface; fleet seeding and start/stop live in
+`fleet_setup` and `up_fleet` (run as CLIs, not imported here).
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 from tools.sim.env import events
 from tools.sim.env.config import APARTMENT_IDS, FLEET_URL, state_dir
@@ -21,6 +23,7 @@ __all__ = [
     "persona_env_extras",
     "refresh_logins",
     "urls",
+    "wait_for_heartbeats",
 ]
 
 
@@ -37,6 +40,13 @@ def urls() -> dict[str, str]:
         "fleet web app (browser pages)": f"{FLEET_URL}/ui/",
         **tenant_urls(),
     }
+
+
+def wait_for_heartbeats(now: datetime, silent: frozenset[str]) -> list[str]:
+    """Block until every non-silent apartment reported for the virtual day `now`."""
+    from tools.sim.env import settle
+
+    return settle.wait_for_fresh_heartbeats(now, silent)
 
 
 def persona_env_extras() -> dict[str, str]:

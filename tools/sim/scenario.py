@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -76,6 +77,18 @@ def build_schedule(seed: int, weeks: int, apartments: list[str]) -> list[Event]:
                     week = rng.randrange(0, weeks)
                     events.append(Event(f"{kind}:{apartment}:{n}", week, kind, apartment))
     return sorted(events, key=lambda e: (e.week, e.id))
+
+
+def silent_apartments(applied: Iterable[str]) -> frozenset[str]:
+    """Apartments inside an open heartbeat-loss window: a `heartbeat_loss:<apt>:<n>` was applied
+    and its `restore:<apt>:<n>` was not. Their sender is paused on purpose."""
+    done = set(applied)
+    silent = set()
+    for event_id in done:
+        kind, _, rest = event_id.partition(":")
+        if kind == str(EventKind.HEARTBEAT_LOSS) and f"restore:{rest}" not in done:
+            silent.add(rest.rpartition(":")[0])
+    return frozenset(silent)
 
 
 def due_events(schedule: list[Event], week: int, applied: list[str]) -> list[Event]:

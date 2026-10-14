@@ -89,3 +89,18 @@ def test_events_can_land_in_the_last_weeks() -> None:
         if e.week >= weeks - 3 and e.kind is not EventKind.HEARTBEAT_RESTORE
     ]
     assert late
+
+
+def test_silent_apartments_are_losses_without_their_restore():
+    from tools.sim.scenario import silent_apartments
+
+    applied = [
+        "heartbeat_loss:sim-a02:0",
+        "restore:sim-a02:0",  # window closed
+        "heartbeat_loss:sim-a02:1",  # open again
+        "heartbeat_loss:sim-a07:0",  # open
+        "restore:sim-a09:0",  # restore without loss in the list: nothing
+        "backup:sim-a03:1",
+    ]
+    assert silent_apartments(applied) == {"sim-a02", "sim-a07"}
+    assert silent_apartments([]) == frozenset()
