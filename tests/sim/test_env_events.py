@@ -249,7 +249,7 @@ def test_vm_commands_validate_the_id_and_never_touch_other_vms():
     assert all(c[0] == "docker" for c in cmds)
 
 
-@pytest.mark.parametrize("kind", [EventKind.BACKUP, EventKind.TOKEN_EXPIRY])
+@pytest.mark.parametrize("kind", [EventKind.BACKUP])
 def test_container_only_kinds_are_still_skipped_for_vm_apartments(kind):
     with pytest.raises(NotImplementedError):
         apply_event_with(_ev(kind, apt="sim-a01"), lambda cmd: pytest.fail("no command"))

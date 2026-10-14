@@ -359,8 +359,6 @@ def test_token_expiry_completes_a_half_done_rotation(fleet, client):
 def test_token_expiry_skips_vm_apartments(fleet):
     with pytest.raises(NotImplementedError, match="VM"):
         fleet_events.token_expiry(_ev(EventKind.TOKEN_EXPIRY, apt="sim-a01"))
-    with pytest.raises(NotImplementedError, match="no container"):
-        _apply(_ev(EventKind.TOKEN_EXPIRY, apt="sim-a01"))
 
 
 def test_force_reauth_unknown_or_tokenless_apartment_is_false(fleet):
@@ -418,13 +416,6 @@ def test_tenant_change_refuses_a_locked_out_apartment(fleet):
     storage.rotate_apartment_token_for_tenant_change(APT, "two", CONFIRM_USER, NOW)  # drops it
     with pytest.raises(RuntimeError, match="start over"):
         _apply(_ev(EventKind.TENANT_CHANGE))
-
-
-def test_tenant_change_on_a_vm_apartment_acts_fleet_side_only(fleet):
-    tmp, storage, _ = fleet
-    _apply(_ev(EventKind.TENANT_CHANGE, apt="sim-a01"))
-    assert not (tmp / "agent-tokens" / "sim-a01.token").exists()
-    assert storage.get_apartment("sim-a01") is not None
 
 
 def test_tenant_change_deletes_diagnostic_bundle_blobs(fleet, monkeypatch):

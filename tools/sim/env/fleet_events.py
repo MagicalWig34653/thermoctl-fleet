@@ -144,13 +144,13 @@ def token_expiry(event: Event) -> None:
     `reauth_required` 401."""
     apartment = apartment_of(event)
     if apartment not in CONTAINER_APARTMENTS:
-        raise NotImplementedError(f"{event.kind}: {apartment} has no token file (VM)")
+        raise NotImplementedError(f"{event.kind}: {apartment} has no token file (VM)")  # vm_reauth
     _deliver(state_dir(), apartment, run_op("token_expiry", _args(event, apartment)))
 
 
 def tenant_change(event: Event) -> None:
     """The landlord's tenant change, then the device's re-authentication replayed so
-    the container agent gets its new token (VM apartments: fleet side only)."""
+    the container agent gets its new token (VM apartments: `vm_reauth`)."""
     apartment = apartment_of(event)
     result = run_op("tenant_change", _args(event, apartment))
     if apartment in CONTAINER_APARTMENTS:

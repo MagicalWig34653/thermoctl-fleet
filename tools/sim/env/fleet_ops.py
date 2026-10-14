@@ -139,26 +139,81 @@ def token_expiry(storage: Storage, apartment: str, now: datetime) -> dict[str, A
     return {"token": complete_rotation(storage, apartment, now)}
 
 
+def _start_tenant_change(
+    storage: Storage, apartment: str, event_id: str, now: datetime, bundle_root: Path | None
+) -> None:
+    """Step one of the landlord's tenant change (`rotate_apartment_token_for_tenant_change`:
+    token stopped, history, alarms, log excerpts and diagnostic-bundle rows deleted, audit
+    entry), bundle blobs removed like the UI route does. A rotation left pending by an
+    interrupted earlier run is left alone (a second call would drop the pending state and
+    lock the device out)."""
+    if storage.get_apartment(apartment) is None:
+        raise RuntimeError(f"apartment {apartment} is not in the fleet database")
+    if storage.apartment_reauth_pending(apartment):
+        return
+    outcome = storage.rotate_apartment_token_for_tenant_change(
+        apartment, f"simulation: {event_id}", UI_USER, now
+    )
+    if bundle_root is not None:
+        blobs = DiagnosticBundleBlobStorage(bundle_root)
+        for storage_path in outcome.diagnostic_bundle_storage_paths:
+            blobs.delete(storage_path)
+
+
 def tenant_change(
     storage: Storage, apartment: str, event_id: str, now: datetime, bundle_root: Path | None
 ) -> dict[str, Any]:
-    """`rotate_apartment_token_for_tenant_change` (token stopped, history, alarms, log
-    excerpts and diagnostic-bundle rows deleted, audit entry), bundle blobs removed like
-    the UI route does, then the device's re-authentication replayed. A rotation left
-    pending by an interrupted earlier run is only completed, never repeated (a second
-    call would drop the pending state and lock the device out)."""
-    if storage.get_apartment(apartment) is None:
-        raise RuntimeError(f"apartment {apartment} is not in the fleet database")
-    pending = storage.apartment_reauth_pending(apartment)
-    if not pending:
-        outcome = storage.rotate_apartment_token_for_tenant_change(
-            apartment, f"simulation: {event_id}", UI_USER, now
-        )
-        if bundle_root is not None:
-            blobs = DiagnosticBundleBlobStorage(bundle_root)
-            for storage_path in outcome.diagnostic_bundle_storage_paths:
-                blobs.delete(storage_path)
+    """`_start_tenant_change`, then the device's re-authentication replayed (container
+    apartments only: their sim agent has no private key)."""
+    _start_tenant_change(storage, apartment, event_id, now, bundle_root)
     return {"token": complete_rotation(storage, apartment, now)}
+
+
+def anchor_reauth(storage: Storage, apartment: str, device_token_hash: str) -> None:
+    """Make the pending re-authentication recognise the token the DEVICE really holds
+    (`reauth_old_token_hash` = its hash, no live token, no half-used nonce). Equal to the
+    state a tenant change leaves when the device and the fleet agree; it also repairs a
+    device whose token the fleet has already replaced (the fleet then only knows the new
+    one, the device presents the old one)."""
+    with storage.session() as session:
+        session.execute(
+            update(ApartmentRecord)
+            .where(ApartmentRecord.id == apartment)
+            .values(
+                token_hash=None,
+                reauth_old_token_hash=device_token_hash,
+                rotation_nonce_hash=None,
+                rotation_nonce_expires_at=None,
+                rotation_nonce_consumed_at=None,
+            )
+        )
+
+
+def begin_device_reauth(
+    storage: Storage,
+    apartment: str,
+    mode: str,
+    event_id: str,
+    device_token_hash: str | None,
+    now: datetime,
+    bundle_root: Path | None,
+) -> dict[str, Any]:
+    """Fleet side of an event on a device that re-authenticates BY ITSELF (VM base
+    station: the real agent's own `reauthenticate`, with the device key only it holds).
+    Leaves the apartment in the pending state, never completes the rotation. `mode`:
+    `token_expiry` (forced reauth), `tenant_change` (the landlord's tenant change) or
+    `repair` (only re-anchor an already inconsistent apartment). Idempotent."""
+    if mode == "token_expiry":
+        force_reauth(storage, apartment)
+    elif mode == "tenant_change":
+        _start_tenant_change(storage, apartment, event_id, now, bundle_root)
+    elif mode != "repair":
+        raise ValueError(f"unknown reauth mode {mode!r}")
+    if device_token_hash is not None:
+        anchor_reauth(storage, apartment, device_token_hash)
+    if not storage.apartment_reauth_pending(apartment):
+        raise RuntimeError(f"{apartment} has no token and no rotation pending")
+    return {"pending": True}
 
 
 def device_report(storage: Storage, device_id: str) -> dict[str, Any]:
@@ -252,6 +307,16 @@ def run_op(storage: Storage, op: str, args: dict[str, Any], bundle_root: Path | 
         return token_expiry(storage, apartment, now)
     if op == "tenant_change":
         return tenant_change(storage, apartment, args["event_id"], now, bundle_root)
+    if op == "begin_device_reauth":
+        return begin_device_reauth(
+            storage,
+            apartment,
+            args["mode"],
+            args["event_id"],
+            args.get("device_token_hash"),
+            now,
+            bundle_root,
+        )
     raise ValueError(f"unknown op {op!r}")
 
 

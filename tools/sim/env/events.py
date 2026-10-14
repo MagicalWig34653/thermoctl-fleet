@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from tools.sim.env import fleet_events
+from tools.sim.env import fleet_events, vm_reauth
 from tools.sim.env.config import (
     NETWORK,
     PREFIX,
@@ -241,6 +241,22 @@ def _fleet_side(action: Callable[[Event], None], *, container: bool = False) -> 
     return handler
 
 
+def _reauth(
+    container_side: Callable[[Event], None], vm_side: Callable[[Event, RunCmd], None]
+) -> Handler:
+    """Token rotation: a container apartment gets its new token written into its token
+    file; a VM apartment's real agent re-authenticates itself (`vm_reauth`)."""
+
+    def handler(event: Event, run_cmd: RunCmd) -> None:
+        if event.apartment in VM_APARTMENTS:
+            vm_side(event, run_cmd)
+        else:
+            _container_of(event)
+            container_side(event)
+
+    return handler
+
+
 HANDLERS: dict[EventKind, Handler] = {
     EventKind.HEARTBEAT_LOSS: _docker("pause"),
     EventKind.HEARTBEAT_RESTORE: _docker("unpause"),
@@ -249,8 +265,8 @@ HANDLERS: dict[EventKind, Handler] = {
     EventKind.FAULT: _fault,
     EventKind.IMAGE_UPDATE: _fleet_side(fleet_events.image_update),
     EventKind.BACKUP: _fleet_side(fleet_events.backup, container=True),
-    EventKind.TOKEN_EXPIRY: _fleet_side(fleet_events.token_expiry, container=True),
-    EventKind.TENANT_CHANGE: _fleet_side(fleet_events.tenant_change),
+    EventKind.TOKEN_EXPIRY: _reauth(fleet_events.token_expiry, vm_reauth.token_expiry),
+    EventKind.TENANT_CHANGE: _reauth(fleet_events.tenant_change, vm_reauth.tenant_change),
     EventKind.CLOCK_DRIFT: _clock_drift,
 }
 UNIMPLEMENTED_KINDS: frozenset[EventKind] = frozenset()  # every kind has a mechanism
