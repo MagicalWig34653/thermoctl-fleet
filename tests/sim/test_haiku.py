@@ -134,9 +134,8 @@ def test_short_persona_note_about_rate_limits_is_not_a_limit(tmp_path: Path):
             "hi", cwd=tmp_path, popen=fake(stdout="There is no rate limit on login.", code=code)
         )
         assert not res.limit_hit
-    assert not run_persona(
-        "hi", cwd=tmp_path, popen=fake(stdout=OBSERVED, code=0)
-    ).limit_hit  # exit 0 never counts
+    # adapted: this used to assert that OBSERVED with exit 0 is no limit; the exit code of a
+    # real limit notice is unknown, so it is a limit at any exit code now (see below).
 
 
 def test_persona_talking_about_limits_is_not_a_limit(tmp_path: Path):
@@ -252,3 +251,58 @@ def test_run_persona_unregisters_when_interrupted(tmp_path: Path):
     with pytest.raises(Boom):
         run_persona("hi", cwd=tmp_path, popen=lambda c, **k: Proc("", "", 0), registry=reg)
     assert reg.pgids() == []
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_observed_message_is_a_limit_at_any_exit_code(tmp_path: Path, code: int):
+    res = run_persona("hi", cwd=tmp_path, popen=fake(stdout=OBSERVED + "\n", code=code))
+    assert res.limit_hit and not res.ok
+
+
+@pytest.mark.parametrize("code", [0, 1])
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "5-hour session limit reached - resets at 3pm",
+        "Weekly limit reached, resets on Monday",
+        "Your credit balance is too low",
+        "API Error: 429 rate_limit_error",
+        "Overloaded",
+    ],
+)
+def test_limit_variants_on_stdout_or_stderr_at_any_exit_code(tmp_path: Path, msg: str, code: int):
+    for kw in ({"stdout": msg}, {"stderr": msg}):
+        res = run_persona("hi", cwd=tmp_path, popen=fake(code=code, **kw))
+        assert res.limit_hit and not res.ok, (msg, kw, code)
+
+
+def test_persona_answer_mentioning_rate_limit_with_done_is_ok(tmp_path: Path):
+    res = run_persona(
+        "hi", cwd=tmp_path, popen=fake(stdout="no rate limit on the login page\nDONE", code=0)
+    )
+    assert res.ok and not res.limit_hit
+
+
+def test_short_silent_exit_zero_is_a_failure_not_a_limit(tmp_path: Path):
+    for out in ("", "\n", "ok, looked around", "Looks fine."):
+        res = run_persona("hi", cwd=tmp_path, popen=fake(stdout=out, code=0))
+        assert not res.ok and not res.limit_hit, out
+
+
+def test_full_length_answer_without_done_but_with_findings_is_ok(tmp_path: Path):
+    out = "x" * 450 + '\nFINDING: {"title":"t"}\n'
+    res = run_persona("hi", cwd=tmp_path, popen=fake(stdout=out, code=0))
+    assert res.ok and not res.limit_hit
+    # a short answer with a FINDING line (no DONE) is also a real answer
+    res = run_persona("hi", cwd=tmp_path, popen=fake(stdout='FINDING: {"a":1}', code=0))
+    assert res.ok
+
+
+def test_long_answer_ending_in_usage_limit_is_not_a_limit(tmp_path: Path):
+    for tail in ("x" * 450, "short\nFINDING: {}\nDONE"):
+        out = tail + "\nthe page shows a usage limit"
+        res = run_persona("hi", cwd=tmp_path, popen=fake(stdout=out, stderr="", code=1))
+        assert not res.limit_hit and not res.ok, tail
+    # exit 0, unrelated stderr warning mentioning quota: not a limit
+    res = run_persona("hi", cwd=tmp_path, popen=fake(stdout="DONE", stderr="quota warn", code=0))
+    assert res.ok and not res.limit_hit

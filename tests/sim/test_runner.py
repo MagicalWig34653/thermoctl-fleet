@@ -420,3 +420,37 @@ def test_retry_of_old_failures_also_trips_the_breaker(tmp_path):
     with pytest.raises(TooManyFailures):
         run(**make(tmp_path, broken, [], weeks=3))
     assert len(calls) == 3
+
+
+def _via_run_persona(stdout: str, code: int):
+    from pathlib import Path
+
+    from tests.sim.test_haiku import fake
+    from tools.sim.haiku import run_persona
+
+    def persona(prompt):
+        return run_persona(prompt, cwd=Path("."), popen=fake(stdout=stdout, code=code))
+
+    return persona
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_limit_notice_at_any_exit_code_pauses_before_marking_the_step(tmp_path, code):
+    notice = "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage"
+    with pytest.raises(LimitPause):
+        run(**make(tmp_path, _via_run_persona(notice, code), [], weeks=3))
+    state = SimState.load(tmp_path / "s" / "state.json")
+    assert state.week == 0 and not any(state.is_done(f"w000:{p}") for p in ("landlord",))
+    assert not (tmp_path / "f").exists() or not list((tmp_path / "f").glob("*.jsonl"))
+
+
+def test_silent_exit_zero_answer_is_a_failure_and_the_step_stays_undone(tmp_path):
+    from tools.sim.runner import TooManyFailures
+
+    with pytest.raises(TooManyFailures):
+        run(**make(tmp_path, _via_run_persona("", 0), [], weeks=3))
+    state_dir = tmp_path / "s"
+    rows = [json.loads(x) for x in (state_dir / "failures.jsonl").read_text().splitlines()]
+    assert rows and all(
+        not SimState.load(state_dir / "state.json").is_done(r["step"]) for r in rows
+    )

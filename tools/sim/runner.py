@@ -63,9 +63,12 @@ class TooManyFailures(Exception):  # noqa: N818 - a stop condition, like LimitPa
     limit) would otherwise burn through every remaining week without doing any persona work.
     """
 
-    def __init__(self, step_id: str, count: int, last_text: str) -> None:
+    def __init__(
+        self, step_id: str, count: int, last_text: str, message: str | None = None
+    ) -> None:
         super().__init__(
-            f"{count} persona calls failed in a row (last: {step_id}): "
+            message
+            or f"{count} persona calls failed in a row (last: {step_id}): "
             f"{last_text.strip()[:_FAILURE_TEXT_MAX] or '(no output)'}"
         )
         self.step_id = step_id

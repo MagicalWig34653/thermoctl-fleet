@@ -90,22 +90,31 @@ def ensure_persona_cwd(state_dir: Path) -> Path:
     return d
 
 
-def _is_limit(stdout: str, stderr: str) -> bool:
-    """Only called for a non-zero exit.
+_MARKER = re.compile(r"\bDONE\b|FINDING:")
 
-    A limit is: stderr matches; or stderr is empty and the last 3 stdout lines match; or the
-    whole stdout is one short notice (under 400 chars) that matches. Claude Code prints
-    "You've hit your monthly spend limit ..." on stdout, and the text of a real persona run
-    is long, so a finding that merely mentions a rate limit does not trip this.
-    """
-    if _LIMIT.search(stderr):
-        return True
+
+def _has_marker(stdout: str) -> bool:
+    return bool(_MARKER.search(stdout))
+
+
+def _is_short_silent(stdout: str) -> bool:
+    """Short and without any DONE/FINDING marker: no real persona answer."""
     body = stdout.strip()
-    if len(body) < _STDOUT_LIMIT_MAX_CHARS and _NOTICE.search(body):
+    return len(body) < _STDOUT_LIMIT_MAX_CHARS and not _has_marker(body)
+
+
+def _is_limit(stdout: str, stderr: str, returncode: int) -> bool:
+    """Independent of the exit code, because the exit code of a limit notice is not known.
+
+    A limit is: stderr matches (the broad pattern set for a non-zero exit, the notice set for
+    exit 0); or stdout is one short notice (under 400 chars, no DONE and no FINDING marker)
+    that matches the notice set. Claude Code prints "You've hit your monthly spend limit ..."
+    on stdout; the text of a real persona run is long or carries markers, so an answer that
+    merely mentions a rate limit never trips this.
+    """
+    if (_LIMIT if returncode != 0 else _NOTICE).search(stderr):
         return True
-    if not stderr.strip():
-        return bool(_NOTICE.search("\n".join(body.splitlines()[-3:])))
-    return False
+    return _is_short_silent(stdout) and bool(_NOTICE.search(stdout))
 
 
 def _text(value: object) -> str:
@@ -137,7 +146,7 @@ def run_persona(
 ) -> PersonaResult:
     """Run `claude -p` once; the prompt goes via stdin so `ps` does not show it.
 
-    A usage limit only counts on a non-zero exit. On timeout the whole process
+    A limit notice counts at any exit code (see `_is_limit`). On timeout the whole process
     group is killed and partial stdout is kept. `env` defaults to the current
     environment. While the session runs its process group is in `registry`.
     """
@@ -182,8 +191,11 @@ def run_persona(
             except subprocess.TimeoutExpired:  # pragma: no cover - pipe held open
                 pass
             return PersonaResult(ok=False, text=partial, limit_hit=False)
-        if proc.returncode != 0 and _is_limit(stdout, stderr):
+        if _is_limit(stdout, stderr, proc.returncode):
             return PersonaResult(ok=False, text=stdout, limit_hit=True)
-        return PersonaResult(ok=proc.returncode == 0, text=stdout, limit_hit=False)
+        # Exit 0 with a short answer lacking DONE/FINDING (or nothing at all) is a failed
+        # step, not a successful one with zero findings: the runner retries it.
+        ok = proc.returncode == 0 and not _is_short_silent(stdout)
+        return PersonaResult(ok=ok, text=stdout, limit_hit=False)
     finally:
         registry.unregister(proc.pid)

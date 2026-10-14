@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -14,6 +15,7 @@ from tools.sim.findings import build_index
 from tools.sim.haiku import ensure_persona_cwd, run_persona
 from tools.sim.personas import PERSONAS
 from tools.sim.runner import (
+    MAX_CONSECUTIVE_FAILURES,
     TOOL_NOTES,
     LimitPause,
     LoginsUnavailable,
@@ -70,11 +72,26 @@ def _stack_is_up() -> bool:
     return (state_dir() / "users.json").is_file()
 
 
-def _safe_refresh(refresh: Callable[[], None], directory: Path) -> Callable[[], None]:
+_REFRESH_ROLES = re.compile(r"role\(s\) ([\w, -]+?)(?:;|$)")
+
+
+def _failed_roles(message: str) -> list[str]:
+    match = _REFRESH_ROLES.search(message)
+    if not match:
+        return ["unknown"]
+    return [r.strip() for r in match.group(1).split(",") if r.strip()] or ["unknown"]
+
+
+def _safe_refresh(
+    refresh: Callable[[], None], directory: Path, max_in_a_row: int = MAX_CONSECUTIVE_FAILURES
+) -> Callable[[], None]:
     """A stale login must not abort a week of simulation: warn loudly and record it.
 
-    `LoginsUnavailable` (a role never had a login) is not caught: it stops the run.
+    `LoginsUnavailable` (a role never had a login) is not caught: it stops the run. A role
+    whose refresh fails `max_in_a_row` weeks in a row raises `TooManyFailures` naming it: a
+    broken login makes every persona call useless.
     """
+    streaks: dict[str, int] = {}
 
     def hook() -> None:
         try:
@@ -88,6 +105,23 @@ def _safe_refresh(refresh: Callable[[], None], directory: Path) -> Callable[[], 
             except ValueError:  # pragma: no cover - the runner just validated the state
                 week = 0
             record_failure(directory, "login-refresh", week, str(exc))
+            failed = _failed_roles(str(exc))
+            streaks.update({r: streaks.get(r, 0) + 1 for r in failed})
+            for role in [r for r in streaks if r not in failed]:
+                streaks[role] = 0
+            for role in failed:
+                if streaks[role] >= max_in_a_row:
+                    raise TooManyFailures(
+                        "login-refresh",
+                        streaks[role],
+                        str(exc),
+                        message=(
+                            f"login refresh failed {streaks[role]} weeks in a row for role "
+                            f"{role}: {str(exc)[:500]}"
+                        ),
+                    ) from exc
+        else:
+            streaks.clear()
 
     return hook
 

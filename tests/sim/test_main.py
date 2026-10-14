@@ -328,3 +328,45 @@ def test_preflight_prints_the_table_and_exits_with_the_aggregate(dirs, monkeypat
 def test_preflight_rejects_an_unknown_persona(dirs, capsys):
     assert cli.main(["preflight", "--personas", "nobody"]) == 1
     assert "unknown persona" in capsys.readouterr().err
+
+
+def test_safe_refresh_three_weeks_in_a_row_for_one_role_stops_the_run(dirs, capsys):
+    from tools.sim.runner import TooManyFailures
+
+    def boom():
+        raise RuntimeError("login refresh FAILED for role(s) landlord; stale cookies kept")
+
+    hook = cli._safe_refresh(boom, dirs / "s")
+    hook()
+    hook()
+    with pytest.raises(TooManyFailures, match="role landlord"):
+        hook()
+
+
+def test_safe_refresh_streak_is_per_role_and_reset_by_success(dirs, capsys):
+    from tools.sim.runner import TooManyFailures
+
+    msgs = iter(
+        [
+            "landlord",
+            "admin",
+            "landlord",
+            "admin",
+            "landlord",
+            None,
+            "landlord",
+            "landlord",
+            "landlord",
+        ]
+    )
+
+    def flaky():
+        role = next(msgs)
+        if role:
+            raise RuntimeError(f"login refresh FAILED for role(s) {role}; stale cookies kept")
+
+    hook = cli._safe_refresh(flaky, dirs / "s")
+    for _ in range(8):  # alternating roles, then a success, then two failures: no stop
+        hook()
+    with pytest.raises(TooManyFailures):
+        hook()
