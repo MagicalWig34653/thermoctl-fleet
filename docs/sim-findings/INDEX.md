@@ -22,3 +22,4 @@ No findings yet.
 - [Finding 40: the watchdog's service user is never created, so the watchdog never runs on an image built by the recipe](40-watchdog-user-never-created.md)
 - [Finding 41: the pre-set watchdog state file is rejected by the watchdog](41-watchdog-preset-state-file-is-rejected.md)
 - [Finding 42: the agent cuts every idle command stream after 10 s, the fleet pings every 15 s](42-agent-sse-read-timeout-shorter-than-ping.md)
+- [Finding 51: after a tenant change the base station's agent exits instead of re-authenticating, the image recipe never passes `--apartment-id`](51-agent-cannot-reauthenticate-without-apartment-id.md)
