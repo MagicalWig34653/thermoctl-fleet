@@ -257,6 +257,8 @@ class SimAgent:
         self._pending_version: dict[str, Any] | None = None
         self._seen_revision: object = None
         self._seen_backup: object = None
+        self._last_clock: datetime | None = None
+        self._same_clock_ticks = 0
         if state_dir is not None:
             marker = read_marker(state_dir, apartment, "version")
             if marker is not None:  # a restarted box already runs what was last installed
@@ -266,6 +268,21 @@ class SimAgent:
             backup = read_marker(state_dir, apartment, "backup")
             if backup is not None:  # a reboot does not repeat an old backup
                 self._seen_backup = backup.get("id")
+
+    def _sent_at(self) -> datetime:
+        """The heartbeat's time. The virtual clock stands still between two clock steps, so
+        ticks repeat the same `sent_at`, which the fleet drops as a duplicate. If the first
+        one of a new virtual instant reached a fleet container whose own clock had not caught
+        up yet, its `received_at` would stay in the past for good (then a `not_reporting`
+        alarm or a stale preflight, no real base station causes either). The SECOND tick at
+        the same instant is therefore sent 1 ms later: a new row, received with the caught-up
+        clock. Later ticks repeat it unchanged (dropped as before)."""
+        now = self._now()
+        if now == self._last_clock:
+            self._same_clock_ticks += 1
+        else:
+            self._last_clock, self._same_clock_ticks = now, 0
+        return now + timedelta(milliseconds=1) if self._same_clock_ticks == 1 else now
 
     def _reload_token(self) -> None:
         if self._token_file is None:
@@ -349,7 +366,7 @@ class SimAgent:
             health = self._health()
             if self._version is not None:
                 health = {**health, "thermoctl": {**health["thermoctl"], "version": self._version}}
-            hb = build_heartbeat(self.apartment, health, self._now())
+            hb = build_heartbeat(self.apartment, health, self._sent_at())
         except ValidationError:
             log.warning("heartbeat for %s does not validate; not sent", self.apartment)
             return False

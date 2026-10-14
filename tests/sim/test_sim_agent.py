@@ -381,3 +381,23 @@ def test_pinned_client_checks_the_fingerprint_and_the_ca(tmp_path: Path, monkeyp
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_second_tick_at_a_standing_clock_is_a_new_row_the_rest_repeat():
+    from datetime import timedelta
+
+    seen: list[datetime] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(Heartbeat.model_validate_json(req.content).sent_at)
+        return httpx.Response(204)
+
+    clock = [NOW]
+    agent = SimAgent("sim-a03", _client(handler), TOKEN, healthy_sections, now=lambda: clock[0])
+    for _ in range(4):
+        agent.tick()
+    assert seen == [NOW, NOW + timedelta(milliseconds=1), NOW, NOW]
+    clock[0] = NOW + timedelta(days=1)  # the clock moves: first tick exact again
+    agent.tick()
+    agent.tick()
+    assert seen[4:] == [clock[0], clock[0] + timedelta(milliseconds=1)]
