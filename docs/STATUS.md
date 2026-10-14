@@ -12404,3 +12404,5 @@ Simulation, Task 13-prep: findings 25 (device tokens never expire, by design) an
 Simulation, Task 13-prep: smoke-run raw findings archived to `docs/sim-findings/smoke/`, the index starts empty for the full run.
 
 Simulation, Task 13-prep: `python -m tools.sim preflight` (read-only readiness table) and `python -m tools.sim.env.stack --up|--down|--status`; RUNBOOK "Full run" has the exact sequence.
+
+Simulation, Task 13 (run 1 aftermath): limit detection now catches the stdout-only "monthly spend limit" notice, a circuit breaker stops after 3 non-limit failures (exit 76), tenant login refresh retries; analysis in `docs/sim-findings/03-run1-aborted.md`.

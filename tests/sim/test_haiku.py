@@ -92,11 +92,51 @@ def test_new_keywords_detected(tmp_path: Path):
 def test_limit_in_stdout_tail_only_when_stderr_empty(tmp_path: Path):
     res = run_persona("hi", cwd=tmp_path, popen=fake(stdout="x\nusage limit reached", code=1))
     assert res.limit_hit
-    # stderr present and unrelated: stdout is not consulted at all
-    res = run_persona(
-        "hi", cwd=tmp_path, popen=fake(stdout="usage limit reached", stderr="boom", code=1)
-    )
+    # stderr present and unrelated, stdout long: the tail is not consulted
+    long_out = "usage limit reached\n" + "x" * 500 + "\nok"
+    res = run_persona("hi", cwd=tmp_path, popen=fake(stdout=long_out, stderr="boom", code=1))
     assert not res.limit_hit
+
+
+OBSERVED = (
+    "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage?from=cc"
+)
+
+
+def test_observed_stdout_only_message_is_a_limit(tmp_path: Path):
+    res = run_persona("hi", cwd=tmp_path, popen=fake(stdout=OBSERVED + "\n", code=1))
+    assert res.limit_hit and not res.ok and res.text.startswith("You've hit")
+    # also when stderr carries something unrelated
+    res = run_persona("hi", cwd=tmp_path, popen=fake(stdout=OBSERVED, stderr="warn", code=1))
+    assert res.limit_hit
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "5-hour session limit reached - resets at 3pm",
+        "Weekly limit reached, resets on Monday",
+        "Your credit balance is too low",
+        "API Error: 429 rate_limit_error",
+        "Overloaded",
+        "You have exceeded your quota",
+    ],
+)
+def test_known_phrasings_are_limits(tmp_path: Path, msg: str):
+    for kw in ({"stdout": msg}, {"stderr": msg}):
+        res = run_persona("hi", cwd=tmp_path, popen=fake(code=1, **kw))
+        assert res.limit_hit, (msg, kw)
+
+
+def test_short_persona_note_about_rate_limits_is_not_a_limit(tmp_path: Path):
+    for code in (0, 1):
+        res = run_persona(
+            "hi", cwd=tmp_path, popen=fake(stdout="There is no rate limit on login.", code=code)
+        )
+        assert not res.limit_hit
+    assert not run_persona(
+        "hi", cwd=tmp_path, popen=fake(stdout=OBSERVED, code=0)
+    ).limit_hit  # exit 0 never counts
 
 
 def test_persona_talking_about_limits_is_not_a_limit(tmp_path: Path):

@@ -355,3 +355,68 @@ def test_terminated_during_persona_saves_state_and_propagates(tmp_path):
     assert len(state.done_steps) == 1  # first persona finished, second was interrupted
     assert not (tmp_path / "f" / "INDEX.md").exists()  # no half-finished report
     assert not (tmp_path / "s" / "failures.jsonl").exists()  # an interruption is no failure
+
+
+def test_limit_hit_stops_before_the_week_advances(tmp_path):
+    from tools.sim.clock import clock_path
+
+    calls = []
+
+    def limited(prompt):
+        calls.append(prompt)
+        return PersonaResult(False, "", True) if len(calls) == 2 else GOOD
+
+    with pytest.raises(LimitPause):
+        run(**make(tmp_path, limited, [], weeks=30))
+    state = SimState.load(tmp_path / "s" / "state.json")
+    assert len(calls) == 2
+    assert state.week == 0  # still the week of the failed persona
+    assert clock_path(tmp_path / "s").read_text().startswith("2026-01-05")
+
+
+def test_three_failures_in_a_row_raise_too_many_failures(tmp_path):
+    from tools.sim.runner import TooManyFailures
+
+    calls = []
+
+    def broken(prompt):
+        calls.append(prompt)
+        return PersonaResult(False, "tool exploded", False)
+
+    with pytest.raises(TooManyFailures) as info:
+        run(**make(tmp_path, broken, [], weeks=30))
+    assert len(calls) == 3
+    assert "tool exploded" in str(info.value) and info.value.count == 3
+    assert SimState.load(tmp_path / "s" / "state.json").week == 0
+    rows = (tmp_path / "s" / "failures.jsonl").read_text().splitlines()
+    assert len(rows) == 3
+
+
+def test_success_resets_the_failure_count(tmp_path):
+    n = 0
+
+    def alternating(prompt):
+        nonlocal n
+        n += 1
+        return GOOD if n % 3 == 0 else PersonaResult(False, "meh", False)
+
+    run(**make(tmp_path, alternating, [], weeks=3))  # never 3 failures in a row
+    assert SimState.load(tmp_path / "s" / "state.json").week == 3
+
+
+def test_retry_of_old_failures_also_trips_the_breaker(tmp_path):
+    from tools.sim.runner import TooManyFailures
+
+    d = tmp_path / "s"
+    d.mkdir()
+    rows = [{"step": f"w00{i}:landlord", "week": i, "text": "x"} for i in range(5)]
+    (d / "failures.jsonl").write_text("\n".join(__import__("json").dumps(r) for r in rows) + "\n")
+    calls = []
+
+    def broken(prompt):
+        calls.append(prompt)
+        return PersonaResult(False, "still broken", False)
+
+    with pytest.raises(TooManyFailures):
+        run(**make(tmp_path, broken, [], weeks=3))
+    assert len(calls) == 3

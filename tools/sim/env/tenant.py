@@ -261,28 +261,74 @@ def down(directory: Path, run_cmd: RunCmd) -> None:
     run_cmd(_compose("down", "--volumes", "--remove-orphans"), env)
 
 
+SESSION_COOKIE = "thermoctl_session"
+LOGIN_ATTEMPTS = 3
+_RETRY_WAIT_S = 5.0
+_SETTLE_TIMEOUT_MS = 15_000
+
+
 def login_succeeded(final_url: str, base_url: str) -> bool:
     """A good login ends away from `/login`, on the same instance."""
     return final_url.startswith(base_url) and "/login" not in final_url
 
 
-def _login_one(  # pragma: no cover - needs a real Chromium and a running instance
+def has_session_cookie(cookies: list[Mapping[str, Any]]) -> bool:
+    """The instance's session cookie is the authoritative proof of a login."""
+    return any(c.get("name") == SESSION_COOKIE and c.get("value") for c in cookies)
+
+
+def login_with_retries(
+    attempt: Callable[[], dict[str, Any] | None],
+    *,
+    attempts: int = LOGIN_ATTEMPTS,
+    wait_s: float = _RETRY_WAIT_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any] | None:
+    """Try a login up to `attempts` times with a real-time pause in between.
+
+    Nothing about the simulation advances while this waits; a login that keeps failing
+    returns None (the caller reports it loudly and keeps the stale state).
+    """
+    for number in range(attempts):
+        state = attempt()
+        if state is not None:
+            return state
+        if number < attempts - 1:
+            sleep(wait_s)
+    return None
+
+
+def _login_once(  # pragma: no cover - needs a real Chromium and a running instance
     browser: Any, n: int, password: str
 ) -> dict[str, Any] | None:
+    """One login. The form is boosted by the page's script, so `page.url` right after the
+    first navigation event can still be the login page; wait for the session cookie to
+    appear and for the URL to leave `/login` instead of judging a single snapshot."""
     context = browser.new_context(locale="de-DE")
     try:
         page = context.new_page()
         page.goto(f"{tenant_url(n)}/login", wait_until="load", timeout=_NAV_TIMEOUT_MS)
         page.fill("#username", tenant_username(n))
         page.fill("#password", password)
-        with page.expect_navigation(timeout=_NAV_TIMEOUT_MS):
-            page.click("button[type=submit]")
-        if login_succeeded(page.url, tenant_url(n)):
-            state: dict[str, Any] = context.storage_state()
-            return state
+        page.click("button[type=submit]")
+        deadline = time.monotonic() + _SETTLE_TIMEOUT_MS / 1000
+        while time.monotonic() < deadline:
+            if has_session_cookie(context.cookies()) and login_succeeded(page.url, tenant_url(n)):
+                page.wait_for_load_state("load", timeout=_NAV_TIMEOUT_MS)
+                state: dict[str, Any] = context.storage_state()
+                return state
+            page.wait_for_timeout(250)
+    except Exception as exc:  # noqa: BLE001 - a flaky page load is a failed attempt, not a crash
+        print(f"tenant{n}: login attempt error: {exc}", file=sys.stderr)
     finally:
         context.close()
     return None
+
+
+def _login_one(  # pragma: no cover - needs a real Chromium and a running instance
+    browser: Any, n: int, password: str
+) -> dict[str, Any] | None:
+    return login_with_retries(lambda: _login_once(browser, n, password))
 
 
 def refresh_logins(directory: Path) -> dict[str, bool]:  # pragma: no cover - needs Chromium
@@ -291,7 +337,7 @@ def refresh_logins(directory: Path) -> dict[str, bool]:  # pragma: no cover - ne
 
     users = load_users(directory)
     if users is None:
-        raise RuntimeError(f"no {USERS_FILE} in {directory}: run `tools.sim.env.tenant --up` first")
+        raise RuntimeError(f"no {USERS_FILE} in {directory}: run `tenant --up` first")
     results: dict[str, bool] = {}
     with sync_playwright() as pw:
         browser = pw.chromium.launch()

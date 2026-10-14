@@ -18,6 +18,7 @@ from tools.sim.runner import (
     LimitPause,
     LoginsUnavailable,
     Terminated,
+    TooManyFailures,
     outstanding_failures,
     record_failure,
     run,
@@ -29,6 +30,7 @@ from tools.sim.state import SimState
 ROOT = Path(__file__).resolve().parents[2]
 FINDINGS_DIR = ROOT / "docs" / "sim-findings"
 EXIT_PAUSED = 75
+EXIT_TOO_MANY_FAILURES = 76
 EXIT_ENV_MISSING = 2
 
 
@@ -189,6 +191,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:  # resume with different parameters, corrupt state
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except TooManyFailures as stop:
+        print(
+            f"stopped: {stop}\nstate saved; fix the cause, run `python -m tools.sim preflight`, "
+            "then rerun the identical `run` command to resume (see RUNBOOK section 3)",
+            file=sys.stderr,
+        )
+        _print_outstanding()
+        return EXIT_TOO_MANY_FAILURES
     except LimitPause as pause:
         print(f"paused at {pause}; rerun `python -m tools.sim run` to resume")
         _print_outstanding()

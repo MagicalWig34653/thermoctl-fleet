@@ -79,6 +79,19 @@ saved, nothing repeats. Wait for the owner's go (the limit must have reset),
 then rerun the exact same command. Failed persona steps listed in
 `failures.jsonl` are retried first.
 
+How a limit is recognised (`tools/sim/haiku.py`): only on a non-zero exit of `claude -p`, and
+only if stderr matches a known phrasing, or stdout (whole, under 400 chars, or its last 3
+lines) holds a limit notice such as "You've hit your monthly spend limit ... raise it at ...",
+"session limit", "weekly limit ... resets", 429, overloaded, credit balance, quota exceeded.
+A persona finding that merely mentions a "rate limit" never counts.
+
+**Exit code 76 (circuit breaker).** After 3 persona failures in a row that are not limit hits
+the run stops cleanly (`TooManyFailures`): state is saved, the message names the last failing
+step and its text, and no further week is started. Read `sim-state/failures.jsonl`, fix the
+cause (login, tool, billing), run `python -m tools.sim preflight`, then rerun the identical
+`run` command. Any success resets the count; failed steps are retried first on resume. Exit
+75 (limit) always stops *before* the week advances past the failed persona.
+
 ## 4. Logins expire
 
 Session cookies do not last forever. The run refreshes the logins at the start
@@ -90,6 +103,18 @@ python -m tools.sim.env.logins --refresh
 
 A role that cannot log in keeps its previous state file and the run goes on
 with a warning; a persona then sees the anonymous page.
+
+Tenant logins (run 1: 58 `login-refresh` failures, always tenant1..3, never the fleet roles,
+no pattern by week): the tenant instances' own audit logs list 157 successful logins and no
+failed login, and the code has no throttle or lockout on success, so the server accepted every
+attempt. The defect was on the harness side: it judged the login by `page.url` straight after
+the first navigation event, which races with the page's own redirect handling. It now waits
+(up to 15 s) for the session cookie `thermoctl_session` and a URL off `/login`, and retries up
+to 3 times with a 5 s real-time pause; the simulated clock does not move meanwhile. Only
+after 3 failed attempts does the role count as failed (warning, stale state kept). The
+cause is inferred from the server-side evidence, not reproduced live (the stack was not to be
+touched); if `login-refresh` rows still appear, look at the per-attempt stderr line
+`tenantN: login attempt error`.
 
 ## 5. Tear down
 

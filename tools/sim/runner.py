@@ -53,6 +53,26 @@ class LimitPause(Exception):
     """Usage limit hit; state is saved, rerun to resume."""
 
 
+MAX_CONSECUTIVE_FAILURES = 3
+
+
+class TooManyFailures(Exception):  # noqa: N818 - a stop condition, like LimitPause
+    """Persona calls failed several times in a row (not a limit hit); state is saved.
+
+    A broken environment (expired login, missing tool, billing problem not recognised as a
+    limit) would otherwise burn through every remaining week without doing any persona work.
+    """
+
+    def __init__(self, step_id: str, count: int, last_text: str) -> None:
+        super().__init__(
+            f"{count} persona calls failed in a row (last: {step_id}): "
+            f"{last_text.strip()[:_FAILURE_TEXT_MAX] or '(no output)'}"
+        )
+        self.step_id = step_id
+        self.count = count
+        self.last_text = last_text
+
+
 class Terminated(BaseException):  # noqa: N818 - a signal, not an error
     """SIGTERM/SIGINT arrived; children are killed, `exit_code` is 128 + signal.
 
@@ -192,6 +212,10 @@ def run(
     handler raises NotImplementedError is logged to `skipped-events.jsonl` and counted
     as applied; any other exception aborts the run (state saved). `refresh_logins`,
     if given, is called at the start of every simulated week after the first.
+
+    A limit hit raises `LimitPause` before the week advances (the failed persona is
+    retried first on resume); `MAX_CONSECUTIVE_FAILURES` failures in a row that are not
+    limit hits raise `TooManyFailures`, also with the state saved. Any success resets the count.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
@@ -208,6 +232,16 @@ def run(
     clock.write()
     schedule = build_schedule(seed, weeks, apartments)
 
+    failures_in_a_row = 0
+
+    def note_failure(step_id: str, week_of: int, text: str) -> None:
+        nonlocal failures_in_a_row
+        _record_failure(state_dir, step_id, week_of, text)
+        failures_in_a_row += 1
+        if failures_in_a_row >= MAX_CONSECUTIVE_FAILURES:
+            state.save(state_path)
+            raise TooManyFailures(step_id, failures_in_a_row, text)
+
     try:
         # Failed steps of earlier runs belong to weeks that already ended; retry
         # them first, with the prompt dated to their own week.
@@ -223,8 +257,9 @@ def run(
             if result.limit_hit:
                 raise LimitPause(step_id)
             if not result.ok:
-                _record_failure(state_dir, step_id, week_of, result.text)
+                note_failure(step_id, week_of, result.text)
                 continue
+            failures_in_a_row = 0
             append_findings(findings_dir, parse_findings(result.text, week_of, persona_id))
             state.mark_step(step_id)
             state.save(state_path)
@@ -255,8 +290,9 @@ def run(
                     state.save(state_path)
                     raise LimitPause(step_id)
                 if not result.ok:
-                    _record_failure(state_dir, step_id, week, result.text)
+                    note_failure(step_id, week, result.text)
                     continue  # not marked done: retried on the next run
+                failures_in_a_row = 0
                 append_findings(findings_dir, parse_findings(result.text, week, persona.id))
                 state.mark_step(step_id)
                 state.save(state_path)

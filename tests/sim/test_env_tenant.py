@@ -177,3 +177,29 @@ def test_compose_file_shape():
         assert svc["environment"]["FAKETIME_TIMESTAMP_FILE"] == "/sim-clock/clock"
         assert svc["environment"]["THERMOCTL_MQTT_ENABLED"] == "false"
     assert all(v["name"].startswith("thermoctl-sim") for v in doc["volumes"].values())
+
+
+def test_has_session_cookie():
+    assert tenant.has_session_cookie(
+        [{"name": "x", "value": "1"}, {"name": "thermoctl_session", "value": "s"}]
+    )
+    assert not tenant.has_session_cookie([{"name": "thermoctl_csrf", "value": "c"}])
+    assert not tenant.has_session_cookie([{"name": "thermoctl_session", "value": ""}])
+    assert not tenant.has_session_cookie([])
+
+
+def test_login_with_retries_succeeds_on_the_second_attempt():
+    sleeps, calls = [], []
+
+    def attempt():
+        calls.append(1)
+        return {"cookies": []} if len(calls) == 2 else None
+
+    assert tenant.login_with_retries(attempt, sleep=sleeps.append, wait_s=5) == {"cookies": []}
+    assert len(calls) == 2 and sleeps == [5]
+
+
+def test_login_with_retries_gives_up_after_three_attempts():
+    sleeps, calls = [], []
+    assert tenant.login_with_retries(lambda: calls.append(1), sleep=sleeps.append, wait_s=2) is None
+    assert len(calls) == 3 and sleeps == [2, 2]  # no pause after the last attempt

@@ -12,7 +12,20 @@ from pathlib import Path
 from typing import Any
 
 _LIMIT = re.compile(
-    r"usage limit|rate limit|limit reached|quota|429|overloaded|credit balance|resets at",
+    r"usage limit|session limit|weekly limit|monthly (?:spend )?limit|spend limit|limit reached"
+    r"|hit your (?:\w+ )*limit|raise it|resets?\b|rate.?limit|quota|\b429\b|overloaded"
+    r"|credit balance",
+    re.IGNORECASE,
+)
+# A limit message printed on stdout is one short notice; a real persona answer is longer.
+# The stdout-only rule uses this narrower set (no bare "rate limit"/"quota"), so a short
+# persona note such as "no rate limit on the login page" never counts.
+_STDOUT_LIMIT_MAX_CHARS = 400
+_NOTICE = re.compile(
+    r"usage limit|session limit|weekly limit|monthly (?:spend )?limit|spend limit|limit reached"
+    r"|hit your (?:\w+ )*limit|raise it|exceeded your quota|quota (?:exceeded|reached)"
+    r"|resets? (?:at|in|on)\b|\b429\b|overloaded"
+    r"|credit balance",
     re.IGNORECASE,
 )
 
@@ -78,12 +91,21 @@ def ensure_persona_cwd(state_dir: Path) -> Path:
 
 
 def _is_limit(stdout: str, stderr: str) -> bool:
-    """Look at stderr only; fall back to the last 3 stdout lines if stderr is empty."""
-    if stderr.strip():
-        haystack = stderr
-    else:
-        haystack = "\n".join(stdout.strip().splitlines()[-3:])
-    return bool(_LIMIT.search(haystack))
+    """Only called for a non-zero exit.
+
+    A limit is: stderr matches; or stderr is empty and the last 3 stdout lines match; or the
+    whole stdout is one short notice (under 400 chars) that matches. Claude Code prints
+    "You've hit your monthly spend limit ..." on stdout, and the text of a real persona run
+    is long, so a finding that merely mentions a rate limit does not trip this.
+    """
+    if _LIMIT.search(stderr):
+        return True
+    body = stdout.strip()
+    if len(body) < _STDOUT_LIMIT_MAX_CHARS and _NOTICE.search(body):
+        return True
+    if not stderr.strip():
+        return bool(_NOTICE.search("\n".join(body.splitlines()[-3:])))
+    return False
 
 
 def _text(value: object) -> str:

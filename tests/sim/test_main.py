@@ -73,6 +73,26 @@ def test_run_pause_returns_75(dirs, capsys, monkeypatch):
     assert "rerun" in capsys.readouterr().out
 
 
+def test_run_too_many_failures_returns_76(dirs, capsys, monkeypatch):
+    class Env:
+        apartments = staticmethod(lambda: ["a01"])
+        urls = staticmethod(lambda: {"fleet": "http://127.0.0.1:1"})
+        apply_event = staticmethod(lambda event: None)
+        persona_env_extras = staticmethod(dict)
+
+    monkeypatch.setattr(cli.importlib, "import_module", lambda name: Env)
+    monkeypatch.setattr(cli, "ensure_persona_cwd", lambda d: d)
+    from tools.sim.haiku import PersonaResult
+
+    monkeypatch.setattr(
+        cli, "run_persona", lambda p, cwd, env: PersonaResult(False, "tool exploded", False)
+    )
+    assert cli.main(["run", "--weeks", "5"]) == 76
+    err = capsys.readouterr().err
+    assert "3 persona calls failed in a row" in err and "tool exploded" in err
+    assert "rerun" in err
+
+
 def test_status_on_corrupt_state_is_one_line_error(dirs, capsys):
     (dirs / "s").mkdir()
     (dirs / "s" / "state.json").write_text("{not json")
@@ -119,7 +139,9 @@ def test_run_passes_env_and_prints_outstanding(dirs, capsys, monkeypatch):
 
     def fake(prompt, cwd, env):
         seen["env"] = env
-        return PersonaResult(False, "boom", False)  # every step fails, none limit
+        seen["n"] = seen.get("n", 0) + 1
+        ok = seen["n"] % 2 == 0  # every other step fails (never 3 in a row), none a limit
+        return PersonaResult(ok, "boom" if not ok else "FINDINGS: none\nDONE", False)
 
     monkeypatch.setattr(cli, "run_persona", fake)
     assert cli.main(["run", "--weeks", "1"]) == 0
