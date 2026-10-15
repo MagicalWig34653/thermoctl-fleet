@@ -172,6 +172,21 @@ python -m tools.sim rewind --to-week 73 --weeks 156 --yes      # apply
   particular can show a past open/close pattern the replayed weeks will repeat.
 - Then `preflight` and the identical `run` command.
 
+### One apartment reads a day stale (exit 77, "missing: sim-aNN")
+
+Cause (weeks 68, 86, 87): the fleet container's libfaketime clock lagged behind the new
+virtual day when the first heartbeat of that instant arrived, so its `received_at` was one
+day old. The sender then has to produce another new row, but the old sender sent only ONE
+retry (`sent_at` + 1 ms), and over the VMs' TLS proxy that single send was lost with
+`RemoteProtocolError` (stale keep-alive), so no further row ever appeared. Fix: at a standing
+clock the sender sends `t + k ms` on every tick (k capped at 50, so at most 51 rows per
+virtual instant). `wait_for_heartbeats` already judged by `received_at` and now prints which
+apartment is stale and how old its newest `received_at` is. Repair of a running stack after
+changing `sim_agent.py`: `limactl shell thermoctl-sim-aNN -- sudo bash -c 'install -m 0644
+/thermoctl-fleet/tools/sim/sim_agent.py /opt/thermoctl-sim/tools/sim/sim_agent.py && docker
+restart thermoctl-sim-agent'` for both VMs, `docker restart thermoctl-sim-sim-aNN` for a03..a12,
+then `python -m tools.sim.env.up_fleet --check` (all 12 within about a minute).
+
 ## 4. Logins expire
 
 Session cookies do not last forever. The run refreshes the logins at the start

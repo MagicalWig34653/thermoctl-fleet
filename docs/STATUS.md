@@ -12414,3 +12414,5 @@ Simulation, Task 13 (run 1 aftermath): limit detection now catches the stdout-on
 Simulation, Task 13 (run 2 aftermath): weekly fleet health guard (exit 77), `python -m tools.sim rewind --to-week N [--yes]` and a pid lock for `run`; disk-full incident in `docs/sim-findings/04-run2-disk-full.md`, procedure in RUNBOOK 3a.
 
 Simulation, Task 13 (rewind fix): `rewind --yes` resets the sim fleet's time-dependent login state (TOTP replay watermark, throttles, later sessions) via fleet op `reset_time_state` and reports the residue; manual: `python -m tools.sim.env.fleet_events reset-time-state --to <time>`.
+
+Simulation, Task 13 (a01 stale heartbeat): standing-clock sender ticks now send `t + k ms` (k capped at 50) instead of a single +1 ms retry, which was lost over the VM TLS proxy; the settle wait prints which apartment is stale and why; runbook note in `docs/sim-findings/RUNBOOK.md`.
