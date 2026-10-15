@@ -94,6 +94,73 @@ cause (login, tool, billing), run `python -m tools.sim preflight`, then rerun th
 `run` command. Any success resets the count; failed steps are retried first on resume. Exit
 75 (limit) always stops *before* the week advances past the failed persona.
 
+## 3a. Exit codes, fleet health guard, disk full, rewind
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | all weeks done | - |
+| 1 | error (bad parameters, corrupt state, no login, another run active) | read the message |
+| 2 | environment module missing | - |
+| 75 | usage limit hit (section 3) | wait for the owner's go, rerun the identical `run` |
+| 76 | circuit breaker: 3 persona failures in a row (or a role's login refresh failing 3 weeks in a row) | fix the cause, `preflight`, rerun |
+| 77 | **fleet unhealthy**: the weekly health guard found a problem | fix the fleet, `preflight`, rerun (below) |
+| 130 / 143 | SIGINT / SIGTERM (section "Signals") | rerun |
+
+**Health guard (exit 77).** At the start of a run and at the start of every simulated week
+(after the login refresh, before that week's events and personas) the runner calls a health
+check. Any problem saves the state and stops with `FleetUnhealthy` (exit 77); no event is
+applied, no persona runs and no step is marked done. The CLI prints every problem. Checks:
+
+- fleet `/healthz` answers 200;
+- every apartment outside an open heartbeat-loss window has a heartbeat within 15 virtual
+  minutes (the fleet only stores heartbeats if it can write, so this is the write signal);
+- the weekly login refresh did not fail for all of landlord, caretaker and admin at once;
+- `docker exec thermoctl-sim-fleet df -P /data` shows at least 1 GiB available (if the
+  command cannot be read, this check is skipped; the others still apply).
+
+After fixing the cause: `python -m tools.sim preflight`, then rerun the identical `run`
+command. The resume runs the guard first. A second `run` while one is active is refused
+(`<state>/run.pid`; a stale file of a dead process is replaced).
+
+**Disk full on the Docker VM (run 2).** The fleet's SQLite could not write
+(`sqlite3.OperationalError: database or disk is full`) because the Colima VM's disk was 100%
+full; see `04-run2-disk-full.md`. Check, read-only:
+
+```sh
+colima ssh -- df -h /var/lib/docker     # the VM disk that holds images, volumes, container layers
+docker system df                        # what Docker uses: images, containers, volumes, build cache
+```
+
+Then free only what the sim owns (`thermoctl-sim*` containers, images, volumes, build cache) or
+dangling resources, and only with the owner's consent. Never remove `thermoctl-sim-fleet-data`
+(the fleet database) and nothing that is not the sim's. If there is nothing left to free,
+`colima stop && colima start --disk N` grows the VM disk (N in GiB, larger than now) but
+**restarts all containers** on the VM; the sim stack then needs `stack --status` and a check
+that the agents and the clock mount came back before resuming.
+
+**Rewind to an earlier week.** For when weeks from N on are tainted:
+
+```sh
+python -m tools.sim rewind --to-week 73 --weeks 156            # dry run: only counts
+python -m tools.sim rewind --to-week 73 --weeks 156 --yes      # apply
+```
+
+- `--weeks` must be the value the run was started with (default 156): it rebuilds the event
+  schedule (with the seed from `state.json`) that maps event ids to weeks. If the applied
+  events do not fit that schedule the rewind is refused.
+- Refused while a run is active (pid file or a `tools.sim run` process, `pgrep`).
+- Backup first: `state.json`, `failures.jsonl`, `skipped-events.jsonl` and
+  `docs/sim-findings/raw/findings.jsonl` are copied to `<state>/rewind-backups/<UTC timestamp>/`.
+- Then: `state.week = N`; persona steps and applied events of weeks >= N are removed; rows of
+  weeks >= N are dropped from the raw findings, `failures.jsonl` and `skipped-events.jsonl`;
+  the virtual clock file is rewritten in place to SIM_START + N weeks. A summary with counts
+  is printed.
+- Fleet-side effects of the dropped events (desired states, backups, rotated tokens) stay in
+  the fleet database; events are idempotent on re-application (section "Event coverage"), so
+  the resume tolerates that. The rewind does not touch the fleet's own history (heartbeats of
+  the dropped weeks stay).
+- Then `preflight` and the identical `run` command.
+
 ## 4. Logins expire
 
 Session cookies do not last forever. The run refreshes the logins at the start

@@ -12410,3 +12410,5 @@ Simulation, Task 13-prep: smoke-run raw findings archived to `docs/sim-findings/
 Simulation, Task 13-prep: `python -m tools.sim preflight` (read-only readiness table) and `python -m tools.sim.env.stack --up|--down|--status`; RUNBOOK "Full run" has the exact sequence.
 
 Simulation, Task 13 (run 1 aftermath): limit detection now catches the stdout-only "monthly spend limit" notice, a circuit breaker stops after 3 non-limit failures (exit 76), tenant login refresh retries; analysis in `docs/sim-findings/03-run1-aborted.md`.
+
+Simulation, Task 13 (run 2 aftermath): weekly fleet health guard (exit 77), `python -m tools.sim rewind --to-week N [--yes]` and a pid lock for `run`; disk-full incident in `docs/sim-findings/04-run2-disk-full.md`, procedure in RUNBOOK 3a.
