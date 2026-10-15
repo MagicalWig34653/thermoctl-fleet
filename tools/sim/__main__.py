@@ -12,11 +12,13 @@ from pathlib import Path
 
 from tools.sim.env.config import APARTMENT_IDS, state_dir
 from tools.sim.findings import build_index
+from tools.sim.guard import LoginOutcome
 from tools.sim.haiku import ensure_persona_cwd, run_persona
 from tools.sim.personas import PERSONAS
 from tools.sim.runner import (
     MAX_CONSECUTIVE_FAILURES,
     TOOL_NOTES,
+    FleetUnhealthy,
     LimitPause,
     LoginsUnavailable,
     Terminated,
@@ -33,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FINDINGS_DIR = ROOT / "docs" / "sim-findings"
 EXIT_PAUSED = 75
 EXIT_TOO_MANY_FAILURES = 76
+EXIT_FLEET_UNHEALTHY = 77
 EXIT_ENV_MISSING = 2
 
 
@@ -83,13 +86,17 @@ def _failed_roles(message: str) -> list[str]:
 
 
 def _safe_refresh(
-    refresh: Callable[[], None], directory: Path, max_in_a_row: int = MAX_CONSECUTIVE_FAILURES
+    refresh: Callable[[], None],
+    directory: Path,
+    max_in_a_row: int = MAX_CONSECUTIVE_FAILURES,
+    outcome: LoginOutcome | None = None,
 ) -> Callable[[], None]:
     """A stale login must not abort a week of simulation: warn loudly and record it.
 
     `LoginsUnavailable` (a role never had a login) is not caught: it stops the run. A role
     whose refresh fails `max_in_a_row` weeks in a row raises `TooManyFailures` naming it: a
-    broken login makes every persona call useless.
+    broken login makes every persona call useless. `outcome`, if given, learns which roles the
+    latest refresh failed for (the health guard treats all fleet roles failing as an outage).
     """
     streaks: dict[str, int] = {}
 
@@ -106,6 +113,8 @@ def _safe_refresh(
                 week = 0
             record_failure(directory, "login-refresh", week, str(exc))
             failed = _failed_roles(str(exc))
+            if outcome is not None:
+                outcome.record_failure(failed)
             streaks.update({r: streaks.get(r, 0) + 1 for r in failed})
             for role in [r for r in streaks if r not in failed]:
                 streaks[role] = 0
@@ -122,6 +131,8 @@ def _safe_refresh(
                     ) from exc
         else:
             streaks.clear()
+            if outcome is not None:
+                outcome.record_success()
 
     return hook
 
@@ -198,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
     child_env = persona_env(ROOT, sys.executable, os.environ)
     child_env.update(getattr(env, "persona_env_extras", dict)())
     refresh = getattr(env, "refresh_logins", None)
+    outcome = LoginOutcome()
+    make_health_check = getattr(env, "health_check", None)
     try:
         with termination_handlers():
             run(
@@ -213,8 +226,11 @@ def main(argv: list[str] | None = None) -> int:
                 wait_for_heartbeats=getattr(env, "wait_for_heartbeats", None),
                 seed=args.seed,
                 personas=selected,
-                refresh_logins=_safe_refresh(refresh, state_dir())
+                refresh_logins=_safe_refresh(refresh, state_dir(), outcome=outcome)
                 if refresh and _stack_is_up()
+                else None,
+                health_check=make_health_check(outcome)
+                if make_health_check and _stack_is_up()
                 else None,
             )
     except Terminated as stop:
@@ -226,6 +242,16 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:  # resume with different parameters, corrupt state
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except FleetUnhealthy as stop:
+        problems = "\n".join(f"  - {p}" for p in stop.problems)
+        print(
+            f"stopped: the fleet is not healthy, no persona ran against it:\n{problems}\n"
+            "state saved; fix the cause (RUNBOOK section 3a), run "
+            "`python -m tools.sim preflight`, then rerun the identical `run` command to resume",
+            file=sys.stderr,
+        )
+        _print_outstanding()
+        return EXIT_FLEET_UNHEALTHY
     except TooManyFailures as stop:
         print(
             f"stopped: {stop}\nstate saved; fix the cause, run `python -m tools.sim preflight`, "

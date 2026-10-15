@@ -370,3 +370,68 @@ def test_safe_refresh_streak_is_per_role_and_reset_by_success(dirs, capsys):
         hook()
     with pytest.raises(TooManyFailures):
         hook()
+
+
+def _unhealthy_env(monkeypatch, outcomes):
+    class Env:
+        @staticmethod
+        def apartments():
+            return ["a01"]
+
+        @staticmethod
+        def urls():
+            return {"fleet": "http://127.0.0.1:1"}
+
+        @staticmethod
+        def apply_event(event):
+            pass
+
+        @staticmethod
+        def health_check(outcome):
+            outcomes.append(outcome)
+            return lambda: ["fleet /healthz answers 500", "disk nearly full"]
+
+    monkeypatch.setattr(cli.importlib, "import_module", lambda name: Env)
+    monkeypatch.setattr(cli, "ensure_persona_cwd", lambda d: d)
+
+
+def test_run_unhealthy_fleet_returns_77_with_problems_and_resume_hint(dirs, capsys, monkeypatch):
+    (dirs / "s").mkdir()
+    (dirs / "s" / "users.json").write_text("{}")  # the stack counts as up
+    outcomes = []
+    _unhealthy_env(monkeypatch, outcomes)
+    called = []
+    monkeypatch.setattr(cli, "run_persona", lambda *a, **k: called.append(1))
+    assert cli.main(["run", "--weeks", "1"]) == 77
+    err = capsys.readouterr().err
+    assert "fleet /healthz answers 500" in err and "disk nearly full" in err
+    assert "RUNBOOK" in err and "rerun the identical" in err
+    assert called == [] and len(outcomes) == 1
+
+
+def test_run_without_a_stack_has_no_health_check(dirs, monkeypatch):
+    _unhealthy_env(monkeypatch, [])
+    seen = {}
+    monkeypatch.setattr(cli, "run", lambda **kw: seen.update(kw))
+    assert cli.main(["run", "--weeks", "1"]) == 0
+    assert seen["health_check"] is None
+
+
+def test_safe_refresh_reports_the_failed_roles_to_the_outcome(dirs):
+    from tools.sim.guard import LoginOutcome
+
+    outcome = LoginOutcome()
+    fail = {"on": True}
+
+    def refresh():
+        if fail["on"]:
+            raise RuntimeError(
+                "login refresh FAILED for role(s) admin, caretaker, landlord; stale cookies kept"
+            )
+
+    hook = cli._safe_refresh(refresh, dirs / "s", outcome=outcome)
+    hook()
+    assert outcome.fleet_outage()
+    fail["on"] = False
+    hook()
+    assert not outcome.fleet_outage()

@@ -76,6 +76,18 @@ class TooManyFailures(Exception):  # noqa: N818 - a stop condition, like LimitPa
         self.last_text = last_text
 
 
+class FleetUnhealthy(Exception):  # noqa: N818 - a stop condition, like LimitPause
+    """The weekly health check found problems; state is saved, nothing ran against the fleet.
+
+    Raised before the week's events and persona steps, so no step is marked done and no
+    event applied against a fleet that cannot write.
+    """
+
+    def __init__(self, problems: Sequence[str]) -> None:
+        super().__init__("; ".join(problems))
+        self.problems = list(problems)
+
+
 class Terminated(BaseException):  # noqa: N818 - a signal, not an error
     """SIGTERM/SIGINT arrived; children are killed, `exit_code` is 128 + signal.
 
@@ -204,6 +216,7 @@ def run(
     personas: Sequence[str] | None = None,
     refresh_logins: Callable[[], None] | None = None,
     wait_for_heartbeats: Callable[[datetime, frozenset[str]], list[str]] | None = None,
+    health_check: Callable[[], list[str]] | None = None,
 ) -> None:
     """Run (or resume) the simulation up to `weeks`.
 
@@ -225,6 +238,11 @@ def run(
     of each week: it blocks until every apartment except the `silent` ones (open
     heartbeat-loss window) reported for the new virtual day and returns the ones that did
     not; they are printed as one warning per week (never written to failures.jsonl).
+
+    `health_check()`, if given, returns a list of problems. It runs once when the run
+    starts (before failed steps are retried) and at the start of every week after the
+    login refresh, before that week's events and personas; any problem saves the state
+    and raises `FleetUnhealthy`, so no persona ever runs against a sick fleet.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
@@ -251,7 +269,16 @@ def run(
             state.save(state_path)
             raise TooManyFailures(step_id, failures_in_a_row, text)
 
+    def guard_health() -> None:
+        if health_check is None:
+            return
+        problems = health_check()
+        if problems:
+            state.save(state_path)
+            raise FleetUnhealthy(problems)
+
     try:
+        guard_health()
         # Failed steps of earlier runs belong to weeks that already ended; retry
         # them first, with the prompt dated to their own week.
         by_id = {p.id: p for p in PERSONAS}
@@ -277,6 +304,7 @@ def run(
             state.week = week
             if refresh_logins is not None and week > 0:  # week 0: fresh from up_fleet --logins
                 refresh_logins()
+            guard_health()
             for event in due_events(schedule, week, state.applied_events):
                 try:
                     apply_event(event)

@@ -486,3 +486,55 @@ def test_waiter_is_told_who_is_deliberately_silent(tmp_path):
             e.apartment for e in events if e.kind == "heartbeat_restore" and e.id in applied
         }
         assert silent == open_
+
+
+def test_health_check_healthy_run_continues(tmp_path):
+    calls, events = [], []
+    run(**make(tmp_path, lambda p: (calls.append(p), GOOD)[1], events), health_check=lambda: [])
+    assert calls and SimState.load(tmp_path / "s" / "state.json").week == 3
+
+
+def test_unhealthy_fleet_stops_before_personas_and_marks_nothing(tmp_path):
+    from tools.sim.runner import FleetUnhealthy
+
+    calls, events = [], []
+    seen_weeks = []
+
+    def check():
+        seen_weeks.append(SimState.load(tmp_path / "s" / "state.json").week)
+        return ["disk full"] if len(seen_weeks) == 3 else []  # start, week 0, week 1 -> sick
+
+    with pytest.raises(FleetUnhealthy) as info:
+        run(**make(tmp_path, lambda p: (calls.append(p), GOOD)[1], events), health_check=check)
+    assert info.value.problems == ["disk full"]
+    state = SimState.load(tmp_path / "s" / "state.json")
+    assert state.week == 1
+    assert not any(s.startswith("w001") for s in state.done_steps)
+    assert any(s.startswith("w000") for s in state.done_steps)
+    assert all(e.week < 1 for e in events)
+
+
+def test_unhealthy_at_the_start_of_a_resume_runs_nothing(tmp_path):
+    from tools.sim.runner import FleetUnhealthy
+
+    calls, events = [], []
+    with pytest.raises(FleetUnhealthy):
+        run(
+            **make(tmp_path, lambda p: (calls.append(p), GOOD)[1], events),
+            health_check=lambda: ["x"],
+        )
+    assert calls == [] and events == []
+
+
+def test_health_check_runs_after_refresh_and_before_events_and_personas(tmp_path):
+    order = []
+    run(
+        **{
+            **make(tmp_path, lambda p: (order.append("persona"), GOOD)[1], [], weeks=2),
+            "apply_event": lambda e: order.append("event"),
+        },
+        refresh_logins=lambda: order.append("refresh"),
+        health_check=lambda: (order.append("health"), [])[1],
+    )
+    week1 = order[order.index("refresh") :]
+    assert week1[:2] == ["refresh", "health"]
