@@ -159,6 +159,17 @@ python -m tools.sim rewind --to-week 73 --weeks 156 --yes      # apply
   the fleet database; events are idempotent on re-application (section "Event coverage"), so
   the resume tolerates that. The rewind does not touch the fleet's own history (heartbeats of
   the dropped weeks stay).
+- **Login state is reset.** The fleet refuses a TOTP step not newer than the last accepted one,
+  so after a rewind every UI login would fail (401, exit 77). `rewind --yes` therefore calls the
+  fleet op `reset_time_state` in the sim fleet container: `last_totp_step` and the failure
+  counters/locks of all UI users are cleared, all UI login throttle rows deleted, UI sessions
+  created after the new clock deleted. If the fleet is down, a loud warning with the manual
+  command is printed; run it once the fleet is up:
+  `python -m tools.sim.env.fleet_events reset-time-state --to 2027-05-31T08:00:00`, then
+  `python -m tools.sim.env.logins --refresh`.
+- **Residue** (reported by the op, not changed): heartbeats sent, alarms raised/cleared,
+  commands and backups created after the new clock stay in the fleet database. Alarms in
+  particular can show a past open/close pattern the replayed weeks will repeat.
 - Then `preflight` and the identical `run` command.
 
 ## 4. Logins expire

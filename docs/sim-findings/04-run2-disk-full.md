@@ -27,3 +27,16 @@ guard at the start of every week and when a run starts (fleet `/healthz`, fresh 
 every non-silent apartment, login refresh not failing for all fleet roles, at least 1 GiB free
 on the fleet volume). A problem stops the run with exit 77 before any persona runs. Added with
 it: `python -m tools.sim rewind` and a pid lock against two runners.
+
+## Rewind side effects
+
+Rewinding run 2 from week 74 to 73 moved the virtual clock back one week but left the fleet
+untouched. The next start stopped with exit 77: `POST /ui/login` returned 401 for all fleet
+roles, because the fleet's TOTP replay protection (`UiUserRecord.last_totp_step`) held a step
+from the now-future virtual time and rejected every code of the rewound clock. Fix:
+`reset_time_state` (fleet op, run by `rewind --yes`, or by hand with
+`python -m tools.sim.env.fleet_events reset-time-state --to <time>`) clears the TOTP watermark,
+failure counters, login throttle rows and later-created UI sessions. Applied live for
+2027-05-31T08:00:00: 3 users reset, 0 throttle rows, 0 sessions; logins ok, preflight 0 FAIL.
+Residue left in the fleet database (rows dated after that time): 75 heartbeats, 26 alarms
+raised, 24 alarms cleared, 0 commands, 0 backups.
