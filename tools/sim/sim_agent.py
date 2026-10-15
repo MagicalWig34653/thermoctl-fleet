@@ -57,6 +57,7 @@ from tools.sim.http import allowed_hosts, check_url
 log = logging.getLogger("sim_agent")
 
 AGENT_ID = "sim-agent/1"
+MAX_STANDING_OFFSET_MS = 50  # rows per standing virtual instant: this + 1
 _SECTIONS = {
     "thermoctl": ("version", "reachable", "mode"),
     "control": ("last_decision", "zones", "zones_with_heat_demand", "zones_without_reading"),
@@ -274,15 +275,19 @@ class SimAgent:
         ticks repeat the same `sent_at`, which the fleet drops as a duplicate. If the first
         one of a new virtual instant reached a fleet container whose own clock had not caught
         up yet, its `received_at` would stay in the past for good (then a `not_reporting`
-        alarm or a stale preflight, no real base station causes either). The SECOND tick at
-        the same instant is therefore sent 1 ms later: a new row, received with the caught-up
-        clock. Later ticks repeat it unchanged (dropped as before)."""
+        alarm or a stale preflight, no real base station causes either). Every further tick
+        at the same instant is therefore sent k ms later (k = ticks so far, capped at
+        `MAX_STANDING_OFFSET_MS`): each is a new row until the cap, received with the
+        caught-up clock, and it does not matter if some sends fail on the wire (a stale
+        keep-alive through the TLS proxy lost the one retry of the earlier design). At most
+        `MAX_STANDING_OFFSET_MS + 1` rows per virtual instant; beyond that ticks repeat."""
         now = self._now()
         if now == self._last_clock:
             self._same_clock_ticks += 1
         else:
             self._last_clock, self._same_clock_ticks = now, 0
-        return now + timedelta(milliseconds=1) if self._same_clock_ticks == 1 else now
+        offset = min(self._same_clock_ticks, MAX_STANDING_OFFSET_MS)
+        return now + timedelta(milliseconds=offset)
 
     def _reload_token(self) -> None:
         if self._token_file is None:

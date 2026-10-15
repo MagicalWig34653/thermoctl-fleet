@@ -383,8 +383,10 @@ def test_pinned_client_checks_the_fingerprint_and_the_ca(tmp_path: Path, monkeyp
         server.server_close()
 
 
-def test_second_tick_at_a_standing_clock_is_a_new_row_the_rest_repeat():
+def test_standing_clock_ticks_offset_by_one_ms_each_up_to_the_bound_then_repeat():
     from datetime import timedelta
+
+    from tools.sim.sim_agent import MAX_STANDING_OFFSET_MS
 
     seen: list[datetime] = []
 
@@ -394,10 +396,38 @@ def test_second_tick_at_a_standing_clock_is_a_new_row_the_rest_repeat():
 
     clock = [NOW]
     agent = SimAgent("sim-a03", _client(handler), TOKEN, healthy_sections, now=lambda: clock[0])
-    for _ in range(4):
+    for _ in range(MAX_STANDING_OFFSET_MS + 4):
         agent.tick()
-    assert seen == [NOW, NOW + timedelta(milliseconds=1), NOW, NOW]
+    ms = [int((t - NOW).total_seconds() * 1000) for t in seen]
+    assert ms[:4] == [0, 1, 2, 3]
+    assert max(ms) == MAX_STANDING_OFFSET_MS == 50  # bound: at most 51 rows per instant
+    assert ms[-3:] == [MAX_STANDING_OFFSET_MS] * 3
     clock[0] = NOW + timedelta(days=1)  # the clock moves: first tick exact again
     agent.tick()
     agent.tick()
-    assert seen[4:] == [clock[0], clock[0] + timedelta(milliseconds=1)]
+    assert seen[-2:] == [clock[0], clock[0] + timedelta(milliseconds=1)]
+
+
+def test_a_lagging_fleet_clock_and_failed_ticks_still_end_in_a_fresh_row():
+    """The fleet stores a row per distinct sent_at, stamped with ITS (lagging) clock; sends
+    that fail on the wire (stale keep-alive through the TLS proxy) store nothing."""
+    from datetime import timedelta
+
+    rows: list[tuple[datetime, datetime]] = []  # (sent_at, received_at)
+    calls = [0]
+    fleet_clock = NOW - timedelta(days=1)  # lags until the 6th call
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        sent = Heartbeat.model_validate_json(req.content).sent_at
+        if calls[0] == 2:  # the old design's one retry (tick 1) is lost on the wire
+            raise httpx.RemoteProtocolError("server disconnected")
+        received = NOW if calls[0] >= 6 else fleet_clock
+        if sent not in [r[0] for r in rows]:  # unique (apartment, sent_at)
+            rows.append((sent, received))
+        return httpx.Response(204)
+
+    agent = SimAgent("sim-a01", _client(handler), TOKEN, healthy_sections, now=lambda: NOW)
+    for _ in range(8):
+        agent.tick()
+    assert max(r for _, r in rows) == NOW  # a row with a fresh received_at exists

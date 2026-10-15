@@ -73,3 +73,20 @@ def test_silent_apartments_are_never_waited_for():
         )
         == []
     )
+
+
+def test_describe_missing_names_apartment_and_reason():
+    seen = {**FRESH, "sim-a01": NOW - timedelta(days=1), "sim-a05": None}
+    text = settle.describe_missing(seen, NOW, ["sim-a01", "sim-a05"])
+    assert "sim-a01: last received_at 2026-02-28 10:00:00 (1440 min old" in text
+    assert "sim-a05: never received" in text
+
+
+def test_timeout_prints_why_to_stderr(capsys):
+    _, mono, sleep = _clock()
+    stale = {**FRESH, "sim-a01": NOW - timedelta(days=1)}
+    out = settle.wait_for_fresh_heartbeats(
+        NOW, frozenset(), read=lambda: stale, sleep=sleep, monotonic=mono, timeout_s=4
+    )
+    assert out == ["sim-a01"]
+    assert "sim-a01: last received_at" in capsys.readouterr().err

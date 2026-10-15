@@ -12,6 +12,7 @@ week the runner calls `wait_for_fresh_heartbeats`, which polls the fleet databas
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -44,6 +45,20 @@ def missing_apartments(
     return out
 
 
+def describe_missing(seen: Mapping[str, datetime | None], now: datetime, missing: list[str]) -> str:
+    """One line per stale apartment: its newest `received_at` (what the fleet judges by) and age."""
+    lines = []
+    for apartment in missing:
+        last = seen.get(apartment)
+        if last is None:
+            lines.append(f"  {apartment}: never received a heartbeat")
+            continue
+        last = _utc(last)
+        age = int((_utc(now) - last).total_seconds() // 60)
+        lines.append(f"  {apartment}: last received_at {last:%Y-%m-%d %H:%M:%S} ({age} min old)")
+    return "\n".join(lines)
+
+
 def wait_for_fresh_heartbeats(
     now: datetime,
     silent: frozenset[str],
@@ -62,10 +77,18 @@ def wait_for_fresh_heartbeats(
         read = last_heartbeats
     deadline = monotonic() + timeout_s
     while True:
+        seen: Mapping[str, datetime | None] = {}
         try:
-            missing = missing_apartments(read(), now, silent)
+            seen = read()
+            missing = missing_apartments(seen, now, silent)
         except Exception:  # noqa: BLE001 - a transient read failure must not stop the run
             missing = [a for a in APARTMENT_IDS if a not in silent]
         if not missing or monotonic() >= deadline:
+            if missing:
+                print(
+                    "warning: no fresh heartbeat (judged by the fleet's received_at, as the "
+                    f"health guard does):\n{describe_missing(seen, now, missing)}",
+                    file=sys.stderr,
+                )
             return missing
         sleep(poll_s)
