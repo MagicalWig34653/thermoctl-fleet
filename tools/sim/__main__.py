@@ -6,6 +6,7 @@ import argparse
 import importlib
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -15,6 +16,7 @@ from tools.sim.findings import build_index
 from tools.sim.guard import LoginOutcome
 from tools.sim.haiku import ensure_persona_cwd, run_persona
 from tools.sim.personas import PERSONAS
+from tools.sim.rewind import RewindRefused, RunnerBusy, rewind, run_lock
 from tools.sim.runner import (
     MAX_CONSECUTIVE_FAILURES,
     TOOL_NOTES,
@@ -137,6 +139,15 @@ def _safe_refresh(
     return hook
 
 
+def _runner_process_running() -> bool:  # pragma: no cover - runs pgrep
+    done = subprocess.run(  # noqa: S603
+        ["pgrep", "-f", r"tools\.sim run"],  # noqa: S607
+        capture_output=True,
+        check=False,
+    )
+    return done.returncode == 0
+
+
 def _print_outstanding() -> None:
     skipped = skipped_event_count(state_dir())
     if skipped:
@@ -161,6 +172,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     pre_p.add_argument("--personas", default=None, help="comma list of persona ids (default all)")
     pre_p.add_argument("--seed", type=int, default=1)
+    rew_p = sub.add_parser(
+        "rewind",
+        help="reset a stopped run to an earlier week (dry run unless --yes)",
+        description=(
+            "Reset state.json, failures.jsonl, skipped-events.jsonl, the raw findings and the "
+            "virtual clock to the start of week N; a timestamped backup of the four files goes "
+            "to <state>/rewind-backups/<ts>/. Refuses while a run is active. Fleet-side effects "
+            "of the dropped events (desired states, backups, rotated tokens) stay in the fleet "
+            "database; events are idempotent on re-application, so a resume tolerates that."
+        ),
+    )
+    rew_p.add_argument("--to-week", type=int, required=True)
+    rew_p.add_argument(
+        "--weeks", type=int, default=156, help="the --weeks the run was started with (default 156)"
+    )
+    rew_p.add_argument("--yes", action="store_true", help="apply (default: dry run)")
     sub.add_parser("status")
     sub.add_parser("report")
     args = parser.parse_args(argv)
@@ -186,6 +213,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(preflight.format_table(checks))
         return preflight.exit_code(checks)
+    if args.cmd == "rewind":
+        try:
+            summary = rewind(
+                state_dir=state_dir(),
+                findings_dir=FINDINGS_DIR,
+                to_week=args.to_week,
+                weeks=args.weeks,
+                apartments=list(APARTMENT_IDS),
+                apply=args.yes,
+                process_running=_runner_process_running,
+            )
+        except (RewindRefused, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(summary.format())
+        return 0
     if args.cmd == "status":
         try:
             state = SimState.load(state_dir() / "state.json")
@@ -212,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     outcome = LoginOutcome()
     make_health_check = getattr(env, "health_check", None)
     try:
-        with termination_handlers():
+        with run_lock(state_dir()), termination_handlers():
             run(
                 weeks=args.weeks,
                 state_dir=state_dir(),
@@ -233,6 +276,9 @@ def main(argv: list[str] | None = None) -> int:
                 if make_health_check and _stack_is_up()
                 else None,
             )
+    except RunnerBusy as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     except Terminated as stop:
         print(f"terminated (exit {stop.exit_code}); state saved, rerun to resume")
         return stop.exit_code

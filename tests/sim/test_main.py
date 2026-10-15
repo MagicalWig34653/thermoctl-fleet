@@ -435,3 +435,62 @@ def test_safe_refresh_reports_the_failed_roles_to_the_outcome(dirs):
     fail["on"] = False
     hook()
     assert not outcome.fleet_outage()
+
+
+def _seed_state(dirs, week=2):
+    from tools.sim.env.config import APARTMENT_IDS
+    from tools.sim.scenario import build_schedule
+
+    applied = [e.id for e in build_schedule(1, 4, list(APARTMENT_IDS)) if e.week < week]
+    SimState(
+        week=week, done_steps=["w000:landlord", "w001:landlord"], applied_events=applied, seed=1
+    ).save(dirs / "s" / "state.json")
+
+
+def test_rewind_is_a_dry_run_without_yes(dirs, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_runner_process_running", lambda: False)
+    _seed_state(dirs)
+    assert cli.main(["rewind", "--to-week", "1", "--weeks", "4"]) == 0
+    assert "DRY RUN" in capsys.readouterr().out
+    assert SimState.load(dirs / "s" / "state.json").week == 2
+
+
+def test_rewind_yes_applies(dirs, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_runner_process_running", lambda: False)
+    _seed_state(dirs)
+    assert cli.main(["rewind", "--to-week", "1", "--weeks", "4", "--yes"]) == 0
+    assert SimState.load(dirs / "s" / "state.json").week == 1
+    assert "persona steps removed:  1" in capsys.readouterr().out
+
+
+def test_rewind_refuses_while_the_runner_runs(dirs, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_runner_process_running", lambda: True)
+    _seed_state(dirs)
+    assert cli.main(["rewind", "--to-week", "1", "--weeks", "4", "--yes"]) == 1
+    assert "stop it first" in capsys.readouterr().err
+    assert SimState.load(dirs / "s" / "state.json").week == 2
+
+
+def test_run_refuses_a_second_runner_and_cleans_up_its_pid_file(dirs, capsys, monkeypatch):
+    import os
+
+    class Env:
+        apartments = staticmethod(lambda: ["a01"])
+        urls = staticmethod(lambda: {})
+        apply_event = staticmethod(lambda e: None)
+
+    monkeypatch.setattr(cli.importlib, "import_module", lambda name: Env)
+    monkeypatch.setattr(cli, "ensure_persona_cwd", lambda d: d)
+    (dirs / "s").mkdir()
+    (dirs / "s" / "run.pid").write_text(f"{os.getppid()}\n")  # a live process that is not us
+    assert cli.main(["run", "--weeks", "1"]) == 1
+    assert "another run is active" in capsys.readouterr().err
+    assert (dirs / "s" / "run.pid").exists()  # the holder's lock is untouched
+    (dirs / "s" / "run.pid").unlink()
+    seen = {}
+    monkeypatch.setattr(
+        cli, "run", lambda **kw: seen.update(pid=(dirs / "s" / "run.pid").read_text())
+    )
+    assert cli.main(["run", "--weeks", "1"]) == 0
+    assert seen["pid"].strip() == str(os.getpid())
+    assert not (dirs / "s" / "run.pid").exists()
