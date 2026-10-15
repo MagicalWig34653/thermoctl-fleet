@@ -494,3 +494,58 @@ def test_run_refuses_a_second_runner_and_cleans_up_its_pid_file(dirs, capsys, mo
     assert cli.main(["run", "--weeks", "1"]) == 0
     assert seen["pid"].strip() == str(os.getpid())
     assert not (dirs / "s" / "run.pid").exists()
+
+
+def test_rewind_yes_resets_the_fleet_time_state(dirs, capsys, monkeypatch):
+    from tools.sim.env import fleet_events
+
+    seen = []
+    monkeypatch.setattr(cli, "_runner_process_running", lambda: False)
+    monkeypatch.setattr(
+        fleet_events,
+        "run_op",
+        lambda op, args: (
+            seen.append((op, args))
+            or {
+                "to": args["to_iso"],
+                "users_reset": 3,
+                "throttle_rows_deleted": 0,
+                "sessions_deleted": 0,
+                "residue": {},
+            }
+        ),
+    )
+    _seed_state(dirs)
+    assert cli.main(["rewind", "--to-week", "1", "--weeks", "4", "--yes"]) == 0
+    assert seen and seen[0][0] == "reset_time_state"
+    assert "2026-" in seen[0][1]["to_iso"] or "2025-" in seen[0][1]["to_iso"]
+    assert "fleet time state reset" in capsys.readouterr().out
+
+
+def test_rewind_dry_run_does_not_touch_the_fleet(dirs, monkeypatch):
+    from tools.sim.env import fleet_events
+
+    monkeypatch.setattr(cli, "_runner_process_running", lambda: False)
+    monkeypatch.setattr(fleet_events, "run_op", lambda op, args: pytest.fail("fleet touched"))
+    _seed_state(dirs)
+    assert cli.main(["rewind", "--to-week", "1", "--weeks", "4"]) == 0
+
+
+def test_rewind_warns_loudly_with_the_manual_command_when_the_fleet_is_down(
+    dirs, capsys, monkeypatch
+):
+    from tools.sim.env import fleet_events
+
+    def down(op, args):
+        raise RuntimeError(
+            "fleet op reset_time_state failed in thermoctl-sim-fleet: no such container"
+        )
+
+    monkeypatch.setattr(cli, "_runner_process_running", lambda: False)
+    monkeypatch.setattr(fleet_events, "run_op", down)
+    _seed_state(dirs)
+    assert cli.main(["rewind", "--to-week", "1", "--weeks", "4", "--yes"]) == 0
+    assert SimState.load(dirs / "s" / "state.json").week == 1  # the local rewind stands
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "still holds time state" in err
+    assert "fleet_events reset-time-state --to " in err

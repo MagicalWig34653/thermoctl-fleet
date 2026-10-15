@@ -14,12 +14,15 @@ fleet endpoint makes after the signature check are replayed, exactly like `enrol
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import subprocess
+import sys
 import zlib
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -155,3 +158,53 @@ def tenant_change(event: Event) -> None:
     result = run_op("tenant_change", _args(event, apartment))
     if apartment in CONTAINER_APARTMENTS:
         _deliver(state_dir(), apartment, result)
+
+
+# --- rewind: time-dependent fleet state ---
+
+
+def manual_reset_command(to: datetime) -> str:
+    return f"python -m tools.sim.env.fleet_events reset-time-state --to {to.isoformat()}"
+
+
+def format_reset(result: dict[str, Any]) -> str:
+    residue = result["residue"]
+    lines = [
+        f"fleet time state reset for virtual time {result['to']}:",
+        f"  ui users reset (TOTP watermark, failure counters): {result['users_reset']}",
+        f"  login throttle rows deleted:                        {result['throttle_rows_deleted']}",
+        f"  ui sessions created after that time deleted:        {result['sessions_deleted']}",
+        "  residue, reported and NOT changed (rows dated after that time):",
+    ]
+    lines += [f"    {name}: {count}" for name, count in residue.items()]
+    return "\n".join(lines)
+
+
+def reset_time_state(to: datetime) -> dict[str, Any]:
+    """`fleet_ops.reset_time_state` in the sim fleet container (the clock moved back to `to`)."""
+    result = run_op("reset_time_state", {"to_iso": to.isoformat()})
+    assert isinstance(result, dict)
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="tools.sim.env.fleet_events", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    reset_p = sub.add_parser(
+        "reset-time-state",
+        help="make the sim fleet's login state consistent with a clock moved back",
+    )
+    reset_p.add_argument("--to", required=True, help="virtual time, e.g. 2027-05-31T08:00:00")
+    args = parser.parse_args(argv)
+    try:
+        to = datetime.fromisoformat(args.to)
+        result = reset_time_state(to)
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(format_reset(result))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

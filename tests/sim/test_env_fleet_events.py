@@ -495,3 +495,160 @@ def test_unknown_op_is_rejected(fleet):
     _, storage, _ = fleet
     with pytest.raises(ValueError, match="unknown op"):
         fleet_ops.run_op(storage, "format_disk", {"now": NOW.isoformat(), "apartment": APT}, None)
+
+
+# --- reset_time_state (rewind) ---
+
+T = datetime(2027, 5, 31, 8, tzinfo=UTC)
+FUTURE = datetime(2027, 6, 7, 8)  # naive UTC, as the fleet stores it
+PAST = datetime(2027, 5, 20, 8)
+
+
+def _populate_future_state(storage):
+    from fleet.storage import (
+        AlarmRecord,
+        BackupRecord,
+        CommandRecord,
+        HeartbeatRecord,
+        UiLoginThrottleRecord,
+        UiSessionRecord,
+        UiUserRecord,
+    )
+
+    user = storage.create_ui_user("sim-landlord", "hash", "secret", PAST)
+    with storage.session() as s:
+        row = s.get(UiUserRecord, user.id)
+        row.last_totp_step = 99_999_999
+        row.failed_attempts = 4
+        row.locked_until = FUTURE
+        row.failure_window_started_at = FUTURE
+        s.add(UiLoginThrottleRecord(ip="10.0.0.1", failures=3, window_started_at=FUTURE))
+        for name, created in (("old", PAST), ("new", FUTURE)):
+            s.add(
+                UiSessionRecord(
+                    token_hash=name,
+                    user_id=user.id,
+                    csrf_token="c",
+                    created_at=created,
+                    expires_at=created.replace(year=2028),
+                    last_seen_at=created,
+                )
+            )
+        for sent in (PAST, FUTURE, FUTURE.replace(day=8)):
+            s.add(
+                HeartbeatRecord(
+                    apartment_id=APT,
+                    received_at=sent,
+                    sent_at=sent,
+                    protocol_version=1,
+                    payload_json="{}",
+                )
+            )
+        s.add(
+            AlarmRecord(apartment_id=APT, kind="a", urgency="u", raised_at=PAST, cleared_at=FUTURE)
+        )
+        s.add(AlarmRecord(apartment_id=APT, kind="b", urgency="u", raised_at=FUTURE))
+        s.add(
+            CommandRecord(
+                command_id="c1",
+                apartment_id=APT,
+                command_type="fetch_logs",
+                created_at=FUTURE,
+                expires_at=FUTURE,
+                created_by="x",
+                protocol_version=1,
+            )
+        )
+        s.add(
+            BackupRecord(
+                backup_id="b1",
+                apartment_id=APT,
+                kind="device_config",
+                created_at=FUTURE,
+                size_bytes=1,
+                content_hash="h",
+                storage_path="p",
+            )
+        )
+    return user.id
+
+
+def test_reset_time_state_clears_login_state_and_reports_residue(fleet):
+    from fleet.storage import (
+        AlarmRecord,
+        HeartbeatRecord,
+        UiLoginThrottleRecord,
+        UiSessionRecord,
+        UiUserRecord,
+    )
+
+    _, storage, _ = fleet
+    user_id = _populate_future_state(storage)
+    result = fleet_ops.run_op(storage, "reset_time_state", {"to_iso": T.isoformat()}, None)
+    assert result["users_reset"] == 1
+    assert result["throttle_rows_deleted"] == 1
+    assert result["sessions_deleted"] == 1
+    assert result["residue"] == {
+        "heartbeats_sent_after": 2,
+        "alarms_raised_after": 1,
+        "alarms_cleared_after": 1,
+        "commands_created_after": 1,
+        "backups_created_after": 1,
+    }
+    with storage.session() as s:
+        user = s.get(UiUserRecord, user_id)
+        assert user.last_totp_step is None
+        assert (user.failed_attempts, user.locked_until, user.failure_window_started_at) == (
+            0,
+            None,
+            None,
+        )
+        assert user.password_hash == "hash" and user.totp_secret == "secret"
+        assert s.query(UiLoginThrottleRecord).count() == 0
+        assert [x.token_hash for x in s.query(UiSessionRecord)] == ["old"]
+        # reported, not changed
+        assert s.query(HeartbeatRecord).count() == 3
+        assert s.query(AlarmRecord).count() == 2
+
+
+def test_reset_time_state_is_idempotent_on_an_empty_fleet(fleet):
+    _, storage, _ = fleet
+    result = fleet_ops.reset_time_state(storage, T)
+    assert result["users_reset"] == 0 and set(result["residue"].values()) == {0}
+
+
+def test_reset_time_state_accepts_a_naive_time(fleet):
+    _, storage, _ = fleet
+    assert (
+        fleet_ops.reset_time_state(storage, T.replace(tzinfo=None))["to"] == "2027-05-31T08:00:00"
+    )
+
+
+def test_events_wrapper_and_cli_call_the_op_with_the_iso_time(fleet, capsys):
+    seen = {}
+
+    def runner(op, args):
+        seen.update(op=op, args=args)
+        return {
+            "to": "2027-05-31T08:00:00",
+            "users_reset": 3,
+            "throttle_rows_deleted": 0,
+            "sessions_deleted": 2,
+            "residue": {"heartbeats_sent_after": 7},
+        }
+
+    fleet_events.run_op = runner  # the fixture's monkeypatch restores it
+    assert fleet_events.main(["reset-time-state", "--to", "2027-05-31T08:00:00"]) == 0
+    assert seen == {"op": "reset_time_state", "args": {"to_iso": "2027-05-31T08:00:00"}}
+    out = capsys.readouterr().out
+    assert "heartbeats_sent_after: 7" in out and "NOT changed" in out
+
+
+def test_cli_reports_an_unreachable_fleet_and_a_bad_time(monkeypatch, capsys):
+    def boom(op, args):
+        raise RuntimeError("fleet op reset_time_state failed in thermoctl-sim-fleet: down")
+
+    monkeypatch.setattr(fleet_events, "run_op", boom)
+    assert fleet_events.main(["reset-time-state", "--to", "2027-05-31T08:00:00"]) == 1
+    assert "down" in capsys.readouterr().err
+    assert fleet_events.main(["reset-time-state", "--to", "not-a-time"]) == 1

@@ -11,7 +11,7 @@ import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from tools.sim.env.config import APARTMENT_IDS, state_dir
+from tools.sim.env.config import APARTMENT_IDS, state_dir, virtual_now
 from tools.sim.findings import build_index
 from tools.sim.guard import LoginOutcome
 from tools.sim.haiku import ensure_persona_cwd, run_persona
@@ -160,6 +160,25 @@ def _print_outstanding() -> None:
     print(f"{count} failed persona steps outstanding (retried on the next run)")
 
 
+def _reset_fleet_time_state() -> None:
+    """After a rewind the fleet still holds login state dated in the rewound-away future
+    (TOTP replay watermark, throttles, sessions): reset it, or warn loudly with the manual
+    command. Rewind is not failed by this; the local rewind is already done."""
+    from tools.sim.env import fleet_events
+
+    to = virtual_now(state_dir())
+    try:
+        print(fleet_events.format_reset(fleet_events.reset_time_state(to)))
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(
+            "WARNING: the sim fleet still holds time state from the future (TOTP replay "
+            "watermark: every UI login will be refused with 401, plus throttles and "
+            f"sessions) -- {exc}\nStart the fleet, then run:\n  PYTHONPATH=. "
+            f"{fleet_events.manual_reset_command(to)}",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tools.sim")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -180,7 +199,9 @@ def main(argv: list[str] | None = None) -> int:
             "virtual clock to the start of week N; a timestamped backup of the four files goes "
             "to <state>/rewind-backups/<ts>/. Refuses while a run is active. Fleet-side effects "
             "of the dropped events (desired states, backups, rotated tokens) stay in the fleet "
-            "database; events are idempotent on re-application, so a resume tolerates that."
+            "database; events are idempotent on re-application, so a resume tolerates that. "
+            "The fleet's login state dated after the new clock (TOTP replay watermark, "
+            "throttles, sessions) is reset in the sim fleet container."
         ),
     )
     rew_p.add_argument("--to-week", type=int, required=True)
@@ -228,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         print(summary.format())
+        if summary.applied:
+            _reset_fleet_time_state()
         return 0
     if args.cmd == "status":
         try:

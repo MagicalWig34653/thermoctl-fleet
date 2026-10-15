@@ -20,18 +20,25 @@ import os
 import secrets
 import sys
 import zlib
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import CursorResult, delete, func, select, update
 
 from fleet.bundle_storage import DiagnosticBundleBlobStorage
 from fleet.desired_state_sources import DISPLAY_SOURCES
 from fleet.storage import (
+    AlarmRecord,
     ApartmentRecord,
+    BackupRecord,
+    CommandRecord,
     DeviceRegistrationRecord,
+    HeartbeatRecord,
     Storage,
+    UiLoginThrottleRecord,
+    UiSessionRecord,
+    UiUserRecord,
     create_storage,
     hash_token,
 )
@@ -290,7 +297,66 @@ def command_status(storage: Storage, apartment: str) -> dict[str, Any]:
     }
 
 
+def reset_time_state(storage: Storage, to: datetime) -> dict[str, Any]:
+    """Make the fleet consistent with a virtual clock that moved BACK to `to` (rewind).
+
+    This is sim tooling acting on the sim database, not a product path: the product has
+    no operation for "the clock went backwards", and `fleet.admin reset-totp` only
+    handles one user. It changes only login state the sim recreates itself:
+
+    - `ui_users`: `last_totp_step` -> NULL (otherwise every code of the earlier clock is
+      refused as a replay), `failed_attempts`/`locked_until`/`failure_window_started_at`
+      cleared. The password and the TOTP secret are untouched.
+    - `ui_login_throttle`: all rows deleted (counters and block windows of the future).
+    - `ui_sessions`: rows created after `to` deleted (the sim logs in again).
+
+    Everything else is only REPORTED (rows dated after `to`), never changed: heartbeats,
+    alarms (raised or cleared after), commands, backups. The report is the rewind
+    residue the owner should know about.
+    """
+    at = to.astimezone(UTC).replace(tzinfo=None) if to.tzinfo is not None else to
+    with storage.session() as session:
+        users = cast(
+            CursorResult[Any],
+            session.execute(
+                update(UiUserRecord).values(
+                    last_totp_step=None,
+                    failed_attempts=0,
+                    locked_until=None,
+                    failure_window_started_at=None,
+                )
+            ),
+        ).rowcount
+        throttles = cast(CursorResult[Any], session.execute(delete(UiLoginThrottleRecord))).rowcount
+        sessions = cast(
+            CursorResult[Any],
+            session.execute(delete(UiSessionRecord).where(UiSessionRecord.created_at > at)),
+        ).rowcount
+
+        def count(column: Any, model: Any) -> int:
+            return int(
+                session.scalar(select(func.count()).select_from(model).where(column > at)) or 0
+            )
+
+        residue = {
+            "heartbeats_sent_after": count(HeartbeatRecord.sent_at, HeartbeatRecord),
+            "alarms_raised_after": count(AlarmRecord.raised_at, AlarmRecord),
+            "alarms_cleared_after": count(AlarmRecord.cleared_at, AlarmRecord),
+            "commands_created_after": count(CommandRecord.created_at, CommandRecord),
+            "backups_created_after": count(BackupRecord.created_at, BackupRecord),
+        }
+    return {
+        "to": at.isoformat(),
+        "users_reset": users,
+        "throttle_rows_deleted": throttles,
+        "sessions_deleted": sessions,
+        "residue": residue,
+    }
+
+
 def run_op(storage: Storage, op: str, args: dict[str, Any], bundle_root: Path | None) -> Any:
+    if op == "reset_time_state":
+        return reset_time_state(storage, datetime.fromisoformat(args["to_iso"]))
     now = datetime.fromisoformat(args["now"])
     apartment = args["apartment"]
     if op == "device_report":
