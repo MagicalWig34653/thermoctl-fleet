@@ -88,6 +88,15 @@ class CommandResult(BaseModel):
     error_text: str | None = None
 
 
+# Default keep-alive cadence of the SSE command stream (`GET /v1/commands`,
+# section 3): the fleet sends a `: ping` comment this often while no command
+# is pending. A shared constant (not a number in each package) so the agent's
+# stream read timeout (`agent.commands_channel.SSE_READ_TIMEOUT_S`) is derived
+# from the very value the fleet pings with, and cannot silently drift below it
+# (sim finding 42). The fleet may override the interval per deployment via
+# `FLEET_COMMANDS_SSE_PING_INTERVAL_S`; the agent's multiple has headroom.
+COMMANDS_SSE_PING_INTERVAL_S = 15.0
+
 # Section 7: "the last n lines ... capped at 500 lines" -- reused here (not
 # re-derived as a second number) for `LogExcerpt.lines`'s own upper bound,
 # the same cap `Command.lines` already enforces on the *request* side.

@@ -94,7 +94,7 @@ from pydantic import TypeAdapter
 
 from agent.registration import _parse_and_clamp_retry_after
 from agent.safe_io import UnsafeStateFileError, read_text_safe
-from protocol.commands import Command, CommandResult
+from protocol.commands import COMMANDS_SSE_PING_INTERVAL_S, Command, CommandResult
 from protocol.desired_state import DesiredStateEvent
 from protocol.version import PROTOCOL_VERSION
 
@@ -102,6 +102,14 @@ logger = logging.getLogger(__name__)
 
 # Section 3's own fallback cadence: "the agent polls every 60 s".
 DEFAULT_FALLBACK_POLL_INTERVAL_S = 60.0
+
+# Sim finding 42: the SSE stream is idle between commands, so its read
+# timeout must clearly exceed the fleet's keep-alive ping interval -- the
+# client's ordinary 10 s request timeout cut every idle stream before the
+# next 15 s ping. Three missed pings of headroom; only the stream gets this,
+# ordinary requests keep the short timeout (`agent.transport.build_client`).
+SSE_READ_TIMEOUT_MULTIPLE = 3
+SSE_READ_TIMEOUT_S = SSE_READ_TIMEOUT_MULTIPLE * COMMANDS_SSE_PING_INTERVAL_S
 
 # P5.1c: a persisted `Last-Event-ID` is sent verbatim into an HTTP request
 # header (`_stream_once`/`_poll_once`) -- bounded in both length and
@@ -430,7 +438,10 @@ def _stream_once(
     if last_event_id is not None:
         headers["Last-Event-ID"] = last_event_id
 
-    with connect_sse(client, "GET", "/v1/commands", headers=headers) as event_source:
+    stream_timeout = httpx.Timeout(client.timeout.connect, read=SSE_READ_TIMEOUT_S)
+    with connect_sse(
+        client, "GET", "/v1/commands", headers=headers, timeout=stream_timeout
+    ) as event_source:
         _raise_for_non_200(event_source.response, "GET /v1/commands (SSE)")
         on_contact(True)
         for sse in event_source.iter_sse():

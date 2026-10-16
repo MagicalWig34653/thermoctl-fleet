@@ -835,3 +835,28 @@ def test_private_key_and_token_never_leak_during_registration(
         # code -- what must not appear is the private key's own encoding.
         private_key_b64 = encode_bytes(raw_private_key_bytes)
         assert private_key_b64 not in caplog.text
+
+
+def test_apartment_id_from_token_matches_the_fleets_token_shape() -> None:
+    import secrets
+
+    from agent.registration import apartment_id_from_token
+
+    for apartment in ("house7-a03", "house_7_a_03", "a"):
+        for _ in range(50):  # the random part may itself contain "_" or "-"
+            token = f"agent_{apartment}_{secrets.token_urlsafe(32)}"
+            assert apartment_id_from_token(token) == apartment
+
+
+def test_apartment_id_from_token_rejects_anything_not_in_that_shape() -> None:
+    import secrets
+
+    from agent.registration import apartment_id_from_token
+
+    random_part = secrets.token_urlsafe(32)
+    assert apartment_id_from_token(random_part) is None  # no prefix
+    assert apartment_id_from_token(f"agent_{random_part}") is None  # no apartment
+    assert apartment_id_from_token(f"agent__{random_part}") is None  # empty apartment
+    assert apartment_id_from_token(f"agent_apt_{random_part[:-1]}") is None  # short
+    assert apartment_id_from_token(f"agent_apt_{random_part[:-1]}!") is None  # bad char
+    assert apartment_id_from_token("") is None

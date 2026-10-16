@@ -1401,3 +1401,58 @@ def test_load_outbox_degrades_on_a_fifo_quickly_not_a_hang(tmp_path: Path) -> No
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
+
+
+# -----------------------------------------------------------------------------
+# Sim finding 42: an idle stream must survive past the client's ordinary
+# request timeout -- the fleet's keep-alive pings keep it alive.
+# -----------------------------------------------------------------------------
+
+
+def test_sse_read_timeout_is_clearly_above_the_fleet_ping_interval() -> None:
+    from agent.commands_channel import SSE_READ_TIMEOUT_S
+    from fleet.app import _DEFAULT_COMMANDS_SSE_PING_INTERVAL_S
+
+    # The bug: a 10 s read timeout against a 15 s ping.
+    assert SSE_READ_TIMEOUT_S >= 2 * _DEFAULT_COMMANDS_SSE_PING_INTERVAL_S
+    assert SSE_READ_TIMEOUT_S > 10.0
+
+
+def test_idle_stream_with_only_pings_outlives_the_clients_request_timeout(
+    tmp_path: Path, app_storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scaled down: the client's ordinary timeout (0.3 s) is shorter than the
+    fleet's ping interval (0.5 s), exactly the shape of 10 s vs 15 s. The
+    stream sees only pings for ~1.2 s, then a command arrives instantly --
+    with the old behaviour `httpx.ReadTimeout` hit first."""
+
+    import threading
+    import time
+
+    from agent import commands_channel
+
+    monkeypatch.setenv("FLEET_COMMANDS_SSE_PING_INTERVAL_S", "0.5")
+    monkeypatch.setattr(commands_channel, "SSE_READ_TIMEOUT_S", 3.0)
+    token = _issue_token(app_storage)
+    created: list[Command] = []
+
+    def create_later() -> None:
+        time.sleep(1.2)
+        created.append(
+            app_storage.create_command(
+                APARTMENT, CommandType.REPORT_NOW, lines=None, ui_username="landlord",
+                now=datetime.now(UTC),
+            )
+        )
+
+    with run_tls_fleet_app(app, tmp_path / "tls") as (base_url, ca_file, fingerprint):
+        with build_client(base_url, fingerprint, ca_file=ca_file, timeout=0.3) as client:
+            client.headers["Authorization"] = f"Bearer {token}"
+            thread = threading.Thread(target=create_later)
+            thread.start()
+            gen = commands_channel._stream_once(client, tmp_path / "last-event-id")
+            try:
+                item = next(gen)
+            finally:
+                thread.join()
+    assert created and item == created[0]

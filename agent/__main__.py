@@ -18,6 +18,7 @@ from agent.registration import (
     DEFAULT_DATA_DIR,
     DEFAULT_REGISTRATION_FILE,
     RegistrationError,
+    apartment_id_from_token,
     load_token,
     register,
 )
@@ -207,7 +208,12 @@ def _run_agent(args: argparse.Namespace) -> int:
                     )
                     break
                 except CommandStreamReauthRequired:
-                    if reauthenticated or not args.apartment_id:
+                    # Sim finding 51: the apartment id for the rotation URL
+                    # comes from `--apartment-id` if given (override), else
+                    # from the stored token's own `agent_<apartment>_...`
+                    # shape -- the image recipe never passes the flag.
+                    rotation_apartment_id = args.apartment_id or apartment_id_from_token(token)
+                    if reauthenticated or not rotation_apartment_id:
                         if reauthenticated:
                             # The rotation flow itself appeared to succeed
                             # (a new token was obtained and set), yet the
@@ -222,7 +228,7 @@ def _run_agent(args: argparse.Namespace) -> int:
                     reauthenticated = True
                     reauth_backoff.wait_if_needed(backoff_path, datetime.now(UTC))
                     try:
-                        outcome = reauthenticate(args.apartment_id, data_dir, client, token)
+                        outcome = reauthenticate(rotation_apartment_id, data_dir, client, token)
                     except TokenRotationError:
                         reauth_backoff.record_failure(backoff_path, datetime.now(UTC))
                         raise
@@ -232,7 +238,8 @@ def _run_agent(args: argparse.Namespace) -> int:
     except CommandStreamReauthRequired:
         print(
             "thermoctl-agent: token re-authentication already attempted once; "
-            "refusing to retry again. Check --apartment-id and that a tenant "
+            "refusing to retry again (or the apartment id could not be determined; "
+            "pass --apartment-id). Check that a tenant "
             "change is actually pending for this apartment.",
             file=sys.stderr,
         )
