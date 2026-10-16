@@ -1,6 +1,19 @@
 # Status
 
-Last updated: 2026-10-06.
+Last updated: 2026-10-16.
+
+## Sim findings F51 and F42 fixed (2026-10-16)
+
+F51: after a tenant change the agent re-authenticates without `--apartment-id`.
+`agent.registration.apartment_id_from_token` names the apartment from the
+stored token (`agent_<apartment>_<43-char random>`, fixed-length split, only
+used for the rotation URL; the fleet still verifies the signature); the flag
+stays as an override. No key handling changed. F42: the SSE stream gets its
+own read timeout, `agent.commands_channel.SSE_READ_TIMEOUT_S` = 3 x the shared
+`protocol.commands.COMMANDS_SSE_PING_INTERVAL_S` (15 s, also the fleet's
+default); ordinary requests keep 10 s. Tests: stored-token reauth with and
+without the flag, token parser, and a real-TLS idle stream with pings only
+outliving the client timeout. `collect_heartbeat` (P2.3) untouched.
 
 
 ## README rewritten (2026-10-06)

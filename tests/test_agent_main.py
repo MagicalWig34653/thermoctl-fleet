@@ -464,6 +464,94 @@ def test_run_cli_reauth_required_twice_gives_up_without_looping(
     assert "already attempted once" in capsys.readouterr().err
 
 
+def _reauth_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token: str
+) -> tuple[list[str], list[int]]:
+    """Stored `token`, a runner failing with reauth once, a fake rotation
+    flow recording the apartment id it was called with."""
+
+    import json
+    import secrets
+
+    from agent.commands_channel import CommandStreamReauthRequired
+    from agent.registration import _store_token
+    from agent.token_rotation import TokenRotationOutcome
+
+    _store_token(tmp_path, token)
+    config = tmp_path / "registration.json"
+    config.write_text(
+        json.dumps(
+            {
+                "fleet_address": "https://fleet.invalid",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "registration_code": secrets.token_urlsafe(32),
+            }
+        )
+    )
+    calls: list[int] = []
+    reauth_calls: list[str] = []
+
+    def runner(client: httpx.Client, **kwargs: object) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise CommandStreamReauthRequired("reauth required")
+
+    def fake_reauthenticate(
+        apartment_id: str, data_dir: Path, client: httpx.Client, old_token: str
+    ) -> object:
+        reauth_calls.append(apartment_id)
+        return TokenRotationOutcome(token=secrets.token_urlsafe(32))
+
+    monkeypatch.setattr(agent_main, "build_client", lambda a, p: httpx.Client(base_url=a))
+    monkeypatch.setattr(loop, "run", runner)
+    monkeypatch.setattr(agent_main, "reauthenticate", fake_reauthenticate)
+    return reauth_calls, calls
+
+
+def test_run_cli_reauthenticates_from_the_stored_token_without_apartment_id_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sim finding 51: the image starts the agent without `--apartment-id`;
+    a tenant change must still be recovered, naming the apartment from the
+    stored token (`agent_<apartment>_<random>`)."""
+
+    import secrets
+
+    token = f"agent_house7-a03_{secrets.token_urlsafe(32)}"
+    reauth_calls, calls = _reauth_fixture(tmp_path, monkeypatch, token)
+
+    code = agent_main.main(
+        [
+            "run", "--data-dir", str(tmp_path),
+            "--registration-file", str(tmp_path / "registration.json"),
+        ]
+    )
+
+    assert code == 0
+    assert reauth_calls == ["house7-a03"]
+    assert len(calls) == 2
+
+
+def test_run_cli_apartment_id_flag_overrides_the_id_in_the_stored_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import secrets
+
+    token = f"agent_house7-a03_{secrets.token_urlsafe(32)}"
+    reauth_calls, _ = _reauth_fixture(tmp_path, monkeypatch, token)
+
+    code = agent_main.main(
+        [
+            "run", "--data-dir", str(tmp_path),
+            "--registration-file", str(tmp_path / "registration.json"),
+            "--apartment-id", "override-1",
+        ]
+    )
+
+    assert code == 0
+    assert reauth_calls == ["override-1"]
+
+
 def test_run_cli_reauth_required_without_apartment_id_gives_up_immediately(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

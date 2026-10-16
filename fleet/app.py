@@ -88,6 +88,7 @@ from protocol import (
     TokenRequest,
     verification_code_for,
 )
+from protocol.commands import COMMANDS_SSE_PING_INTERVAL_S
 from protocol.heartbeat import MAX_CATCH_UP_HEARTBEATS
 from protocol.registration import MIN_NONCE_BYTES, decode_bytes, encode_bytes
 from protocol.version import PROTOCOL_VERSION
@@ -116,7 +117,7 @@ _DEFAULT_COMMANDS_SSE_RETRY_MS = 5_000
 # line sent on this cadence so an idle connection (no command pending) does
 # not look dead to an intermediary proxy.
 _COMMANDS_SSE_PING_INTERVAL_ENV = "FLEET_COMMANDS_SSE_PING_INTERVAL_S"
-_DEFAULT_COMMANDS_SSE_PING_INTERVAL_S = 15.0
+_DEFAULT_COMMANDS_SSE_PING_INTERVAL_S = COMMANDS_SSE_PING_INTERVAL_S
 
 # P5.1c: a well-formed SSE event id is `<epoch>.<sequence>` -- `<epoch>`
 # exactly matching `fleet.storage._generate_epoch`'s own shape (16 random

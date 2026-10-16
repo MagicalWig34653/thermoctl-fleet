@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import stat
 import time
 from collections.abc import Callable
@@ -291,6 +292,41 @@ def load_token(data_dir: Path) -> str | None:
     if not path.exists() and not path.is_symlink():
         return None
     return _read_private_file(path).decode("utf-8").strip()
+
+
+# `secrets.token_urlsafe(32)` -- the random part of every agent token the
+# fleet issues (`fleet.storage`) -- is always exactly 43 URL-safe base64
+# characters. That fixed length is what makes the split below unambiguous even
+# though the random part may itself contain `_`.
+_TOKEN_RANDOM_LENGTH = 43
+_TOKEN_PREFIX = "agent_"  # noqa: S105 -- a prefix, not a secret
+_TOKEN_RANDOM_PATTERN = re.compile(rf"[A-Za-z0-9_-]{{{_TOKEN_RANDOM_LENGTH}}}")
+
+
+def apartment_id_from_token(token: str) -> str | None:
+    """The apartment id named by a stored agent token
+    (`agent_<apartment>_<random>`, section 4), or `None` if the token does not
+    have exactly that shape.
+
+    **Only used to name this apartment in the token-rotation URL** when the
+    optional `--apartment-id` flag is absent (sim finding 51) -- never to
+    authenticate anything: the fleet checks the signature over the apartment id
+    against the key it has on file, so a wrong parse can only make the rotation
+    fail, not succeed for another apartment. (`fleet/auth.py` rightly does not
+    parse tokens for *lookup*; the fleet needs no such shortcut, the agent
+    needs it because nothing else on the device carries the id.) No key
+    material is read or stored here.
+    """
+
+    if not token.startswith(_TOKEN_PREFIX):
+        return None
+    rest = token[len(_TOKEN_PREFIX) :]
+    if len(rest) < _TOKEN_RANDOM_LENGTH + 2 or rest[-_TOKEN_RANDOM_LENGTH - 1] != "_":
+        return None
+    if not _TOKEN_RANDOM_PATTERN.fullmatch(rest[-_TOKEN_RANDOM_LENGTH:]):
+        return None
+    apartment = rest[: -_TOKEN_RANDOM_LENGTH - 1]
+    return apartment or None
 
 
 def _store_token(data_dir: Path, token: str) -> None:
