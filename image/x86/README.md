@@ -43,3 +43,17 @@ before the post-install hook. The hook calls the shared installer with
 
 This build has not been run end to end on this macOS worktree, which lacks
 Linux loop devices and a mkosi build environment.
+
+## Build input: `THERMOCTL_AGENT_DIGEST`
+
+The build needs the agent image digest, `sha256:<64 lowercase hex>`, to write
+the watchdog's preset state file (`install.sh --agent-digest`). Set the
+environment variable when calling mkosi (usage:
+`THERMOCTL_AGENT_DIGEST=sha256:... mkosi build`; `mkosi.conf` forwards it with
+`Environment=THERMOCTL_AGENT_DIGEST`), or stage it as
+`mkosi.extra/opt/thermoctl-build/agent-digest` (what
+`.github/workflows/image.yml` does, from its `agent_digest` dispatch input or
+the `THERMOCTL_AGENT_DIGEST` repository variable). There is no default: if it
+is unset, a tag such as `latest`, or not exactly `sha256:` plus 64 lowercase
+hex characters, `mkosi.postinst.chroot` fails the build. No digest is stored
+in this repository.

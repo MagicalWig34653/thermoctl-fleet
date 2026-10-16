@@ -23,6 +23,25 @@
 #                                      access and no Go toolchain of its
 #                                      own, so building inside it is not an
 #                                      option)
+#
+# Build input THERMOCTL_AGENT_DIGEST (image/pi/README.md): the agent image
+# digest the watchdog's preset state file is written with. Taken from the
+# environment, else from files/agent-digest (which the workflow writes, as
+# pi-gen's build-docker.sh only forwards its config file, not arbitrary
+# variables). No default, no tag: unset or not sha256:<64 lowercase hex>
+# fails the build before anything is copied.
+if [ -z "${THERMOCTL_AGENT_DIGEST:-}" ] && [ -f files/agent-digest ]; then
+  THERMOCTL_AGENT_DIGEST="$(tr -d '[:space:]' <files/agent-digest)"
+fi
+if [ -z "${THERMOCTL_AGENT_DIGEST:-}" ]; then
+  echo "00-run.sh: THERMOCTL_AGENT_DIGEST is not set; set it to sha256:<64 lowercase hex> (the agent image digest)" >&2
+  exit 2
+fi
+if ! [[ "$THERMOCTL_AGENT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "00-run.sh: THERMOCTL_AGENT_DIGEST must be sha256:<64 lowercase hex>, got: $THERMOCTL_AGENT_DIGEST" >&2
+  exit 2
+fi
+
 install -d "${ROOTFS_DIR}/opt/thermoctl-fleet"
 cp -r files/thermoctl-fleet/image "${ROOTFS_DIR}/opt/thermoctl-fleet/image"
 cp -r files/thermoctl-fleet/watchdog "${ROOTFS_DIR}/opt/thermoctl-fleet/watchdog"
@@ -38,8 +57,10 @@ chmod 0755 "${ROOTFS_DIR}/usr/local/bin/thermoctl-watchdog" \
 # --skip-watchdog-build: the binaries are already in place (above) --
 # --arch arm64 still selects the arm64-only thermoctl-leds unit
 # (image/common/install.sh's own ARCH check).
-on_chroot <<'EOF'
-bash /opt/thermoctl-fleet/image/common/install.sh --root / --arch arm64 --skip-watchdog-build
+# The digest is validated above (hex only), so expanding it on the host
+# into the heredoc is safe.
+on_chroot <<EOF
+bash /opt/thermoctl-fleet/image/common/install.sh --root / --arch arm64 --skip-watchdog-build --agent-digest ${THERMOCTL_AGENT_DIGEST}
 EOF
 
 rm -rf "${ROOTFS_DIR}/opt/thermoctl-fleet"

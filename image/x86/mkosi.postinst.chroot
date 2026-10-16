@@ -8,6 +8,23 @@
 # /opt/thermoctl-build by mkosi.extra before this hook executes.
 REPO_ROOT=/opt/thermoctl-build
 
+# Build input THERMOCTL_AGENT_DIGEST (image/x86/README.md): the agent image
+# digest for the watchdog's preset state file. Passed in by mkosi.conf's
+# `Environment=THERMOCTL_AGENT_DIGEST`, else read from
+# $REPO_ROOT/agent-digest (staged by the workflow). No default, no tag:
+# unset or not sha256:<64 lowercase hex> fails the build.
+if [ -z "${THERMOCTL_AGENT_DIGEST:-}" ] && [ -f "$REPO_ROOT/agent-digest" ]; then
+  THERMOCTL_AGENT_DIGEST="$(tr -d '[:space:]' <"$REPO_ROOT/agent-digest")"
+fi
+if [ -z "${THERMOCTL_AGENT_DIGEST:-}" ]; then
+  echo "mkosi.postinst.chroot: THERMOCTL_AGENT_DIGEST is not set; set it to sha256:<64 lowercase hex> (the agent image digest)" >&2
+  exit 2
+fi
+if ! [[ "$THERMOCTL_AGENT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "mkosi.postinst.chroot: THERMOCTL_AGENT_DIGEST must be sha256:<64 lowercase hex>, got: $THERMOCTL_AGENT_DIGEST" >&2
+  exit 2
+fi
+
 install -d -m 0755 /usr/local/bin
 cp "$REPO_ROOT/watchdog-bin/thermoctl-watchdog" /usr/local/bin/
 cp "$REPO_ROOT/watchdog-bin/thermoctl-restore-mover" /usr/local/bin/
@@ -16,7 +33,8 @@ chmod 0755 /usr/local/bin/thermoctl-watchdog /usr/local/bin/thermoctl-restore-mo
 # --skip-watchdog-build: binaries already placed above. --arch amd64: the
 # status-LED unit is deliberately not installed on this target
 # (image/x86/README.md -- no 40-pin header on a mini PC).
-bash "$REPO_ROOT/image/common/install.sh" --root / --arch amd64 --skip-watchdog-build
+bash "$REPO_ROOT/image/common/install.sh" --root / --arch amd64 --skip-watchdog-build \
+  --agent-digest "$THERMOCTL_AGENT_DIGEST"
 rm -rf "$REPO_ROOT"
 
 # Mount the ESP at /boot/firmware, not systemd-gpt-auto-generator's own

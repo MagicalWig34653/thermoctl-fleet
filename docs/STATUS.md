@@ -3,6 +3,21 @@
 Last updated: 2026-10-16.
 
 
+## Image builds supply the agent digest (2026-10-16)
+
+Closes the F41 open point. `image/pi/pi-gen-stage/01-thermoctl/00-run.sh` and
+`image/x86/mkosi.postinst.chroot` read the build input
+`THERMOCTL_AGENT_DIGEST` (pi: also `files/agent-digest`; x86: also
+`/opt/thermoctl-build/agent-digest`; `mkosi.conf` forwards it with
+`Environment=`), fail the build with exit 2 if it is unset or not
+`sha256:<64 lowercase hex>`, and pass it to `install.sh --agent-digest`. No
+default and no digest in the repo; `install.sh` and the watchdog are
+unchanged. `.github/workflows/image.yml` takes an `agent_digest` dispatch
+input or the `THERMOCTL_AGENT_DIGEST` repository variable, so a tag build
+without that variable now fails by design. Both READMEs document it. Tests:
+`tests/test_image_build_digest.py`.
+
+
 ## Sim findings F40/F41: watchdog user and preset state file (2026-10-16)
 
 Both fixed on the recipe side; watchdog Go code unchanged.
@@ -15,8 +30,7 @@ Both fixed on the recipe side; watchdog Go code unchanged.
   reads `desired`/`proven` and rejects an empty `desired`. `install.sh` now
   takes `--agent-digest sha256:<hex>` (or `THERMOCTL_AGENT_DIGEST`) and writes
   `desired=`/`proven=` with it. Without a digest it writes no file and warns.
-  **Open:** `image/pi` and `image/x86` do not pass a digest yet, so real
-  images still ship without a state file until the build supplies one.
+  Closed: both image build paths now supply the digest (see above).
 - Tests in `tests/test_image_install_sh.py`: the unit's `User=` matches the
   sysusers entry, and the real watchdog binary accepts the recipe's state file
   in `-check-mode`.
