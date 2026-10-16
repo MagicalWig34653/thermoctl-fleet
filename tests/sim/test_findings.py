@@ -129,3 +129,16 @@ def test_index_ignores_finder_duplicates_and_the_smoke_archive(tmp_path: Path) -
     text = build_index(tmp_path).read_text(encoding="utf-8")
     assert "(10-x.md)" in text and "X copy" not in text
     assert "Old" not in text and "No findings yet." in text
+
+
+def test_index_emits_link_block_to_readme_and_curation(tmp_path: Path) -> None:
+    (tmp_path / "curation").mkdir()
+    (tmp_path / "curation" / "cluster-landlord.md").write_text("# Landlord cluster\n")
+    (tmp_path / "README.md").write_text("# Report\n")
+    (tmp_path / "pentest").mkdir()
+    (tmp_path / "pentest" / "results.md").write_text("# Pentest\n")
+    index = build_index(tmp_path).read_text()
+    assert "(README.md)" in index
+    assert "(curation/cluster-landlord.md)" in index
+    assert "(pentest/results.md)" in index
+    assert index.index("(README.md)") < index.index("raw, unfiltered")

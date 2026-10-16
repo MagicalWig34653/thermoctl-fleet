@@ -1,10 +1,8 @@
 # Simulation findings
 
-Start with the consolidated report: [README.md](README.md). Curation notes (clusters, verdicts, evidence):
-[landlord](curation/cluster-landlord.md), [caretaker](curation/cluster-caretaker.md),
-[tenants](curation/cluster-tenants.md), [admin, newcomer, security](curation/cluster-admin-newcomer-security.md),
-[stuck absence alarm](curation/verification-stuck-absence-alarm.md),
-[tenant hypotheses](curation/verification-tenant-hypotheses.md). Pentest: [pentest/results.md](pentest/results.md).
+Start with the consolidated report: [README.md](README.md).
+Curation notes (clusters, verdicts, evidence): [Curation: admin, newcomer and security shard](curation/cluster-admin-newcomer-security.md), [Curation: caretaker shard](curation/cluster-caretaker.md), [Curation: landlord shard](curation/cluster-landlord.md), [Curation: tenant shard](curation/cluster-tenants.md), [Cross-review of docs/sim-findings/README.md (commit 5c350ed)](curation/cross-review-readme.md), [Verification: "Meldet sich nicht" next to "Letzter Kontakt vor < 1 Min." (L04/L05, C07/C08)](curation/verification-stuck-absence-alarm.md), [Verification: tenant hypotheses H1 (T04), H2 (T11), H3 (S07)](curation/verification-tenant-hypotheses.md).
+Pentest: [pentest/results.md](pentest/results.md).
 The list below is the raw, unfiltered persona output (claimed severities).
 
 ## blocker

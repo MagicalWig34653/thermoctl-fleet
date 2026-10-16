@@ -106,6 +106,24 @@ def _md_title(path: Path) -> str:
     return path.stem
 
 
+def _link_block(out_dir: Path) -> list[str]:
+    """Pointers to the consolidated report, curation notes and pentest results."""
+    block: list[str] = []
+    if (out_dir / "README.md").is_file():
+        block.append("Start with the consolidated report: [README.md](README.md).")
+    notes = sorted((out_dir / "curation").glob("*.md")) if (out_dir / "curation").is_dir() else []
+    notes = [n for n in notes if not re.search(r" \d+\.md$", n.name)]
+    if notes:
+        links = ", ".join(f"[{_md_title(n)}](curation/{n.name})" for n in notes)
+        block.append(f"Curation notes (clusters, verdicts, evidence): {links}.")
+    if (out_dir / "pentest" / "results.md").is_file():
+        block.append("Pentest: [pentest/results.md](pentest/results.md).")
+    if block:
+        block.append("The list below is the raw, unfiltered persona output (claimed severities).")
+        return ["\n".join(block) + "\n"]
+    return []
+
+
 def build_index(out_dir: Path) -> Path:
     source = out_dir / "raw" / "findings.jsonl"
     rows: list[dict[str, Any]] = []
@@ -119,6 +137,7 @@ def build_index(out_dir: Path) -> Path:
         title_key = " ".join(row["title"].casefold().split())
         seen.setdefault((row["area"], title_key), row)
     lines = ["# Simulation findings\n"]
+    lines.extend(_link_block(out_dir))
     if not seen:
         lines.append("No findings yet.\n")
     for severity in Severity:
