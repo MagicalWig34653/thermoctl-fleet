@@ -1,0 +1,82 @@
+# The three tenant UIs (thermoctl, headless) of the usage simulation, one per tenant persona.
+# Started by `python -m tools.sim.env.tenant --up`, which exports the SIM_* variables.
+# Own compose project: `--down` here never touches the fleet project `thermoctl-sim`.
+# Every resource name starts with `thermoctl-sim`; nothing else is touched.
+name: thermoctl-sim-tenants
+
+x-tenant: &tenant
+  image: thermoctl-sim-tenant:local
+  pull_policy: never   # built here; never pulled
+  restart: unless-stopped
+  # Not root: libfaketime keeps a semaphore that the root-started entrypoint creates and the
+  # unprivileged process it hands over to cannot open (the container then hangs silently).
+  # 10001 is the image's own `thermoctl` user; /data of a fresh volume is owned by it.
+  user: "10001:10001"
+  environment:
+    PYTHONDONTWRITEBYTECODE: "1"
+    THERMOCTL_DATABASE_URL: "sqlite:////data/thermoctl.db"
+    THERMOCTL_SECRET_KEY: "${SIM_TENANT_SECRET_KEY:?set by tenant.py}"
+    THERMOCTL_SECURE_COOKIES: "false"   # plain http on 127.0.0.1
+    THERMOCTL_MQTT_ENABLED: "false"     # no broker; Meross credentials are never set
+    THERMOCTL_ENV_FILE: ""
+    THERMOCTL_LOG_FORMAT: "text"
+    # Virtual clock, same mechanism as the fleet: absolute timestamp file, frozen until rewritten.
+    LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+    FAKETIME_TIMESTAMP_FILE: /sim-clock/clock
+    FAKETIME_CACHE_DURATION: "1"
+
+services:
+  tenant1:
+    <<: *tenant
+    container_name: thermoctl-sim-tenant1
+    # One build for all three (same image tag; parallel builds of one tag collide).
+    build:
+      context: ../../..
+      dockerfile: tools/sim/env/Dockerfile.tenant-sim
+      args:
+        BASE_IMAGE: thermoctl-sim-tenant-base:local
+    ports:
+      - "127.0.0.1:8301:8000"
+    volumes:
+      - tenant1-data:/data
+      - "${SIM_STATE_DIR:?set by tenant.py}/clock:/sim-clock:ro"
+      # Seeding runs the sibling's own demo seed inside the container; only these three
+      # directories are visible, read-only (no .git, no database files of the sibling).
+      - "${SIM_THERMOCTL_SRC:?set by tenant.py}/tests:/seed/tests:ro"
+      - "${SIM_THERMOCTL_SRC}/browser_tests:/seed/browser_tests:ro"
+      - "${SIM_THERMOCTL_SRC}/tools:/seed/tools:ro"
+      - "./tenant_seed.py:/seed/tenant_seed.py:ro"
+
+  tenant2:
+    <<: *tenant
+    container_name: thermoctl-sim-tenant2
+    ports:
+      - "127.0.0.1:8302:8000"
+    volumes:
+      - tenant2-data:/data
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "${SIM_THERMOCTL_SRC}/tests:/seed/tests:ro"
+      - "${SIM_THERMOCTL_SRC}/browser_tests:/seed/browser_tests:ro"
+      - "${SIM_THERMOCTL_SRC}/tools:/seed/tools:ro"
+      - "./tenant_seed.py:/seed/tenant_seed.py:ro"
+
+  tenant3:
+    <<: *tenant
+    container_name: thermoctl-sim-tenant3
+    ports:
+      - "127.0.0.1:8303:8000"
+    volumes:
+      - tenant3-data:/data
+      - "${SIM_STATE_DIR}/clock:/sim-clock:ro"
+      - "${SIM_THERMOCTL_SRC}/tests:/seed/tests:ro"
+      - "${SIM_THERMOCTL_SRC}/browser_tests:/seed/browser_tests:ro"
+      - "${SIM_THERMOCTL_SRC}/tools:/seed/tools:ro"
+      - "./tenant_seed.py:/seed/tenant_seed.py:ro"
+
+volumes:
+  tenant1-data:
+    name: thermoctl-sim-tenant1-data
+  tenant2-data:
+    name: thermoctl-sim-tenant2-data
+  tenant3-data:
+    name: thermoctl-sim-tenant3-data

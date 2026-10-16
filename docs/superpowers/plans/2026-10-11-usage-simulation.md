@@ -903,6 +903,24 @@ if __name__ == "__main__":  # pragma: no cover
 
 ---
 
+### Task 8b: Sim agent (heartbeat driver) -- added after Task 1
+
+Task 1 found that `python -m agent run` sends no heartbeats (`collect_heartbeat`/`send_heartbeat` raise `NotImplementedError`, `agent/loop.py:1074,1089`) and that `../thermoctl` has no `/api/v1/health`. That is itself a product finding (record it in `docs/sim-findings/` as `blocker`: "agent never sends heartbeats"). The simulation therefore brings its own driver.
+
+**Files:**
+- Create: `tools/sim/sim_agent.py`
+- Test: `tests/sim/test_sim_agent.py`
+
+**Interfaces:**
+- Consumes: `agent.heartbeat_sender.send_heartbeat` (`agent/heartbeat_sender.py:135`) and `protocol.heartbeat` models (read their real signatures first; do not modify them), registration/token files from Task 1 notes section (d).
+- Produces: `SimAgent(apartment: str, client, token: str, health: Callable[[], dict])`, `.tick() -> bool` (send one heartbeat built from `health()`, return True on 2xx), `python -m tools.sim.sim_agent --apartment sim-a03 --fleet URL --token-file F --interval-s 5` loop entry point.
+
+- [ ] **Step 1:** Failing test with an `httpx.MockTransport`: `tick()` posts to `/v1/heartbeat` with the bearer token and a body that validates against the real `protocol.heartbeat` model; a 401 returns False and does not raise.
+- [ ] **Step 2-4:** Implement using the real protocol model; the health dict comes from a small, seeded fault-injectable generator (`FaultFile`: reads `<state>/faults/<apartment>.json`, absent file = healthy). No room temperatures, setpoints, schedules or tenant data in the payload (CLAUDE.md "not a data collector").
+- [ ] **Step 5:** Commit `feat(sim): sim agent heartbeat driver`.
+
+---
+
 ### Task 9: Environment (fleet, container agents, VMs, event application)
 
 **Files:**

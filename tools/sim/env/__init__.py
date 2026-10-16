@@ -1,0 +1,116 @@
+"""Simulation environment: what `python -m tools.sim run` imports lazily.
+
+`apartments()`, `urls()`, `apply_event(event)`, `persona_env_extras()`, `refresh_logins()` and
+`wait_for_heartbeats(now, silent)` and `health_check(outcome)` are the whole surface; fleet
+seeding and start/stop live in `fleet_setup` and `up_fleet` (run as CLIs, not imported here).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import datetime
+
+from tools.sim.env import events
+from tools.sim.env.config import APARTMENT_IDS, FLEET_URL, state_dir
+from tools.sim.env.events import HANDLERS, UNIMPLEMENTED_KINDS, apply_event, apply_event_with
+
+__all__ = [
+    "HANDLERS",
+    "UNIMPLEMENTED_KINDS",
+    "apartments",
+    "apply_event",
+    "apply_event_with",
+    "events",
+    "health_check",
+    "persona_env_extras",
+    "refresh_logins",
+    "urls",
+    "wait_for_heartbeats",
+]
+
+
+def apartments() -> list[str]:
+    return list(APARTMENT_IDS)
+
+
+def urls() -> dict[str, str]:
+    """Endpoints named in persona prompts; `tenantN` is the heating app of persona tenantN."""
+    from tools.sim.env.tenant import tenant_urls
+
+    return {
+        "fleet": FLEET_URL,
+        "fleet web app (browser pages)": f"{FLEET_URL}/ui/",
+        **tenant_urls(),
+    }
+
+
+def wait_for_heartbeats(now: datetime, silent: frozenset[str]) -> list[str]:
+    """Block until every non-silent apartment reported for the virtual day `now`."""
+    from tools.sim.env import settle
+
+    return settle.wait_for_fresh_heartbeats(now, silent)
+
+
+def persona_env_extras() -> dict[str, str]:
+    """Extra environment for persona sessions (Playwright storage state per role)."""
+    return {"SIM_STORAGE_STATE_DIR": str(state_dir() / "storage-states")}
+
+
+def refresh_logins() -> None:
+    """Log the UI users in again (cookies expire).
+
+    Raises `LoginsUnavailable` if a role failed and never had a storage state,
+    `RuntimeError` if any other role failed (the previous state is kept).
+    """
+    from tools.sim.env import logins
+    from tools.sim.runner import LoginsUnavailable
+
+    results = logins.refresh()
+    from tools.sim.env import tenant
+
+    if tenant.load_users(state_dir()) is not None:  # tenant UIs were started
+        results.update(tenant.refresh_logins(state_dir()))
+    failed = sorted(role for role, ok in results.items() if not ok)
+    if not failed:
+        return
+    directory = state_dir()
+    missing = [r for r in failed if not (logins.storage_dir(directory) / f"{r}.json").is_file()]
+    if missing:
+        raise LoginsUnavailable(f"no login for role(s) {', '.join(missing)} and no earlier state")
+    raise RuntimeError(f"login refresh FAILED for role(s) {', '.join(failed)}; stale cookies kept")
+
+
+def health_check(outcome: object) -> Callable[[], list[str]]:  # pragma: no cover - wiring
+    """The weekly fleet guard: /healthz, heartbeats fresh for every non-silent apartment,
+    all fleet roles able to log in (`outcome`), at least 1 GiB free on the fleet volume."""
+    from tools.sim import preflight
+    from tools.sim.env.config import virtual_now
+    from tools.sim.env.up_fleet import last_heartbeats
+    from tools.sim.guard import LoginOutcome, build_health_check, docker_disk_avail
+    from tools.sim.scenario import silent_apartments
+    from tools.sim.state import SimState
+
+    assert isinstance(outcome, LoginOutcome)
+    http_status = preflight.real_probes().http_status
+
+    def healthz() -> str | None:
+        code = http_status(f"{FLEET_URL}/healthz")
+        if code == 200:
+            return None
+        return f"fleet /healthz {'unreachable' if code is None else f'answers {code}'}"
+
+    def silent() -> frozenset[str]:
+        try:
+            return silent_apartments(SimState.load(state_dir() / "state.json").applied_events)
+        except (OSError, ValueError):
+            return frozenset()
+
+    return build_health_check(
+        healthz=healthz,
+        heartbeats=last_heartbeats,
+        now=lambda: virtual_now(state_dir()),
+        silent=silent,
+        apartments=APARTMENT_IDS,
+        disk_avail=docker_disk_avail,
+        logins=outcome,
+    )

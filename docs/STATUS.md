@@ -3,12 +3,56 @@
 Last updated: 2026-10-11.
 
 
+## Usage simulation: Limit-Erkennung unabhängig vom Exit-Code (2026-10-14)
+
+`tools/sim/haiku.py` erkennt Limit-Hinweise (stderr oder kurze Stdout-Meldung ohne `DONE`/`FINDING:`) bei jedem Exit-Code. Exit 0 mit kurzer/leerer Antwort ohne `DONE`/`FINDING:` ist ein Fehlschlag (wird wiederholt), nie ein erledigter Schritt. Drei wöchentliche Login-Refreshes in Folge für dieselbe Rolle stoppen den Lauf (`TooManyFailures`). Lauf-1-Bericht korrigiert (Wochen 17 bis 138 unbeobachtet).
+
+## Usage simulation: Formulare und Signale (Task 10b, 2026-10-11)
+
+`browse act` (fill/click/select/check/wait_text, max. 20 Schritte, Passwortwerte maskiert) lässt Personas Formulare absenden; SIGTERM/SIGINT beenden die Persona-Prozessgruppe, speichern den Zustand und enden mit 143/130. Noch nicht live gelaufen.
+
+## Usage simulation: Smoke-Run-Vorbereitung (Task 10a, 2026-10-11)
+
+Drift begrenzt (+-86400 s), `run --personas/--seed` (Filter im Checkpoint, Resume mit anderem Filter abgelehnt), nicht implementierte Events landen in `skipped-events.jsonl`, Persona-Logins (`up_fleet --logins`, `env.logins --refresh`, wöchentlich im Lauf), Ablauf in `docs/sim-findings/RUNBOOK.md`. Noch nicht live gelaufen.
+
+## Usage simulation: fleet environment (Task 9a, 2026-10-11)
+
+`tools/sim/env/` seeds a local sim fleet (3 properties, 12 apartments, 12 prepared
+devices, 3 UI users) and runs it in Docker under libfaketime (`up_fleet`, `--down`);
+event handlers for loss/restore/wifi/power/fault are in, the rest raise until 9b/9c.
+No product code changed. Review fixes: private registration files, strict container ids, fleet mounts only the clock dir, recoverable seeding.
+
+
+## Usage simulation: container agents (Task 9b, 2026-10-11)
+
+`tools/sim/env/` enrols sim-a03..sim-a12 through the real Storage API (`enroll.py`), runs them as ten `agent-sim-aNN` compose services (`up_fleet --agents`, `--check` prints last heartbeats); CLOCK_DRIFT is a per-agent offset file read by `sim_agent`. Not yet run live (Task 10).
+
+## Usage simulation: browse tool hardening (2026-10-11)
+
+`tools/sim/browse.py` now also blocks WebSockets to non-allowed hosts; finding 10 corrected (never-seen apartments are skipped by the absence alarm, not alarmed).
+
+
+## Usage simulation: environment notes (2026-10-11)
+
+`docs/sim-findings/00-environment-notes.md` records what the harness can rely
+on. Main finding: `python -m agent run` sends no heartbeats yet
+(`collect_heartbeat` raises `NotImplementedError`, P2.3), and `../thermoctl`
+has no `/api/v1/health`, so the sim must supply its own heartbeat sender.
+libfaketime verified (absolute timestamp without `@` freezes time). No
+product code changed.
+
+
 ## Usage simulation: design approved (2026-10-11)
 
 Design for a 2-3 year landlord/tenant simulation (Lima VMs + container
 agents, virtual clock, Haiku personas, small fleet pentest) is in
 `docs/superpowers/specs/2026-10-11-usage-simulation-design.md`. Findings
-only, no fixes. Nothing implemented yet.
+only, no fixes. Harness in `tools/sim/` (scenario schedule with
+non-overlapping outages, tolerant findings parser) in progress. Persona
+sessions are confined: local-only HTTP wrapper `tools.sim.http` instead of
+curl, file tools denied, prompt on stdin, scratch cwd, stderr-only limit detection.
+Resumable runner and CLI (`python -m tools.sim run|status|report`; exit 75 on
+usage limit, failed persona steps go to `sim-state/failures.jsonl` and are retried).
 
 
 ## README rewritten (2026-10-06)
@@ -12309,3 +12353,68 @@ daneben). `apple-touch-icon.png` ist auf Website und in der Fleet-Oberfläche
 (`/ui/static/apple-touch-icon.png`, in `base.html`/`login.html` verlinkt)
 der iOS-Export desselben Icons. Das Favicon im Browser-Tab bleibt das flache
 SVG-Zeichen, weil es in 16 px schärfer ist.
+
+## 2026-10-11: Simulationsharness, Uhr und Checkpoint
+
+`tools/sim/clock.py` (virtuelle Uhr als libfaketime-Zeitstempeldatei) und
+`tools/sim/state.py` (atomarer Checkpoint je Persona-Schritt) mit Tests in
+`tests/sim/`. Nur Werkzeug, kein Produktcode.
+
+`tools/sim/scenario.py` (deterministischer Ereignisplan, kein LLM) und
+`tools/sim/findings.py` (Befunde als JSONL, `INDEX.md` nach Schwere und
+Bereich) mit Tests in `tests/sim/`. Nur Werkzeug, kein Produktcode.
+
+`tools/sim/personas.py` (sieben Personas, Kadenz, englischer Rollenspiel-Prompt)
+und `tools/sim/haiku.py` (headless `claude -p`, enge `--allowedTools`,
+Usage-Limit-Erkennung nur bei Exit-Code != 0) mit Tests in `tests/sim/`.
+Nur Werkzeug, kein Produktcode.
+
+`tools/sim/sim_agent.py` (Heartbeat-Treiber je Wohnung, Fehler per Datei
+`<state>/faults/<apartment>.json`, baut das echte `protocol.heartbeat`-Modell)
+mit Tests in `tests/sim/`; `tools/sim/http.py` sperrt `--cookie-jar` auf das
+Arbeitsverzeichnis. Nur Werkzeug, kein Produktcode.
+
+Persona-Sitzungen laufen mit `PYTHONPATH` und dem Venv-Interpreter vorn auf
+`PATH`; defekte `failures.jsonl`-Zeilen werden übersprungen, `status` meldet
+einen defekten Checkpoint einzeilig, der Lauf nennt offene Fehlschritte.
+
+`tools/sim/browse.py` (Playwright-Browserwerkzeug für Personas: `shot`/`text`,
+nur lokale Hosts, Ausgabe nur im Arbeitsverzeichnis, fremde Unteranfragen
+abgebrochen) mit Tests in `tests/sim/`. Nur Werkzeug, kein Produktcode.
+
+`docs/sim-findings/10-agent-heartbeat-gap.md`: erster Befund der Simulation
+(Blocker: der Agent sendet keinen Heartbeat, die Ausbleiben-Warnung träfe
+jede Wohnung).
+
+Simulation, erster Livelauf (Task 10, `docs/sim-findings/01-smoke-run.md`): Stack,
+virtuelle Uhr, Ausbleiben-Alarm und Persona-Pipeline laufen; 9 Harness-Fehler
+behoben, 4 Produktbefunde (11 bis 14). Offen: Formulare absenden, frischer
+State pro Lauf.
+
+Pentest (Task 12, simulation): `python -m tools.sim.pentest` runs 43 scripted checks against the loopback sim fleet; 5 findings (20 to 24, one major: a NaN heartbeat breaks the UI), results in `docs/sim-findings/pentest/results.md`. It advances the shared sim clock and pollutes the sim DB: run it only against a throw-away SIM_STATE_DIR (exit 2 on a state with progress, unless `--i-know-this-pollutes-the-run`; RUNBOOK); `browse act` never echoes typed values and exits 1 on a failed step.
+
+Tenant UIs (Task 9c-T): `python -m tools.sim.env.tenant --up|--logins|--down` runs three headless thermoctl instances (ports 8301-8303) for the tenant personas; first look in `docs/sim-findings/30-tenant-ui-first-look.md`.
+
+Event handlers (Task 9c): image_update, backup, token_expiry and tenant_change are implemented (`tools/sim/env/fleet_events.py`, sim agent reacts to marker files); `UNIMPLEMENTED_KINDS` is empty, coverage table in the sim RUNBOOK ("Event coverage").
+
+VM base stations (Task 9d): `python -m tools.sim.env.vms --up|--down|--status|--logs` runs sim-a01/a02 as real Lima VMs with the real agent (register + run) behind a loopback TLS proxy; live run in `docs/sim-findings/02-vm-run.md`, product findings 40-42 (watchdog user missing, preset state file rejected, SSE timeout shorter than ping).
+
+Simulation, Task 13-prep: the VM helper adopts and deletes only VMs it created (`<state>/vms-created.json`), and a VM power loss tolerates an already stopped VM.
+
+Simulation, Task 13-prep: `tests/sim/test_product_findings.py` holds strict-xfail static regression tests for findings 40, 41, 42; they flip loudly when the product is fixed.
+
+Simulation, Task 13-prep: findings 25 (device tokens never expire, by design) and 26 (UI accepts a revision for a non-pilot apartment) written; RUNBOOK states the watchdog was not exercised.
+
+Simulation, Task 13-prep: smoke-run raw findings archived to `docs/sim-findings/smoke/`, the index starts empty for the full run.
+
+Simulation, Task 13-prep: `python -m tools.sim preflight` (read-only readiness table) and `python -m tools.sim.env.stack --up|--down|--status`; RUNBOOK "Full run" has the exact sequence.
+
+Simulation, Task 13 (run 1 aftermath): limit detection now catches the stdout-only "monthly spend limit" notice, a circuit breaker stops after 3 non-limit failures (exit 76), tenant login refresh retries; analysis in `docs/sim-findings/03-run1-aborted.md`.
+
+Simulation, Task 13 (run 2 aftermath): weekly fleet health guard (exit 77), `python -m tools.sim rewind --to-week N [--yes]` and a pid lock for `run`; disk-full incident in `docs/sim-findings/04-run2-disk-full.md`, procedure in RUNBOOK 3a.
+
+Simulation, Task 13 (rewind fix): `rewind --yes` resets the sim fleet's time-dependent login state (TOTP replay watermark, throttles, later sessions) via fleet op `reset_time_state` and reports the residue; manual: `python -m tools.sim.env.fleet_events reset-time-state --to <time>`.
+
+Simulation, Task 13 (a01 stale heartbeat): standing-clock sender ticks now send `t + k ms` (k capped at 50) instead of a single +1 ms retry, which was lost over the VM TLS proxy; the settle wait prints which apartment is stale and why; runbook note in `docs/sim-findings/RUNBOOK.md`.
+
+Simulation, completed: 156-week usage run (3296 raw findings), pentest (43 checks), curated clusters and consolidated report in `docs/sim-findings/README.md`; harness in `tools/sim/`, runbook in `docs/sim-findings/RUNBOOK.md`. Findings only, no product code changed.
