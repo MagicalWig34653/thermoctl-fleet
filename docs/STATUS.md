@@ -1,6 +1,31 @@
 # Status
 
-Last updated: 2026-10-06.
+Last updated: 2026-10-16.
+
+
+## Sim findings 12, 13, 20-24 fixed (2026-10-16)
+
+Hardening from the simulation/pentest findings; no protocol field and no
+`CommandType` change.
+
+- F24: `SystemState.clock_drift_s` is `allow_inf_nan=False` (422 at ingest);
+  422 bodies no longer echo `input` (a NaN there made the 422 itself a 500).
+  `Storage.get_latest_heartbeat` / `list_heartbeats` skip a stored row that no
+  longer validates (log warning; latest falls back to the newest valid one of
+  the last 50), so a poisoned row cannot take down the overview.
+- F22/F23: new `fleet/hardening.py`. `POST /v1/heartbeat` is capped at
+  `FLEET_MAX_HEARTBEAT_BODY_BYTES` (default 64 KiB), `/v1/heartbeats` at
+  `FLEET_MAX_HEARTBEAT_BATCH_BODY_BYTES` (default 4 MiB): 413 by
+  `Content-Length` and by streamed byte count. Free-text heartbeat fields have
+  `max_length=128`. `RecursionError` from deeply nested JSON answers 422.
+- F20/F21: `X-Content-Type-Options: nosniff` on every response; `/v1/*` and
+  `/healthz` also get `X-Frame-Options`, `Referrer-Policy` and
+  `Content-Security-Policy: default-src 'none'`. UI headers unchanged.
+- F12: `/docs`, `/redoc`, `/openapi.json` are off unless
+  `FLEET_ENABLE_API_DOCS=true`.
+- F13: a 404 under `/ui/` for a browser (`Accept: text/html`) renders
+  `not_found.html` (German, with link to the overview); other clients keep JSON.
+- Tests: `tests/test_hardening.py`.
 
 
 ## README rewritten (2026-10-06)

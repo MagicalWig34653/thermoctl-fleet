@@ -47,6 +47,11 @@ from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
 from fleet.data_retention import FAULT_RETENTION_DAYS, HEARTBEAT_RETENTION_DAYS, run_data_retention
 from fleet.ed25519_checks import reject_low_order_public_key, reject_malleable_signature
+from fleet.hardening import (
+    HeartbeatBodyLimitMiddleware,
+    fastapi_docs_kwargs,
+    install_error_handlers,
+)
 from fleet.rollout import advance_all_rollouts
 from fleet.storage import (
     RecordCommandResultOutcome,
@@ -586,7 +591,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await rollout_worker_task
 
 
-app = FastAPI(title="thermoctl-fleet", version=str(PROTOCOL_VERSION), lifespan=lifespan)
+# `/docs`, `/redoc`, `/openapi.json` are off unless `FLEET_ENABLE_API_DOCS` is
+# set (sim finding 12) -- the schema carries internal docstrings.
+app = FastAPI(
+    title="thermoctl-fleet",
+    version=str(PROTOCOL_VERSION),
+    lifespan=lifespan,
+    **fastapi_docs_kwargs(),
+)
+# Added before `install_security_headers`, so the headers also cover its 413.
+app.add_middleware(HeartbeatBodyLimitMiddleware)
+install_error_handlers(app)
 
 # Fleet UI login (P3.0) -- entirely separate auth path from the `/v1/...`
 # agent API above: `ui_router`'s routes use `fleet.ui_auth`

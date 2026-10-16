@@ -3021,6 +3021,14 @@ def install_security_headers(app: object) -> None:
     @app.middleware("http")  # type: ignore[attr-defined,untyped-decorator]
     async def _security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
         response = await call_next(request)
+        # Every response, API and UI alike (sim findings 20/21).
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        path = request.url.path
+        if path == "/healthz" or path.startswith("/v1/"):
+            # JSON only, never framed or rendered: the strictest policy.
+            response.headers["Content-Security-Policy"] = "default-src 'none'"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
         if request.url.path.startswith("/ui"):
             # `script-src 'self'` explicit, not merely inherited from
             # `default-src` (P5.5b: the restore form's vendored age JS,

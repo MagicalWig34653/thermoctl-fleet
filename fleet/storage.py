@@ -55,6 +55,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -69,6 +70,7 @@ from typing import Any, cast
 
 from alembic import command
 from alembic.config import Config
+from pydantic import ValidationError
 from sqlalchemy import (
     Boolean,
     Date,
@@ -1500,6 +1502,24 @@ class TenantChangeOutcome:
     diagnostic_bundle_storage_paths: list[str]
 
 
+logger = logging.getLogger(__name__)
+
+# How many of an apartment's newest rows `get_latest_heartbeat` looks through
+# for one that still validates.
+_LATEST_HEARTBEAT_SCAN_LIMIT = 50
+
+
+def _parse_stored_heartbeat(payload_json: str) -> Heartbeat | None:
+    """The stored payload as a `Heartbeat`, or `None` (logged) if it no
+    longer validates."""
+
+    try:
+        return Heartbeat.model_validate_json(payload_json)
+    except ValidationError:
+        logger.warning("Skipping a stored heartbeat row that no longer validates.")
+        return None
+
+
 class Storage:
     """Thin wrapper around one SQLAlchemy engine -- write/read-back functions
     for apartments (token hash), heartbeats, and events (P1.3).
@@ -1727,7 +1747,12 @@ class Storage:
                 .where(HeartbeatRecord.apartment_id == apartment_id)
                 .order_by(HeartbeatRecord.received_at)
             ).all()
-            return [Heartbeat.model_validate_json(row.payload_json) for row in rows]
+            result: list[Heartbeat] = []
+            for row in rows:
+                parsed = _parse_stored_heartbeat(row.payload_json)
+                if parsed is not None:
+                    result.append(parsed)
+            return result
 
     def get_latest_heartbeat(self, apartment_id: str) -> LatestHeartbeat | None:
         """The most recently *received* heartbeat of `apartment_id`, plus
@@ -1752,7 +1777,7 @@ class Storage:
         """
 
         with self.session() as session:
-            row = session.scalar(
+            rows = session.scalars(
                 select(HeartbeatRecord)
                 .where(HeartbeatRecord.apartment_id == apartment_id)
                 .order_by(
@@ -1760,15 +1785,21 @@ class Storage:
                     HeartbeatRecord.sent_at.desc(),
                     HeartbeatRecord.id.desc(),
                 )
-                .limit(1)
-            )
-            if row is None:
-                return None
-            return LatestHeartbeat(
-                heartbeat=Heartbeat.model_validate_json(row.payload_json),
-                received_at=row.received_at,
-                outdated=row.protocol_version < PROTOCOL_VERSION,
-            )
+                .limit(_LATEST_HEARTBEAT_SCAN_LIMIT)
+            ).all()
+            # A stored row that no longer validates (sim finding 24: a NaN
+            # stored as `null` by an older version) is skipped, newest first,
+            # instead of raising -- one bad row must not take down every page
+            # that builds the house overview.
+            for row in rows:
+                parsed = _parse_stored_heartbeat(row.payload_json)
+                if parsed is not None:
+                    return LatestHeartbeat(
+                        heartbeat=parsed,
+                        received_at=row.received_at,
+                        outdated=row.protocol_version < PROTOCOL_VERSION,
+                    )
+            return None
 
     # -- events ---------------------------------------------------------------
 
