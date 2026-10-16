@@ -24,6 +24,11 @@ on:
   # .img.xz + SHA256SUMS as plain workflow artifacts) -- but never
   # publish-release, which stays gated on the tag alone, below.
   workflow_dispatch:
+    inputs:
+      agent_digest:
+        description: "Agent image digest for the watchdog preset state (sha256:<64 lowercase hex>)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -141,6 +146,8 @@ jobs:
             libarchive-tools libcap2-bin grep rsync xz-utils file git curl bc \
             qemu-utils kpartx parted
       - name: Wire the thermoctl custom stage into pi-gen
+        env:
+          THERMOCTL_AGENT_DIGEST: ${{ inputs.agent_digest || vars.THERMOCTL_AGENT_DIGEST }}
         run: |
           set -eu
           STAGE_SRC="thermoctl-fleet/image/pi/pi-gen-stage"
@@ -174,6 +181,9 @@ jobs:
           # convention -- an empty marker file is enough). This one stays
           # at the STAGE level, not inside 01-thermoctl/.
           touch "$STAGE_DST/EXPORT_IMAGE"
+          # Build input: the agent image digest (no default; 00-run.sh
+          # fails the build if empty or not sha256:<64 lowercase hex>).
+          printf '%s\n' "$THERMOCTL_AGENT_DIGEST" > "$STAGE_DST/01-thermoctl/files/agent-digest"
       - name: Write pi-gen config
         # build-docker.sh (unlike build.sh) does not read these as process
         # environment variables -- it only `source`s a `config` file, either
@@ -312,6 +322,8 @@ jobs:
           mkosi --version
       - name: Stage repository inputs inside the image
         working-directory: thermoctl-fleet
+        env:
+          THERMOCTL_AGENT_DIGEST: ${{ inputs.agent_digest || vars.THERMOCTL_AGENT_DIGEST }}
         run: |
           set -eu
           stage=image/x86/mkosi.extra/opt/thermoctl-build
@@ -320,6 +332,9 @@ jobs:
           cp -r image/common "$stage/image/"
           cp -r watchdog "$stage/watchdog"
           cp -r image/x86/watchdog-bin "$stage/watchdog-bin"
+          # Build input; mkosi.postinst.chroot validates it and fails the
+          # build if empty or not sha256:<64 lowercase hex>.
+          printf '%s\n' "$THERMOCTL_AGENT_DIGEST" > "$stage/agent-digest"
       - name: Build with mkosi
         working-directory: thermoctl-fleet/image/x86
         # mkosi v21 sandboxes more of its own internal operations (package

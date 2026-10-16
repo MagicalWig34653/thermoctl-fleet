@@ -91,3 +91,16 @@ watchdog-binary cross-compile step this stage relies on, **was** run for
 real end to end on this machine, inside a Lima VM
 (`tools/mac-test-vm`) -- see that tool's own section in
 `../README.md` and this task's final report for what that confirmed.
+
+## Build input: `THERMOCTL_AGENT_DIGEST`
+
+The build needs the agent image digest, `sha256:<64 lowercase hex>`, to write
+the watchdog's preset state file (`install.sh --agent-digest`). Set the
+environment variable `THERMOCTL_AGENT_DIGEST` for `01-thermoctl/00-run.sh`
+(usage: `THERMOCTL_AGENT_DIGEST=sha256:... ./build-docker.sh`), or place it in
+`01-thermoctl/files/agent-digest` (what `.github/workflows/image.yml` does,
+from its `agent_digest` dispatch input or the `THERMOCTL_AGENT_DIGEST`
+repository variable). There is no default: if it is unset, a tag such as
+`latest`, or not exactly `sha256:` plus 64 lowercase hex characters, the
+build fails before anything is copied. No digest is stored in this
+repository.
