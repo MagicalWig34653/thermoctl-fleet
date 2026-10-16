@@ -54,11 +54,15 @@ ARCH=""
 REPO_ROOT=""
 SKIP_WATCHDOG_BUILD=0
 SKIP_APT=0
+# Digest of the agent image shipped in this image (section 22.5), for the
+# pre-set watchdog state file. Also read from THERMOCTL_AGENT_DIGEST.
+AGENT_DIGEST="${THERMOCTL_AGENT_DIGEST:-}"
 
 usage() {
   cat <<'EOF'
 Usage: install.sh --arch {arm64|amd64} [--root PATH] [--repo-root PATH]
                    [--skip-watchdog-build] [--skip-apt]
+                   [--agent-digest sha256:<64 hex>]
 EOF
 }
 
@@ -84,6 +88,15 @@ while [ $# -gt 0 ]; do
       SKIP_APT=1
       shift
       ;;
+    --agent-digest)
+      if [ $# -lt 2 ]; then
+        echo "install.sh: --agent-digest needs a value" >&2
+        usage >&2
+        exit 2
+      fi
+      AGENT_DIGEST="$2"
+      shift 2
+      ;;
     -h | --help)
       usage
       exit 0
@@ -102,6 +115,11 @@ if [ "$SKIP_WATCHDOG_BUILD" -eq 0 ] && [ -z "$ARCH" ]; then
 fi
 if [ -n "$ARCH" ] && [ "$ARCH" != "arm64" ] && [ "$ARCH" != "amd64" ]; then
   echo "install.sh: --arch must be 'arm64' or 'amd64', got: $ARCH" >&2
+  exit 2
+fi
+
+if [ -n "$AGENT_DIGEST" ] && ! [[ "$AGENT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "install.sh: --agent-digest must be sha256:<64 lowercase hex>, got: $AGENT_DIGEST" >&2
   exit 2
 fi
 
@@ -295,6 +313,24 @@ if [ -z "$ROOT" ] && command -v systemd-tmpfiles >/dev/null 2>&1 && [ "$SKIP_APT
     "$(root_path /etc/tmpfiles.d)/thermoctl-restore-mover.conf"
 fi
 
+# The watchdog's service user (sim finding F40), declared via sysusers.d.
+install -d -m 0755 "$(root_path /etc/sysusers.d)"
+install -m 0644 "$COMMON_DIR/sysusers.d/thermoctl-watchdog.conf" \
+  "$(root_path /etc/sysusers.d)/thermoctl-watchdog.conf"
+# Create it now (idempotent), not only at the next boot -- same reasoning
+# as the tmpfiles call above. Needs root; under a dry run the file above
+# is the whole result.
+if [ "$(id -u)" -eq 0 ] && [ "$SKIP_APT" -eq 0 ] && command -v systemd-sysusers >/dev/null 2>&1; then
+  if [ -z "$ROOT" ]; then
+    systemd-sysusers "$(root_path /etc/sysusers.d)/thermoctl-watchdog.conf"
+  else
+    # No file argument under --root: systemd-sysusers resolves paths inside
+    # the root itself, so root_path here could double the prefix. It reads
+    # <root>/etc/sysusers.d/ (idempotent).
+    systemd-sysusers --root="$ROOT"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # 5. Agent compose file + registration template + backup-recipients dir
 #    (image/common/README.md's table)
@@ -341,23 +377,26 @@ install -d -m 0755 "$(root_path /var/lib/thermoctl-restore-mover)"
 install -d -m 0755 "$(root_path /run/thermoctl-agent)"
 
 # Section 22.5's pre-set watchdog state file: the build-time fallback
-# revision (section 17, "Fallback without a proven revision") -- present
-# from the very first boot, before the agent has ever written a real one,
-# so the watchdog always has *something* to read. "proven=false" is the
-# conservative, honest starting point: nothing has actually been proven
-# yet.
+# revision (section 17, "Fallback without a proven revision"). The shipped
+# agent digest is entered as both desired and proven (watchdog/state.go
+# parses the lower-case keys desired/proven and rejects an empty desired,
+# so without a digest no file is written -- sim finding F41).
 STATE_FILE="$(root_path /var/lib/thermoctl-watchdog)/state.env"
 if [ ! -f "$STATE_FILE" ]; then
-  cat >"$STATE_FILE" <<'EOF'
+  if [ -n "$AGENT_DIGEST" ]; then
+    cat >"$STATE_FILE" <<EOF
 # Pre-set by image/common/install.sh at image-build time (section 22.5).
 # Overwritten by the agent at runtime once a real revision is reconciled.
-DIGEST=
-PROVEN=false
+desired=$AGENT_DIGEST
+proven=$AGENT_DIGEST
 EOF
-  if [ "$(id -u)" -eq 0 ]; then
-    chown 10002:10002 "$STATE_FILE"
+    if [ "$(id -u)" -eq 0 ]; then
+      chown 10002:10002 "$STATE_FILE"
+    fi
+    chmod 0644 "$STATE_FILE"
+  else
+    echo "install.sh: no --agent-digest/THERMOCTL_AGENT_DIGEST given, NOT writing the watchdog state file" >&2
   fi
-  chmod 0644 "$STATE_FILE"
 fi
 
 # /etc/thermoctl-agent/.env with DOCKER_GID -- must run after docker-ce is

@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-10-11.
+Last updated: 2026-10-16.
 
 
 ## Usage simulation: Limit-Erkennung unabhängig vom Exit-Code (2026-10-14)
@@ -54,6 +54,24 @@ curl, file tools denied, prompt on stdin, scratch cwd, stderr-only limit detecti
 Resumable runner and CLI (`python -m tools.sim run|status|report`; exit 75 on
 usage limit, failed persona steps go to `sim-state/failures.jsonl` and are retried).
 
+
+## Sim findings F40/F41: watchdog user and preset state file (2026-10-16)
+
+Both fixed on the recipe side; watchdog Go code unchanged.
+
+- **F40:** `image/common/sysusers.d/thermoctl-watchdog.conf` declares the
+  `thermoctl-watchdog` system user (nologin, no home); `install.sh` installs
+  it and runs `systemd-sysusers` when root. Without it the unit failed with
+  217/USER. The unit's `Group=docker` supplies the runtime access.
+- **F41:** the preset `state.env` used `DIGEST=`/`PROVEN=`; `watchdog/state.go`
+  reads `desired`/`proven` and rejects an empty `desired`. `install.sh` now
+  takes `--agent-digest sha256:<hex>` (or `THERMOCTL_AGENT_DIGEST`) and writes
+  `desired=`/`proven=` with it. Without a digest it writes no file and warns.
+  **Open:** `image/pi` and `image/x86` do not pass a digest yet, so real
+  images still ship without a state file until the build supplies one.
+- Tests in `tests/test_image_install_sh.py`: the unit's `User=` matches the
+  sysusers entry, and the real watchdog binary accepts the recipe's state file
+  in `-check-mode`.
 
 ## README rewritten (2026-10-06)
 
