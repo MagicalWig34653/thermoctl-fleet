@@ -19,6 +19,7 @@ import os
 
 import pytest
 
+from fleet.permissions import ADMIN_ROLE_NAME, ALL_PERMISSIONS
 from fleet.storage import Storage, UiUserRecord
 from fleet.totp_crypto import encrypt_totp_secret
 
@@ -41,12 +42,23 @@ def store_encrypted_totp_secret(storage: Storage, user_id: int, secret: str) -> 
     storage.set_ui_user_totp_secret(user_id, encrypt_totp_secret(secret, user_id, key))
 
 
+def ensure_admin_role(storage: Storage) -> int:
+    """Id of the "Administrator" role (all permissions). Migration 0020
+    creates it; recreated here for a storage that bypassed the migration."""
+
+    role = storage.get_ui_role_by_name(ADMIN_ROLE_NAME)
+    if role is None:  # pragma: no cover -- migration 0020 always creates it
+        role = storage.create_ui_role(ADMIN_ROLE_NAME, ALL_PERMISSIONS)
+    return role.id
+
+
 def create_ui_user_with_totp(
     storage: Storage,
     username: str,
     password_hash: str,
     totp_secret: str,
     created_at: object,
+    role_id: int | None = None,
 ) -> UiUserRecord:
     """`Storage.create_ui_user` plus the P6.2 encryption step, in one call
     -- for the handful of tests that create a user inline (not via the
@@ -57,6 +69,7 @@ def create_ui_user_with_totp(
         password_hash=password_hash,
         totp_secret="",
         created_at=created_at,  # type: ignore[arg-type]
+        role_id=ensure_admin_role(storage) if role_id is None else role_id,
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return storage.get_ui_user_by_id(record.id)  # type: ignore[return-value]

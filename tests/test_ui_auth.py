@@ -51,7 +51,7 @@ from fleet.ui_auth import (
     totp_provisioning_uri,
     verify_totp,
 )
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 
 USERNAME = "landlord"
 
@@ -80,6 +80,7 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
         password_hash=hash_password(password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id
@@ -126,6 +127,7 @@ def test_migration_0005_creates_and_removes_ui_tables(tmp_path: object) -> None:
         "locked_until",
         "failure_window_started_at",
         "created_at",
+        "role_id",  # migration 0020
     }
     ui_session_columns = {col["name"] for col in inspect(engine).get_columns("ui_sessions")}
     assert ui_session_columns == {
@@ -647,6 +649,7 @@ def test_lockout_counter_regression_runs_reliably(
             password_hash=hash_password(secrets.token_urlsafe(16)),
             totp_secret=generate_totp_secret(),
             created_at=datetime.now(UTC),
+            role_id=ensure_admin_role(storage),
         )
         now = datetime.now(UTC)
         barrier = threading.Barrier(20)

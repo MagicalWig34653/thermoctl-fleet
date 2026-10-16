@@ -24,7 +24,7 @@ from fleet.ui_auth import generate_totp_secret, hash_password
 from fleet.ui_nav import NavCounts, build_nav_counts, nav_counts_from_overview
 from fleet.ui_overview import build_overview
 from protocol.backups import BackupKind
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 from tests.test_ui_overview import (
     APARTMENT_A,
     APARTMENT_B,
@@ -61,6 +61,7 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
         password_hash=hash_password(password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id

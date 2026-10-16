@@ -19,6 +19,7 @@ import pytest
 import fleet.admin as admin_module
 from fleet.storage import create_storage, upgrade
 from fleet.ui_auth import MIN_PASSWORD_LENGTH, hash_password
+from tests.conftest import ensure_admin_role
 
 
 @pytest.fixture
@@ -138,6 +139,7 @@ def test_create_user_rejects_an_existing_username(
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="ignored",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
 
     exit_code = admin_module.main(["create-user", "landlord"])
@@ -167,6 +169,7 @@ def test_create_user_handles_a_concurrent_duplicate_insert_cleanly(
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="AAAAAAAAAAAAAAAA",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
 
     monkeypatch.setattr(Storage, "get_ui_user_by_username", lambda self, username: None)
@@ -195,6 +198,7 @@ def test_reset_totp_replaces_the_secret(
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="AAAAAAAAAAAAAAAA",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
 
     exit_code = admin_module.main(["reset-totp", "landlord"])
@@ -221,6 +225,7 @@ def test_unlock_clears_the_lock_and_failure_counter(database_url: str) -> None:
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="AAAAAAAAAAAAAAAA",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     storage.record_ui_login_failure(
         record.id,
@@ -253,6 +258,7 @@ def test_delete_user_removes_the_account(database_url: str) -> None:
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="AAAAAAAAAAAAAAAA",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
 
     exit_code = admin_module.main(["delete-user", "landlord"])
@@ -417,6 +423,7 @@ def test_reset_totp_stores_a_newly_encrypted_secret(database_url: str) -> None:
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="placeholder",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
 
     exit_code = admin_module.main(["reset-totp", "landlord"])
@@ -439,6 +446,7 @@ def test_reset_totp_fails_loudly_without_a_totp_key(
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="placeholder",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     monkeypatch.delenv("FLEET_TOTP_KEY", raising=False)
 
@@ -474,6 +482,7 @@ def test_rotate_totp_key_reencrypts_every_user(
             password_hash=hash_password(secrets.token_urlsafe(16)),
             totp_secret="",
             created_at=datetime.now(UTC),
+            role_id=ensure_admin_role(storage),
         )
         plaintext_secret = secrets.token_hex(10)
         storage.set_ui_user_totp_secret(
@@ -511,6 +520,7 @@ def test_rotate_totp_key_stops_at_the_first_undecryptable_row_and_reports_it(
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="not-valid-ciphertext-for-any-key",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     monkeypatch.setenv(
         "FLEET_TOTP_KEY_NEW", base64.urlsafe_b64encode(os_module.urandom(32)).decode()
@@ -561,6 +571,7 @@ def test_rotate_totp_key_resumes_after_partial_failure_on_rerun(
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     plaintext_a = secrets.token_hex(10)
     # Written with the *new* key already -- as if a previous, interrupted
@@ -576,6 +587,7 @@ def test_rotate_totp_key_resumes_after_partial_failure_on_rerun(
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     plaintext_b = secrets.token_hex(10)
     storage.set_ui_user_totp_secret(
@@ -617,6 +629,7 @@ def test_rotate_totp_key_row_decryptable_by_neither_key_still_fails_loudly(
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="not-valid-ciphertext-for-any-key",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     monkeypatch.setenv(
         "FLEET_TOTP_KEY_NEW", base64.urlsafe_b64encode(os_module.urandom(32)).decode()

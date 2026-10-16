@@ -55,6 +55,7 @@ from fleet.storage import (
 from protocol import CommandResult, Event, FaultKind, Heartbeat, LogExcerpt
 from protocol.commands import CommandType
 from protocol.version import PROTOCOL_VERSION
+from tests.conftest import ensure_admin_role
 
 
 def _database_url(tmp_path: object) -> str:
@@ -3895,6 +3896,7 @@ def test_migration_0019_downgrade_decrypts_back_to_plaintext(tmp_path: object) -
         password_hash=hash_password("unused-here"),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     from fleet.totp_crypto import encrypt_totp_secret, load_totp_key
 
@@ -3938,6 +3940,7 @@ def test_migration_0019_downgrade_fails_loudly_without_a_totp_key(
         password_hash=hash_password("unused-here"),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     ciphertext = encrypt_totp_secret("JBSWY3DPEHPK3PXP", record.id, key)
     storage.set_ui_user_totp_secret(record.id, ciphertext)
@@ -3950,9 +3953,13 @@ def test_migration_0019_downgrade_fails_loudly_without_a_totp_key(
     # same ciphertext.
     engine = create_storage(url).engine
     assert "webauthn_credentials" in set(inspect(engine).get_table_names())
-    untouched = create_storage(url).get_ui_user_by_username("landlord")
-    assert untouched is not None
-    assert untouched.totp_secret == ciphertext
+    # Raw SQL: the 0020 downgrade (role_id) already ran before 0019 refused.
+    connection = sqlite3.connect(url.removeprefix("sqlite:///"))
+    stored = connection.execute(
+        "SELECT totp_secret FROM ui_users WHERE username = 'landlord'"
+    ).fetchone()[0]
+    connection.close()
+    assert stored == ciphertext
 
 
 def test_migration_0019_downgrade_fails_loudly_with_the_wrong_totp_key(
@@ -3976,6 +3983,7 @@ def test_migration_0019_downgrade_fails_loudly_with_the_wrong_totp_key(
         password_hash=hash_password("unused-here"),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     ciphertext = encrypt_totp_secret("JBSWY3DPEHPK3PXP", record.id, key)
     storage.set_ui_user_totp_secret(record.id, ciphertext)
@@ -3987,9 +3995,13 @@ def test_migration_0019_downgrade_fails_loudly_with_the_wrong_totp_key(
 
     engine = create_storage(url).engine
     assert "webauthn_credentials" in set(inspect(engine).get_table_names())
-    untouched = create_storage(url).get_ui_user_by_username("landlord")
-    assert untouched is not None
-    assert untouched.totp_secret == ciphertext
+    # Raw SQL: the 0020 downgrade (role_id) already ran before 0019 refused.
+    connection = sqlite3.connect(url.removeprefix("sqlite:///"))
+    stored = connection.execute(
+        "SELECT totp_secret FROM ui_users WHERE username = 'landlord'"
+    ).fetchone()[0]
+    connection.close()
+    assert stored == ciphertext
 
 
 def test_migration_0019_downgrade_drops_webauthn_tables(tmp_path: object) -> None:

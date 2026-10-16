@@ -30,7 +30,7 @@ from fleet.webauthn_auth import (
     rp_id,
     verify_login_assertion,
 )
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 from tests.webauthn_fixtures import SoftAuthenticator
 
 RP_ID = "example.org"
@@ -51,6 +51,7 @@ def user_id(storage: Storage) -> int:
         password_hash=hash_password("not-used-here-at-all!!"),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, generate_totp_secret())
     return record.id
@@ -451,6 +452,7 @@ def test_verify_login_assertion_rejects_credential_from_a_different_user(
         password_hash=hash_password("unused"),
         totp_secret="",
         created_at=now,
+        role_id=ensure_admin_role(storage),
     )
     credential_id, authenticator = _register_credential(storage, user_id, "session-a", now)
     user = storage.get_ui_user_by_id(user_id)
@@ -616,6 +618,7 @@ def test_update_webauthn_sign_count_cas_rejects_a_non_increasing_value() -> None
             password_hash=hash_password("unused"),
             totp_secret="",
             created_at=now,
+            role_id=ensure_admin_role(storage),
         )
         credential_id, _authenticator = _register_credential(storage, user.id, "session-a", now)
 

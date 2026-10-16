@@ -25,7 +25,7 @@ from fleet.app import app
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from fleet.webauthn_auth import ORIGIN_ENV, RP_ID_ENV, rp_id
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 from tests.webauthn_fixtures import SoftAuthenticator
 
 USERNAME = "landlord"
@@ -57,6 +57,7 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
         password_hash=hash_password(password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id
@@ -557,6 +558,7 @@ def test_delete_credential_cannot_remove_another_users_credential(
         password_hash=hash_password(other_password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, other_record.id, other_totp_secret)
 

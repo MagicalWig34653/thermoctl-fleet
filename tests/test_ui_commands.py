@@ -45,7 +45,7 @@ from fleet.ui_auth import generate_totp_secret, hash_password
 from fleet.ui_inventory import MAX_REASON_LENGTH
 from protocol import CommandResult, LogExcerpt
 from protocol.commands import CommandType
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 
 USERNAME = "landlord"
 APARTMENT = "house7-a03"
@@ -76,6 +76,7 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
         password_hash=hash_password(password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id

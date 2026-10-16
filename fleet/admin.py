@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy.exc import IntegrityError
 
+from fleet.permissions import ADMIN_ROLE_NAME, ALL_PERMISSIONS
 from fleet.storage import create_storage
 from fleet.totp_crypto import (
     TOTP_KEY_ENV,
@@ -125,6 +126,12 @@ def create_user(username: str) -> int:
 
     password = _read_new_password()
     totp_secret = generate_totp_secret()
+    # F11: the emergency/first-account path creates Administrators (the role
+    # exists after migration 0020; recreated with all permissions if an
+    # operator deleted it).
+    admin_role = storage.get_ui_role_by_name(ADMIN_ROLE_NAME) or storage.create_ui_role(
+        ADMIN_ROLE_NAME, ALL_PERMISSIONS
+    )
     try:
         record = storage.create_ui_user(
             username=normalized_username,
@@ -135,6 +142,7 @@ def create_user(username: str) -> int:
             password_hash=hash_password(password),
             totp_secret="",
             created_at=datetime.now(UTC),
+            role_id=admin_role.id,
         )
     except IntegrityError:
         print(f"User {username!r} already exists.", file=sys.stderr)

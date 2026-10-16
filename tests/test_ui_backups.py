@@ -20,7 +20,7 @@ from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_apartment import BACKUP_KIND_LABELS, BackupDisplay, _format_size_bytes
 from fleet.ui_auth import generate_totp_secret, hash_password
 from protocol.backups import BackupKind
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 
 USERNAME = "landlord"
 APARTMENT = "house7-a03"
@@ -57,6 +57,7 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
         password_hash=hash_password(password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id
