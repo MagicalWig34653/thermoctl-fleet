@@ -94,7 +94,9 @@ class CommandResult(BaseModel):
 # stream read timeout (`agent.commands_channel.SSE_READ_TIMEOUT_S`) is derived
 # from the very value the fleet pings with, and cannot silently drift below it
 # (sim finding 42). The fleet may override the interval per deployment via
-# `FLEET_COMMANDS_SSE_PING_INTERVAL_S`; the agent's multiple has headroom.
+# `FLEET_COMMANDS_SSE_PING_INTERVAL_S`; the agent's multiple has headroom, but an
+# override above three times this value (45 s) makes the agent's stream time out
+# again and fall back to the 60 s polling -- keep the override below that.
 COMMANDS_SSE_PING_INTERVAL_S = 15.0
 
 # Section 7: "the last n lines ... capped at 500 lines" -- reused here (not
