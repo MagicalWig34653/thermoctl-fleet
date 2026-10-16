@@ -89,6 +89,11 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --agent-digest)
+      if [ $# -lt 2 ]; then
+        echo "install.sh: --agent-digest needs a value" >&2
+        usage >&2
+        exit 2
+      fi
       AGENT_DIGEST="$2"
       shift 2
       ;;
@@ -319,7 +324,10 @@ if [ "$(id -u)" -eq 0 ] && [ "$SKIP_APT" -eq 0 ] && command -v systemd-sysusers 
   if [ -z "$ROOT" ]; then
     systemd-sysusers "$(root_path /etc/sysusers.d)/thermoctl-watchdog.conf"
   else
-    systemd-sysusers --root="$ROOT" "$(root_path /etc/sysusers.d)/thermoctl-watchdog.conf"
+    # No file argument under --root: systemd-sysusers resolves paths inside
+    # the root itself, so root_path here could double the prefix. It reads
+    # <root>/etc/sysusers.d/ (idempotent).
+    systemd-sysusers --root="$ROOT"
   fi
 fi
 
