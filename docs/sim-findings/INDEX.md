@@ -1,5 +1,12 @@
 # Simulation findings
 
+Start with the consolidated report: [README.md](README.md). Curation notes (clusters, verdicts, evidence):
+[landlord](curation/cluster-landlord.md), [caretaker](curation/cluster-caretaker.md),
+[tenants](curation/cluster-tenants.md), [admin, newcomer, security](curation/cluster-admin-newcomer-security.md),
+[stuck absence alarm](curation/verification-stuck-absence-alarm.md),
+[tenant hypotheses](curation/verification-tenant-hypotheses.md). Pentest: [pentest/results.md](pentest/results.md).
+The list below is the raw, unfiltered persona output (claimed severities).
+
 ## blocker
 
 ### logic
