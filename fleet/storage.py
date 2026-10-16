@@ -1801,6 +1801,19 @@ class Storage:
                     )
             return None
 
+    def get_latest_heartbeat_received_at(self, apartment_id: str) -> datetime | None:
+        """Receipt time of the newest stored heartbeat row, regardless of
+        whether its payload still validates (absence alarms must not depend
+        on payload validity). `None` only if the apartment has no rows."""
+
+        with self.session() as session:
+            return session.scalar(
+                select(HeartbeatRecord.received_at)
+                .where(HeartbeatRecord.apartment_id == apartment_id)
+                .order_by(HeartbeatRecord.received_at.desc())
+                .limit(1)
+            )
+
     # -- events ---------------------------------------------------------------
 
     def save_event(self, apartment_id: str, event: Event, received_at: datetime) -> None:

@@ -25,7 +25,11 @@ Hardening from the simulation/pentest findings; no protocol field and no
   `FLEET_ENABLE_API_DOCS=true`.
 - F13: a 404 under `/ui/` for a browser (`Accept: text/html`) renders
   `not_found.html` (German, with link to the overview); other clients keep JSON.
-- Tests: `tests/test_hardening.py`.
+- Absence alarms do not depend on payload validity: new
+  `Storage.get_latest_heartbeat_received_at` (raw newest `received_at`) is what
+  `check_absence_alarms` uses; an apartment with an unreadable row counts as
+  reported at that time, only an apartment with no rows is skipped.
+- Tests: `tests/test_hardening.py`, plus two in `tests/test_alarms.py`.
 
 
 ## README rewritten (2026-10-06)
