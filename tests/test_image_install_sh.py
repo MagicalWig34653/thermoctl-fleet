@@ -21,6 +21,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "image" / "common" / "install.sh"
 BASH = shutil.which("bash") or "/bin/bash"
+DIGEST = "sha256:" + "a" * 64
+DRY_RUN = ("--arch", "amd64", "--skip-apt", "--skip-watchdog-build", "--agent-digest", DIGEST)
 
 
 def _run_install_sh(root: Path, *extra_args: str) -> subprocess.CompletedProcess[str]:
@@ -53,10 +55,11 @@ def test_dry_run_places_expected_files(tmp_path: Path) -> None:
     """`--skip-apt --skip-watchdog-build` still exercises every file-copy
     step -- only `apt-get` and `go build` are skipped."""
 
-    result = _run_install_sh(tmp_path, "--arch", "arm64", "--skip-apt", "--skip-watchdog-build")
+    result = _run_install_sh(tmp_path, *DRY_RUN)
     assert result.returncode == 0, result.stderr
 
     expect_files = [
+        "etc/sysusers.d/thermoctl-watchdog.conf",
         "etc/systemd/system/thermoctl-watchdog.service",
         "etc/systemd/system/thermoctl-restore-mover.service",
         "etc/systemd/system/thermoctl-restore-mover.path",
@@ -92,15 +95,15 @@ def test_dry_run_is_idempotent(tmp_path: Path) -> None:
     a real proven revision, this script must never clobber that back to
     the placeholder)."""
 
-    first = _run_install_sh(tmp_path, "--arch", "amd64", "--skip-apt", "--skip-watchdog-build")
+    first = _run_install_sh(tmp_path, *DRY_RUN)
     assert first.returncode == 0, first.stderr
 
     state_file = tmp_path / "var/lib/thermoctl-watchdog/state.env"
-    state_file.write_text("DIGEST=sha256:" + "a" * 64 + "\nPROVEN=true\n", encoding="utf-8")
+    state_file.write_text(f"desired={DIGEST}\nproven={DIGEST}\nsince=1\n", encoding="utf-8")
 
-    second = _run_install_sh(tmp_path, "--arch", "amd64", "--skip-apt", "--skip-watchdog-build")
+    second = _run_install_sh(tmp_path, *DRY_RUN)
     assert second.returncode == 0, second.stderr
-    assert "PROVEN=true" in state_file.read_text(encoding="utf-8")
+    assert "since=1" in state_file.read_text(encoding="utf-8")
 
 
 def test_does_not_touch_registration_file_if_already_present(tmp_path: Path) -> None:
@@ -178,3 +181,70 @@ def test_builds_real_static_watchdog_binaries(tmp_path: Path) -> None:
             check=True,
         ).stdout
         assert "ARM aarch64" in output or "arm64" in output.lower()
+
+
+def test_rejects_malformed_agent_digest(tmp_path: Path) -> None:
+    result = _run_install_sh(
+        tmp_path,
+        "--arch",
+        "amd64",
+        "--skip-apt",
+        "--skip-watchdog-build",
+        "--agent-digest",
+        "latest",
+    )
+    assert result.returncode == 2
+    assert "--agent-digest" in result.stderr
+
+
+def test_without_digest_writes_no_state_file(tmp_path: Path) -> None:
+    """An empty `desired` is rejected by watchdog/state.go, so no file at
+    all (with a warning) beats a file the watchdog cannot parse."""
+
+    result = _run_install_sh(tmp_path, "--arch", "amd64", "--skip-apt", "--skip-watchdog-build")
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "var/lib/thermoctl-watchdog/state.env").exists()
+    assert "NOT writing the watchdog state file" in result.stderr
+
+
+def test_sysusers_declares_the_user_the_unit_runs_as(tmp_path: Path) -> None:
+    """F40: the unit's `User=` must be a user the recipe actually creates
+    (a missing user fails the unit with 217/USER)."""
+
+    result = _run_install_sh(tmp_path, *DRY_RUN)
+    assert result.returncode == 0, result.stderr
+    unit = (tmp_path / "etc/systemd/system/thermoctl-watchdog.service").read_text(encoding="utf-8")
+    unit_user = next(
+        line.split("=", 1)[1].strip() for line in unit.splitlines() if line.startswith("User=")
+    )
+    sysusers = (tmp_path / "etc/sysusers.d/thermoctl-watchdog.conf").read_text(encoding="utf-8")
+    entries = [line.split() for line in sysusers.splitlines() if line.startswith("u ")]
+    assert [entry[1] for entry in entries] == [unit_user]
+    assert entries[0][-1] == "/usr/sbin/nologin"
+
+
+@pytest.mark.skipif(shutil.which("go") is None, reason="go toolchain not installed")
+def test_recipe_state_file_is_accepted_by_the_watchdog(tmp_path: Path) -> None:
+    """F41: the recipe's own state file, read by the real watchdog binary
+    in -check-mode (the same parser the running watchdog uses)."""
+
+    root = tmp_path / "root"
+    result = _run_install_sh(root, *DRY_RUN)
+    assert result.returncode == 0, result.stderr
+
+    binary = tmp_path / "thermoctl-watchdog"
+    subprocess.run(  # noqa: S603 -- fixed argument list, no untrusted input
+        ["go", "build", "-o", str(binary), "."],  # noqa: S607
+        cwd=REPO_ROOT / "watchdog",
+        check=True,
+        capture_output=True,
+    )
+    check = subprocess.run(  # noqa: S603 -- fixed argument list, no untrusted input
+        [str(binary), "-check-mode", "-file", str(root / "var/lib/thermoctl-watchdog/state.env")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode == 0, check.stderr
+    assert f"DESIRED={DIGEST}" in check.stdout
+    assert f"PROVEN={DIGEST}" in check.stdout
