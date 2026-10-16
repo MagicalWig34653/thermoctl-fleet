@@ -16,12 +16,19 @@ from __future__ import annotations
 
 import base64
 import os
+import re
+import secrets
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 
+import pyotp
 import pytest
 
 from fleet.permissions import ADMIN_ROLE_NAME, ALL_PERMISSIONS
 from fleet.storage import Storage, UiUserRecord
 from fleet.totp_crypto import encrypt_totp_secret
+from fleet.ui_auth import generate_totp_secret, hash_password
 
 _TEST_TOTP_KEY = base64.urlsafe_b64encode(b"\x42" * 32).decode("ascii")
 
@@ -73,3 +80,48 @@ def create_ui_user_with_totp(
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return storage.get_ui_user_by_id(record.id)  # type: ignore[return-value]
+
+
+_LOGIN_USERNAME = "roleuser"
+
+
+def login_with_role(client: Any, storage: Storage, role_id: int) -> UiUserRecord:
+    """Creates a user with `role_id` and logs `client` in through the real
+    `/ui/login` flow (password + TOTP). Returns the user."""
+
+    password = secrets.token_urlsafe(16)
+    totp_secret = generate_totp_secret()
+    record = storage.create_ui_user(
+        username=_LOGIN_USERNAME,
+        password_hash=hash_password(password),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+        role_id=role_id,
+    )
+    store_encrypted_totp_secret(storage, record.id, totp_secret)
+    page = client.get("/ui/login")
+    match = re.search(r'name="pre_csrf" value="([^"]*)"', page.text)
+    assert match is not None
+    response = client.post(
+        "/ui/login",
+        data={
+            "username": _LOGIN_USERNAME,
+            "password": password,
+            "totp_code": pyotp.TOTP(totp_secret).at(datetime.now(UTC)),
+            "pre_csrf": match.group(1),
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    return storage.get_ui_user_by_id(record.id)  # type: ignore[return-value]
+
+
+@pytest.fixture
+def login_as(client: Any, storage: Storage) -> Callable[..., UiUserRecord]:
+    """`login_as(role_id=...)`: creates a user with that role and logs the
+    module's `client` fixture in (needs `client` and `storage` fixtures)."""
+
+    def _login(role_id: int) -> UiUserRecord:
+        return login_with_role(client, storage, role_id)
+
+    return _login

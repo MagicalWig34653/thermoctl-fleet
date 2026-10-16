@@ -17,6 +17,8 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from fleet.permissions import MISSING_PERMISSION_DETAIL
+
 API_DOCS_ENV = "FLEET_ENABLE_API_DOCS"
 MAX_HEARTBEAT_BODY_ENV = "FLEET_MAX_HEARTBEAT_BODY_BYTES"
 MAX_HEARTBEAT_BATCH_BODY_ENV = "FLEET_MAX_HEARTBEAT_BATCH_BODY_BYTES"
@@ -127,6 +129,11 @@ async def _not_found_handler(request: Request, exc: Exception) -> Response:
     path = request.url.path
     wants_html = "text/html" in request.headers.get("accept", "")
     is_ui = path == "/ui" or path.startswith("/ui/")
+    if exc.status_code == 403 and exc.detail == MISSING_PERMISSION_DETAIL and is_ui and wants_html:
+        # F11: a missing UI permission is a plain-language page, not JSON.
+        from fleet.ui_routes import templates
+
+        return templates.TemplateResponse(request, "forbidden.html", {}, status_code=403)
     if exc.status_code == 404 and exc.detail == "Not Found" and is_ui and wants_html:
         # Imported here: `fleet.ui_routes` imports a lot, and this module
         # must stay importable on its own.

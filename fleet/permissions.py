@@ -32,6 +32,10 @@ ALL_PERMISSIONS: frozenset[Permission] = frozenset(Permission)
 
 ADMIN_ROLE_NAME = "Administrator"
 
+# `detail` of the 403 raised for a missing permission. `fleet.hardening` keys
+# the plain-language HTML page for `/ui/` on exactly this text.
+MISSING_PERMISSION_DETAIL = "Missing permission."
+
 
 def parse_permissions(names: Iterable[str]) -> frozenset[Permission]:
     """Unknown names are dropped (fail closed)."""
@@ -40,4 +44,10 @@ def parse_permissions(names: Iterable[str]) -> frozenset[Permission]:
     return frozenset(known[n] for n in names if n in known)
 
 
-__all__ = ["ADMIN_ROLE_NAME", "ALL_PERMISSIONS", "Permission", "parse_permissions"]
+__all__ = [
+    "ADMIN_ROLE_NAME",
+    "ALL_PERMISSIONS",
+    "MISSING_PERMISSION_DETAIL",
+    "Permission",
+    "parse_permissions",
+]
