@@ -572,8 +572,8 @@ def check_absence_alarms(
     past the six-minute threshold (section 8's own number, `ABSENCE_THRESHOLD`
     above).
 
-    An apartment that has never sent a heartbeat (`Storage
-    .get_latest_heartbeat` returns `None`) is skipped, not alarmed --
+    An apartment with no heartbeat row at all (`Storage
+    .get_latest_heartbeat_received_at` returns `None`) is skipped, not alarmed --
     section 8 does not say what should happen for one, and this project
     does not invent alarm rules the specification is silent on (see the
     module docstring and `docs/STATUS.md`).
@@ -593,11 +593,14 @@ def check_absence_alarms(
     now_naive = _ensure_naive_utc(now)
 
     for apartment_id in storage.list_apartment_ids():
-        latest_heartbeat = storage.get_latest_heartbeat(apartment_id)
-        if latest_heartbeat is None:
+        # Raw receipt time of the newest row: absence must not depend on
+        # whether the payload still validates (an unreadable row still means
+        # the apartment reported at that time).
+        newest_received_at = storage.get_latest_heartbeat_received_at(apartment_id)
+        if newest_received_at is None:
             continue
 
-        received_at = _ensure_naive_utc(latest_heartbeat.received_at)
+        received_at = _ensure_naive_utc(newest_received_at)
         is_absent = (now_naive - received_at) > ABSENCE_THRESHOLD
 
         latest_alarm = storage.get_latest_alarm(apartment_id, AlarmKind.NOT_REPORTING.value)

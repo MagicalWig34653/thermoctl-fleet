@@ -45,6 +45,11 @@ _DEVICE_ID_PATTERN = r"^0x[0-9a-f]{16}$"
 # cap, etc.).
 MAX_PER_DEVICE_ENTRIES = 128
 
+# Upper bound for every free-text heartbeat field (sim findings 22/23): a
+# heartbeat carries a few hundred bytes, so a padded string is abuse, not data.
+# Only a constraint on existing fields -- no field is added.
+MAX_TEXT_LENGTH = 128
+
 
 class FaultKind(StrEnum):
     """The six fault kinds thermoctl already knows today (section 5)."""
@@ -60,18 +65,18 @@ class FaultKind(StrEnum):
 class OpenFault(BaseModel):
     kind: FaultKind
     since: datetime
-    zone: str
+    zone: str = Field(max_length=MAX_TEXT_LENGTH)
 
 
 class ThermoctlState(BaseModel):
-    version: str
+    version: str = Field(max_length=MAX_TEXT_LENGTH)
     reachable: bool
     # The three operating levels from thermoctl's README ("dry run", "armed
     # without restart", "armed and restarted") are not modeled there as a closed
     # enumeration -- hence deliberately free text here instead of an invented
     # enum. Whoever needs a fixed list defines it together with the thermoctl
     # counterpart (section 10).
-    mode: str
+    mode: str = Field(max_length=MAX_TEXT_LENGTH)
 
 
 class ControlState(BaseModel):
@@ -105,7 +110,7 @@ class PerDeviceState(BaseModel):
 class DeviceState(BaseModel):
     # Deliberately free text, no enum: the specification names "connected" only as
     # an example, not a closed list, for lack of a section 10 in thermoctl.
-    zigbee_bridge: str
+    zigbee_bridge: str = Field(max_length=MAX_TEXT_LENGTH)
     weakest_battery_percent: int = Field(ge=0, le=100)
     worst_signal_quality: int = Field(ge=0, le=100)
     silent_devices: int = Field(ge=0)
@@ -125,7 +130,9 @@ class SystemState(BaseModel):
     uptime_s: int = Field(ge=0)
     memory_free_percent: int = Field(ge=0, le=100)
     disk_free_percent: int = Field(ge=0, le=100)
-    clock_drift_s: float
+    # Finite only (sim finding 24): NaN/inf would be stored as JSON `null` and
+    # make the stored row unreadable.
+    clock_drift_s: float = Field(allow_inf_nan=False)
 
 
 class Heartbeat(BaseModel):
@@ -143,9 +150,9 @@ class Heartbeat(BaseModel):
     understands its fields ... It does not reject it."
     """
 
-    apartment: str = Field(min_length=1)
+    apartment: str = Field(min_length=1, max_length=MAX_TEXT_LENGTH)
     sent_at: datetime
-    agent: str
+    agent: str = Field(max_length=MAX_TEXT_LENGTH)
     protocol_version: int = Field(ge=1)
     thermoctl: ThermoctlState
     control: ControlState

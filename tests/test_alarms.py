@@ -1210,3 +1210,51 @@ def test_empty_webhook_urls_configures_nothing_for_that_channel() -> None:
 
     assert len(notifiers) == 1
     assert isinstance(notifiers[0], LogNotifier)
+
+
+# -- absence must not depend on payload validity (sim finding 24 follow-up) -----
+
+
+def _poison_all_heartbeat_payloads(storage: Storage, *, only_newest: bool = False) -> None:
+    from sqlalchemy import update
+
+    from fleet.storage import HeartbeatRecord
+
+    stmt = update(HeartbeatRecord).values(payload_json="{}")
+    if only_newest:
+        stmt = stmt.where(HeartbeatRecord.received_at >= BASE_TIME + timedelta(minutes=10))
+    with storage.session() as session:
+        session.execute(stmt)
+
+
+def test_poisoned_newest_row_of_a_live_apartment_raises_no_false_alarm(storage: Storage) -> None:
+    _register_and_heartbeat(storage, APARTMENT, BASE_TIME)
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(APARTMENT, BASE_TIME + timedelta(minutes=10)),
+        BASE_TIME + timedelta(minutes=10),
+    )
+    _poison_all_heartbeat_payloads(storage, only_newest=True)
+    notifier = _RecordingNotifier()
+
+    check_absence_alarms(storage, BASE_TIME + timedelta(minutes=12), [notifier])
+
+    assert notifier.notifications == []
+    assert storage.get_latest_alarm(APARTMENT, AlarmKind.NOT_REPORTING.value) is None
+
+
+def test_all_rows_poisoned_and_old_still_raises_the_absence_alarm(
+    storage: Storage, caplog: pytest.LogCaptureFixture
+) -> None:
+    _register_and_heartbeat(storage, APARTMENT, BASE_TIME)
+    _poison_all_heartbeat_payloads(storage)
+    notifier = _RecordingNotifier()
+
+    check_absence_alarms(storage, BASE_TIME + timedelta(minutes=7), [notifier])
+
+    assert len(notifier.notifications) == 1
+    assert notifier.notifications[0].event == "raised"
+    # The read side still logs the unreadable row when something reads it.
+    with caplog.at_level(logging.WARNING):
+        assert storage.get_latest_heartbeat(APARTMENT) is None
+    assert "no longer validates" in caplog.text
