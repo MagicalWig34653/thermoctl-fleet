@@ -3,6 +3,28 @@
 Last updated: 2026-10-16.
 
 
+## UI roles and per-permission access, tasks 1-3 of 7 (F11, 2026-10-16)
+
+Spec `docs/superpowers/specs/2026-10-16-ui-roles-design.md`, plan
+`docs/superpowers/plans/2026-10-16-ui-roles.md`. Done so far: the fixed
+permission catalogue `fleet/permissions.py` (unknown names in the database
+are ignored, `view` is part of every role), tables `ui_roles`,
+`ui_role_permissions`, `ui_invitations` and `ui_users.role_id` (migration
+`0020`: existing users become "Administrator" with all permissions; tested
+upgrade-from-0019 with a user and the downgrade), `Storage` role methods,
+`fleet.ui_auth.require_permission` (permissions read from the database per
+request, so removal is immediate) and a permission on every `/ui` route.
+A route-coverage test fails when a route of the UI router declares none.
+A 403 for a missing permission renders `forbidden.html` for browsers under
+`/ui/` (`fleet/hardening.py`, same Accept-based path as the 404 page), JSON
+otherwise. The `pilot_mode` field of the apartment edit form is applied only
+with `pilot_mode.set`, otherwise the stored value stays; the agent still
+refuses `open_access` without `pilot_mode` itself (principle 5). `fleet.admin
+create-user` creates Administrators for now. Not yet done: invitations
+(task 4/5), the "Nutzer und Rollen" pages (6), CLI `--role` and the
+`delete-user` last-admin guard (7). Nothing in `agent/`, `protocol/` or
+`CommandType` changed.
+
 ## Image builds supply the agent digest (2026-10-16)
 
 Closes the F41 open point. `image/pi/pi-gen-stage/01-thermoctl/00-run.sh` and

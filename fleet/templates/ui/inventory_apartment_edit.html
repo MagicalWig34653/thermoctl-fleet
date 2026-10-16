@@ -39,10 +39,13 @@
             {% endfor %}
         </select>
     </label>
+    {# Convenience only: without "pilot_mode.set" the route ignores the field anyway. #}
+    {% if 'pilot_mode.set' in ui_session.permissions %}
     <label for="pilot_mode">
         <input type="checkbox" id="pilot_mode" name="pilot_mode" value="true" {% if apartment.pilot_mode %}checked{% endif %}>
         Pilotbetrieb (schaltet den Agent-Befehl "open_access" frei)
     </label>
+    {% endif %}
     <label for="reason"><span class="field-label-text">Grund<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
         <input type="text" id="reason" name="reason" required>
     </label>
