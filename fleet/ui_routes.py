@@ -35,6 +35,7 @@ from fleet.backup_storage import BackupBlobStorage, get_backup_storage
 from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
 from fleet.desired_state_sources import DISPLAY_SOURCES
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
+from fleet.permissions import Permission
 from fleet.rollout import DEFAULT_STAGGER_HOURS, DEFAULT_TIMEOUT_HOURS
 from fleet.storage import COMMAND_EXPIRY, Storage, get_storage
 from fleet.totp_crypto import TotpDecryptionError, TotpKeyError, decrypt_totp_secret
@@ -58,11 +59,13 @@ from fleet.ui_auth import (
     check_csrf,
     create_session,
     delete_session,
+    has_permission,
     ip_throttle_duration_s,
     ip_throttle_threshold,
     ip_throttle_window_s,
     is_passwordless_network,
     normalize_username,
+    require_permission,
     require_ui_user,
     resolve_client_ip,
     session_absolute_lifetime_s,
@@ -107,6 +110,19 @@ from protocol.registration import AgentRegistrationFile
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ui")
+
+# F11: one dependency per permission, used as the `authenticated` default of
+# every route. `tests/test_ui_route_coverage.py` fails when a route of this
+# router has none. Own-account routes (logout, passkeys) keep
+# `require_ui_user`: they need a session, not a role.
+_NEEDS_VIEW = Depends(require_permission(Permission.VIEW))
+_NEEDS_FAULTS_ACKNOWLEDGE = Depends(require_permission(Permission.FAULTS_ACKNOWLEDGE))
+_NEEDS_COMMANDS_SEND = Depends(require_permission(Permission.COMMANDS_SEND))
+_NEEDS_BACKUPS_MANAGE = Depends(require_permission(Permission.BACKUPS_MANAGE))
+_NEEDS_TENANT_CHANGE = Depends(require_permission(Permission.TENANT_CHANGE))
+_NEEDS_DESIRED_STATE_EDIT = Depends(require_permission(Permission.DESIRED_STATE_EDIT))
+_NEEDS_INVENTORY_MANAGE = Depends(require_permission(Permission.INVENTORY_MANAGE))
+_NEEDS_ROLLOUTS_MANAGE = Depends(require_permission(Permission.ROLLOUTS_MANAGE))
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates" / "ui"
 # `nav_context` (fleet.ui_nav) provides the lazy `nav_counts()` the base
@@ -603,7 +619,7 @@ def webauthn_delete_credential(
 def index(
     request: Request,
     ansicht: str = "",
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_VIEW,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """"Übersicht" (UI rebuild, phase 1: the owner's design draft) -- the
@@ -643,7 +659,7 @@ def index(
 @router.get("/tasks", response_class=HTMLResponse)
 def tasks_page(
     request: Request,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_VIEW,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """"Aufgaben" -- the full action inbox (the same items "Hier braucht es
@@ -675,7 +691,7 @@ def apartments_list(
     q: str = "",
     property: str = "",  # noqa: A002 -- matches the `?property=` query parameter name
     state: str = "",
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_VIEW,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """"Wohnungen" (UI-redesign stage 2, information-architecture area 2)
@@ -774,7 +790,7 @@ def inventory(
     request: Request,
     filter: str | None = None,
     bereich: str | None = None,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """"Inventar" (P4.1, section 9's fourth view) -- properties, apartments
@@ -796,7 +812,7 @@ def create_property_submit(
     address: str = Form(...),
     notes: str = Form(""),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Creates a property (section 20.1). No `reason`/audit log -- a brand-
@@ -840,7 +856,7 @@ def create_apartment_submit(
     orientation: str = Form(""),
     heating_circuits: str = Form(...),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Creates an apartment (section 20.1/20.2 step 1). **The id is
@@ -930,7 +946,7 @@ def register_device_submit(
     image_version: str = Form(...),
     watchdog_version: str = Form(...),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Registers a device (section 20.1/20.2 step 1). **`state` is always
@@ -997,7 +1013,7 @@ def register_device_submit(
 def apartment_edit_form(
     request: Request,
     apartment_id: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """Renders the "edit apartment" form (label, floor, orientation,
@@ -1039,7 +1055,7 @@ def apartment_edit_submit(
     pilot_mode: str = Form(""),
     reason: str = Form(...),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Applies the "edit apartment" form (P4.1) -- **a non-empty `reason`
@@ -1077,7 +1093,8 @@ def apartment_edit_submit(
         response.headers["Cache-Control"] = "no-store"
         return response
 
-    if storage.get_apartment(apartment_id) is None:
+    existing_apartment = storage.get_apartment(apartment_id)
+    if existing_apartment is None:
         raise HTTPException(status_code=404, detail="Unbekannte Wohnung.")
 
     if not label.strip():
@@ -1101,6 +1118,16 @@ def apartment_edit_submit(
     except ValueError:
         return _error("Anzahl Heizkreise muss eine nicht-negative Zahl sein.")
 
+    # F11: the pilot_mode toggle needs its own permission. Without it the
+    # submitted field is ignored and the stored value stays (an absent
+    # checkbox would otherwise silently switch pilot_mode off). The agent
+    # still refuses `open_access` without pilot_mode on its own
+    # (CLAUDE.md principle 5) -- this only protects the UI.
+    new_pilot_mode = (
+        bool(pilot_mode)
+        if has_permission(authenticated, Permission.PILOT_MODE_SET)
+        else existing_apartment.pilot_mode
+    )
     storage.update_apartment(
         apartment_id,
         label=label.strip(),
@@ -1108,7 +1135,7 @@ def apartment_edit_submit(
         orientation=orientation.strip() or None,
         heating_circuits=parsed_heating_circuits,
         state=state,
-        pilot_mode=bool(pilot_mode),
+        pilot_mode=new_pilot_mode,
         ui_username=authenticated.user.username,
         reason=reason.strip(),
     )
@@ -1147,7 +1174,7 @@ _FLEET_CERT_FINGERPRINT_ENV = "FLEET_CERT_FINGERPRINT"
 def device_prepare_form(
     request: Request,
     device_id: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """Renders the "Vorbereiten" form (P4.2, section 20.2 step 2) -- the
@@ -1179,7 +1206,7 @@ def device_prepare_submit(
     device_id: str,
     confirmed_reset: str = Form(""),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Generates a fresh one-time registration code (`Storage
@@ -1279,7 +1306,7 @@ def _confirm_response(
 @router.get("/inventory/devices/confirm", response_class=HTMLResponse)
 def device_confirm_list(
     request: Request,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """"Bestätigen" (P4.2, section 20.2 step 4) -- every `reported` device,
@@ -1300,7 +1327,7 @@ def device_confirm_submit(
     replace_previous: str = Form(""),
     previous_device_target_state: str = Form(""),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Applies one device's confirmation form (P4.2, section 20.2 step 4,
@@ -1369,7 +1396,7 @@ def device_confirm_submit(
 def replace_device_form(
     request: Request,
     apartment_id: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """"Gerät ausbauen / tauschen" (P4.3, section 20.2 device-swap steps
@@ -1409,7 +1436,7 @@ def replace_device_submit(
     target_state: str = Form(...),
     reason: str = Form(...),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Applies "Gerät ausbauen / tauschen" -- closes the apartment's open
@@ -1501,7 +1528,7 @@ def device_state_submit(
     target_state: str = Form(...),
     reason: str = Form(...),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_INVENTORY_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """The per-device "change state" form on `/ui/inventory` (P4.3, section
@@ -1642,7 +1669,7 @@ def command_confirm_form(
     request: Request,
     apartment_id: str,
     command: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_COMMANDS_SEND,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """Step one of two (section 9): names the apartment and the command in
@@ -1680,7 +1707,7 @@ def command_confirm_submit(
     reason: str = Form(...),
     lines: str = Form(""),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_COMMANDS_SEND,
     lines_submitted: bool = Depends(_command_lines_submitted),  # noqa: B008
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
@@ -1885,7 +1912,7 @@ def _desired_state_edit_response(
 def desired_state_edit_form(
     request: Request,
     apartment_id: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_DESIRED_STATE_EDIT,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     apartment = storage.get_apartment(apartment_id)
@@ -1951,7 +1978,7 @@ def desired_state_edit_submit(
     window_from: str = Form(""),
     window_until: str = Form(""),
     window_temp: str = Form(""),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_DESIRED_STATE_EDIT,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Step one's own submit: validates every field server-side and, on
@@ -2081,7 +2108,7 @@ def desired_state_confirm_submit(
     window_from: str = Form(""),
     window_until: str = Form(""),
     window_temp: str = Form(""),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_DESIRED_STATE_EDIT,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """The actual write -- `Storage.create_desired_state_revision` is only
@@ -2148,7 +2175,7 @@ def desired_state_confirm_submit(
 @router.get("/rollouts", response_class=HTMLResponse)
 def rollout_list(
     request: Request,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_VIEW,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     response = templates.TemplateResponse(
@@ -2222,7 +2249,7 @@ def _rollout_new_response(
 @router.get("/rollouts/new", response_class=HTMLResponse)
 def rollout_new_form(
     request: Request,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_ROLLOUTS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     return _rollout_new_response(
@@ -2251,7 +2278,7 @@ def rollout_new_submit(
     timeout_hours: str = Form(str(DEFAULT_TIMEOUT_HOURS)),
     apartment_ids: list[str] = Form(default_factory=list),  # noqa: B008
     test_apartment_id: str = Form(""),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_ROLLOUTS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Step one's own submit -- validates and, on success, renders the
@@ -2363,7 +2390,7 @@ def rollout_confirm_submit(
     timeout_hours: str = Form(str(DEFAULT_TIMEOUT_HOURS)),
     apartment_ids: list[str] = Form(default_factory=list),  # noqa: B008
     test_apartment_id: str = Form(""),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_ROLLOUTS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """The actual write -- `Storage.create_rollout` is only ever called
@@ -2419,7 +2446,7 @@ def rollout_confirm_submit(
 def rollout_detail_view(
     request: Request,
     rollout_id: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_VIEW,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     detail = build_rollout_detail(storage, rollout_id)
@@ -2442,7 +2469,7 @@ def rollout_resume_submit(
     rollout_id: str,
     csrf_token: str = Form(...),
     reason: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_ROLLOUTS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """P5.4c scope item 2: "resumed ... only by explicit UI action"."""
@@ -2472,7 +2499,7 @@ def rollout_cancel_submit(
     rollout_id: str,
     csrf_token: str = Form(...),
     reason: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_ROLLOUTS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """P5.4c scope item 2: "cancelled ... only by explicit UI action"."""
@@ -2516,7 +2543,7 @@ def apartment_restore_create(
     backup_id: str = Form(...),
     key_block_b64: str = Form(...),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_BACKUPS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Creates one pending restore (P5.5b, the "Wiederherstellen" form) --
@@ -2590,7 +2617,7 @@ def apartment_restore_create(
 def apartment_backup_download(
     apartment_id: str,
     backup_id: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_BACKUPS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
     backup_storage: BackupBlobStorage = Depends(get_backup_storage),  # noqa: B008
 ) -> Response:
@@ -2636,7 +2663,7 @@ def apartment_backup_download(
 def apartment_diagnostic_bundle_download(
     apartment_id: str,
     command_id: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_COMMANDS_SEND,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
     bundle_storage: DiagnosticBundleBlobStorage = Depends(get_bundle_storage),  # noqa: B008
 ) -> Response:
@@ -2723,7 +2750,7 @@ def _tenant_change_confirm_response(
 def tenant_change_confirm_form(
     request: Request,
     apartment_id: str,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_TENANT_CHANGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """Step one of two: names the apartment and spells out, in words, what
@@ -2750,7 +2777,7 @@ def tenant_change_confirm_submit(
     apartment_id: str,
     reason: str = Form(...),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_TENANT_CHANGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
     bundle_storage: DiagnosticBundleBlobStorage = Depends(get_bundle_storage),  # noqa: B008
 ) -> Response:
@@ -2838,7 +2865,7 @@ def fault_acknowledge_submit(
     since: str = Form(...),
     note: str = Form(""),
     csrf_token: str = Form(...),
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_FAULTS_ACKNOWLEDGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> Response:
     """Acknowledges one fault occurrence on "Eine Wohnung" (P6.3). Only ever
@@ -2942,7 +2969,7 @@ def apartment_detail(
     apartment_id: str,
     days: str | None = None,
     ansicht: str | None = None,
-    authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+    authenticated: AuthenticatedUiSession = _NEEDS_VIEW,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
     """"Eine Wohnung" (P3.2, section 9's second view). **`apartment_id` uses

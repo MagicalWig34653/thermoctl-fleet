@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import base64
 import os
+import re
+import secrets
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 
+import pyotp
 import pytest
 
+from fleet.permissions import ADMIN_ROLE_NAME, ALL_PERMISSIONS
 from fleet.storage import Storage, UiUserRecord
 from fleet.totp_crypto import encrypt_totp_secret
+from fleet.ui_auth import generate_totp_secret, hash_password
 
 _TEST_TOTP_KEY = base64.urlsafe_b64encode(b"\x42" * 32).decode("ascii")
 
@@ -41,12 +49,23 @@ def store_encrypted_totp_secret(storage: Storage, user_id: int, secret: str) -> 
     storage.set_ui_user_totp_secret(user_id, encrypt_totp_secret(secret, user_id, key))
 
 
+def ensure_admin_role(storage: Storage) -> int:
+    """Id of the "Administrator" role (all permissions). Migration 0020
+    creates it; recreated here for a storage that bypassed the migration."""
+
+    role = storage.get_ui_role_by_name(ADMIN_ROLE_NAME)
+    if role is None:  # pragma: no cover -- migration 0020 always creates it
+        role = storage.create_ui_role(ADMIN_ROLE_NAME, ALL_PERMISSIONS)
+    return role.id
+
+
 def create_ui_user_with_totp(
     storage: Storage,
     username: str,
     password_hash: str,
     totp_secret: str,
     created_at: object,
+    role_id: int | None = None,
 ) -> UiUserRecord:
     """`Storage.create_ui_user` plus the P6.2 encryption step, in one call
     -- for the handful of tests that create a user inline (not via the
@@ -57,6 +76,52 @@ def create_ui_user_with_totp(
         password_hash=password_hash,
         totp_secret="",
         created_at=created_at,  # type: ignore[arg-type]
+        role_id=ensure_admin_role(storage) if role_id is None else role_id,
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return storage.get_ui_user_by_id(record.id)  # type: ignore[return-value]
+
+
+_LOGIN_USERNAME = "roleuser"
+
+
+def login_with_role(client: Any, storage: Storage, role_id: int) -> UiUserRecord:
+    """Creates a user with `role_id` and logs `client` in through the real
+    `/ui/login` flow (password + TOTP). Returns the user."""
+
+    password = secrets.token_urlsafe(16)
+    totp_secret = generate_totp_secret()
+    record = storage.create_ui_user(
+        username=_LOGIN_USERNAME,
+        password_hash=hash_password(password),
+        totp_secret="",
+        created_at=datetime.now(UTC),
+        role_id=role_id,
+    )
+    store_encrypted_totp_secret(storage, record.id, totp_secret)
+    page = client.get("/ui/login")
+    match = re.search(r'name="pre_csrf" value="([^"]*)"', page.text)
+    assert match is not None
+    response = client.post(
+        "/ui/login",
+        data={
+            "username": _LOGIN_USERNAME,
+            "password": password,
+            "totp_code": pyotp.TOTP(totp_secret).at(datetime.now(UTC)),
+            "pre_csrf": match.group(1),
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    return storage.get_ui_user_by_id(record.id)  # type: ignore[return-value]
+
+
+@pytest.fixture
+def login_as(client: Any, storage: Storage) -> Callable[..., UiUserRecord]:
+    """`login_as(role_id=...)`: creates a user with that role and logs the
+    module's `client` fixture in (needs `client` and `storage` fixtures)."""
+
+    def _login(role_id: int) -> UiUserRecord:
+        return login_with_role(client, storage, role_id)
+
+    return _login

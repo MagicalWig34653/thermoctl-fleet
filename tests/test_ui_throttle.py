@@ -34,7 +34,7 @@ from fleet.ui_auth import (
     resolve_client_ip,
 )
 from fleet.ui_routes import get_ui_notifiers
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 
 USERNAME = "landlord"
 
@@ -63,6 +63,7 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
         password_hash=hash_password(password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id
@@ -562,6 +563,7 @@ def test_concurrent_lockout_notification_regression_runs_reliably(
             password_hash=hash_password(secrets.token_urlsafe(16)),
             totp_secret=generate_totp_secret(),
             created_at=datetime.now(UTC),
+            role_id=ensure_admin_role(storage),
         )
         notifier = _RecordingNotifier()
         now = datetime.now(UTC)

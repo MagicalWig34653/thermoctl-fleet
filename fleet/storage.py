@@ -60,7 +60,7 @@ import os
 import re
 import secrets
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -108,6 +108,7 @@ from fleet.device_lifecycle import (
     STALE_ASSIGNMENT_MESSAGE,
     validate_manual_device_transition,
 )
+from fleet.permissions import Permission, parse_permissions
 from protocol import Event, Heartbeat, LogExcerpt, fault_kind_from_key
 from protocol.backups import BackupKind
 from protocol.commands import Command, CommandResult, CommandType
@@ -407,6 +408,46 @@ class UiUserRecord(Base):
     # docstring for the full reasoning and `docs/STATUS.md`.
     failure_window_started_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    # F11: every account has exactly one role (migration 0020). No cascade --
+    # a role that is still assigned cannot be deleted.
+    role_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("ui_roles.id"), nullable=False, index=True
+    )
+
+
+class UiRoleRecord(Base):
+    __tablename__ = "ui_roles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class UiRolePermissionRecord(Base):
+    __tablename__ = "ui_role_permissions"
+
+    role_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("ui_roles.id", ondelete="CASCADE"), primary_key=True
+    )
+    # Plain string, not an enum column: a name unknown to this code version is
+    # kept in the database but ignored on read (`parse_permissions`).
+    permission: Mapped[str] = mapped_column(String(64), primary_key=True)
+
+
+class UiInvitationRecord(Base):
+    __tablename__ = "ui_invitations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    role_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("ui_roles.id"), nullable=False, index=True
+    )
+    # Only the SHA-256 hash of the one-time token is stored.
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
 
 
 class UiLoginThrottleRecord(Base):
@@ -6902,11 +6943,12 @@ class Storage:
         password_hash: str,
         totp_secret: str,
         created_at: datetime,
+        *,
+        role_id: int,
     ) -> UiUserRecord:
-        """Creates a new UI account. Used only by `fleet.admin`'s
-        `create-user` (never by an endpoint -- "the first account is created
-        via a CLI command, never via the web", project owner decision
-        2026-09-24)."""
+        """Creates a new UI account with the given role. Used by
+        `fleet.admin`'s `create-user` (emergency path / first account) and,
+        since F11, by invitation acceptance."""
 
         with self.session() as session:
             record = UiUserRecord(
@@ -6918,11 +6960,121 @@ class Storage:
                 locked_until=None,
                 failure_window_started_at=None,
                 created_at=_naive_utc(created_at),
+                role_id=role_id,
             )
             session.add(record)
             session.flush()
             session.expunge(record)
             return record
+
+    # -- ui roles and permissions (F11) --------------------------------------
+
+    def create_ui_role(self, name: str, permissions: Iterable[Permission]) -> UiRoleRecord:
+        """Creates a role. `view` is always part of it."""
+
+        with self.session() as session:
+            record = UiRoleRecord(name=name, created_at=_naive_utc(datetime.now(UTC)))
+            session.add(record)
+            session.flush()
+            for permission in {*permissions, Permission.VIEW}:
+                session.add(UiRolePermissionRecord(role_id=record.id, permission=permission.value))
+            session.flush()
+            session.expunge(record)
+            return record
+
+    def get_ui_role(self, role_id: int) -> UiRoleRecord | None:
+        with self.session() as session:
+            record = session.get(UiRoleRecord, role_id)
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def get_ui_role_by_name(self, name: str) -> UiRoleRecord | None:
+        with self.session() as session:
+            record = session.scalar(select(UiRoleRecord).where(UiRoleRecord.name == name))
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def list_ui_roles(self) -> list[UiRoleRecord]:
+        with self.session() as session:
+            records = list(session.scalars(select(UiRoleRecord).order_by(UiRoleRecord.name)))
+            session.expunge_all()
+            return records
+
+    def get_ui_role_permissions(self, role_id: int) -> frozenset[Permission]:
+        """Unknown stored names are ignored (fail closed); `view` is implied
+        for an existing role."""
+
+        with self.session() as session:
+            if session.get(UiRoleRecord, role_id) is None:
+                return frozenset()
+            names = session.scalars(
+                select(UiRolePermissionRecord.permission).where(
+                    UiRolePermissionRecord.role_id == role_id
+                )
+            ).all()
+        return parse_permissions(names) | {Permission.VIEW}
+
+    def set_ui_role_permissions(self, role_id: int, permissions: Iterable[Permission]) -> None:
+        with self.session() as session:
+            session.execute(
+                delete(UiRolePermissionRecord).where(UiRolePermissionRecord.role_id == role_id)
+            )
+            for permission in {*permissions, Permission.VIEW}:
+                session.add(UiRolePermissionRecord(role_id=role_id, permission=permission.value))
+
+    def delete_ui_role(self, role_id: int) -> bool:
+        """Deletes a role unless an account or an open invitation still uses
+        it (returns `False` then). Permission rows are removed explicitly:
+        SQLite does not enforce `ON DELETE CASCADE` without a pragma."""
+
+        with self.session() as session:
+            in_use = session.scalar(
+                select(func.count())
+                .select_from(UiUserRecord)
+                .where(UiUserRecord.role_id == role_id)
+            )
+            pending = session.scalar(
+                select(func.count())
+                .select_from(UiInvitationRecord)
+                .where(UiInvitationRecord.role_id == role_id, UiInvitationRecord.used_at.is_(None))
+            )
+            if in_use or pending:
+                return False
+            session.execute(
+                delete(UiRolePermissionRecord).where(UiRolePermissionRecord.role_id == role_id)
+            )
+            session.execute(delete(UiInvitationRecord).where(UiInvitationRecord.role_id == role_id))
+            result = cast(
+                CursorResult[Any],
+                session.execute(delete(UiRoleRecord).where(UiRoleRecord.id == role_id)),
+            )
+            return result.rowcount == 1
+
+    def set_ui_user_role(self, user_id: int, role_id: int) -> None:
+        with self.session() as session:
+            session.execute(
+                update(UiUserRecord).where(UiUserRecord.id == user_id).values(role_id=role_id)
+            )
+
+    def count_ui_users_with_permission(
+        self, permission: Permission, excluding_user_id: int | None = None
+    ) -> int:
+        """Number of accounts whose role grants `permission` (by the same
+        read rules as `get_ui_role_permissions`)."""
+
+        with self.session() as session:
+            rows = session.execute(select(UiUserRecord.id, UiUserRecord.role_id)).all()
+        grants: dict[int, bool] = {}
+        count = 0
+        for user_id, role_id in rows:
+            if user_id == excluding_user_id:
+                continue
+            if role_id not in grants:
+                grants[role_id] = permission in self.get_ui_role_permissions(role_id)
+            count += grants[role_id]
+        return count
 
     def get_ui_user_by_username(self, username: str) -> UiUserRecord | None:
         with self.session() as session:

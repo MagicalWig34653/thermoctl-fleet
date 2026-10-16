@@ -16,6 +16,7 @@ from fleet.storage import TenantChangeOutcome, create_storage, get_storage
 from protocol.backups import BackupKind
 from protocol.desired_state import DesiredState
 from protocol.heartbeat import Heartbeat
+from tests.conftest import ensure_admin_role
 from tools.sim.clock import clock_path
 from tools.sim.env import HANDLERS, apply_event_with, fleet_events, fleet_ops
 from tools.sim.env.enroll import CONFIRM_USER, enroll_container_apartments
@@ -515,7 +516,9 @@ def _populate_future_state(storage):
         UiUserRecord,
     )
 
-    user = storage.create_ui_user("sim-landlord", "hash", "secret", PAST)
+    user = storage.create_ui_user(
+        "sim-landlord", "hash", "secret", PAST, role_id=ensure_admin_role(storage)
+    )
     with storage.session() as s:
         row = s.get(UiUserRecord, user.id)
         row.last_totp_step = 99_999_999

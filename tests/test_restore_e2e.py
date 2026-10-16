@@ -62,7 +62,7 @@ from fleet.restore_vendor import AGE_VENDOR_JS_SHA256
 from fleet.storage import Storage, create_storage, get_storage, upgrade
 from fleet.ui_auth import generate_totp_secret, hash_password
 from protocol.backups import BackupKind
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 from tests.restore_helpers import make_confirmed_device
 from tests.tls_support import run_tls_fleet_app
 
@@ -168,6 +168,7 @@ def test_restore_end_to_end_over_the_real_fleet_app(
         password_hash=hash_password(password),
         totp_secret="",
         created_at=now,
+        role_id=ensure_admin_role(app_storage),
     )
     store_encrypted_totp_secret(app_storage, ui_user.id, totp_secret)
 

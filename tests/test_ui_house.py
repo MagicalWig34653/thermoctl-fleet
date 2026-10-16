@@ -29,7 +29,7 @@ from fleet.ui_auth import generate_totp_secret, hash_password
 from fleet.ui_house import FAULT_KIND_LABELS, build_house_overview, group_tiles_by_property
 from protocol import FaultKind, Heartbeat
 from protocol.version import PROTOCOL_VERSION
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 
 USERNAME = "landlord"
 APARTMENT_A = "house7-a03"
@@ -597,6 +597,7 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
         password_hash=hash_password(password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id

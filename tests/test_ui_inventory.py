@@ -32,7 +32,7 @@ from fleet.ui_inventory import (
     build_inventory_view,
 )
 from protocol.inventory import ApartmentState, DeviceLifecycle
-from tests.conftest import store_encrypted_totp_secret
+from tests.conftest import ensure_admin_role, store_encrypted_totp_secret
 
 USERNAME = "landlord"
 
@@ -276,6 +276,7 @@ def user_id(storage: Storage, password: str, totp_secret: str) -> int:
         password_hash=hash_password(password),
         totp_secret="",
         created_at=datetime.now(UTC),
+        role_id=ensure_admin_role(storage),
     )
     store_encrypted_totp_secret(storage, record.id, totp_secret)
     return record.id

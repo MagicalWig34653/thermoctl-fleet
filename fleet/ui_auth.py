@@ -96,8 +96,8 @@ import logging
 import os
 import secrets
 import unicodedata
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 import pyotp
@@ -107,6 +107,7 @@ from fastapi import BackgroundTasks, Cookie, Depends, HTTPException, Request
 
 from fleet import webauthn_auth
 from fleet.alarms import Notifier, notify_ui_account_locked
+from fleet.permissions import MISSING_PERMISSION_DETAIL, Permission
 from fleet.storage import Storage, UiSessionRecord, UiUserRecord, get_storage, hash_token
 from fleet.totp_crypto import (
     TOTP_KEY_ENV,
@@ -748,6 +749,18 @@ def create_session(storage: Storage, user_id: int, now: datetime) -> NewSession:
 class AuthenticatedUiSession:
     user: UiUserRecord
     session: UiSessionRecord
+    # F11: filled by `require_permission` (read from the database per
+    # request, never cached in the session). Empty on a session that only
+    # went through `require_ui_user`.
+    permissions: frozenset[Permission] = frozenset()
+
+
+def has_permission(authenticated: AuthenticatedUiSession, permission: Permission) -> bool:
+    """For templates and handlers: does this request's user hold `permission`?
+    Convenience for hiding controls -- the route's own `require_permission`
+    dependency is the check that counts."""
+
+    return permission in authenticated.permissions
 
 
 def get_valid_session(
@@ -820,7 +833,32 @@ def require_ui_user(
     return authenticated
 
 
+def require_permission(permission: Permission) -> Callable[..., AuthenticatedUiSession]:
+    """Dependency factory for a `/ui` route (F11): the logged-in user's role
+    must grant `permission`, else 403. Permissions are read from the database
+    on every request, so a removed permission or role assignment takes effect
+    immediately, within an existing session."""
+
+    def dependency(
+        request: Request,
+        authenticated: AuthenticatedUiSession = Depends(require_ui_user),  # noqa: B008
+        storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
+    ) -> AuthenticatedUiSession:
+        granted = storage.get_ui_role_permissions(authenticated.user.role_id)
+        if permission not in granted:
+            raise HTTPException(status_code=403, detail=MISSING_PERMISSION_DETAIL)
+        with_permissions = replace(authenticated, permissions=granted)
+        request.state.ui_session = with_permissions
+        return with_permissions
+
+    # Read by tests/test_ui_route_coverage.py to prove every route declares one.
+    dependency.__ui_permission__ = permission  # type: ignore[attr-defined]
+    return dependency
+
+
 __all__ = [
+    "has_permission",
+    "require_permission",
     "is_passwordless_network",
     "passwordless_networks",
     "AuthenticatedUiSession",
