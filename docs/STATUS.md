@@ -17,6 +17,25 @@ input or the `THERMOCTL_AGENT_DIGEST` repository variable, so a tag build
 without that variable now fails by design. Both READMEs document it. Tests:
 `tests/test_image_build_digest.py`.
 
+## Sim findings C02, C06, C10, A05, F26 fixed in the fleet UI (2026-10-16)
+
+UI convenience only; the agent stays the security boundary (principle 5), no
+protocol/agent change, no new `CommandType`.
+
+- C02: after a confirmed command the redirect lands on the Wartung tab with
+  `?befehl_gesendet=<command>` (validated against `CommandType`, same
+  query-parameter pattern as `bundle_cleanup_failed`) and shows "Befehl ...
+  gesendet", queued for the base station.
+- C06: `fleet.ui_house.FAULT_NEXT_STEP_TEXT` (all six `FaultKind`s) rendered
+  as "Was tun?" under each open fault.
+- C10: the command confirm page warns when the station is not reporting
+  (open absence alarm or never reported) that the command expires after
+  `fleet.storage.COMMAND_EXPIRY` (15 min) and may not be executed.
+- A05: the "Update-Ausfuehrung derzeit abgeschaltet" notice is repeated on
+  `rollout_new.html`.
+- F26: desired-state edit and confirm pages show a notice when the apartment
+  is not in pilot mode (the agent will not apply the revision); saving is
+  not blocked, `agent/loop.py` still decides.
 
 ## Sim findings F40/F41: watchdog user and preset state file (2026-10-16)
 

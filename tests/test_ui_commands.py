@@ -425,7 +425,9 @@ def test_confirm_post_creates_command_with_correct_fields_and_audit_row(
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == f"/ui/apartments/{APARTMENT}"
+    assert response.headers["location"] == (
+        f"/ui/apartments/{APARTMENT}?ansicht=wartung&befehl_gesendet=backup_now"
+    )
 
     rows = storage.list_commands_for_apartment(APARTMENT)
     assert len(rows) == 1
@@ -826,3 +828,75 @@ def test_apartment_page_shows_log_excerpt_and_dropped_count_escaped(
     assert "<script>alert(1)</script>" not in response.text
     assert "&lt;script&gt;" in response.text
     assert "7 Zeile" in response.text
+
+
+# --- Sim findings C02 / C10 (UI convenience only; the agent still decides) ---
+
+
+def test_confirmed_command_shows_sent_notice_on_the_apartment_page(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    from fleet.storage import COMMAND_EXPIRY
+
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+    confirm_page = client.get(f"/ui/apartments/{APARTMENT}/commands/report_now/confirm")
+    csrf_token = _csrf_from_confirm_page(confirm_page.text)
+
+    response = client.post(
+        f"/ui/apartments/{APARTMENT}/commands/report_now/confirm",
+        data={"reason": "Test", "csrf_token": csrf_token},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert f"Befehl „{COMMAND_TYPE_LABELS[CommandType.REPORT_NOW]}“ gesendet." in response.text
+    assert "wartet jetzt auf die Basisstation" in response.text
+    assert f"nach {int(COMMAND_EXPIRY.total_seconds() // 60)} Minuten ab" in response.text
+
+
+def test_sent_notice_ignores_an_unknown_command_value(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment(storage)
+    _login(client, password, totp_secret)
+
+    response = client.get(
+        f"/ui/apartments/{APARTMENT}?ansicht=wartung&befehl_gesendet=<script>x</script>"
+    )
+
+    assert response.status_code == 200
+    assert "gesendet." not in response.text
+    assert "<script>x</script>" not in response.text
+
+
+def test_confirm_page_warns_when_station_is_offline(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    from fleet.storage import COMMAND_EXPIRY
+
+    _make_apartment(storage)  # never reported -> station is not reporting
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}/commands/report_now/confirm")
+
+    assert response.status_code == 200
+    assert "Die Basisstation meldet sich gerade nicht." in response.text
+    assert f"läuft nach {int(COMMAND_EXPIRY.total_seconds() // 60)} Minuten ab" in response.text
+
+
+def test_confirm_page_has_no_offline_warning_when_station_reports(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    from tests.test_ui_faults import _make_heartbeat
+
+    _make_apartment(storage)
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    now = datetime.now(UTC)
+    storage.save_heartbeat(APARTMENT, _make_heartbeat(APARTMENT, sent_at=now), now)
+    _login(client, password, totp_secret)
+
+    response = client.get(f"/ui/apartments/{APARTMENT}/commands/report_now/confirm")
+
+    assert response.status_code == 200
+    assert "meldet sich gerade nicht" not in response.text

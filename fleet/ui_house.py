@@ -62,6 +62,39 @@ FAULT_KIND_LABELS: dict[FaultKind, str] = {
     FaultKind.TENANT_REPORT: "Mieter-Meldung",
 }
 
+# Plain-language next step per fault kind for the caretaker (sim finding C06):
+# what to look at first, no internal vocabulary. Exactly one entry per
+# `FaultKind` (a test pins this) so a new kind can never show no guidance.
+FAULT_NEXT_STEP_TEXT: dict[FaultKind, str] = {
+    FaultKind.SENSOR_FAULT: (
+        "Ein Temperaturfühler meldet keine brauchbaren Werte. "
+        "Vor Ort prüfen, ob der Fühler der genannten Zone noch Batterie hat "
+        "und in Reichweite der Basisstation liegt."
+    ),
+    FaultKind.BRIDGE_FAULT: (
+        "Die Funkverbindung zu den Fühlern ist gestört. "
+        "Vor Ort prüfen, ob der Funkstick an der Basisstation steckt, "
+        "und die Basisstation einmal aus- und wieder einstecken."
+    ),
+    FaultKind.COMMAND_FAILURE: (
+        "Ein Heizkörperventil hat einen Befehl nicht ausgeführt. "
+        "Vor Ort prüfen, ob das Ventil der genannten Zone erreichbar ist und sich bewegen lässt."
+    ),
+    FaultKind.STUCK_SENSOR: (
+        "Ein Fühler zeigt seit langer Zeit denselben Wert. "
+        "Vor Ort prüfen, ob der Fühler hängt oder die Batterie schwach ist, "
+        "und ihn gegebenenfalls austauschen."
+    ),
+    FaultKind.WINDOW_ALARM: (
+        "Ein Fenster ist offenbar länger offen. "
+        "Beim Mieter nachfragen, ob das Fenster geschlossen werden kann."
+    ),
+    FaultKind.TENANT_REPORT: (
+        "Der Mieter hat ein Problem gemeldet. "
+        "Den Mieter kontaktieren und die Wohnung bei Bedarf besichtigen."
+    ),
+}
+
 
 def place_name(tile: ApartmentTile) -> str:
     """The human name of an apartment for cards and feeds: `"Property ·
@@ -443,6 +476,7 @@ def group_tiles_by_property(tiles: list[ApartmentTile]) -> list[PropertyGroup]:
 
 __all__ = [
     "FAULT_KIND_LABELS",
+    "FAULT_NEXT_STEP_TEXT",
     "NEXT_STEP_TEXT",
     "STATUS_LABELS",
     "ApartmentTile",

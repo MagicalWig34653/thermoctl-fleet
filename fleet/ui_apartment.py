@@ -111,7 +111,7 @@ from fleet.storage import (
     Storage,
 )
 from fleet.ui_format import format_local_datetime, format_technical_reason
-from fleet.ui_house import FAULT_KIND_LABELS, NEXT_STEP_TEXT, STATUS_LABELS
+from fleet.ui_house import FAULT_KIND_LABELS, FAULT_NEXT_STEP_TEXT, NEXT_STEP_TEXT, STATUS_LABELS
 from protocol import FaultKind
 from protocol.backups import BackupKind
 from protocol.commands import CommandType
@@ -691,6 +691,8 @@ class OpenFaultDisplay:
     acknowledged_by: str | None
     acknowledged_at: datetime | None
     acknowledged_note: str | None
+    # C06: plain-language next step for this fault kind.
+    next_step_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -1139,6 +1141,7 @@ def build_apartment_detail(
             acknowledged_by=ack.acknowledged_by if ack is not None else None,
             acknowledged_at=ack.acknowledged_at if ack is not None else None,
             acknowledged_note=ack.note if ack is not None else None,
+            next_step_text=FAULT_NEXT_STEP_TEXT[fault.kind],
         )
 
     open_faults = (

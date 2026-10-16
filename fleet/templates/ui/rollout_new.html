@@ -11,6 +11,8 @@
 <p class="back"><a class="text-button" href="/ui/rollouts">&larr; Zurück zur Übersicht</a></p>
 <h2 class="subpage-title">Neuer Rollout</h2>
 
+<div class="notice notice--amber" role="status">{{ icons.icon("shield") }}<div><strong>Update-Ausführung derzeit abgeschaltet.</strong><p>Ein hier angelegter Rollout wird geräteseitig bei der Testwohnung gestoppt, bis die benötigte Gesundheits- und Außentemperatur-API verfügbar ist. Pilotbetrieb des Geräts ist erforderlich.</p></div></div>
+
 <p>Wählen Sie einen Dienst und die Wohnungen für die schrittweise Verteilung aus.</p>
 <details class="rollout-explainer"><summary>So läuft ein Rollout ab</summary><ol>
     <li>Ein Rollout aktualisiert genau einen Dienst: thermoctl, Zigbee2MQTT, Mosquitto oder Agent.</li>
