@@ -36,7 +36,7 @@ from fleet.bundle_storage import DiagnosticBundleBlobStorage, get_bundle_storage
 from fleet.desired_state_sources import DISPLAY_SOURCES
 from fleet.device_lifecycle import STALE_ASSIGNMENT_MESSAGE
 from fleet.rollout import DEFAULT_STAGGER_HOURS, DEFAULT_TIMEOUT_HOURS
-from fleet.storage import Storage, get_storage
+from fleet.storage import COMMAND_EXPIRY, Storage, get_storage
 from fleet.totp_crypto import TotpDecryptionError, TotpKeyError, decrypt_totp_secret
 from fleet.ui_apartment import (
     COMMAND_TYPE_LABELS,
@@ -1597,6 +1597,7 @@ def _command_confirm_response(
     command_type: CommandType,
     retired: bool,
     error: str | None,
+    station_offline: bool = False,
     status_code: int = 200,
 ) -> HTMLResponse:
     response = templates.TemplateResponse(
@@ -1615,11 +1616,25 @@ def _command_confirm_response(
             "max_lines": MAX_FETCH_LOGS_LINES,
             "retired": retired,
             "error": error,
+            "station_offline": station_offline,
+            "expiry_minutes": int(COMMAND_EXPIRY.total_seconds() // 60),
         },
         status_code=status_code,
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _station_offline(storage: Storage, apartment_id: str) -> bool:
+    """Convenience only (C10): True when the base station currently does not
+    report (open absence alarm) or never reported. Used solely to show a
+    warning on the confirm page; whether a command is executed is decided by
+    the agent (expiry, id check), never by this flag."""
+
+    detail = build_apartment_detail(storage, apartment_id, datetime.now(UTC), None)
+    if detail is None:  # pragma: no cover -- callers checked the apartment exists
+        return False
+    return detail.never_reported or any(alarm.open for alarm in detail.alarms)
 
 
 @router.get("/apartments/{apartment_id}/commands/{command}/confirm", response_class=HTMLResponse)
@@ -1648,6 +1663,7 @@ def command_confirm_form(
         command_type=command_type,
         retired=apartment.state == "retired",
         error=None,
+        station_offline=_station_offline(storage, apartment_id),
     )
 
 
@@ -1693,6 +1709,7 @@ def command_confirm_submit(
             command_type=command_type,
             retired=apartment.state == "retired",
             error=message,
+            station_offline=_station_offline(storage, apartment_id),
             status_code=400,
         )
 
@@ -1731,8 +1748,15 @@ def command_confirm_submit(
         now=datetime.now(UTC),
     )
 
+    # C02: one-shot confirmation via the same query-parameter pattern as
+    # `bundle_cleanup_failed`; the value is validated against `CommandType`
+    # when rendered, so nothing arbitrary is ever echoed.
     return RedirectResponse(
-        url=f"/ui/apartments/{quote(apartment_id, safe='')}", status_code=303
+        url=(
+            f"/ui/apartments/{quote(apartment_id, safe='')}"
+            f"?ansicht=wartung&befehl_gesendet={quote(command_type.value, safe='')}"
+        ),
+        status_code=303,
     )
 
 
@@ -1830,6 +1854,7 @@ def _desired_state_edit_response(
     window_temp: str,
     active_rollout_id: str | None,
     error: str | None,
+    pilot_mode: bool = True,
     status_code: int = 200,
 ) -> HTMLResponse:
     response = templates.TemplateResponse(
@@ -1848,6 +1873,7 @@ def _desired_state_edit_response(
             "max_version_length": MAX_VERSION_LENGTH,
             "active_rollout_id": active_rollout_id,
             "error": error,
+            "pilot_mode": pilot_mode,
         },
         status_code=status_code,
     )
@@ -1905,6 +1931,7 @@ def desired_state_edit_form(
         window_temp=window_temp,
         active_rollout_id=active_rollout.id if active_rollout is not None else None,
         error=None,
+        pilot_mode=apartment.pilot_mode,
     )
 
 
@@ -1973,6 +2000,7 @@ def desired_state_edit_submit(
             window_temp=window_temp,
             active_rollout_id=active_rollout_id,
             error=message,
+            pilot_mode=apartment.pilot_mode,
             status_code=400,
         )
 
@@ -2030,6 +2058,7 @@ def desired_state_edit_submit(
             "both_thermoctl_and_zigbee_changed": both_changed,
             "active_rollout_id": active_rollout_id,
             "error": None,
+            "pilot_mode": apartment.pilot_mode,
         },
     )
     response.headers["Cache-Control"] = "no-store"
@@ -2961,6 +2990,13 @@ def apartment_detail(
     # only ever in the server log, never echoed back into a URL a browser
     # history/referrer could carry.
     bundle_cleanup_failed = request.query_params.get("bundle_cleanup_failed") is not None
+    command_sent_label: str | None = None
+    sent_raw = request.query_params.get("befehl_gesendet")
+    if sent_raw is not None:
+        try:
+            command_sent_label = COMMAND_TYPE_LABELS[CommandType(sent_raw)]
+        except ValueError:
+            command_sent_label = None
     active_tab = _normalize_apartment_tab(ansicht)
     # Human heading of the page (rebuilt UI): "Liegenschaft · Wohnung", floor
     # as eyebrow. Presentation only -- the technical id stays secondary text.
@@ -2990,6 +3026,8 @@ def apartment_detail(
             "apartment_id": apartment_id,
             "detail": detail,
             "bundle_cleanup_failed": bundle_cleanup_failed,
+            "command_sent_label": command_sent_label,
+            "command_expiry_minutes": int(COMMAND_EXPIRY.total_seconds() // 60),
             "active_tab": active_tab,
             "place": place,
             "floor": floor,

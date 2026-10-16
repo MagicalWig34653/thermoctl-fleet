@@ -110,6 +110,7 @@
             </div>
             {% if fault.acknowledged_by %}<span class="badge gray">quittiert von {{ fault.acknowledged_by }}</span>{% else %}<span class="badge error">Offen</span>{% endif %}
         </div>
+        {% if fault.next_step_text %}<p class="fault-next-step"><b>Was tun?</b> {{ fault.next_step_text }}</p>{% endif %}
         {% if fault.acknowledged_note %}<p class="subtitle">Hinweis: {{ fault.acknowledged_note }}</p>{% endif %}
         <form class="ack-form" method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/faults/acknowledge">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -188,6 +189,14 @@
 {% endif %}
 
 {% if active_tab == "wartung" %}
+{% if command_sent_label %}
+{# C02: one-shot confirmation after a confirmed command (query parameter
+   `befehl_gesendet`, validated against CommandType in the route). #}
+<div class="notice" role="status">
+    {{ icons.icon("check") }}
+    <div><b>Befehl „{{ command_sent_label }}“ gesendet.</b><p>Der Befehl wartet jetzt auf die Basisstation. Er erscheint unten im Verlauf als „offen“ und läuft nach {{ command_expiry_minutes }} Minuten ab, falls die Basisstation ihn bis dahin nicht abholt.</p></div>
+</div>
+{% endif %}
 {% if bundle_cleanup_failed %}
 {# Cross-review fix (2026-10-02): the tenant change itself (token rotation,
    history deletion) already succeeded by the time this notice can appear --

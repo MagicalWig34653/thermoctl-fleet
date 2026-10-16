@@ -419,3 +419,33 @@ def test_acknowledged_fault_no_longer_appears_on_tasks_view(
     after = client.get("/ui/tasks")
     assert "Nichts fällig." in after.text
     assert APARTMENT not in after.text
+
+
+def test_open_fault_shows_plain_german_next_step(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    from fleet.ui_house import FAULT_NEXT_STEP_TEXT
+    from protocol.heartbeat import FaultKind
+
+    _make_apartment(storage)
+    now = datetime.now(UTC)
+    _store_open_fault(storage, now - timedelta(hours=2), sent_at=now)
+    _login(client, password, totp_secret)
+
+    page = client.get(f"/ui/apartments/{APARTMENT}")
+
+    assert page.status_code == 200
+    assert "Was tun?" in page.text
+    assert FAULT_NEXT_STEP_TEXT[FaultKind.SENSOR_FAULT] in page.text
+
+
+def test_fault_next_step_text_covers_every_kind_without_jargon() -> None:
+    import re
+
+    from fleet.ui_house import FAULT_NEXT_STEP_TEXT
+    from protocol.heartbeat import FaultKind
+
+    assert set(FAULT_NEXT_STEP_TEXT) == set(FaultKind)
+    for text in FAULT_NEXT_STEP_TEXT.values():
+        assert text.strip()
+        assert not re.search(r"\bP\d+\.\d+\b|--|python|agent|zigbee2mqtt", text, re.IGNORECASE)

@@ -755,3 +755,51 @@ def test_edit_page_shows_no_rollout_warning_when_none_active(
 
     assert response.status_code == 200
     assert "laufenden Rollouts" not in response.text
+
+
+# --- Sim finding F26: show (never enforce) that the agent will not apply it ---
+
+
+def _make_apartment_with_pilot(storage: Storage, apartment_id: str, *, pilot_mode: bool) -> None:
+    property_ = storage.create_property("House 9", "Sample Street 9")
+    storage.create_apartment(
+        apartment_id,
+        property_id=property_.id,
+        label=apartment_id,
+        floor=None,
+        orientation=None,
+        state="occupied",
+        heating_circuits=1,
+        pilot_mode=pilot_mode,
+    )
+
+
+def test_edit_and_confirm_pages_warn_when_apartment_is_not_in_pilot_mode(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_pilot(storage, APARTMENT, pilot_mode=False)
+    _login(client, password, totp_secret)
+
+    edit = client.get(f"/ui/apartments/{APARTMENT}/desired-state/edit")
+    assert "Diese Wohnung ist nicht im Pilotbetrieb" in edit.text
+    assert "wird diese Revision nicht anwenden" in edit.text
+
+    csrf = _extract_hidden_field(edit.text, "csrf_token")
+    confirm = client.post(
+        f"/ui/apartments/{APARTMENT}/desired-state/edit",
+        data={**_valid_form(), "csrf_token": csrf},
+    )
+    assert confirm.status_code == 200
+    assert "Diese Wohnung ist nicht im Pilotbetrieb" in confirm.text
+
+
+def test_edit_page_has_no_pilot_warning_when_pilot_mode_is_on(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _make_apartment_with_pilot(storage, APARTMENT, pilot_mode=True)
+    _login(client, password, totp_secret)
+
+    edit = client.get(f"/ui/apartments/{APARTMENT}/desired-state/edit")
+
+    assert edit.status_code == 200
+    assert "nicht im Pilotbetrieb" not in edit.text

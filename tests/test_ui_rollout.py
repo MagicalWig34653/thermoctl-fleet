@@ -815,3 +815,15 @@ def test_rollout_list_view_renders(
     assert "Bei einem Fehler wird die Verteilung angehalten" in response.text
     assert f'href="/ui/apartments/{PILOT_APARTMENT}"' in response.text
     assert "Wartet" in response.text
+
+
+def test_rollout_new_page_repeats_the_execution_off_notice(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _login(client, password, totp_secret)
+
+    response = client.get("/ui/rollouts/new")
+
+    assert response.status_code == 200
+    assert "Update-Ausführung derzeit abgeschaltet." in response.text
+    assert "bei der Testwohnung gestoppt" in response.text

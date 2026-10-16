@@ -25,6 +25,10 @@
     <div class="notice error" role="alert">{{ icons.icon("alert") }}<div><b>Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.</b></div></div>
     {% else %}
 
+    {% if station_offline %}
+    <div class="notice warn" role="alert">{{ icons.icon("alert") }}<div><b>Die Basisstation meldet sich gerade nicht.</b><p>Der Befehl wird erst ausgeführt, wenn sich die Basisstation wieder meldet und ihn abholt. Er läuft nach {{ expiry_minutes }} Minuten ab und wird danach nicht mehr ausgeführt.</p></div></div>
+    {% endif %}
+
     {% if error %}
     <div class="notice error" role="alert">{{ icons.icon("alert") }}<div><b>{{ error }}</b></div></div>
     {% endif %}

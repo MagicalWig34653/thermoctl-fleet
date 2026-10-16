@@ -26,6 +26,19 @@
         <p>Fail-closed Vorprüfung des Agenten, Pilotbetrieb erforderlich.</p></div>
     </div>
 
+    {% if not pilot_mode %}
+    <div class="notice warn" role="alert">
+        {{ icons.icon("alert") }}
+        <div>
+            <b>Diese Wohnung ist nicht im Pilotbetrieb</b>
+            <p>Die Basisstation wird diese Revision nicht anwenden: Sie lehnt Aktualisierungen ab,
+            solange der Pilotbetrieb für diese Wohnung nicht gesetzt ist. Die Revision kann trotzdem
+            gespeichert werden, sie bleibt dann unbenutzt, bis der Pilotbetrieb aktiviert ist.
+            Diese Anzeige ersetzt nicht die Prüfung am Gerät.</p>
+        </div>
+    </div>
+    {% endif %}
+
     {% if active_rollout_id %}
     <div class="notice warn" role="alert">
         {{ icons.icon("alert") }}
