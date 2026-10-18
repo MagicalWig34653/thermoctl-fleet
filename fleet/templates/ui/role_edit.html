@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+
+{% block title %}{{ "Rolle bearbeiten" if role_id else "Neue Rolle" }} – thermoctl-fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Nutzer und Rollen{% endblock %}
+
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">Verwaltung</div><h1>{{ "Rolle bearbeiten." if role_id else "Neue Rolle." }}</h1><p class="subtitle">Wählen Sie aus, was Personen mit dieser Rolle tun dürfen.</p></div></div>
+<p class="back"><a class="text-button" href="/ui/users">&larr; Zurück zu Nutzer und Rollen</a></p>
+
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+
+<form class="ui-form panel" method="post" action="{{ '/ui/users/roles/%d/edit' % role_id if role_id else '/ui/users/roles/new' }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="role-name"><span class="field-label-text">Name der Rolle<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
+        <input type="text" id="role-name" name="name" value="{{ name }}" maxlength="100" required>
+    </label>
+    <fieldset>
+        <legend>Berechtigungen</legend>
+        {% for permission, label, description in permission_options %}
+        <label for="perm-{{ loop.index }}">
+            <input type="checkbox" id="perm-{{ loop.index }}" name="permissions" value="{{ permission.value }}"
+                {% if permission in selected %}checked{% endif %}{% if permission.value == "view" %} disabled{% endif %}>
+            <strong>{{ label }}</strong> <span class="tiny muted">{{ description }}</span>
+        </label>
+        {% endfor %}
+    </fieldset>
+    <button class="button primary" type="submit">Speichern</button>
+</form>
+{% endblock %}

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+
+{% block title %}Einladung erstellt – thermoctl-fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Nutzer und Rollen{% endblock %}
+
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">Verwaltung</div><h1>Einladung erstellt.</h1><p class="subtitle">Geben Sie diesen Link an {{ username }} weiter (Rolle: {{ role_name }}).</p></div></div>
+<div class="notice notice--amber" role="status">{{ icons.icon("shield") }}<div><strong>Dieser Link wird nur jetzt angezeigt.</strong><p>Kopieren Sie ihn, bevor Sie diese Seite verlassen. Er gilt bis {{ expires_text }} und nur für eine Anmeldung. Ging er verloren, ziehen Sie die Einladung zurück und erstellen eine neue.</p></div></div>
+<section class="panel">
+    <label for="invite-link"><span class="field-label-text">Einladungslink</span>
+        <input type="text" id="invite-link" value="{{ link }}" readonly>
+    </label>
+    <p><a class="text-button" href="/ui/users">&larr; Zurück zu Nutzer und Rollen</a></p>
+</section>
+{% endblock %}

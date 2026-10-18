@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% import "_icons.html" as icons %}
+
+{% block title %}Nutzer und Rollen – thermoctl-fleet{% endblock %}
+{% block main_class %}{% endblock %}
+{% block crumb %}Nutzer und Rollen{% endblock %}
+
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">Verwaltung</div><h1>Nutzer und Rollen.</h1><p class="subtitle">Legen Sie fest, wer was in dieser Oberfläche tun darf, und laden Sie neue Personen ein.</p></div></div>
+
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+{% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+
+<section class="panel" aria-labelledby="users-heading">
+    <h2 id="users-heading">Konten</h2>
+    <div class="table-wrap"><table>
+        <thead><tr><th>Benutzername</th><th>Rolle</th><th>Status</th><th>Aktionen</th></tr></thead>
+        <tbody>
+        {% for user in users %}
+        <tr>
+            <td><strong>{{ user.username }}</strong>{% if user.is_self %} <span class="badge gray">Das sind Sie</span>{% endif %}</td>
+            <td data-label="Rolle">
+                {% if user.is_self %}{{ user.role_name }}{% else %}
+                <form class="ui-form" method="post" action="/ui/users/{{ user.id }}/role">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <label for="role-{{ user.id }}" class="visually-hidden">Neue Rolle für {{ user.username }}</label>
+                    <select id="role-{{ user.id }}" name="role_id">
+                        {% for role in roles %}<option value="{{ role.id }}" {% if role.id == user.role_id %}selected{% endif %}>{{ role.name }}</option>{% endfor %}
+                    </select>
+                    <button class="button small" type="submit">Rolle ändern</button>
+                </form>
+                {% endif %}
+            </td>
+            <td data-label="Status"><span class="badge {{ 'warn' if user.locked else '' }}">{{ user.status }}</span></td>
+            <td data-label="Aktionen">
+                {% if not user.is_self %}
+                {% if user.locked %}
+                <form method="post" action="/ui/users/{{ user.id }}/unlock">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="button small" type="submit">Entsperren</button>
+                </form>
+                {% else %}
+                <form method="post" action="/ui/users/{{ user.id }}/lock">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="button small" type="submit">Sperren</button>
+                </form>
+                {% endif %}
+                <details><summary>Konto löschen</summary>
+                    <form method="post" action="/ui/users/{{ user.id }}/delete">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <p class="tiny muted">Das Konto von {{ user.username }} wird endgültig gelöscht.</p>
+                        <button class="button button--danger small" type="submit">Endgültig löschen</button>
+                    </form>
+                </details>
+                {% else %}<span class="muted">–</span>{% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table></div>
+</section>
+
+<section class="panel" aria-labelledby="invite-heading">
+    <h2 id="invite-heading">Person einladen</h2>
+    <p class="subtitle">Sie erhalten einen Link, den Sie der Person weitergeben. Passwort und Bestätigungscode legt die Person selbst fest. Der Link gilt 24 Stunden und nur einmal.</p>
+    <form class="ui-form" method="post" action="/ui/users/invite">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="invite-username"><span class="field-label-text">Benutzername</span>
+            <input type="text" id="invite-username" name="username" maxlength="255" required autocomplete="off">
+        </label>
+        <label for="invite-role"><span class="field-label-text">Rolle</span>
+            <select id="invite-role" name="role_id">{% for role in roles %}<option value="{{ role.id }}">{{ role.name }}</option>{% endfor %}</select>
+        </label>
+        <button class="button primary" type="submit">Einladung erstellen</button>
+    </form>
+    {% if invitations %}
+    <h3>Offene Einladungen</h3>
+    <div class="table-wrap"><table>
+        <thead><tr><th>Benutzername</th><th>Rolle</th><th>Gültig bis</th><th></th></tr></thead>
+        <tbody>
+        {% for invitation in invitations %}
+        <tr>
+            <td><strong>{{ invitation.username }}</strong></td>
+            <td data-label="Rolle">{{ invitation.role_name }}</td>
+            <td data-label="Gültig bis">{{ invitation.expires_text }}</td>
+            <td>
+                <form method="post" action="/ui/users/invitations/{{ invitation.id }}/revoke">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="button small" type="submit">Einladung zurückziehen</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table></div>
+    <p class="tiny muted">Aus Sicherheitsgründen wird der Link nach dem Erstellen nicht mehr angezeigt. Ziehen Sie die Einladung zurück und erstellen Sie eine neue, falls der Link verloren ging.</p>
+    {% endif %}
+</section>
+
+<section class="panel" aria-labelledby="roles-heading">
+    <div class="section-head"><h2 id="roles-heading">Rollen</h2><a class="button primary" href="/ui/users/roles/new">{{ icons.icon("plus") }} Neue Rolle</a></div>
+    <div class="table-wrap"><table>
+        <thead><tr><th>Rolle</th><th>Darf</th><th>Konten</th><th>Aktionen</th></tr></thead>
+        <tbody>
+        {% for role in roles %}
+        <tr>
+            <td><strong>{{ role.name }}</strong></td>
+            <td data-label="Darf">{{ role.permissions | join(", ") }}</td>
+            <td data-label="Konten">{{ role.members }}</td>
+            <td data-label="Aktionen">
+                <a class="button small" href="/ui/users/roles/{{ role.id }}/edit">Bearbeiten</a>
+                {% if role.members == 0 %}
+                <form method="post" action="/ui/users/roles/{{ role.id }}/delete">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button class="button button--danger small" type="submit">Löschen</button>
+                </form>
+                {% else %}<span class="tiny muted">In Benutzung</span>{% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table></div>
+</section>
+{% endblock %}

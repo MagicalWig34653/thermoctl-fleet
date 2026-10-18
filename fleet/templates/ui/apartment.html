@@ -6,6 +6,7 @@
 {% block crumb %}Wohnungen <span class="crumb-sep">/</span> {{ place or apartment_id }}{% endblock %}
 
 {% block content %}
+{% set perms = ui_session.permissions if ui_session else [] %}
 {# "Eine Wohnung" -- the draft's detail view (tabs Überblick / Wartung /
    Technik). Already German-rendered and derived by
    fleet/ui_apartment.py::build_apartment_detail; this template only iterates
@@ -112,6 +113,7 @@
         </div>
         {% if fault.next_step_text %}<p class="fault-next-step"><b>Was tun?</b> {{ fault.next_step_text }}</p>{% endif %}
         {% if fault.acknowledged_note %}<p class="subtitle">Hinweis: {{ fault.acknowledged_note }}</p>{% endif %}
+        {% if "faults.acknowledge" in perms %}
         <form class="ack-form" method="post" action="/ui/apartments/{{ apartment_id | urlpath }}/faults/acknowledge">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="fault_kind" value="{{ fault.fault_kind }}">
@@ -122,6 +124,7 @@
             </label>
             <button class="button primary" type="submit">{{ icons.icon("check") }}{{ "Erneut quittieren" if fault.acknowledged_by else "Quittieren" }}</button>
         </form>
+        {% endif %}
     </div>
     {% endfor %}
     {% else %}
@@ -217,11 +220,15 @@
     {% if detail.retired %}
     <p class="subtitle">Diese Wohnung ist außer Betrieb, Befehle sind nicht möglich.</p>
     {% else %}
+    {% if "commands.send" in perms %}
     <div class="action-grid">
         {% for value, label in detail.available_commands if value != "backup_now" %}
         <a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ value | urlpath }}/confirm">{{ icons.icon(command_icons.get(value, "settings")) }}{{ label }}</a>
         {% endfor %}
     </div>
+    {% else %}
+    <p class="subtitle">Ihre Rolle darf keine Wartungsbefehle senden.</p>
+    {% endif %}
     {% endif %}
 
     <h3 class="sub-head">Verlauf</h3>
@@ -248,7 +255,7 @@
             <div class="log-block">
                 <p class="tiny muted">Diagnosepaket erstellt {{ cmd.bundle.created_text }}, {{ cmd.bundle.size_text }}</p>
                 <p class="tiny muted">Hash: <code class="id-text">{{ cmd.bundle.content_hash }}</code></p>
-                <a class="button mt-12" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ cmd.bundle.command_id | urlpath }}/bundle/download">{{ icons.icon("download") }}Herunterladen</a>
+                {% if "commands.send" in perms %}<a class="button mt-12" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ cmd.bundle.command_id | urlpath }}/bundle/download">{{ icons.icon("download") }}Herunterladen</a>{% endif %}
                 <p class="tiny muted mt-12">Entschlüsseln: <code class="id-text">{{ cmd.bundle.age_decrypt_command }}</code></p>
             </div>
             {% endif %}
@@ -264,7 +271,7 @@
 <section class="panel" aria-labelledby="backups-heading">
     <div class="section-head">
         <h2 id="backups-heading">Sicherungen</h2>
-        {% if not detail.retired %}
+        {% if not detail.retired and "commands.send" in perms %}
         {% for value, label in detail.available_commands if value == "backup_now" %}
         <a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}/commands/{{ value | urlpath }}/confirm">{{ icons.icon("plus") }}Sichern</a>
         {% endfor %}
@@ -276,7 +283,7 @@
         <span>{{ backup.kind_label }}<small>{{ backup.created_text }} · {{ backup.size_text }}</small><small>Hash: <code class="id-text" title="{{ backup.content_hash }}">{{ backup.content_hash | shortdigest }}</code></small>{% if backup.age_decrypt_command %}<small><details class="inline-details"><summary>Entschlüsseln</summary><code class="id-text">{{ backup.age_decrypt_command }}</code></details></small>{% endif %}</span>
         <span class="row-actions-tight">
         <button type="button" class="button small copy-button" data-copy="{{ backup.content_hash }}" aria-label="Hash kopieren">Hash kopieren</button>
-        <a class="icon-button" href="/ui/apartments/{{ apartment_id | urlpath }}/backups/{{ backup.backup_id | urlpath }}/download" aria-label="{{ backup.kind_label }} vom {{ backup.created_text }} herunterladen">{{ icons.icon("download") }}</a>
+        {% if "backups.manage" in perms %}<a class="icon-button" href="/ui/apartments/{{ apartment_id | urlpath }}/backups/{{ backup.backup_id | urlpath }}/download" aria-label="{{ backup.kind_label }} vom {{ backup.created_text }} herunterladen">{{ icons.icon("download") }}</a>{% endif %}
         </span>
     </div>
     {% endfor %}
@@ -285,6 +292,7 @@
     {% endif %}
 </section>
 
+{% if "backups.manage" in perms %}
 <section class="panel" aria-labelledby="restore-heading">
     <h2 id="restore-heading">Wiederherstellen</h2>
     {# P5.5b, section 15.2/15.3's "Decided afterward" paragraph (2026-09-28):
@@ -332,16 +340,19 @@
     </p>
     {% endif %}
 </section>
+{% endif %}
 </div>
 
+{% if "tenant_change" in perms or "inventory.manage" in perms %}
 <section class="panel panel-wide" aria-labelledby="tenant-change-heading">
     <h2 id="tenant-change-heading">Wohnung übergeben</h2>
     <p class="subtitle">Mieterwechsel und Gerätetausch werden als eigene, geführte Vorgänge behandelt. Der Mieterwechsel setzt Zugangsdaten und Verlauf dieser Wohnung zurück – nicht rückgängig zu machen.</p>
     <div class="action-grid">
-        <a class="button danger" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">{{ icons.icon("key") }}Mieterwechsel durchführen</a>
-        <a class="button" href="/ui/inventory/apartments/{{ apartment_id | urlpath }}/replace-device">{{ icons.icon("server") }}Basisstation austauschen</a>
+        {% if "tenant_change" in perms %}<a class="button danger" href="/ui/apartments/{{ apartment_id | urlpath }}/tenant-change/confirm">{{ icons.icon("key") }}Mieterwechsel durchführen</a>{% endif %}
+        {% if "inventory.manage" in perms %}<a class="button" href="/ui/inventory/apartments/{{ apartment_id | urlpath }}/replace-device">{{ icons.icon("server") }}Basisstation austauschen</a>{% endif %}
     </div>
 </section>
+{% endif %}
 
 </div>
 {% endif %}
@@ -417,7 +428,7 @@
     {% endfor %}
     {% endif %}
 
-    {% if not detail.retired %}
+    {% if not detail.retired and "desired_state.edit" in perms %}
     <div class="mt-20"><a class="button" href="/ui/apartments/{{ apartment_id | urlpath }}/desired-state/edit">{{ icons.icon("settings") }}Sollzustand bearbeiten</a></div>
     {% endif %}
 </section>

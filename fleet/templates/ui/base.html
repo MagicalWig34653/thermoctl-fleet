@@ -48,11 +48,12 @@ one helper from real data, never hard-coded.
     "aufgaben" if _path.startswith("/ui/tasks") else
     "einrichtung" if _path.startswith("/ui/inventory") else
     "updates" if _path.startswith("/ui/rollouts") else
+    "nutzer" if _path.startswith("/ui/users") else
     "konto" if _path.startswith("/ui/account") else
     none %}
 {% set crumb_labels = {
     "uebersicht": "Übersicht", "wohnungen": "Wohnungen", "aufgaben": "Aufgaben",
-    "einrichtung": "Einrichtung", "updates": "Updates", "konto": "Konto"} %}
+    "einrichtung": "Einrichtung", "updates": "Updates", "nutzer": "Nutzer und Rollen", "konto": "Konto"} %}
 {% set nav = nav_counts() %}
 {% set initials = (ui_session.user.username[:2] | upper) %}
 <aside class="sidebar" id="sidebar" aria-label="Seitenleiste">
@@ -79,6 +80,12 @@ one helper from real data, never hard-coded.
             {% if badge %}<span class="count">{{ badge }}<span class="visually-hidden"> offen</span></span>{% endif %}
         </a>
         {% endfor %}
+        {# Convenience only: the routes under /ui/users check `users.manage` themselves. #}
+        {% if "users.manage" in ui_session.permissions %}
+        <a class="nav-link{% if active_area == "nutzer" %} active{% endif %}" href="/ui/users" {% if active_area == "nutzer" %}aria-current="page"{% endif %}>
+            {{ icons.icon("key") }}Nutzer und Rollen
+        </a>
+        {% endif %}
     </nav>
     <div class="sidebar-bottom">
         <div class="service-note"><span class="dot"></span>Fleet-Dienst erreichbar<br><span class="service-stand">Letzter Stand{% if nav %} · {{ nav.stand }}{% endif %}</span></div>

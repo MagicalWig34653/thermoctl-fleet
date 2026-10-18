@@ -2,6 +2,34 @@
 
 Last updated: 2026-10-18.
 
+## UI roles, task 6 of 7: "Nutzer und Rollen" pages (F11, 2026-10-18)
+
+`fleet/ui_users_routes.py` (registered on the `/ui` router, so the
+route-coverage test sees it) with the templates `users.html`,
+`role_edit.html`, `invite_created.html`; every route requires `users.manage`,
+every POST checks the session CSRF token. The nav link "Nutzer und Rollen"
+shows only with `users.manage`; `apartment.html` and `rollout_detail.html`
+hide the buttons/forms the role lacks (convenience, the routes still check).
+
+Lock-out protection is transactional now: `Storage.change_ui_user_role`,
+`remove_ui_user`, `lock_ui_user`, `update_ui_role` (and `delete_ui_role_checked`,
+`create_ui_role_checked`) run in one transaction (`BEGIN IMMEDIATE` on SQLite),
+count the usable `users.manage` holders before and after the change and roll
+back with `AdminOutcome.LAST_MANAGER` when it would drop from some to none.
+The `guard_*` functions in `fleet/ui_users.py` only give friendlier texts. Two
+threads demoting/deleting/locking the two managers (file SQLite) leave exactly
+one (`tests/test_ui_lockout_storage.py`). A locked account (temporary or manual)
+is not a usable holder. Manual lock: `locked_until = 9999-01-01` plus ended
+sessions; the login-failure code leaves an active lock untouched and a
+successful login needs an unlocked account, so nothing unlocks it by accident;
+only "Entsperren" (or CLI `unlock`/`reset-totp`) clears it. A role in use cannot
+be deleted, `view` stays in every role, role names are unique/non-empty/<= 100.
+The invitation link is shown once in the POST response (`no-store`, no
+redirect); the list of open invitations shows username, role and expiry, never
+the token, and an invitation can be revoked. Known gap: the account/passkey
+pages are rendered without the permission lookup, so the nav link is not shown
+there. Not yet done: CLI `--role` and the `delete-user` guard (7).
+
 ## UI roles, tasks 4-5 of 7: invitations (F11, 2026-10-18)
 
 `fleet/ui_users.py` (invite, accept, `guard_role_change`,
