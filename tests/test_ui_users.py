@@ -260,16 +260,19 @@ def test_expiry_boundary_valid_at_exactly_24h_expired_after(storage: Storage, ro
     assert get_open_invitation(storage, token, edge + timedelta(microseconds=1)) is None
 
 
-def test_locked_manager_is_not_counted(storage: Storage, admin_role: int) -> None:
+def test_only_manually_locked_manager_is_not_counted(storage: Storage, admin_role: int) -> None:
     a = storage.create_ui_user("a", "h", "", NOW, role_id=admin_role)
     b = storage.create_ui_user("b", "h", "", NOW, role_id=admin_role)
     count = storage.count_ui_users_with_permission
     assert count(Permission.USERS_MANAGE, excluding_user_id=a.id, now=NOW) == 1
+    # a temporary failed-login lock still counts (it expires by itself)
     with storage.session() as session:
         session.execute(
             text("UPDATE ui_users SET locked_until = :t WHERE id = :id"),
             {"t": (NOW + timedelta(hours=1)).replace(tzinfo=None), "id": b.id},
         )
+    assert count(Permission.USERS_MANAGE, excluding_user_id=a.id, now=NOW) == 1
+    storage.lock_ui_user(b.id, NOW)
     assert count(Permission.USERS_MANAGE, excluding_user_id=a.id, now=NOW) == 0
-    later = NOW + timedelta(hours=2)
-    assert count(Permission.USERS_MANAGE, excluding_user_id=a.id, now=later) == 1
+    storage.unlock_ui_user(b.id)
+    assert count(Permission.USERS_MANAGE, excluding_user_id=a.id, now=NOW) == 1

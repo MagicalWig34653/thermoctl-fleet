@@ -42,6 +42,8 @@ LAST_MANAGER_ROLE = (
     "darf. Sie wurde nicht gespeichert."
 )
 
+BUSY = "Bitte in einem Moment erneut versuchen. Die Datenbank ist gerade beschäftigt."
+
 PERMISSION_LABELS: dict[Permission, tuple[str, str]] = {
     Permission.VIEW: (
         "Ansehen",
@@ -87,6 +89,7 @@ _OUTCOME_TEXT: dict[AdminOutcome, str] = {
     AdminOutcome.NAME_TAKEN: ROLE_NAME_TAKEN,
     AdminOutcome.NAME_EMPTY: ROLE_NAME_EMPTY,
     AdminOutcome.NAME_TOO_LONG: ROLE_NAME_TOO_LONG,
+    AdminOutcome.BUSY: BUSY,
 }
 
 

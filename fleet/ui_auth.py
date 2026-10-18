@@ -108,7 +108,14 @@ from fastapi import BackgroundTasks, Cookie, Depends, HTTPException, Request
 from fleet import webauthn_auth
 from fleet.alarms import Notifier, notify_ui_account_locked
 from fleet.permissions import MISSING_PERMISSION_DETAIL, Permission
-from fleet.storage import Storage, UiSessionRecord, UiUserRecord, get_storage, hash_token
+from fleet.storage import (
+    MANUAL_LOCK_UNTIL,
+    Storage,
+    UiSessionRecord,
+    UiUserRecord,
+    get_storage,
+    hash_token,
+)
 from fleet.totp_crypto import (
     TOTP_KEY_ENV,
     TotpDecryptionError,
@@ -679,7 +686,10 @@ def authenticate(
             )
             _record_failure_and_maybe_notify(storage, user, now, notifiers, background_tasks)
             return None
-        storage.record_ui_login_success_webauthn(user.id)
+        if not storage.record_ui_login_success_webauthn(user.id):
+            # Manually locked in the meantime: no login.
+            _record_failure_and_maybe_notify(storage, user, now, notifiers, background_tasks)
+            return None
         return user
 
     assert matched_totp_step is not None
@@ -786,6 +796,11 @@ def get_valid_session(
         return None
     user = storage.get_ui_user_by_id(session.user_id)
     if user is None:
+        return None
+    # A MANUAL lock (administrator action) also ends existing sessions; the
+    # temporary failed-login lock deliberately does not, so an attacker
+    # cannot kick the legitimate user out by failing logins on purpose.
+    if user.locked_until is not None and user.locked_until >= MANUAL_LOCK_UNTIL:
         return None
     storage.touch_ui_session(session.id, now)
     return AuthenticatedUiSession(user=user, session=session)

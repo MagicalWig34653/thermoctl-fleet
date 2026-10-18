@@ -2,6 +2,23 @@
 
 Last updated: 2026-10-18.
 
+## UI roles, review fixes (F11, 2026-10-18)
+
+Only a MANUAL lock (`locked_until >= MANUAL_LOCK_UNTIL`) makes an account
+unusable for the lock-out invariant and for sessions; the temporary
+failed-login lock expires by itself, still counts as a usable manager and does
+not end sessions (otherwise an attacker could trigger it on purpose).
+`record_ui_login_success` and `record_ui_login_success_webauthn` (now returns
+`bool`) are conditional in the same UPDATE and never lift a manual lock; the
+login (and the passkey-register re-auth) fails if the account was locked in
+between. `get_valid_session` rejects a manually locked user. The five mutating
+admin methods return `AdminOutcome.BUSY` on SQLite "locked/busy" (routes: 503,
+"Bitte in einem Moment erneut versuchen"), `update_ui_role` maps a vanished
+role to `ROLE_NOT_FOUND`. Ids in `/ui/users` routes are bounded (1..2**31-1,
+422 otherwise). `BEGIN IMMEDIATE` stays (it serializes `update_ui_role`'s
+multi-row rewrite). New tests: lock vs. login success, sessions ended by lock,
+used invitation not revocable, busy database, concurrent role edit/delete.
+
 ## UI roles, task 7 of 7: CLI `--role`, docs (F11, 2026-10-18)
 
 `fleet.admin create-user NAME --role ROLE`: the role must exist (unknown name:

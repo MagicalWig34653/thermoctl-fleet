@@ -383,3 +383,66 @@ def test_apartment_page_hides_controls_the_role_lacks(client: TestClient, storag
     )
     full = client.get(f"/ui/apartments/{apartment_id}?ansicht=wartung")
     assert "/tenant-change/confirm" in full.text
+
+
+# -- review fixes: manual lock vs. sessions, busy database, id bounds ---------------
+
+
+def _set_locked_until(storage: Storage, user_id: int, value: datetime | None) -> None:
+    with storage.session() as session:
+        record = session.get(UiUserRecord, user_id)
+        assert record is not None
+        record.locked_until = value
+
+
+def test_session_of_a_manually_locked_user_is_rejected_even_if_the_row_exists(
+    client: TestClient, storage: Storage, me: UiUserRecord
+) -> None:
+    assert client.get("/ui/users").status_code == 200
+    # set the marker directly: the session row stays in place
+    _set_locked_until(storage, me.id, MANUAL_LOCK_UNTIL)
+    response = client.get("/ui/users", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/ui/login"
+
+
+def test_temporary_failed_login_lock_does_not_end_a_session(
+    client: TestClient, storage: Storage, me: UiUserRecord
+) -> None:
+    _set_locked_until(storage, me.id, NOW.replace(tzinfo=None) + timedelta(hours=1))
+    assert client.get("/ui/users").status_code == 200
+
+
+def test_busy_database_answers_503_with_a_german_text(
+    client: TestClient,
+    storage: Storage,
+    me: UiUserRecord,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fleet.storage import AdminOutcome
+
+    reader = storage.create_ui_role("Leser", set()).id
+    target = other_user(storage, "ben", reader)
+    token = csrf(client)
+    monkeypatch.setattr(storage, "lock_ui_user", lambda *_a, **_k: AdminOutcome.BUSY)
+    response = client.post(
+        f"/ui/users/{target}/lock", data={"csrf_token": token}, follow_redirects=False
+    )
+    assert response.status_code == 503
+    assert "Bitte in einem Moment erneut versuchen" in response.text
+
+
+def test_absurd_ids_answer_4xx_not_500(client: TestClient, me: UiUserRecord) -> None:
+    huge = str(2**70)
+    token = csrf(client)
+    by_path = client.post(
+        f"/ui/users/{huge}/lock", data={"csrf_token": token}, follow_redirects=False
+    )
+    by_form = client.post(
+        "/ui/users/1/role",
+        data={"csrf_token": token, "role_id": huge},
+        follow_redirects=False,
+    )
+    assert by_path.status_code == 422
+    assert by_form.status_code == 422
+    assert client.get(f"/ui/users/roles/{huge}/edit").status_code == 422

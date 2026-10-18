@@ -3,17 +3,20 @@ refuse on their own, also under concurrency."""
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine
 
 from fleet.permissions import Permission
 from fleet.storage import (
     MANUAL_LOCK_UNTIL,
     AdminOutcome,
     Storage,
+    UiSessionRecord,
     UiUserRecord,
     create_storage,
     upgrade,
@@ -64,7 +67,7 @@ def test_second_manager_allows_demoting_the_first(storage: Storage) -> None:
     assert user is not None and user.role_id == reader
 
 
-def test_locked_manager_does_not_count(storage: Storage) -> None:
+def test_manually_locked_manager_does_not_count(storage: Storage) -> None:
     manager, reader = _roles(storage)
     a = _user(storage, "a", manager)
     b = _user(storage, "b", manager)
@@ -77,7 +80,10 @@ def test_locked_manager_does_not_count(storage: Storage) -> None:
     assert storage.remove_ui_user(a, NOW) is AdminOutcome.OK
 
 
-def test_temporarily_locked_manager_does_not_count_either(storage: Storage) -> None:
+def test_temporarily_locked_manager_still_counts(storage: Storage) -> None:
+    """A failed-login lock expires by itself, so it must not disable the
+    protection (an attacker could trigger it on purpose)."""
+
     manager, _ = _roles(storage)
     a = _user(storage, "a", manager)
     b = _user(storage, "b", manager)
@@ -85,7 +91,127 @@ def test_temporarily_locked_manager_does_not_count_either(storage: Storage) -> N
         record = s.get(UiUserRecord, a)
         assert record is not None
         record.locked_until = NOW.replace(tzinfo=None) + timedelta(hours=1)
-    assert storage.remove_ui_user(b, NOW) is AdminOutcome.LAST_MANAGER
+    # a still counts: b may go, and then a (temporarily locked) is the last one
+    assert storage.remove_ui_user(b, NOW) is AdminOutcome.OK
+    assert storage.remove_ui_user(a, NOW) is AdminOutcome.LAST_MANAGER
+
+
+def test_manual_lock_ends_sessions(storage: Storage) -> None:
+    manager, _ = _roles(storage)
+    _user(storage, "a", manager)
+    b = _user(storage, "b", manager)
+    with storage.session() as s:
+        s.add(
+            UiSessionRecord(
+                user_id=b,
+                token_hash="t" * 64,
+                csrf_token="c",
+                created_at=NOW.replace(tzinfo=None),
+                last_seen_at=NOW.replace(tzinfo=None),
+                expires_at=NOW.replace(tzinfo=None) + timedelta(hours=1),
+            )
+        )
+    assert storage.get_ui_session_by_token_hash("t" * 64) is not None
+    assert storage.lock_ui_user(b, NOW) is AdminOutcome.OK
+    assert storage.get_ui_session_by_token_hash("t" * 64) is None
+
+
+def test_login_success_never_clears_a_manual_lock(storage: Storage) -> None:
+    manager, _ = _roles(storage)
+    _user(storage, "a", manager)
+    b = _user(storage, "b", manager)
+    # authenticate read the account as unlocked; an admin locks it; the
+    # success write that follows must not lift the lock
+    assert storage.lock_ui_user(b, NOW) is AdminOutcome.OK
+    assert storage.record_ui_login_success(b, 12345) is False
+    assert storage.record_ui_login_success_webauthn(b) is False
+    assert _locked_until(storage, b) == MANUAL_LOCK_UNTIL
+    # a temporary lock is still cleared by a success, as before
+    c = _user(storage, "c", manager)
+    with storage.session() as s:
+        record = s.get(UiUserRecord, c)
+        assert record is not None
+        record.locked_until = NOW.replace(tzinfo=None) + timedelta(hours=1)
+    assert storage.record_ui_login_success(c, 12345) is True
+    assert _locked_until(storage, c) is None
+
+
+def test_revoking_a_used_invitation_returns_false_and_keeps_the_row(storage: Storage) -> None:
+    _, reader = _roles(storage)
+    invitation = storage.create_ui_invitation(
+        username="x",
+        role_id=reader,
+        token_hash="c" * 64,
+        created_by=None,
+        created_at=NOW,
+        expires_at=NOW + timedelta(hours=24),
+    )
+    assert storage.mark_ui_invitation_used(invitation.id, NOW) is True
+    assert storage.revoke_ui_invitation(invitation.id) is False
+    assert storage.get_ui_invitation_by_hash("c" * 64) is not None
+
+
+def test_busy_database_gives_busy_outcome_not_an_exception(tmp_path: Path) -> None:
+    url = f"sqlite:///{tmp_path}/busy.db"
+    upgrade(url)
+    setup = create_storage(url)
+    manager, reader = _roles(setup)
+    a = _user(setup, "a", manager)
+    _user(setup, "b", manager)
+
+    blocker = sqlite3.connect(f"{tmp_path}/busy.db", isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")  # an external writer holds the lock
+    try:
+        short = Storage(create_engine(url, future=True, connect_args={"timeout": 0.05}))
+        results = [
+            short.change_ui_user_role(a, reader, NOW),
+            short.remove_ui_user(a, NOW),
+            short.lock_ui_user(a, NOW),
+            short.update_ui_role(reader, "Neu", set(), NOW),
+            short.delete_ui_role_checked(reader),
+        ]
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert results == [AdminOutcome.BUSY] * 5
+
+
+def test_concurrent_role_edit_and_delete_is_clean(tmp_path: Path) -> None:
+    url = f"sqlite:///{tmp_path}/race3.db"
+    upgrade(url)
+    for _round in range(5):
+        stores = [create_storage(url), create_storage(url)]
+        role = stores[0].create_ui_role(f"R{_round}", set()).id
+        barrier = threading.Barrier(2)
+        outcomes: list[AdminOutcome] = []
+
+        def edit(
+            store: Storage = stores[0],
+            role_id: int = role,
+            barrier: threading.Barrier = barrier,
+            outcomes: list[AdminOutcome] = outcomes,
+        ) -> None:
+            barrier.wait()
+            outcomes.append(store.update_ui_role(role_id, "Neu", {Permission.COMMANDS_SEND}, NOW))
+
+        def delete(
+            store: Storage = stores[1],
+            role_id: int = role,
+            barrier: threading.Barrier = barrier,
+            outcomes: list[AdminOutcome] = outcomes,
+        ) -> None:
+            barrier.wait()
+            outcomes.append(store.delete_ui_role_checked(role_id))
+
+        threads = [threading.Thread(target=edit), threading.Thread(target=delete)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(outcomes) == 2
+        assert AdminOutcome.OK in outcomes
+        assert set(outcomes) <= {AdminOutcome.OK, AdminOutcome.ROLE_NOT_FOUND}
+        stores[0].update_ui_role(role, f"Reset{_round}", set(), NOW)  # whichever way it ended
 
 
 def test_manual_lock_is_not_shortened_by_login_failures(storage: Storage) -> None:

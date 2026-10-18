@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import Depends, Form, HTTPException, Request
+from fastapi import Depends, Form, HTTPException, Path, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from fleet.permissions import Permission, parse_permissions
@@ -33,6 +33,7 @@ from fleet.ui_auth import AuthenticatedUiSession, check_csrf, require_permission
 from fleet.ui_format import format_local_datetime
 from fleet.ui_routes import router, templates
 from fleet.ui_users import (
+    BUSY,
     PERMISSION_LABELS,
     SELF_REMOVAL,
     create_invitation,
@@ -44,6 +45,18 @@ from fleet.ui_users import (
 _NEEDS_USERS_MANAGE = Depends(require_permission(Permission.USERS_MANAGE))
 
 _CSRF_ERROR = "Invalid or missing CSRF token."
+
+# Ids are bounded so an absurd value answers 422 instead of overflowing the
+# database driver (500).
+_MAX_ID = 2**31 - 1
+_RoleIdPath = Annotated[int, Path(ge=1, le=_MAX_ID)]
+_UserIdPath = Annotated[int, Path(ge=1, le=_MAX_ID)]
+_InvitationIdPath = Annotated[int, Path(ge=1, le=_MAX_ID)]
+_RoleIdForm = Annotated[int, Form(ge=1, le=_MAX_ID)]
+
+
+def _error_status(error: str | None) -> int:
+    return 503 if error == BUSY else 400
 
 
 @dataclass(frozen=True)
@@ -227,7 +240,7 @@ def role_new_submit(
             name=name,
             selected=selected,
             error=outcome_message(outcome),
-            status_code=400,
+            status_code=_error_status(outcome_message(outcome)),
         )
     return RedirectResponse(url="/ui/users", status_code=303)
 
@@ -235,7 +248,7 @@ def role_new_submit(
 @router.get("/users/roles/{role_id}/edit", response_class=HTMLResponse)
 def role_edit_form(
     request: Request,
-    role_id: int,
+    role_id: _RoleIdPath,
     authenticated: AuthenticatedUiSession = _NEEDS_USERS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
 ) -> HTMLResponse:
@@ -254,7 +267,7 @@ def role_edit_form(
 @router.post("/users/roles/{role_id}/edit")
 def role_edit_submit(
     request: Request,
-    role_id: int,
+    role_id: _RoleIdPath,
     name: str = Form(""),
     permissions: list[str] = Form(default=[]),  # noqa: B008 -- FastAPI's own idiom
     csrf_token: str = Form(...),
@@ -274,7 +287,7 @@ def role_edit_submit(
             name=name,
             selected=selected,
             error=outcome_message(outcome, role_edit=True),
-            status_code=400,
+            status_code=_error_status(outcome_message(outcome, role_edit=True)),
         )
     return RedirectResponse(url="/ui/users", status_code=303)
 
@@ -282,7 +295,7 @@ def role_edit_submit(
 @router.post("/users/roles/{role_id}/delete")
 def role_delete_submit(
     request: Request,
-    role_id: int,
+    role_id: _RoleIdPath,
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = _NEEDS_USERS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
@@ -290,8 +303,9 @@ def role_delete_submit(
     _check(authenticated, csrf_token)
     outcome = storage.delete_ui_role_checked(role_id)
     if outcome is not AdminOutcome.OK:
+        error = outcome_message(outcome)
         return _users_response(
-            request, storage, authenticated, error=outcome_message(outcome), status_code=400
+            request, storage, authenticated, error=error, status_code=_error_status(error)
         )
     return RedirectResponse(url="/ui/users", status_code=303)
 
@@ -299,8 +313,8 @@ def role_delete_submit(
 @router.post("/users/invite")
 def users_invite_submit(
     request: Request,
+    role_id: _RoleIdForm,
     username: str = Form(""),
-    role_id: int = Form(...),
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = _NEEDS_USERS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
@@ -333,7 +347,7 @@ def users_invite_submit(
 @router.post("/users/invitations/{invitation_id}/revoke")
 def invitation_revoke_submit(
     request: Request,
-    invitation_id: int,
+    invitation_id: _InvitationIdPath,
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = _NEEDS_USERS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
@@ -353,8 +367,8 @@ def invitation_revoke_submit(
 @router.post("/users/{user_id}/role")
 def user_role_submit(
     request: Request,
-    user_id: int,
-    role_id: int = Form(...),
+    user_id: _UserIdPath,
+    role_id: _RoleIdForm,
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = _NEEDS_USERS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
@@ -364,14 +378,16 @@ def user_role_submit(
     if error is None:
         error = outcome_message(storage.change_ui_user_role(user_id, role_id, datetime.now(UTC)))
     if error is not None:
-        return _users_response(request, storage, authenticated, error=error, status_code=400)
+        return _users_response(
+            request, storage, authenticated, error=error, status_code=_error_status(error)
+        )
     return RedirectResponse(url="/ui/users", status_code=303)
 
 
 @router.post("/users/{user_id}/lock")
 def user_lock_submit(
     request: Request,
-    user_id: int,
+    user_id: _UserIdPath,
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = _NEEDS_USERS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
@@ -383,14 +399,16 @@ def user_lock_submit(
     if error is None:
         error = outcome_message(storage.lock_ui_user(user_id, datetime.now(UTC)))
     if error is not None:
-        return _users_response(request, storage, authenticated, error=error, status_code=400)
+        return _users_response(
+            request, storage, authenticated, error=error, status_code=_error_status(error)
+        )
     return RedirectResponse(url="/ui/users", status_code=303)
 
 
 @router.post("/users/{user_id}/unlock")
 def user_unlock_submit(
     request: Request,
-    user_id: int,
+    user_id: _UserIdPath,
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = _NEEDS_USERS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
@@ -411,7 +429,7 @@ def user_unlock_submit(
 @router.post("/users/{user_id}/delete")
 def user_delete_submit(
     request: Request,
-    user_id: int,
+    user_id: _UserIdPath,
     csrf_token: str = Form(...),
     authenticated: AuthenticatedUiSession = _NEEDS_USERS_MANAGE,
     storage: Storage = Depends(get_storage),  # noqa: B008 -- FastAPI's own idiom
@@ -421,5 +439,7 @@ def user_delete_submit(
     if error is None:
         error = outcome_message(storage.remove_ui_user(user_id, datetime.now(UTC)))
     if error is not None:
-        return _users_response(request, storage, authenticated, error=error, status_code=400)
+        return _users_response(
+            request, storage, authenticated, error=error, status_code=_error_status(error)
+        )
     return RedirectResponse(url="/ui/users", status_code=303)
