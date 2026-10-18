@@ -3290,3 +3290,8 @@ def install_security_headers(app: object) -> None:
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["Referrer-Policy"] = "no-referrer"
         return response
+
+
+# The "Nutzer und Rollen" pages (F11) register on this router. Imported last
+# because that module imports `router` and `templates` from here.
+import fleet.ui_users_routes  # noqa: E402,F401

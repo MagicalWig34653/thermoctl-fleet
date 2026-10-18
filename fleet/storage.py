@@ -52,6 +52,7 @@ per `CLAUDE.md`.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import json
@@ -100,8 +101,9 @@ from sqlalchemy import (
 from sqlalchemy.dialects import postgresql as _postgresql_dialect
 from sqlalchemy.dialects import sqlite as _sqlite_dialect
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy.orm.exc import StaleDataError
 
 from fleet.device_lifecycle import (
     REMOVE_DEVICE_TARGET_STATES,
@@ -1121,6 +1123,52 @@ class DiagnosticBundleSummary:
     created_at: datetime
     size_bytes: int
     content_hash: str
+
+
+class AdminOutcome(StrEnum):
+    """Result of a transactional UI-account administration call (F11)."""
+
+    OK = "ok"
+    USER_NOT_FOUND = "user_not_found"
+    ROLE_NOT_FOUND = "role_not_found"
+    LAST_MANAGER = "last_manager"
+    ROLE_IN_USE = "role_in_use"
+    NAME_TAKEN = "name_taken"
+    NAME_EMPTY = "name_empty"
+    NAME_TOO_LONG = "name_too_long"
+    BUSY = "busy"
+
+
+# Manual lock of a UI account: far in the future, so it never expires by
+# itself. Distinguishes a manual lock (administrator action) from the
+# automatic, time-limited one of the login-failure counter.
+MANUAL_LOCK_UNTIL = datetime(9999, 1, 1)
+MAX_ROLE_NAME_LENGTH = 100
+
+
+def _manual_lock_clear(column: Any) -> Any:
+    """SQL condition: the account is NOT manually locked (`locked_until` is
+    NULL or below `MANUAL_LOCK_UNTIL`). A manual lock is only ever lifted by
+    an administrator, never by a login success."""
+
+    return or_(column.is_(None), column < MANUAL_LOCK_UNTIL)
+
+
+def _busy_outcome(function: Any) -> Any:
+    """Turns SQLite's "database is locked/busy" `OperationalError` of an
+    administration method into `AdminOutcome.BUSY` (never a 500)."""
+
+    @functools.wraps(function)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return function(*args, **kwargs)
+        except OperationalError as error:
+            message = str(error).lower()
+            if "locked" in message or "busy" in message:
+                return AdminOutcome.BUSY
+            raise
+
+    return wrapper
 
 
 class StoreDiagnosticBundleOutcome(StrEnum):
@@ -7059,6 +7107,228 @@ class Storage:
                 update(UiUserRecord).where(UiUserRecord.id == user_id).values(role_id=role_id)
             )
 
+    # -- ui administration with transactional lock-out protection (F11) ------
+    #
+    # Every mutation that can take the last usable `users.manage` holder away
+    # (role of a user changes, user deleted or locked, `users.manage` removed
+    # from a role, role renamed/edited) runs here, in ONE transaction that
+    # starts with `BEGIN IMMEDIATE` (SQLite: the write lock is taken before
+    # the first read, so two concurrent demotions are serialized and the
+    # second one sees the first one's result). The count of usable holders is
+    # taken before and after the change inside that transaction; if the change
+    # would take it from >0 to 0 it is rolled back and `LAST_MANAGER` is
+    # returned. The checks in `fleet.ui_users` (`guard_*`) only produce
+    # friendlier texts -- they are not what protects.
+
+    def _begin_exclusive(self, session: Session) -> None:
+        # Kept although the check after the write already catches a lost race:
+        # `update_ui_role` rewrites several rows, and the write lock up front
+        # makes two role edits (or an edit and a delete) strictly sequential.
+        if self.engine.dialect.name == "sqlite":
+            session.execute(text("BEGIN IMMEDIATE"))
+
+    @staticmethod
+    def _usable_manager_count(session: Session, now: datetime) -> int:
+        """Accounts not MANUALLY locked whose role grants `users.manage`,
+        counted inside the caller's transaction. A temporary lock from failed
+        logins expires by itself and must not weaken the protection (an
+        attacker could otherwise trigger it on purpose)."""
+
+        granting = select(UiRolePermissionRecord.role_id).where(
+            UiRolePermissionRecord.permission == Permission.USERS_MANAGE.value
+        )
+        return (
+            session.scalar(
+                select(func.count())
+                .select_from(UiUserRecord)
+                .where(
+                    UiUserRecord.role_id.in_(granting),
+                    _manual_lock_clear(UiUserRecord.locked_until),
+                )
+            )
+            or 0
+        )
+
+    def create_ui_role_checked(
+        self, name: str, permissions: Iterable[Permission]
+    ) -> tuple[AdminOutcome, UiRoleRecord | None]:
+        """Creates a role with a trimmed, non-empty, unique name."""
+
+        clean = name.strip()
+        if not clean:
+            return AdminOutcome.NAME_EMPTY, None
+        if len(clean) > MAX_ROLE_NAME_LENGTH:
+            return AdminOutcome.NAME_TOO_LONG, None
+        try:
+            return AdminOutcome.OK, self.create_ui_role(clean, permissions)
+        except IntegrityError:
+            return AdminOutcome.NAME_TAKEN, None
+
+    @_busy_outcome
+    def change_ui_user_role(self, user_id: int, role_id: int, now: datetime) -> AdminOutcome:
+        moment = _naive_utc(now)
+        with self.session() as session:
+            self._begin_exclusive(session)
+            if session.get(UiUserRecord, user_id) is None:
+                return AdminOutcome.USER_NOT_FOUND
+            if session.get(UiRoleRecord, role_id) is None:
+                return AdminOutcome.ROLE_NOT_FOUND
+            before = self._usable_manager_count(session, moment)
+            session.execute(
+                update(UiUserRecord).where(UiUserRecord.id == user_id).values(role_id=role_id)
+            )
+            session.flush()
+            if before > 0 and self._usable_manager_count(session, moment) == 0:
+                session.rollback()
+                return AdminOutcome.LAST_MANAGER
+            return AdminOutcome.OK
+
+    @_busy_outcome
+    def remove_ui_user(self, user_id: int, now: datetime) -> AdminOutcome:
+        """Deletes an account and its sessions, unless it is the last usable
+        `users.manage` holder."""
+
+        moment = _naive_utc(now)
+        with self.session() as session:
+            self._begin_exclusive(session)
+            if session.get(UiUserRecord, user_id) is None:
+                return AdminOutcome.USER_NOT_FOUND
+            before = self._usable_manager_count(session, moment)
+            session.execute(delete(UiSessionRecord).where(UiSessionRecord.user_id == user_id))
+            session.execute(delete(UiUserRecord).where(UiUserRecord.id == user_id))
+            session.flush()
+            if before > 0 and self._usable_manager_count(session, moment) == 0:
+                session.rollback()
+                return AdminOutcome.LAST_MANAGER
+            return AdminOutcome.OK
+
+    @_busy_outcome
+    def lock_ui_user(self, user_id: int, now: datetime) -> AdminOutcome:
+        """Manual lock: `locked_until` is set to `MANUAL_LOCK_UNTIL` (so the
+        login-failure window logic, which only ever sets a lock to a nearby
+        time and leaves an active lock untouched, cannot shorten it) and the
+        account's sessions are ended. Refused for the last usable holder."""
+
+        moment = _naive_utc(now)
+        with self.session() as session:
+            self._begin_exclusive(session)
+            if session.get(UiUserRecord, user_id) is None:
+                return AdminOutcome.USER_NOT_FOUND
+            before = self._usable_manager_count(session, moment)
+            session.execute(
+                update(UiUserRecord)
+                .where(UiUserRecord.id == user_id)
+                .values(locked_until=MANUAL_LOCK_UNTIL)
+            )
+            session.execute(delete(UiSessionRecord).where(UiSessionRecord.user_id == user_id))
+            session.flush()
+            if before > 0 and self._usable_manager_count(session, moment) == 0:
+                session.rollback()
+                return AdminOutcome.LAST_MANAGER
+            return AdminOutcome.OK
+
+    @_busy_outcome
+    def update_ui_role(
+        self, role_id: int, name: str, permissions: Iterable[Permission], now: datetime
+    ) -> AdminOutcome:
+        """Renames a role and replaces its permissions (`view` stays). Refused
+        when removing `users.manage` would leave no usable holder."""
+
+        clean = name.strip()
+        if not clean:
+            return AdminOutcome.NAME_EMPTY
+        if len(clean) > MAX_ROLE_NAME_LENGTH:
+            return AdminOutcome.NAME_TOO_LONG
+        moment = _naive_utc(now)
+        try:
+            with self.session() as session:
+                self._begin_exclusive(session)
+                role = session.get(UiRoleRecord, role_id)
+                if role is None:
+                    return AdminOutcome.ROLE_NOT_FOUND
+                before = self._usable_manager_count(session, moment)
+                role.name = clean
+                session.execute(
+                    delete(UiRolePermissionRecord).where(UiRolePermissionRecord.role_id == role_id)
+                )
+                for permission in {*permissions, Permission.VIEW}:
+                    session.add(
+                        UiRolePermissionRecord(role_id=role_id, permission=permission.value)
+                    )
+                session.flush()
+                if before > 0 and self._usable_manager_count(session, moment) == 0:
+                    session.rollback()
+                    return AdminOutcome.LAST_MANAGER
+                return AdminOutcome.OK
+        except IntegrityError:
+            return AdminOutcome.NAME_TAKEN
+        except StaleDataError:
+            # The role vanished between read and write: same clean outcome.
+            return AdminOutcome.ROLE_NOT_FOUND
+
+    @_busy_outcome
+    def delete_ui_role_checked(self, role_id: int) -> AdminOutcome:
+        """Deletes an unused role; `ROLE_IN_USE` while an account or an open
+        invitation still has it. Checked and deleted in one transaction, so
+        a concurrent assignment cannot slip in between."""
+
+        with self.session() as session:
+            self._begin_exclusive(session)
+            if session.get(UiRoleRecord, role_id) is None:
+                return AdminOutcome.ROLE_NOT_FOUND
+            in_use = session.scalar(
+                select(func.count())
+                .select_from(UiUserRecord)
+                .where(UiUserRecord.role_id == role_id)
+            )
+            pending = session.scalar(
+                select(func.count())
+                .select_from(UiInvitationRecord)
+                .where(UiInvitationRecord.role_id == role_id, UiInvitationRecord.used_at.is_(None))
+            )
+            if in_use or pending:
+                return AdminOutcome.ROLE_IN_USE
+            session.execute(
+                delete(UiRolePermissionRecord).where(UiRolePermissionRecord.role_id == role_id)
+            )
+            session.execute(delete(UiInvitationRecord).where(UiInvitationRecord.role_id == role_id))
+            session.execute(delete(UiRoleRecord).where(UiRoleRecord.id == role_id))
+            return AdminOutcome.OK
+
+    def list_open_ui_invitations(self, now: datetime) -> list[UiInvitationRecord]:
+        """Unused, unexpired invitations (never exposes a token: only the
+        hash is stored, and callers must not show it)."""
+
+        moment = _naive_utc(now)
+        with self.session() as session:
+            records = list(
+                session.scalars(
+                    select(UiInvitationRecord)
+                    .where(
+                        UiInvitationRecord.used_at.is_(None),
+                        UiInvitationRecord.expires_at >= moment,
+                    )
+                    .order_by(UiInvitationRecord.id)
+                )
+            )
+            session.expunge_all()
+            return records
+
+    def revoke_ui_invitation(self, invitation_id: int) -> bool:
+        """Deletes an unused invitation; `False` if it is gone or used."""
+
+        with self.session() as session:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    delete(UiInvitationRecord).where(
+                        UiInvitationRecord.id == invitation_id,
+                        UiInvitationRecord.used_at.is_(None),
+                    )
+                ),
+            )
+            return result.rowcount == 1
+
     # -- ui invitations (F11) ------------------------------------------------
 
     def create_ui_invitation(
@@ -7170,14 +7440,14 @@ class Storage:
         now: datetime | None = None,
     ) -> int:
         """Number of usable accounts whose role grants `permission` (by the
-        same read rules as `get_ui_role_permissions`). An account locked at
-        `now` does not count: it cannot log in, so it is no usable holder."""
+        same read rules as `get_ui_role_permissions`). An account
+        `now` is not a usable holder only when it is MANUALLY locked (a
+        temporary failed-login lock expires by itself)."""
 
-        moment = _naive_utc(now or datetime.now(UTC))
         with self.session() as session:
             rows = session.execute(
                 select(UiUserRecord.id, UiUserRecord.role_id).where(
-                    or_(UiUserRecord.locked_until.is_(None), UiUserRecord.locked_until <= moment)
+                    _manual_lock_clear(UiUserRecord.locked_until)
                 )
             ).all()
         grants: dict[int, bool] = {}
@@ -7368,6 +7638,9 @@ class Storage:
                         UiUserRecord.last_totp_step.is_(None),
                         UiUserRecord.last_totp_step < totp_step,
                     ),
+                    # A manual lock is never lifted (nor a session granted)
+                    # by a login: rowcount 0 -> the caller treats it as failed.
+                    _manual_lock_clear(UiUserRecord.locked_until),
                 )
                 .values(
                     failed_attempts=0,
@@ -7658,7 +7931,7 @@ class Storage:
         with self.session() as session:
             session.execute(delete(UiSessionRecord).where(UiSessionRecord.token_hash == token_hash))
 
-    def record_ui_login_success_webauthn(self, user_id: int) -> None:
+    def record_ui_login_success_webauthn(self, user_id: int) -> bool:
         """The WebAuthn-second-factor equivalent of `record_ui_login_success`
         above: resets the account-level failure counter and any lock. No
         `last_totp_step`-style CAS is needed here -- replay protection for a
@@ -7666,11 +7939,18 @@ class Storage:
         (`consume_webauthn_challenge`), not from a counter on this row."""
 
         with self.session() as session:
-            session.execute(
-                update(UiUserRecord)
-                .where(UiUserRecord.id == user_id)
-                .values(failed_attempts=0, locked_until=None, failure_window_started_at=None)
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(UiUserRecord)
+                    .where(
+                        UiUserRecord.id == user_id,
+                        _manual_lock_clear(UiUserRecord.locked_until),
+                    )
+                    .values(failed_attempts=0, locked_until=None, failure_window_started_at=None)
+                ),
             )
+            return result.rowcount == 1
 
     # -- webauthn credentials / challenges (P6.2) ----------------------------------
 

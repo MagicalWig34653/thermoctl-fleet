@@ -16,7 +16,7 @@
 <div class="list-row"><span class="muted">{{ converged }} erfolgreich · {{ detail.apartments | length - converged }} ausstehend{% if detail.stopped_reason %} · {{ detail.stopped_reason }}{% endif %}</span></div></section>
 <section class="panel rollout-meta" aria-label="Rollout-Einstellungen"><div class="list-row"><span>Digest</span><code>{{ detail.digest }}</code></div><div class="list-row"><span>Wartezeit nach Testwohnung</span><strong>{{ detail.stagger_hours }} h</strong></div><div class="list-row"><span>Zeitüberschreitung je Wohnung</span><strong>{{ detail.timeout_hours }} h</strong></div>{% if detail.pilot_converged_text %}<div class="list-row"><span>Testwohnung erfolgreich seit</span><strong>{{ detail.pilot_converged_text }}</strong></div>{% endif %}<div class="list-row"><span>Erstellt von</span><strong>{{ detail.created_by }}</strong></div><div class="list-row"><span>Grund</span><strong>{{ detail.reason }}</strong></div></section>
 
-<div class="rollout-actions">{% if detail.can_resume %}
+<div class="rollout-actions">{% if detail.can_resume and "rollouts.manage" in ui_session.permissions %}
 <form class="ui-form panel" method="post" action="/ui/rollouts/{{ detail.rollout_id | urlpath }}/resume" data-rollout-confirm="Fortsetzen">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="resume_reason"><span class="field-label-text">Grund für Fortsetzen<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>
@@ -25,7 +25,7 @@
     <button class="button primary" type="submit">Fortsetzen</button>
 </form>
 {% endif %}
-{% if detail.can_cancel %}
+{% if detail.can_cancel and "rollouts.manage" in ui_session.permissions %}
 <form class="ui-form panel" method="post" action="/ui/rollouts/{{ detail.rollout_id | urlpath }}/cancel" data-rollout-confirm="Abbrechen">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="cancel_reason"><span class="field-label-text">Grund für Abbruch<span class="field-required" aria-hidden="true"> *</span><span class="visually-hidden"> Pflichtfeld</span></span>

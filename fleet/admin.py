@@ -1,9 +1,11 @@
 """Fleet UI account management CLI (P3.0, extended by P6.2).
 
-`python -m fleet.admin <command> ...` -- the **only** way a UI account is
-ever created ("the first account is created via a CLI command, never via
-the web", project owner decision 2026-09-24; there is deliberately no
-`POST /ui/register` or similar endpoint anywhere in this package). Passkey
+`python -m fleet.admin <command> ...` -- the first-account and emergency
+path for UI accounts. (Project owner decision 2026-09-24 was "accounts only
+via this CLI, never via the web"; the owner overrode it on 2026-10-16: further
+accounts are created by invitation link in the web UI, F11. There is still no
+open `POST /ui/register`.) `create-user --role NAME` picks the role (default
+Administrator); `delete-user` refuses the last `users.manage` holder. Passkey
 (WebAuthn) credentials are added differently: a logged-in user registers
 one through the UI itself (`fleet/ui_routes.py`, re-authenticating with
 their current second factor first) -- there is no CLI command for that,
@@ -35,7 +37,7 @@ from datetime import UTC, datetime
 from sqlalchemy.exc import IntegrityError
 
 from fleet.permissions import ADMIN_ROLE_NAME, ALL_PERMISSIONS
-from fleet.storage import create_storage
+from fleet.storage import AdminOutcome, create_storage
 from fleet.totp_crypto import (
     TOTP_KEY_ENV,
     TotpDecryptionError,
@@ -97,7 +99,7 @@ def _read_new_password() -> str:
     return first
 
 
-def create_user(username: str) -> int:
+def create_user(username: str, role_name: str | None = None) -> int:
     """`create-user` -- checked, then created. The check-then-create
     sequence is inherently racy (two concurrent `create-user` invocations
     for the same username could both pass the "not exists" check before
@@ -118,6 +120,22 @@ def create_user(username: str) -> int:
         print(f"User {username!r} already exists.", file=sys.stderr)
         return 1
 
+    # F11: the role is resolved before anything is prompted. Default (and
+    # `--role Administrator`): the Administrator role, recreated with all
+    # permissions if an operator deleted it. Any other name must exist --
+    # roles are created in the web UI, not here.
+    wanted_role = (role_name or ADMIN_ROLE_NAME).strip()
+    role = storage.get_ui_role_by_name(wanted_role)
+    if role is None and wanted_role == ADMIN_ROLE_NAME:
+        role = storage.create_ui_role(ADMIN_ROLE_NAME, ALL_PERMISSIONS)
+    if role is None:
+        print(
+            f"Role {wanted_role!r} does not exist. Create it in the web UI "
+            "(Nutzer und Rollen) first, or omit --role to create an Administrator.",
+            file=sys.stderr,
+        )
+        return 1
+
     # Fetched before any Argon2/password prompting, per CLAUDE.md "startup
     # fails loudly": there is no point asking the operator to type a
     # password twice only to then discover the TOTP secret cannot be
@@ -126,12 +144,6 @@ def create_user(username: str) -> int:
 
     password = _read_new_password()
     totp_secret = generate_totp_secret()
-    # F11: the emergency/first-account path creates Administrators (the role
-    # exists after migration 0020; recreated with all permissions if an
-    # operator deleted it).
-    admin_role = storage.get_ui_role_by_name(ADMIN_ROLE_NAME) or storage.create_ui_role(
-        ADMIN_ROLE_NAME, ALL_PERMISSIONS
-    )
     try:
         record = storage.create_ui_user(
             username=normalized_username,
@@ -142,7 +154,7 @@ def create_user(username: str) -> int:
             password_hash=hash_password(password),
             totp_secret="",
             created_at=datetime.now(UTC),
-            role_id=admin_role.id,
+            role_id=role.id,
         )
     except IntegrityError:
         print(f"User {username!r} already exists.", file=sys.stderr)
@@ -252,7 +264,16 @@ def delete_user(username: str) -> int:
     if user is None:
         print(f"User {username!r} not found.", file=sys.stderr)
         return 1
-    storage.delete_ui_user(user.id)
+    # Transactional: refused when this is the last usable `users.manage`
+    # holder, so the CLI cannot lock everyone out of "Nutzer und Rollen".
+    outcome = storage.remove_ui_user(user.id, datetime.now(UTC))
+    if outcome is AdminOutcome.LAST_MANAGER:
+        print(
+            f"User {username!r} is the last account that may manage users and roles "
+            "and was not deleted. Create another such account first.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"User {username!r} deleted.")
     return 0
 
@@ -302,6 +323,11 @@ def main(argv: list[str] | None = None) -> int:
 
     create_parser = subparsers.add_parser("create-user", help="Create a new UI account.")
     create_parser.add_argument("username")
+    create_parser.add_argument(
+        "--role",
+        default=None,
+        help="Role of the new account (default: Administrator, created if missing).",
+    )
 
     reset_totp_parser = subparsers.add_parser(
         "reset-totp", help="Generate a new TOTP secret for an existing account."
@@ -337,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "create-user":
-        return create_user(args.username)
+        return create_user(args.username, args.role)
     if args.command == "reset-totp":
         return reset_totp(args.username)
     if args.command == "unlock":

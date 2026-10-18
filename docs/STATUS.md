@@ -2,6 +2,63 @@
 
 Last updated: 2026-10-18.
 
+## UI roles, review fixes (F11, 2026-10-18)
+
+Only a MANUAL lock (`locked_until >= MANUAL_LOCK_UNTIL`) makes an account
+unusable for the lock-out invariant and for sessions; the temporary
+failed-login lock expires by itself, still counts as a usable manager and does
+not end sessions (otherwise an attacker could trigger it on purpose).
+`record_ui_login_success` and `record_ui_login_success_webauthn` (now returns
+`bool`) are conditional in the same UPDATE and never lift a manual lock; the
+login (and the passkey-register re-auth) fails if the account was locked in
+between. `get_valid_session` rejects a manually locked user. The five mutating
+admin methods return `AdminOutcome.BUSY` on SQLite "locked/busy" (routes: 503,
+"Bitte in einem Moment erneut versuchen"), `update_ui_role` maps a vanished
+role to `ROLE_NOT_FOUND`. Ids in `/ui/users` routes are bounded (1..2**31-1,
+422 otherwise). `BEGIN IMMEDIATE` stays (it serializes `update_ui_role`'s
+multi-row rewrite). New tests: lock vs. login success, sessions ended by lock,
+used invitation not revocable, busy database, concurrent role edit/delete.
+
+## UI roles, task 7 of 7: CLI `--role`, docs (F11, 2026-10-18)
+
+`fleet.admin create-user NAME --role ROLE`: the role must exist (unknown name:
+error before any prompt), without `--role` (or `--role Administrator`) the
+Administrator role is used and recreated with all permissions if missing.
+`delete-user` goes through `Storage.remove_ui_user` and refuses the last usable
+`users.manage` holder. Owner decision of 2026-09-24 ("accounts never via the
+web") is explicitly overridden by the owner on 2026-10-16 (invitations in the
+web UI); the CLI stays as first-account and emergency path. The agent check for
+`open_access` is unchanged. F11 and A09 marked resolved in
+`docs/sim-findings/README.md`. This completes the UI roles plan.
+
+## UI roles, task 6 of 7: "Nutzer und Rollen" pages (F11, 2026-10-18)
+
+`fleet/ui_users_routes.py` (registered on the `/ui` router, so the
+route-coverage test sees it) with the templates `users.html`,
+`role_edit.html`, `invite_created.html`; every route requires `users.manage`,
+every POST checks the session CSRF token. The nav link "Nutzer und Rollen"
+shows only with `users.manage`; `apartment.html` and `rollout_detail.html`
+hide the buttons/forms the role lacks (convenience, the routes still check).
+
+Lock-out protection is transactional now: `Storage.change_ui_user_role`,
+`remove_ui_user`, `lock_ui_user`, `update_ui_role` (and `delete_ui_role_checked`,
+`create_ui_role_checked`) run in one transaction (`BEGIN IMMEDIATE` on SQLite),
+count the usable `users.manage` holders before and after the change and roll
+back with `AdminOutcome.LAST_MANAGER` when it would drop from some to none.
+The `guard_*` functions in `fleet/ui_users.py` only give friendlier texts. Two
+threads demoting/deleting/locking the two managers (file SQLite) leave exactly
+one (`tests/test_ui_lockout_storage.py`). A locked account (temporary or manual)
+is not a usable holder. Manual lock: `locked_until = 9999-01-01` plus ended
+sessions; the login-failure code leaves an active lock untouched and a
+successful login needs an unlocked account, so nothing unlocks it by accident;
+only "Entsperren" (or CLI `unlock`/`reset-totp`) clears it. A role in use cannot
+be deleted, `view` stays in every role, role names are unique/non-empty/<= 100.
+The invitation link is shown once in the POST response (`no-store`, no
+redirect); the list of open invitations shows username, role and expiry, never
+the token, and an invitation can be revoked. Known gap: the account/passkey
+pages are rendered without the permission lookup, so the nav link is not shown
+there. Not yet done: CLI `--role` and the `delete-user` guard (7).
+
 ## UI roles, tasks 4-5 of 7: invitations (F11, 2026-10-18)
 
 `fleet/ui_users.py` (invite, accept, `guard_role_change`,

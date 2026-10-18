@@ -10,7 +10,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 
 from fleet.permissions import Permission
-from fleet.storage import Storage, UiInvitationRecord, UiUserRecord, hash_token
+from fleet.storage import AdminOutcome, Storage, UiInvitationRecord, UiUserRecord, hash_token
 from fleet.ui_auth import (
     MIN_PASSWORD_LENGTH,
     hash_password,
@@ -30,6 +30,77 @@ LAST_USER_MANAGER = (
     "Dies ist das letzte Konto mit der Berechtigung zur Nutzerverwaltung und bleibt erhalten."
 )
 UNKNOWN_USER = "Das Konto existiert nicht."
+ROLE_IN_USE = (
+    "Diese Rolle ist noch einem Konto oder einer offenen Einladung zugewiesen "
+    "und kann nicht gelöscht werden."
+)
+ROLE_NAME_TAKEN = "Eine Rolle mit diesem Namen gibt es bereits."
+ROLE_NAME_EMPTY = "Der Name der Rolle darf nicht leer sein."
+ROLE_NAME_TOO_LONG = "Der Name der Rolle ist zu lang (höchstens 100 Zeichen)."
+LAST_MANAGER_ROLE = (
+    "Diese Änderung würde dazu führen, dass niemand mehr Nutzer und Rollen verwalten "
+    "darf. Sie wurde nicht gespeichert."
+)
+
+BUSY = "Bitte in einem Moment erneut versuchen. Die Datenbank ist gerade beschäftigt."
+
+PERMISSION_LABELS: dict[Permission, tuple[str, str]] = {
+    Permission.VIEW: (
+        "Ansehen",
+        "Übersicht, Wohnungen, Aufgaben und Alarme sehen (immer enthalten).",
+    ),
+    Permission.FAULTS_ACKNOWLEDGE: ("Störungen quittieren", "Störungen als gesehen bestätigen."),
+    Permission.COMMANDS_SEND: (
+        "Wartungsbefehle senden",
+        "Wartungsbefehle an eine Wohnung bestätigen und Diagnosepakete herunterladen.",
+    ),
+    Permission.BACKUPS_MANAGE: (
+        "Sicherungen verwalten",
+        "Sicherungen herunterladen und wiederherstellen.",
+    ),
+    Permission.TENANT_CHANGE: ("Mieterwechsel", "Einen Mieterwechsel durchführen."),
+    Permission.DESIRED_STATE_EDIT: (
+        "Sollzustand ändern",
+        "Den Sollzustand einer Wohnung bearbeiten und bestätigen.",
+    ),
+    Permission.PILOT_MODE_SET: (
+        "Pilotbetrieb schalten",
+        "Den Pilotbetrieb einer Wohnung ein- oder ausschalten.",
+    ),
+    Permission.INVENTORY_MANAGE: (
+        "Einrichtung verwalten",
+        "Gebäude, Wohnungen und Geräte anlegen, ändern und austauschen.",
+    ),
+    Permission.ROLLOUTS_MANAGE: (
+        "Updates verteilen",
+        "Rollouts anlegen, abbrechen und fortsetzen.",
+    ),
+    Permission.USERS_MANAGE: (
+        "Nutzer und Rollen verwalten",
+        "Rollen, Einladungen und Konten verwalten.",
+    ),
+}
+
+_OUTCOME_TEXT: dict[AdminOutcome, str] = {
+    AdminOutcome.USER_NOT_FOUND: UNKNOWN_USER,
+    AdminOutcome.ROLE_NOT_FOUND: UNKNOWN_ROLE,
+    AdminOutcome.LAST_MANAGER: LAST_USER_MANAGER,
+    AdminOutcome.ROLE_IN_USE: ROLE_IN_USE,
+    AdminOutcome.NAME_TAKEN: ROLE_NAME_TAKEN,
+    AdminOutcome.NAME_EMPTY: ROLE_NAME_EMPTY,
+    AdminOutcome.NAME_TOO_LONG: ROLE_NAME_TOO_LONG,
+    AdminOutcome.BUSY: BUSY,
+}
+
+
+def outcome_message(outcome: AdminOutcome, *, role_edit: bool = False) -> str | None:
+    """German text for a refused storage outcome, `None` for `OK`."""
+
+    if outcome is AdminOutcome.OK:
+        return None
+    if role_edit and outcome is AdminOutcome.LAST_MANAGER:
+        return LAST_MANAGER_ROLE
+    return _OUTCOME_TEXT[outcome]
 
 
 def _naive_utc(value: datetime) -> datetime:

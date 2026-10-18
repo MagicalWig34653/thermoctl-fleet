@@ -17,7 +17,8 @@ from datetime import UTC, datetime
 import pytest
 
 import fleet.admin as admin_module
-from fleet.storage import create_storage, upgrade
+from fleet.permissions import ADMIN_ROLE_NAME, ALL_PERMISSIONS, Permission
+from fleet.storage import Storage, create_storage, upgrade
 from fleet.ui_auth import MIN_PASSWORD_LENGTH, hash_password
 from tests.conftest import ensure_admin_role
 
@@ -251,20 +252,91 @@ def test_unlock_unknown_user_fails(database_url: str) -> None:
     assert admin_module.main(["unlock", "no-such-user"]) == 1
 
 
-def test_delete_user_removes_the_account(database_url: str) -> None:
-    storage = create_storage(database_url)
+def _make_admin(storage: Storage, username: str) -> None:
     storage.create_ui_user(
-        username="landlord",
+        username=username,
         password_hash=hash_password(secrets.token_urlsafe(16)),
         totp_secret="AAAAAAAAAAAAAAAA",
         created_at=datetime.now(UTC),
         role_id=ensure_admin_role(storage),
     )
 
+
+def test_delete_user_removes_the_account(database_url: str) -> None:
+    storage = create_storage(database_url)
+    _make_admin(storage, "landlord")
+    _make_admin(storage, "second")
+
     exit_code = admin_module.main(["delete-user", "landlord"])
 
     assert exit_code == 0
     assert create_storage(database_url).get_ui_user_by_username("landlord") is None
+
+
+def test_delete_user_refuses_the_last_user_manager(
+    database_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    storage = create_storage(database_url)
+    _make_admin(storage, "landlord")
+
+    exit_code = admin_module.main(["delete-user", "landlord"])
+
+    assert exit_code == 1
+    assert "last account" in capsys.readouterr().err
+    assert create_storage(database_url).get_ui_user_by_username("landlord") is not None
+
+
+def test_delete_user_of_a_non_manager_is_fine_without_other_admins(database_url: str) -> None:
+    storage = create_storage(database_url)
+    reader = storage.create_ui_role("Hausmeister", set())
+    storage.create_ui_user("ben", "h", "", datetime.now(UTC), role_id=reader.id)
+
+    assert admin_module.main(["delete-user", "ben"]) == 0
+
+
+def test_create_user_with_role_assigns_the_existing_role(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = create_storage(database_url)
+    role = storage.create_ui_role("Hausmeister", {Permission.COMMANDS_SEND})
+    _patch_password(monkeypatch, secrets.token_urlsafe(16))
+
+    assert admin_module.main(["create-user", "ben", "--role", "Hausmeister"]) == 0
+
+    user = create_storage(database_url).get_ui_user_by_username("ben")
+    assert user is not None and user.role_id == role.id
+
+
+def test_create_user_with_unknown_role_fails_before_prompting(
+    database_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def no_prompt(*_a: object, **_kw: object) -> str:
+        raise AssertionError("must not prompt for a password")
+
+    monkeypatch.setattr(getpass, "getpass", no_prompt)
+
+    assert admin_module.main(["create-user", "ben", "--role", "Gibtsnicht"]) == 1
+    assert "does not exist" in capsys.readouterr().err
+    assert create_storage(database_url).get_ui_user_by_username("ben") is None
+
+
+def test_create_user_default_role_is_administrator_with_all_permissions(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = create_storage(database_url)
+    existing = storage.get_ui_role_by_name(ADMIN_ROLE_NAME)
+    if existing is not None:  # an operator may have deleted it; the CLI recreates it
+        storage.delete_ui_role_checked(existing.id)
+    _patch_password(monkeypatch, secrets.token_urlsafe(16))
+
+    assert admin_module.main(["create-user", "chef"]) == 0
+
+    storage = create_storage(database_url)
+    user = storage.get_ui_user_by_username("chef")
+    assert user is not None
+    assert storage.get_ui_role_permissions(user.role_id) == ALL_PERMISSIONS
+    role = storage.get_ui_role(user.role_id)
+    assert role is not None and role.name == ADMIN_ROLE_NAME
 
 
 def test_delete_user_unknown_user_fails(database_url: str) -> None:
