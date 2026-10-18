@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hmac
 import json
 import logging
 import os
@@ -52,6 +53,7 @@ from fleet.ui_apartment import (
 )
 from fleet.ui_apartments_list import build_apartments_list_view
 from fleet.ui_auth import (
+    MIN_PASSWORD_LENGTH,
     PRE_SESSION_CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
     AuthenticatedUiSession,
@@ -59,6 +61,7 @@ from fleet.ui_auth import (
     check_csrf,
     create_session,
     delete_session,
+    generate_totp_secret,
     has_permission,
     ip_throttle_duration_s,
     ip_throttle_threshold,
@@ -70,6 +73,7 @@ from fleet.ui_auth import (
     resolve_client_ip,
     session_absolute_lifetime_s,
     totp_key,
+    totp_provisioning_uri,
     verify_totp,
     webauthn_begin_throttle_key,
     webauthn_begin_throttle_threshold,
@@ -101,6 +105,7 @@ from fleet.ui_rollout import (
     build_rollout_detail,
     build_rollout_list,
 )
+from fleet.ui_users import accept_invitation, get_open_invitation
 from protocol.commands import CommandType
 from protocol.desired_state import DesiredState, Services, ServiceState, UpdateWindow
 from protocol.heartbeat import FaultKind
@@ -234,7 +239,7 @@ def get_ui_notifiers() -> list[Notifier]:
 
 
 @router.get("/login", response_class=HTMLResponse)
-def login_form(request: Request) -> HTMLResponse:
+def login_form(request: Request, invited: str | None = None) -> HTMLResponse:
     """Renders the login form with a fresh pre-session CSRF cookie/field
     pair (P3.0 requirement: "SameSite plus a pre-session CSRF cookie/token
     pair" -- there is no session yet at this point for a server-side CSRF
@@ -248,6 +253,7 @@ def login_form(request: Request) -> HTMLResponse:
         {
             "pre_csrf": pre_csrf,
             "error": None,
+            "notice": _INVITE_DONE_NOTICE if invited == "1" else None,
             "webauthn_enabled": webauthn_auth.is_configured(),
             "passwordless_available": webauthn_auth.is_configured()
             and is_passwordless_network(resolve_client_ip(request)),
@@ -448,6 +454,180 @@ def login_submit(
     # it after a successful login leaves no unused credential-shaped cookie
     # behind.
     response.delete_cookie(key=PRE_SESSION_CSRF_COOKIE_NAME, path="/ui/login")
+    return response
+
+
+# -- invitation acceptance (F11, public) ---------------------------------------
+
+_INVITE_COOKIE_PATH = "/ui/invite"
+_INVITE_NO_STORE = {"Cache-Control": "no-store"}
+_INVITE_DONE_NOTICE = "Ihr Konto wurde angelegt. Sie können sich jetzt anmelden."
+
+
+def _set_invite_csrf_cookie(response: Response, value: str) -> None:
+    response.set_cookie(
+        key=PRE_SESSION_CSRF_COOKIE_NAME,
+        value=value,
+        max_age=900,
+        path=_INVITE_COOKIE_PATH,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+    )
+
+
+def _invite_throttle_key(client_ip: str) -> str:
+    # Own counter row (same table, same thresholds as the login): token
+    # guessing must not lock the login of an office NAT, and vice versa.
+    return f"invite:{client_ip}"
+
+
+def _invite_totp_signature(token: str, totp_secret: str) -> str:
+    """HMAC binding the server-generated TOTP secret to one invitation token,
+    so the POST cannot swap in a chosen secret. Domain-separated from the
+    key's encryption use."""
+
+    subkey = hmac.new(totp_key(), b"invite-hmac-v1", "sha256").digest()
+    message = f"{token}:{totp_secret}".encode()
+    return hmac.new(subkey, message, "sha256").hexdigest()
+
+
+def _invalid_invite_response(request: Request) -> Response:
+    # One response for unknown, expired, used and throttled: same status,
+    # same body, nothing about the account.
+    response: Response = templates.TemplateResponse(
+        request, "invite_invalid.html", {}, status_code=404, headers=_INVITE_NO_STORE
+    )
+    response.delete_cookie(key=PRE_SESSION_CSRF_COOKIE_NAME, path=_INVITE_COOKIE_PATH)
+    return response
+
+
+def _invite_form_response(
+    request: Request,
+    token: str,
+    username: str,
+    totp_secret: str,
+    *,
+    error: str | None = None,
+    status_code: int = 200,
+) -> Response:
+    pre_csrf = secrets.token_urlsafe(32)
+    response: Response = templates.TemplateResponse(
+        request,
+        "invite.html",
+        {
+            "token": token,
+            "username": username,
+            "pre_csrf": pre_csrf,
+            "totp_secret": totp_secret,
+            "totp_signature": _invite_totp_signature(token, totp_secret),
+            "provisioning_uri": totp_provisioning_uri(username, totp_secret),
+            "min_password_length": MIN_PASSWORD_LENGTH,
+            "error": error,
+        },
+        status_code=status_code,
+        headers=_INVITE_NO_STORE,
+    )
+    _set_invite_csrf_cookie(response, pre_csrf)
+    return response
+
+
+@router.get("/invite/{token}", response_class=HTMLResponse)
+def invite_form(
+    request: Request,
+    token: str,
+    storage: Storage = Depends(get_storage),  # noqa: B008
+) -> Response:
+    now = datetime.now(UTC)
+    client_ip = resolve_client_ip(request)
+    if not storage.reserve_ip_login_attempt(
+        _invite_throttle_key(client_ip),
+        now,
+        ip_throttle_threshold(),
+        ip_throttle_window_s(),
+        ip_throttle_duration_s(),
+    ):
+        return _invalid_invite_response(request)
+    invitation = get_open_invitation(storage, token, now)
+    if invitation is None:
+        return _invalid_invite_response(request)
+    # Opening a valid link is not a failed guess: give the reservation back.
+    storage.release_ip_login_attempt(_invite_throttle_key(client_ip), now)
+    return _invite_form_response(request, token, invitation.username, generate_totp_secret())
+
+
+@router.post("/invite/{token}")
+def invite_submit(
+    request: Request,
+    token: str,
+    password: str = Form(default=""),
+    password_confirm: str = Form(default=""),
+    totp_secret: str = Form(default=""),
+    totp_signature: str = Form(default=""),
+    totp_code: str = Form(default=""),
+    pre_csrf: str = Form(default=""),
+    pre_csrf_cookie: str | None = Cookie(default=None, alias=PRE_SESSION_CSRF_COOKIE_NAME),
+    storage: Storage = Depends(get_storage),  # noqa: B008
+) -> Response:
+    if not pre_csrf_cookie or not pre_csrf or not check_csrf(pre_csrf_cookie, pre_csrf):
+        raise HTTPException(
+            status_code=403, detail="Invalid or missing CSRF token.", headers=_INVITE_NO_STORE
+        )
+
+    now = datetime.now(UTC)
+    client_ip = resolve_client_ip(request)
+    throttle_key = _invite_throttle_key(client_ip)
+    if not storage.reserve_ip_login_attempt(
+        throttle_key,
+        now,
+        ip_throttle_threshold(),
+        ip_throttle_window_s(),
+        ip_throttle_duration_s(),
+    ):
+        return _invalid_invite_response(request)
+
+    invitation = get_open_invitation(storage, token, now)
+    if invitation is None:
+        return _invalid_invite_response(request)
+
+    expected_signature = _invite_totp_signature(token, totp_secret)
+    if not hmac.compare_digest(expected_signature, totp_signature):
+        # Tampered or stale secret: start over with a fresh, server-signed one.
+        return _invite_form_response(
+            request,
+            token,
+            invitation.username,
+            generate_totp_secret(),
+            error="Die Eingaben waren ungültig. Bitte richten Sie die Authenticator-App neu ein.",
+            status_code=400,
+        )
+
+    def retry(message: str) -> Response:
+        return _invite_form_response(
+            request, token, invitation.username, totp_secret, error=message, status_code=400
+        )
+
+    if password != password_confirm:
+        return retry("Die Passwörter stimmen nicht überein.")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return retry(f"Das Passwort muss mindestens {MIN_PASSWORD_LENGTH} Zeichen lang sein.")
+
+    user = accept_invitation(storage, token, password, totp_secret, totp_code, now)
+    if user is None:
+        # Wrong code, or the link was used / the name taken in the meantime:
+        # the latter re-checks to the same page as any dead link.
+        if (
+            get_open_invitation(storage, token, now) is None
+            or storage.get_ui_user_by_username(invitation.username) is not None
+        ):
+            return _invalid_invite_response(request)
+        return retry("Der Bestätigungscode ist nicht korrekt. Bitte erneut versuchen.")
+
+    storage.release_ip_login_attempt(throttle_key, now)
+    response: Response = RedirectResponse(
+        url="/ui/login?invited=1", status_code=303, headers=_INVITE_NO_STORE
+    )
+    response.delete_cookie(key=PRE_SESSION_CSRF_COOKIE_NAME, path=_INVITE_COOKIE_PATH)
     return response
 
 

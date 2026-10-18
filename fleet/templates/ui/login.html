@@ -74,6 +74,9 @@
                     {% if error %}
                     <p class="error" role="alert" data-step-only="1">{{ error }}</p>
                     {% endif %}
+                    {% if notice %}
+                    <p class="field-note" role="status" data-step-only="1">{{ notice }}</p>
+                    {% endif %}
 
                     <div class="step-pane" data-pane="1">
                         <label class="field" for="username">

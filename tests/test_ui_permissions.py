@@ -175,6 +175,42 @@ def test_route_matrix_403_without_the_permission_and_open_with_only_it(
     assert allowed.headers.get("location") != "/ui/login"
 
 
+def _all_gated_routes() -> list[tuple[str, str]]:
+    cases: list[tuple[str, str]] = []
+    for route in ui_api_routes():
+        if not dependency_permissions(route):
+            continue
+        path = re.sub(r"\{[^}]*\}", "x", route.path)
+        for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+            cases.append((method, path))
+    return cases
+
+
+@pytest.mark.parametrize(("method", "path"), _all_gated_routes(), ids=lambda v: str(v))
+def test_dangling_role_id_gets_403_on_every_gated_route(
+    real_client: TestClient, storage: Storage, method: str, path: str
+) -> None:
+    """A user whose `role_id` points to a role that does not exist grants
+    nothing: 403 everywhere, no error, no fall-through to a grant."""
+
+    from sqlalchemy import text
+
+    role = storage.create_ui_role("Voll", set(Permission))
+    user = login_with_role(real_client, storage, role.id)
+    with storage.session() as session:
+        session.execute(
+            text("UPDATE ui_users SET role_id = :missing WHERE id = :id"),
+            {"missing": 987654, "id": user.id},
+        )
+    assert storage.get_ui_role(987654) is None
+
+    response = real_client.request(
+        method, path, data={} if method == "POST" else None, follow_redirects=False
+    )
+
+    assert response.status_code == 403, (method, path)
+
+
 # -- pilot_mode needs its own permission --------------------------------------
 
 

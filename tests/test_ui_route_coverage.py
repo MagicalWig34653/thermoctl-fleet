@@ -18,6 +18,8 @@ OWN_ACCOUNT_AND_PUBLIC = {
     "login_form",
     "login_submit",
     "login_webauthn_begin",
+    "invite_form",
+    "invite_submit",
     "logout",
     "webauthn_account_page",
     "webauthn_register_begin",

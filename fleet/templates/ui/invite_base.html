@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex">
+    <title>{% block title %}Einladung{% endblock %} · thermoctl fleet</title>
+    {# Public, unauthenticated page (F11). CSP: external stylesheet only, no
+       inline style or script; the form works without JavaScript. #}
+    <link rel="icon" type="image/svg+xml" href="/ui/static/favicon.svg">
+    <link rel="apple-touch-icon" href="/ui/static/apple-touch-icon.png">
+    <link rel="stylesheet" href="/ui/static/auth.css">
+</head>
+<body>
+{% import "_icons.html" as icons %}
+<div class="auth-shell">
+    <aside class="story">
+        <a class="brand" href="/ui/" aria-label="thermoctl fleet">
+            <span class="brand-mark">{{ icons.icon("brand") }}</span>
+            <span class="brand-name">thermoctl<small>FLEET</small></span>
+        </a>
+        <div class="story-copy">
+            <div class="eyebrow">Einladung</div>
+            <h2>Willkommen<br><em>bei thermoctl fleet.</em></h2>
+            <p>Legen Sie Ihr Passwort fest und richten Sie die Bestätigung per Authenticator-App ein.</p>
+        </div>
+        {% include "_auth_illustration.html" %}
+    </aside>
+    <section class="auth-side">
+        <main id="main" class="auth-content">
+            <div class="auth-flow">
+                {% block content %}{% endblock %}
+            </div>
+        </main>
+        <footer class="auth-footer">
+            <span>thermoctl fleet · Mit Ruhe verwalten.</span>
+            <span class="footer-lock">{{ icons.icon("lock") }}Geschützter Zugang</span>
+        </footer>
+    </section>
+</div>
+</body>
+</html>

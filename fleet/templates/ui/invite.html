@@ -1,0 +1,48 @@
+{% extends "invite_base.html" %}
+
+{% block title %}Konto einrichten{% endblock %}
+
+{% block content %}
+<h1>Konto einrichten</h1>
+<p class="intro">Sie wurden als <strong>{{ username }}</strong> eingeladen.</p>
+
+<form method="post" action="/ui/invite/{{ token }}" class="auth-form" autocomplete="off">
+    <input type="hidden" name="pre_csrf" value="{{ pre_csrf }}">
+    <input type="hidden" name="totp_secret" value="{{ totp_secret }}">
+    <input type="hidden" name="totp_signature" value="{{ totp_signature }}">
+
+    {% if error %}
+    <p class="error" role="alert">{{ error }}</p>
+    {% endif %}
+
+    <label class="field" for="password">
+        <span class="field-label">Passwort (mindestens {{ min_password_length }} Zeichen)</span>
+        <div class="input-wrap">
+            <input id="password" name="password" type="password" autocomplete="new-password" required minlength="{{ min_password_length }}" autofocus>
+        </div>
+    </label>
+    <label class="field" for="password_confirm">
+        <span class="field-label">Passwort wiederholen</span>
+        <div class="input-wrap">
+            <input id="password_confirm" name="password_confirm" type="password" autocomplete="new-password" required minlength="{{ min_password_length }}">
+        </div>
+    </label>
+
+    <p class="field-note">Richten Sie jetzt die Bestätigung per Authenticator-App ein: Fügen Sie ein neues Konto mit diesem Schlüssel hinzu und geben Sie anschließend den angezeigten sechsstelligen Code ein.</p>
+    <label class="field" for="totp_secret_display">
+        <span class="field-label">Schlüssel für die Authenticator-App</span>
+        <div class="input-wrap">
+            <input id="totp_secret_display" type="text" value="{{ totp_secret }}" readonly spellcheck="false">
+        </div>
+    </label>
+    <p class="field-note">Oder als Adresse für die App: <code>{{ provisioning_uri }}</code></p>
+    <label class="field" for="totp_code">
+        <span class="field-label">Bestätigungscode</span>
+        <div class="input-wrap">
+            <input id="totp_code" name="totp_code" type="text" inputmode="numeric" autocomplete="one-time-code" required spellcheck="false">
+        </div>
+    </label>
+
+    <button class="button primary" type="submit"><span>Konto anlegen</span></button>
+</form>
+{% endblock %}
