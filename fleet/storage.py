@@ -7058,6 +7058,65 @@ class Storage:
                 update(UiUserRecord).where(UiUserRecord.id == user_id).values(role_id=role_id)
             )
 
+    # -- ui invitations (F11) ------------------------------------------------
+
+    def create_ui_invitation(
+        self,
+        *,
+        username: str,
+        role_id: int,
+        token_hash: str,
+        created_by: int | None,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> UiInvitationRecord:
+        """Stores an invitation. Only the SHA-256 hash of the token is
+        persisted, never the token itself."""
+
+        with self.session() as session:
+            record = UiInvitationRecord(
+                username=username,
+                role_id=role_id,
+                token_hash=token_hash,
+                created_by=created_by,
+                created_at=_naive_utc(created_at),
+                expires_at=_naive_utc(expires_at),
+                used_at=None,
+            )
+            session.add(record)
+            session.flush()
+            session.expunge(record)
+            return record
+
+    def get_ui_invitation_by_hash(self, token_hash: str) -> UiInvitationRecord | None:
+        with self.session() as session:
+            record = session.scalar(
+                select(UiInvitationRecord).where(UiInvitationRecord.token_hash == token_hash)
+            )
+            if record is not None:
+                session.expunge(record)
+            return record
+
+    def mark_ui_invitation_used(self, invitation_id: int, now: datetime) -> bool:
+        """Atomically consumes an invitation: `True` for exactly one caller
+        (`UPDATE ... WHERE used_at IS NULL`, rowcount 1), `False` for every
+        concurrent or later one -- single use does not depend on a prior
+        read."""
+
+        with self.session() as session:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(UiInvitationRecord)
+                    .where(
+                        UiInvitationRecord.id == invitation_id,
+                        UiInvitationRecord.used_at.is_(None),
+                    )
+                    .values(used_at=_naive_utc(now))
+                ),
+            )
+            return result.rowcount == 1
+
     def count_ui_users_with_permission(
         self, permission: Permission, excluding_user_id: int | None = None
     ) -> int:
