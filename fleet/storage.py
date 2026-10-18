@@ -109,6 +109,7 @@ from fleet.device_lifecycle import (
     validate_manual_device_transition,
 )
 from fleet.permissions import Permission, parse_permissions
+from fleet.totp_crypto import encrypt_totp_secret
 from protocol import Event, Heartbeat, LogExcerpt, fault_kind_from_key
 from protocol.backups import BackupKind
 from protocol.commands import Command, CommandResult, CommandType
@@ -7100,31 +7101,85 @@ class Storage:
     def mark_ui_invitation_used(self, invitation_id: int, now: datetime) -> bool:
         """Atomically consumes an invitation: `True` for exactly one caller
         (`UPDATE ... WHERE used_at IS NULL`, rowcount 1), `False` for every
-        concurrent or later one -- single use does not depend on a prior
-        read."""
+        concurrent or later one."""
 
         with self.session() as session:
-            result = cast(
-                CursorResult[Any],
-                session.execute(
-                    update(UiInvitationRecord)
-                    .where(
-                        UiInvitationRecord.id == invitation_id,
-                        UiInvitationRecord.used_at.is_(None),
-                    )
-                    .values(used_at=_naive_utc(now))
-                ),
-            )
-            return result.rowcount == 1
+            return self._consume_invitation(session, invitation_id, now)
+
+    @staticmethod
+    def _consume_invitation(session: Session, invitation_id: int, now: datetime) -> bool:
+        result = cast(
+            CursorResult[Any],
+            session.execute(
+                update(UiInvitationRecord)
+                .where(
+                    UiInvitationRecord.id == invitation_id,
+                    UiInvitationRecord.used_at.is_(None),
+                )
+                .values(used_at=_naive_utc(now))
+            ),
+        )
+        return result.rowcount == 1
+
+    def redeem_ui_invitation(
+        self,
+        invitation_id: int,
+        password_hash: str,
+        totp_secret: str,
+        key: bytes,
+        now: datetime,
+        matched_totp_step: int,
+    ) -> UiUserRecord | None:
+        """Consumes the invitation and creates the account in ONE transaction:
+        the single-use `UPDATE ... WHERE used_at IS NULL` (rowcount 1, else
+        `None`), the user row, the id-bound encrypted TOTP secret and the
+        matched TOTP step (so the setup code cannot be replayed at the first
+        login). Any exception, including `IntegrityError` for a taken
+        username (returns `None`), rolls everything back, `used_at` too."""
+
+        try:
+            with self.session() as session:
+                if not self._consume_invitation(session, invitation_id, now):
+                    return None
+                invitation = session.get(UiInvitationRecord, invitation_id)
+                assert invitation is not None
+                record = UiUserRecord(
+                    username=invitation.username,
+                    password_hash=password_hash,
+                    totp_secret="",
+                    last_totp_step=matched_totp_step,
+                    failed_attempts=0,
+                    locked_until=None,
+                    failure_window_started_at=None,
+                    created_at=_naive_utc(now),
+                    role_id=invitation.role_id,
+                )
+                session.add(record)
+                session.flush()
+                record.totp_secret = encrypt_totp_secret(totp_secret, record.id, key)
+                session.flush()
+                session.expunge(record)
+                return record
+        except IntegrityError:
+            return None
 
     def count_ui_users_with_permission(
-        self, permission: Permission, excluding_user_id: int | None = None
+        self,
+        permission: Permission,
+        excluding_user_id: int | None = None,
+        now: datetime | None = None,
     ) -> int:
-        """Number of accounts whose role grants `permission` (by the same
-        read rules as `get_ui_role_permissions`)."""
+        """Number of usable accounts whose role grants `permission` (by the
+        same read rules as `get_ui_role_permissions`). An account locked at
+        `now` does not count: it cannot log in, so it is no usable holder."""
 
+        moment = _naive_utc(now or datetime.now(UTC))
         with self.session() as session:
-            rows = session.execute(select(UiUserRecord.id, UiUserRecord.role_id)).all()
+            rows = session.execute(
+                select(UiUserRecord.id, UiUserRecord.role_id).where(
+                    or_(UiUserRecord.locked_until.is_(None), UiUserRecord.locked_until <= moment)
+                )
+            ).all()
         grants: dict[int, bool] = {}
         count = 0
         for user_id, role_id in rows:

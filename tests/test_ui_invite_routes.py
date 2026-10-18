@@ -94,7 +94,10 @@ def test_valid_flow_creates_a_user_who_can_log_in(
         data={
             "username": "neu",
             "password": PASSWORD,
-            "totp_code": pyotp.TOTP(data["totp_secret"]).now(),
+            # The setup code itself is consumed; the next step's code works.
+            "totp_code": pyotp.TOTP(data["totp_secret"]).at(
+                datetime.now(UTC) + timedelta(seconds=30)
+            ),
             "pre_csrf": _field(login.text, "pre_csrf"),
         },
         follow_redirects=False,
@@ -284,3 +287,65 @@ def test_successful_accept_does_not_spend_the_budget(
             f"/ui/invite/{invite}", data=_form_data(page.text), follow_redirects=False
         )
         assert done.status_code == 303, name
+
+
+def _failed_login(client: TestClient) -> None:
+    login = client.get("/ui/login")
+    client.post(
+        "/ui/login",
+        data={
+            "username": "x",
+            "password": "y",
+            "totp_code": "",
+            "pre_csrf": _field(login.text, "pre_csrf"),
+        },
+    )
+
+
+def test_setup_code_cannot_be_replayed_at_first_login(
+    client: TestClient, storage: Storage, token: str
+) -> None:
+    page = client.get(f"/ui/invite/{token}")
+    data = _form_data(page.text)
+    assert client.post(f"/ui/invite/{token}", data=data, follow_redirects=False).status_code == 303
+
+    login = client.get("/ui/login")
+    response = client.post(
+        "/ui/login",
+        data={
+            "username": "neu",
+            "password": PASSWORD,
+            "totp_code": data["totp_code"],
+            "pre_csrf": _field(login.text, "pre_csrf"),
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 401
+
+
+def test_invite_exhaustion_does_not_block_login(client: TestClient, storage: Storage) -> None:
+    from fleet.ui_auth import generate_totp_secret, hash_password
+    from tests.conftest import create_ui_user_with_totp
+
+    secret = generate_totp_secret()
+    create_ui_user_with_totp(storage, "alt", hash_password(PASSWORD), secret, datetime.now(UTC))
+    for _ in range(ip_throttle_threshold() + 1):
+        assert client.get("/ui/invite/unknown-token").status_code == 404
+    login = client.get("/ui/login")
+    response = client.post(
+        "/ui/login",
+        data={
+            "username": "alt",
+            "password": PASSWORD,
+            "totp_code": pyotp.TOTP(secret).now(),
+            "pre_csrf": _field(login.text, "pre_csrf"),
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+
+def test_login_exhaustion_does_not_block_a_valid_invite(client: TestClient, token: str) -> None:
+    for _ in range(ip_throttle_threshold() + 1):
+        _failed_login(client)
+    assert client.get(f"/ui/invite/{token}").status_code == 200

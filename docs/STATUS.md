@@ -24,6 +24,16 @@ meant for locking too). New regression test: a user whose `role_id` points
 to no role gets 403 on every gated route. Not yet done: "Nutzer und Rollen"
 pages (6), CLI `--role` and the `delete-user` guard (7).
 
+Review fixes (same day): accepting an invitation is one transaction
+(`Storage.redeem_ui_invitation`: single-use UPDATE, user row, id-bound
+encrypted TOTP secret, matched TOTP step; any failure or a taken username
+rolls back and leaves the link unused). The setup code is recorded as
+`last_totp_step`, so it cannot be replayed at the first login. The signature
+uses an HMAC subkey (`invite-hmac-v1`) instead of the raw TOTP key. Invitations
+are valid up to and including `expires_at`. `count_ui_users_with_permission`
+ignores currently locked accounts, so a locked manager does not protect the
+last-manager guard.
+
 
 ## UI roles and per-permission access, tasks 1-3 of 7 (F11, 2026-10-16)
 

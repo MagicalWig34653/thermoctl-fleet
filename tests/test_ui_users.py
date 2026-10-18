@@ -206,3 +206,70 @@ def test_removal_allowed_with_a_second_manager(storage: Storage, admin_role: int
     a = storage.create_ui_user("a", "h", "", NOW, role_id=admin_role)
     b = storage.create_ui_user("b", "h", "", NOW, role_id=admin_role)
     assert guard_user_removal(storage, a.id, b.id) is None
+
+
+# -- atomic redeem, boundary, locked managers ------------------------------------
+
+
+def test_encrypt_failure_rolls_back_user_and_leaves_invite_unused(
+    storage: Storage, role_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = create_invitation(storage, "neu", role_id, None, NOW)
+    secret = generate_totp_secret()
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("encrypt failed")
+
+    monkeypatch.setattr("fleet.storage.encrypt_totp_secret", boom)
+    with pytest.raises(RuntimeError):
+        accept_invitation(storage, token, PASSWORD, secret, _code(secret), NOW)
+    monkeypatch.undo()
+
+    assert storage.get_ui_user_by_username("neu") is None
+    assert get_open_invitation(storage, token, NOW) is not None
+    assert accept_invitation(storage, token, PASSWORD, secret, _code(secret), NOW) is not None
+
+
+def test_integrity_error_leaves_invite_unused(storage: Storage, role_id: int) -> None:
+    token = create_invitation(storage, "neu", role_id, None, NOW)
+    invitation = get_open_invitation(storage, token, NOW)
+    assert invitation is not None
+    storage.create_ui_user("neu", "h", "", NOW, role_id=role_id)
+
+    result = storage.redeem_ui_invitation(
+        invitation.id, "hash", generate_totp_secret(), totp_key(), NOW, 5
+    )
+
+    assert result is None
+    assert get_open_invitation(storage, token, NOW) is not None
+
+
+def test_redeem_stores_matched_step(storage: Storage, role_id: int) -> None:
+    token = create_invitation(storage, "neu", role_id, None, NOW)
+    secret = generate_totp_secret()
+    user = accept_invitation(storage, token, PASSWORD, secret, _code(secret), NOW)
+    assert user is not None
+    assert user.last_totp_step == int(NOW.timestamp()) // 30
+
+
+def test_expiry_boundary_valid_at_exactly_24h_expired_after(storage: Storage, role_id: int) -> None:
+    # Semantics: valid up to and including expires_at, expired right after.
+    token = create_invitation(storage, "neu", role_id, None, NOW)
+    edge = NOW + timedelta(hours=24)
+    assert get_open_invitation(storage, token, edge) is not None
+    assert get_open_invitation(storage, token, edge + timedelta(microseconds=1)) is None
+
+
+def test_locked_manager_is_not_counted(storage: Storage, admin_role: int) -> None:
+    a = storage.create_ui_user("a", "h", "", NOW, role_id=admin_role)
+    b = storage.create_ui_user("b", "h", "", NOW, role_id=admin_role)
+    count = storage.count_ui_users_with_permission
+    assert count(Permission.USERS_MANAGE, excluding_user_id=a.id, now=NOW) == 1
+    with storage.session() as session:
+        session.execute(
+            text("UPDATE ui_users SET locked_until = :t WHERE id = :id"),
+            {"t": (NOW + timedelta(hours=1)).replace(tzinfo=None), "id": b.id},
+        )
+    assert count(Permission.USERS_MANAGE, excluding_user_id=a.id, now=NOW) == 0
+    later = NOW + timedelta(hours=2)
+    assert count(Permission.USERS_MANAGE, excluding_user_id=a.id, now=later) == 1

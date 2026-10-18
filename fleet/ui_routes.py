@@ -487,8 +487,9 @@ def _invite_totp_signature(token: str, totp_secret: str) -> str:
     so the POST cannot swap in a chosen secret. Domain-separated from the
     key's encryption use."""
 
-    message = f"invite-totp:{token}:{totp_secret}".encode()
-    return hmac.new(totp_key(), message, "sha256").hexdigest()
+    subkey = hmac.new(totp_key(), b"invite-hmac-v1", "sha256").digest()
+    message = f"{token}:{totp_secret}".encode()
+    return hmac.new(subkey, message, "sha256").hexdigest()
 
 
 def _invalid_invite_response(request: Request) -> Response:
@@ -615,7 +616,10 @@ def invite_submit(
     if user is None:
         # Wrong code, or the link was used / the name taken in the meantime:
         # the latter re-checks to the same page as any dead link.
-        if get_open_invitation(storage, token, now) is None:
+        if (
+            get_open_invitation(storage, token, now) is None
+            or storage.get_ui_user_by_username(invitation.username) is not None
+        ):
             return _invalid_invite_response(request)
         return retry("Der Bestätigungscode ist nicht korrekt. Bitte erneut versuchen.")
 

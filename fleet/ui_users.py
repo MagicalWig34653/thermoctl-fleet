@@ -9,11 +9,8 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy.exc import IntegrityError
-
 from fleet.permissions import Permission
 from fleet.storage import Storage, UiInvitationRecord, UiUserRecord, hash_token
-from fleet.totp_crypto import encrypt_totp_secret
 from fleet.ui_auth import (
     MIN_PASSWORD_LENGTH,
     hash_password,
@@ -77,6 +74,7 @@ def get_open_invitation(
     invitation = storage.get_ui_invitation_by_hash(hash_token(raw_token))
     if invitation is None or invitation.used_at is not None:
         return None
+    # Boundary: valid up to and including `expires_at`, expired after it.
     if invitation.expires_at < _naive_utc(now):
         return None
     return invitation
@@ -96,24 +94,15 @@ def accept_invitation(
     invitation = get_open_invitation(storage, raw_token, now)
     if invitation is None or len(password) < MIN_PASSWORD_LENGTH:
         return None
-    if verify_totp(totp_secret, totp_code, now, None) is None:
+    step = verify_totp(totp_secret, totp_code, now, None)
+    if step is None:
         return None
     # Read before anything is consumed: a missing key must not burn the invite.
     key = totp_key()
-    if not storage.mark_ui_invitation_used(invitation.id, now):  # atomic, single use
-        return None
-    try:
-        user = storage.create_ui_user(
-            invitation.username,
-            hash_password(password),
-            "",
-            now,
-            role_id=invitation.role_id,
-        )
-    except IntegrityError:
-        return None
-    storage.set_ui_user_totp_secret(user.id, encrypt_totp_secret(totp_secret, user.id, key))
-    return user
+    # One transaction: single-use mark, user row, encrypted secret, TOTP step.
+    return storage.redeem_ui_invitation(
+        invitation.id, hash_password(password), totp_secret, key, now, step
+    )
 
 
 def _is_last_user_manager(storage: Storage, target_id: int) -> bool:
