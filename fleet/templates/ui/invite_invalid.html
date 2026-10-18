@@ -1,0 +1,10 @@
+{% extends "invite_base.html" %}
+
+{% block title %}Einladung ungültig{% endblock %}
+
+{% block content %}
+{# One page for unknown, expired and used links: no reason, no username. #}
+<h1>Dieser Einladungslink ist nicht mehr gültig.</h1>
+<p class="intro">Bitten Sie die Person, die Sie eingeladen hat, um eine neue Einladung.</p>
+<p class="field-note"><a href="/ui/login">Zur Anmeldung</a></p>
+{% endblock %}

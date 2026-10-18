@@ -1,6 +1,28 @@
 # Status
 
-Last updated: 2026-10-16.
+Last updated: 2026-10-18.
+
+## UI roles, tasks 4-5 of 7: invitations (F11, 2026-10-18)
+
+`fleet/ui_users.py` (invite, accept, `guard_role_change`,
+`guard_user_removal`) plus the `Storage` invitation methods and the public
+pages `GET/POST /ui/invite/{token}`. Token: `token_urlsafe(32)`, 24 h, single
+use through an atomic `UPDATE ... WHERE used_at IS NULL`; only the SHA-256
+hash is stored. Unknown, expired, used and throttled links give one
+identical 404 page without a username. The invitee chooses a password
+(twice, `MIN_PASSWORD_LENGTH`) and must enter a valid TOTP code for a
+server-generated secret before the account exists; the secret travels in a
+hidden field signed with an HMAC (key `FLEET_TOTP_KEY`) bound to the token,
+so the POST cannot swap in another one. The secret is stored encrypted like
+for `create-user`. The IP throttle uses the login thresholds under its own
+counter key (`invite:<ip>`, so token probing cannot lock the login); a
+successful accept or a valid link opening releases the reservation. Pre-session
+CSRF double-submit cookie scoped to `/ui/invite`, `Cache-Control: no-store`.
+Lock-out guards: no self role change, no self removal, the last
+`users.manage` holder cannot be demoted or removed (the guard for removal is
+meant for locking too). New regression test: a user whose `role_id` points
+to no role gets 403 on every gated route. Not yet done: "Nutzer und Rollen"
+pages (6), CLI `--role` and the `delete-user` guard (7).
 
 
 ## UI roles and per-permission access, tasks 1-3 of 7 (F11, 2026-10-16)
