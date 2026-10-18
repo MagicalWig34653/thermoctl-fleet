@@ -124,7 +124,8 @@ Suggestions only; nothing was decided or changed. Items touching principles 1-6 
 **Larger work**
 
 1. Agent re-authentication from the stored registration instead of an optional flag, with a test (F51); then the real heartbeat (F10, spec section 8 rule for never-reported devices needs the owner's decision).
-2. Roles in the fleet UI (`ui_users`), user list, hiding the pilot toggle from non-admins as a convenience only; the agent check stays authoritative (F11, A09).
+2. ~~Roles in the fleet UI, hiding the pilot toggle from non-admins as a convenience only; the agent check stays authoritative (F11).~~ **Resolved 2026-10-18:** freely definable roles built from a fixed permission catalogue, enforced per route, accounts by invitation link, `create-user --role`; the agent check is unchanged (`docs/superpowers/specs/2026-10-16-ui-roles-design.md`).
+   - ~~User list and role management page (A09).~~ **Resolved 2026-10-18:** page "Nutzer und Rollen" (`/ui/users`) with roles, invitations, role assignment, lock/unlock and delete, protected against locking out the last user manager.
 3. Commit before redirect in mutating tenant views, together with F50 (H1); render the stale-sensor flag at read time (H2).
 4. Landlord overview: plain-language alarm text, portfolio summary and priority, paging and filtering of the 50-row alarm list and of the command history, tenant change entry in Einrichtung (L01-L03, L07, C09).
 5. Onboarding help and empty states (N01, N03, N04); tenant wording for Notbetrieb and the cold-room reason (T13, T14); absence form (T19, T20).

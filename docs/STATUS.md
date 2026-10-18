@@ -2,6 +2,18 @@
 
 Last updated: 2026-10-18.
 
+## UI roles, task 7 of 7: CLI `--role`, docs (F11, 2026-10-18)
+
+`fleet.admin create-user NAME --role ROLE`: the role must exist (unknown name:
+error before any prompt), without `--role` (or `--role Administrator`) the
+Administrator role is used and recreated with all permissions if missing.
+`delete-user` goes through `Storage.remove_ui_user` and refuses the last usable
+`users.manage` holder. Owner decision of 2026-09-24 ("accounts never via the
+web") is explicitly overridden by the owner on 2026-10-16 (invitations in the
+web UI); the CLI stays as first-account and emergency path. The agent check for
+`open_access` is unchanged. F11 and A09 marked resolved in
+`docs/sim-findings/README.md`. This completes the UI roles plan.
+
 ## UI roles, task 6 of 7: "Nutzer und Rollen" pages (F11, 2026-10-18)
 
 `fleet/ui_users_routes.py` (registered on the `/ui` router, so the

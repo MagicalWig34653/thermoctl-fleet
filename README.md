@@ -155,12 +155,15 @@ in a local `.env` that is never committed.
 <summary><b>Operating the fleet service: accounts and configuration</b></summary>
 <br>
 
-Accounts are created only on the server, never through the web UI. The
-password is prompted interactively; `FLEET_DATABASE_URL` and `FLEET_TOTP_KEY`
-must be set.
+The first account (and the emergency path) is created on the server with the
+CLI; the password is prompted interactively, `FLEET_DATABASE_URL` and
+`FLEET_TOTP_KEY` must be set. Further accounts are invited in the web UI
+(page "Nutzer und Rollen", one-time link, 24 hours). `--role` picks an existing
+role; without it the account becomes an Administrator.
 
 ```bash
 python -m fleet.admin create-user alice
+python -m fleet.admin create-user bob --role Hausmeister
 ```
 
 Required for operation:
