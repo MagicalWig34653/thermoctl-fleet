@@ -147,7 +147,7 @@
 <section class="panel panel-wide" aria-labelledby="devices-heading">
     <div class="section-head">
         <h2 id="devices-heading">Batterie &amp; Signal</h2>
-        {% if not detail.never_reported %}<span class="tiny muted">{{ detail.per_device | length }} {{ "Gerät" if detail.per_device | length == 1 else "Geräte" }} · letzter gemeldeter Stand</span>{% endif %}
+        {% if not detail.never_reported %}<span class="tiny muted">{% if detail.per_device %}{{ detail.per_device | length }} {{ "Gerät" if detail.per_device | length == 1 else "Geräte" }} · letzter gemeldeter Stand{% else %}Zusammenfassung aus dem letzten Herzschlag{% endif %}</span>{% endif %}
     </div>
     {% if detail.never_reported %}
     <div class="empty-state">{{ icons.icon("battery") }}<p>Noch keine Daten.</p></div>

@@ -2,6 +2,16 @@
 
 Last updated: 2026-11-23.
 
+## Battery panel no longer claims "0 Geräte" (2026-11-23)
+
+The "Batterie & Signal" panel of the apartment page counted `per_device`
+("0 Geräte") although the weakest battery and worst signal beside it come from
+the heartbeat itself; the per-device list is optional and the agent does not
+send it yet (sim finding L11). Without a list the panel head now reads
+"Zusammenfassung aus dem letzten Herzschlag"; with one it still shows "N Geräte
+· letzter gemeldeter Stand". Tests `test_battery_panel_*` in
+`tests/test_ui_apartment.py` (the first written red).
+
 ## UI follows the system dark scheme (2026-11-23)
 
 The fleet UI (app shell, login/2FA/invitation pages, legacy pages) follows

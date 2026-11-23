@@ -1305,3 +1305,55 @@ def test_single_heartbeat_is_not_pluralised(
 
     assert "1 Herzschlag<" in body
     assert "1 Herzschläge" not in body
+
+
+def _battery_panel(client: TestClient, per_device: list[dict[str, object]] | None) -> str:
+    """The "Batterie & Signal" panel of the Überblick tab, as rendered HTML."""
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=ueberblick")
+    assert response.status_code == 200
+    start = response.text.index('id="devices-heading"')
+    return response.text[start : response.text.index("</section>", start)]
+
+
+def _seed_heartbeat(storage: Storage, per_device: list[dict[str, object]] | None = None) -> None:
+    storage.set_apartment_token(APARTMENT, secrets.token_urlsafe(32))
+    storage.save_heartbeat(
+        APARTMENT,
+        _make_heartbeat(APARTMENT, sent_at=RECENT_TIME, per_device=per_device),
+        RECENT_TIME,
+    )
+
+
+def test_battery_panel_without_a_device_list_does_not_claim_zero_devices(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    """The summary values (weakest battery, worst signal) come from the
+    heartbeat itself; the per-device list is optional. Saying "0 Geräte" right
+    above "Schwächste Batterie 62 %" contradicts the page."""
+    _seed_heartbeat(storage)
+    _login(client, password, totp_secret)
+
+    panel = _battery_panel(client, None)
+
+    assert "Schwächste Batterie" in panel
+    assert "62 %" in panel
+    assert "0 Geräte" not in panel
+    assert "Zusammenfassung aus dem letzten Herzschlag" in panel
+
+
+def test_battery_panel_with_a_device_list_still_shows_the_count(
+    client: TestClient, storage: Storage, password: str, totp_secret: str, user_id: int
+) -> None:
+    _seed_heartbeat(
+        storage,
+        [
+            {"device_id": "0x00124b0012345678", "battery_percent": 55, "signal_quality": 70},
+            {"device_id": "0x00124b0012345679", "battery_percent": 62, "signal_quality": 47},
+        ],
+    )
+    _login(client, password, totp_secret)
+
+    panel = _battery_panel(client, [])
+
+    assert "2 Geräte · letzter gemeldeter Stand" in panel
+    assert "Zusammenfassung aus dem letzten Herzschlag" not in panel
