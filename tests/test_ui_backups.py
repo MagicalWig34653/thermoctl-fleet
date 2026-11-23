@@ -260,3 +260,58 @@ def test_download_of_another_apartments_backup_is_404(
     response = client.get(f"/ui/apartments/{APARTMENT}/backups/{summary.backup_id}/download")
 
     assert response.status_code == 404
+
+
+def _backup_row(client: TestClient) -> str:
+    response = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung")
+    assert response.status_code == 200
+    start = response.text.index('<div class="list-row">', response.text.index("Sicherungen"))
+    return response.text[start : response.text.index("</details>", start) + len("</details>")]
+
+
+def test_backup_row_keeps_hash_and_decrypt_command_in_technical_details(
+    client: TestClient, storage: Storage, blob_storage: BackupBlobStorage,
+    password: str, totp_secret: str, user_id: int,
+) -> None:
+    """A landlord sees kind, time and size; the checksum and the shell command
+    are for technicians and sit behind a visibly labelled, collapsed section
+    (before: a bare "Hash:" line and a loose word "Entschlüsseln")."""
+    _create_apartment(storage)
+    path = blob_storage.store(APARTMENT, BackupKind.OPERATIONAL_DATA, b"age-encryption.org/v1...")
+    storage.create_backup_record(
+        APARTMENT, BackupKind.OPERATIONAL_DATA, size_bytes=24, content_hash="b" * 64,
+        storage_path=path, now=datetime.now(UTC),
+    )
+    _login(client, password, totp_secret)
+
+    row = _backup_row(client)
+    details_start = row.index("<details")
+    outside, inside = row[:details_start], row[details_start:]
+
+    assert "Hash:" not in outside
+    assert "age -d" not in outside
+    assert "Technische Details" in inside
+    assert "age -d -i" in inside
+    assert "sha256:" in inside.lower() or "Prüfsumme" in inside
+    # the copy button (next to the row, outside the details) keeps working
+    page = client.get(f"/ui/apartments/{APARTMENT}?ansicht=wartung").text
+    assert 'data-copy="' + "b" * 64 + '"' in page
+
+
+def test_backup_without_decrypt_command_still_has_technical_details_for_the_checksum(
+    client: TestClient, storage: Storage, blob_storage: BackupBlobStorage,
+    password: str, totp_secret: str, user_id: int,
+) -> None:
+    _create_apartment(storage)
+    path = blob_storage.store(APARTMENT, BackupKind.DEVICE_CONFIG, b"{}")
+    storage.create_backup_record(
+        APARTMENT, BackupKind.DEVICE_CONFIG, size_bytes=2, content_hash="a" * 64,
+        storage_path=path, now=datetime.now(UTC),
+    )
+    _login(client, password, totp_secret)
+
+    row = _backup_row(client)
+
+    assert "Technische Details" in row
+    assert "age -d" not in row
+    assert "Hash:" not in row[: row.index("<details")]

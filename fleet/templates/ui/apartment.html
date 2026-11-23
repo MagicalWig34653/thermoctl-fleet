@@ -280,7 +280,7 @@
     {% if detail.backups %}
     {% for backup in detail.backups %}
     <div class="list-row">
-        <span>{{ backup.kind_label }}<small>{{ backup.created_text }} · {{ backup.size_text }}</small><small>Hash: <code class="id-text" title="{{ backup.content_hash }}">{{ backup.content_hash | shortdigest }}</code></small>{% if backup.age_decrypt_command %}<small><details class="inline-details"><summary>Entschlüsseln</summary><code class="id-text">{{ backup.age_decrypt_command }}</code></details></small>{% endif %}</span>
+        <span>{{ backup.kind_label }}<small>{{ backup.created_text }} · {{ backup.size_text }}</small><small><details class="inline-details tech-details"><summary>Technische Details</summary><span class="tech-line">Prüfsumme (Hash): <code class="id-text" title="{{ backup.content_hash }}">{{ backup.content_hash | shortdigest }}</code></span>{% if backup.age_decrypt_command %}<span class="tech-line">Entschlüsseln (für Techniker, Schlüsseldatei nötig): <code class="id-text">{{ backup.age_decrypt_command }}</code></span>{% endif %}</details></small></span>
         <span class="row-actions-tight">
         <button type="button" class="button small copy-button" data-copy="{{ backup.content_hash }}" aria-label="Hash kopieren">Hash kopieren</button>
         {% if "backups.manage" in perms %}<a class="icon-button" href="/ui/apartments/{{ apartment_id | urlpath }}/backups/{{ backup.backup_id | urlpath }}/download" aria-label="{{ backup.kind_label }} vom {{ backup.created_text }} herunterladen">{{ icons.icon("download") }}</a>{% endif %}

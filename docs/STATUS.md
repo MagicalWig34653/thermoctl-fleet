@@ -2,6 +2,19 @@
 
 Last updated: 2026-11-23.
 
+## Backups: technical details collapsed (2026-11-23)
+
+On the apartment page's Wartung tab a backup row showed a bare "Hash: sha256:..."
+line and a loose, link-less word "Entschlüsseln" (its `summary` was
+`display:inline`, which hides the disclosure triangle; sim finding L09). Now the
+row shows kind, time and size only; checksum and the `age -d` command sit in a
+collapsed "Technische Details" (visible triangle, new `.tech-details` rules)
+with a one-line explanation. The "Hash kopieren" button and the download stay
+beside the row. Tests `test_backup_row_keeps_hash_and_decrypt_command_in_technical_details`
+and `test_backup_without_decrypt_command_...` in `tests/test_ui_backups.py`
+(written red first). Not changed: the diagnostic bundle's own hash line in the
+command log (`apartment.html`).
+
 ## Battery panel no longer claims "0 Geräte" (2026-11-23)
 
 The "Batterie & Signal" panel of the apartment page counted `per_device`
