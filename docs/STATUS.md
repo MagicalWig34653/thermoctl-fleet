@@ -1,6 +1,28 @@
 # Status
 
-Last updated: 2026-10-18.
+Last updated: 2026-11-23.
+
+## UI follows the system dark scheme (2026-11-23)
+
+The fleet UI (app shell, login/2FA/invitation pages, legacy pages) follows
+`prefers-color-scheme: dark`; before, it stayed light whatever the system said.
+`fleet-ui.css`, `auth.css` and `legacy.css` no longer carry colour literals in
+their rules: every colour is a custom property in a `:root` block (the light
+values, generated 1:1 from the old literals as `--c-<hex>`, so the light scheme
+is pixel-identical apart from clock texts) and one `@media
+(prefers-color-scheme: dark)` block at the end re-declares them. The semantic
+tokens (`--bg`, `--paper`, `--ink`, `--muted`, `--line`, `--green`, `--red`,
+`--amber` and their backgrounds) have hand-picked dark values, all others are
+derived from the light value by lightness inversion. The login illustration
+(inline SVG attributes, out of reach of tokens) is inverted by a `filter`.
+`<meta name="color-scheme" content="light dark">` in `base.html`, `login.html`
+and `invite_base.html`. New tests `tests/test_ui_dark_theme.py` (no literal in a
+rule, every light token has a dark value, contrast not below AA or the light
+value, meta tag, illustration filter); the old "light only" assertion in
+`tests/test_ui_rebuild.py` was dropped. Checked in a real browser (Playwright,
+`prefers-color-scheme` emulated) at 1440 and 390 px: login, overview,
+apartments, tasks, apartment detail, set-up, updates, account.
+New tokens must go into `:root` plus the dark block, never into a rule.
 
 ## UI roles, review fixes (F11, 2026-10-18)
 

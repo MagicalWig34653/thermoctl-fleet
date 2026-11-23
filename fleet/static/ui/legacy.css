@@ -12,6 +12,7 @@
     --signal: #b74c40;
     --focus-ring: #76b49b;
 }
+:root{color-scheme:light dark;--c-88888888:#88888888;}
 
 .legacy .hint {
     border: 1px solid currentColor;
@@ -250,7 +251,7 @@ ul.task-list {
 }
 
 .task-list li {
-    border: 1px solid #8888;
+    border: 1px solid var(--c-88888888);
     border-radius: 0.25rem;
     padding: 0.5rem 0.75rem;
 }
@@ -281,7 +282,7 @@ ul.task-list {
     gap: 0.5rem;
 }
 
-    border: 1px solid #8888;
+    border: 1px solid var(--c-88888888);
     border-radius: 0.25rem;
     padding: 0.5rem 0.75rem;
 }
@@ -327,4 +328,12 @@ code.digest {
 
 .legacy h2 {
     margin-top: 0;
+}
+
+/* ======================================================================
+ * DARK SCHEME -- only token values change; no rule below the :root blocks
+ * may carry a colour literal (tests/test_ui_dark_theme.py).
+ * ====================================================================== */
+@media (prefers-color-scheme: dark){
+  :root{--c-88888888:#75757588;--flame:#9ebfad;--focus-ring:#53826f;--signal:#ad5a51;--surface:#262626;--teal:#82bda8}
 }

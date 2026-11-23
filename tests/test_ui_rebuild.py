@@ -360,7 +360,7 @@ def test_static_assets_of_the_rebuild_are_served_same_origin(client: TestClient)
     assert client.get("/ui/static/fonts/Archivo-Regular.ttf").status_code == 404
 
 
-def test_design_system_stylesheet_is_light_only_with_the_draft_tokens() -> None:
+def test_design_system_stylesheet_keeps_the_draft_tokens_in_the_light_scheme() -> None:
     css = (STATIC / "fleet-ui.css").read_text(encoding="utf-8")
 
     for token in (
@@ -371,7 +371,7 @@ def test_design_system_stylesheet_is_light_only_with_the_draft_tokens() -> None:
         "--red:#b74c40",
     ):
         assert token in css
-    assert "prefers-color-scheme" not in css
+    # The dark scheme is covered by tests/test_ui_dark_theme.py.
     assert "Archivo" not in css
     assert "@font-face" not in css
     assert "INTERAKTIVER" not in css
